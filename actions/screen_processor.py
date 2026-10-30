@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -85,7 +88,76 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
         return img_bytes, f"image/{source_format.lower()}"
 
 
+def looks_blank(img_bytes: bytes, mime: str) -> bool:
+    """True when the capture is a single flat colour (a failed screenshot).
+
+    A blank frame is what a Wayland capture without portal permission looks
+    like: the X root with no native windows. Describing it to the user as "uma
+    tela em branco" is technically true and practically useless — the honest
+    answer is "o sistema não autorizou a captura".
+    """
+    if not _PIL:
+        return len(img_bytes) < 8_000
+    try:
+        img = PIL.Image.open(io.BytesIO(img_bytes)).convert("L")
+        img.thumbnail((64, 64), PIL.Image.BILINEAR)
+        px = list(img.getdata())
+        if not px:
+            return True
+        mean = sum(px) / len(px)
+        var = sum((p - mean) ** 2 for p in px) / len(px)
+        return var < 4.0          # desvio < 2 níveis: cor chapada
+    except Exception:
+        return False
+
+
+def _capture_screen_wayland() -> tuple[bytes, str] | None:
+    """Full-screen capture through the XDG portal. None = not applicable.
+
+    On GNOME/Wayland `mss` photographs only the XWayland root: native windows
+    are missing and the whole thing comes back as an ~11 KB black frame — which
+    is why the assistant described "uma tela em branco" while a full desktop was
+    in front of the user. GNOME's own Shell.Screenshot is closed to outside
+    callers, so the portal (one approval dialog, remembered afterwards) is the
+    only honest path. The helper runs on the system python because the venv has
+    no PyGObject.
+    """
+    if os.environ.get("XDG_SESSION_TYPE", "").lower() != "wayland":
+        return None
+    helper = Path(__file__).resolve().parent.parent / "core" / "portal_shot.py"
+    if not helper.exists():
+        return None
+    tmp = Path(tempfile.gettempdir()) / f"jarvis-shot-{os.getpid()}.png"
+    try:
+        r = subprocess.run(["/usr/bin/python3", str(helper), str(tmp), "30"],
+                           capture_output=True, text=True, timeout=45)
+    except Exception as e:
+        print(f"[Vision] portal indisponível: {e}")
+        return None
+    if r.returncode != 0:
+        detail = (r.stderr or "").strip().splitlines()
+        print(f"[Vision] portal falhou ({r.returncode}): "
+              f"{detail[-1][:120] if detail else 'sem detalhe'}")
+        return None
+    try:
+        data = tmp.read_bytes()
+    except Exception as e:
+        print(f"[Vision] portal sem arquivo: {e}")
+        return None
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    print(f"[Vision] portal: {len(data):,} bytes")
+    return _compress(data, "PNG")
+
+
 def _capture_screen() -> tuple[bytes, str]:
+
+    wayland = _capture_screen_wayland()
+    if wayland:
+        return wayland
 
     if not _MSS:
         raise RuntimeError("mss is not installed. Run: pip install mss")

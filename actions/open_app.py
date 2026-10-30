@@ -1,3 +1,4 @@
+import os
 import time
 import subprocess
 import platform
@@ -20,7 +21,12 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
     "brave":              {"Windows": "brave",                   "Darwin": "Brave Browser",        "Linux": "brave-browser"},
     "safari":             {"Windows": "msedge",                  "Darwin": "Safari",               "Linux": "firefox"},
     "opera":              {"Windows": "opera",                   "Darwin": "Opera",                "Linux": "opera"},
-    "whatsapp":           {"Windows": "WhatsApp",                "Darwin": "WhatsApp",             "Linux": "whatsapp"},
+    # Linux: o WhatsApp não tem .deb oficial; o snap mais comum atende pelo
+    # binário `whatsapp-desktop-linux` (/snap/bin). Manter `whatsapp` como
+    # segunda opção cobre quem instalou via wrapper/flatpak próprio.
+    "whatsapp":           {"Windows": "WhatsApp",                "Darwin": "WhatsApp",             "Linux": "whatsapp-desktop-linux"},
+    "zap":                {"Windows": "WhatsApp",                "Darwin": "WhatsApp",             "Linux": "whatsapp-desktop-linux"},
+    "wapp":               {"Windows": "WhatsApp",                "Darwin": "WhatsApp",             "Linux": "whatsapp-desktop-linux"},
     "telegram":           {"Windows": "Telegram",                "Darwin": "Telegram",             "Linux": "telegram"},
     "discord":            {"Windows": "Discord",                 "Darwin": "Discord",              "Linux": "discord"},
     "slack":              {"Windows": "Slack",                   "Darwin": "Slack",                "Linux": "slack"},
@@ -173,6 +179,49 @@ _LINUX_TERMINAL_FALLBACKS = [
     "xterm", "lxterminal", "mate-terminal", "tilix", "alacritty", "kitty",
 ]
 
+def _desktop_file_candidates(haystack: str) -> list[str]:
+    """Nome de arquivos .desktop que podem representar o app (sem sufixo).
+
+    Snap costuma usar `_<nome>`, flatpak `.<tld>.<nome>`, e o usuário pode
+    ter um atalho simples. Basta casar por substring — o caller ainda chama
+    gtk-launch, que se recusa a abrir o que não existe.
+    """
+    keys = {haystack.lower()}
+    for x in (haystack.lower().replace(" ", "-"),
+              haystack.lower().replace(" ", ""),
+              haystack.lower().replace(" ", "_")):
+        keys.add(x)
+        keys.add(f"{x}-{x}")          # snap: whatsapp-desktop-linux_whatsapp-desktop-linux
+    return sorted(keys)
+
+
+def _launch_via_desktop_file(app_name: str) -> bool:
+    import glob
+    roots = [
+        "/var/lib/snapd/desktop/applications",
+        os.path.expanduser("~/.local/share/applications"),
+        "/usr/share/applications",
+        "/var/lib/flatpak/exports/share/applications",
+    ]
+    stems: set[str] = set()
+    pattern = app_name.lower().replace(" ", "").replace("-", "")
+    for root in roots:
+        for path in glob.glob(os.path.join(root, "*.desktop")):
+            base = os.path.basename(path)[:-len(".desktop")].lower()
+            if pattern and pattern.replace("_", "") in base.replace("_", "").replace("-", ""):
+                stems.add(os.path.basename(path)[:-len(".desktop")])
+    # gtk-launch espera o id do .desktop (com `_` do snap preservado)
+    for stem in sorted(stems):
+        try:
+            r = subprocess.run(["gtk-launch", stem], capture_output=True, timeout=5)
+            if r.returncode == 0:
+                time.sleep(1.0)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _launch_linux(app_name: str) -> bool:
 
     # terminal emulators: try common ones in order
@@ -213,11 +262,7 @@ def _launch_linux(app_name: str) -> bool:
     except Exception:
         pass
 
-    for desktop_name in [
-        app_name.lower(),
-        app_name.lower().replace(" ", "-"),
-        app_name.lower().replace(" ", ""),
-    ]:
+    for desktop_name in _desktop_file_candidates(app_name):
         try:
             result = subprocess.run(
                 ["gtk-launch", desktop_name],
@@ -227,6 +272,12 @@ def _launch_linux(app_name: str) -> bool:
                 return True
         except Exception:
             pass
+
+    # Última chance: garimpar .desktop por substring (snap/flatpak/atalho do
+    # usuário), porque o id do snap tem o nome repetido com underscore e o
+    # nome que o usuário fala raramente bate.
+    if _launch_via_desktop_file(app_name):
+        return True
 
     return False
 

@@ -310,49 +310,96 @@ def _focus_window(title: str) -> str:
 
     return f"focus_window: unknown OS '{os_name}'"
 
+def _load_brain_st() -> dict:
+    """Configurações do cérebro, lidas direto do arquivo.
+
+    Este módulo é invocado do thread de tools — o `st` do main.py não está ao
+    alcance aqui, e a resposta de visão precisa saber se o provedor atual é o
+    cérebro local (custom/Ollama) ou o Gemini.
+    """
+    try:
+        from core import brain as _b
+        from memory.config_manager import get_plugin_config
+        return _b.settings(get_plugin_config)
+    except Exception as e:
+        print(f"[ComputerControl] brain settings indisponível: {e}")
+        return {}
+
+
 def _screen_find(description: str) -> tuple[int, int] | None:
-    api_key = _get_api_key()
-    if not api_key:
-        print("[ComputerControl] ⚠️ No API key for screen_find")
+    """Localiza um elemento na tela e devolve (x, y) do centro.
+
+    Usa primeiro o cérebro local (qwen2.5-vl no mesmo Ollama — o screenshot
+    nunca sai da máquina); se não estiver ativo, cai no Gemini. Assim o
+    `screen_click`/`screen_find` continuam funcionando com a cadeia
+    custom/qwen2.5:7b-instruct que roda hoje.
+    """
+    try:
+        _require_pyautogui()
+        sw, sh = pyautogui.size()
+        # O `_capture_screen` do screen_processor usa `mss`, que funciona sem
+        # gnome-screenshot e já é o canal que o `screen_process` usa. Vai por
+        # ele também aqui para não depender de pacotes extras no Linux.
+        from actions.screen_processor import _capture_screen
+        image_bytes, mime = _capture_screen()
+        # `_capture_screen` thumbnaila até 1280×720. A imagem que o modelo vê
+        # NÃO é do tamanho do screen — sem escalar, um clique "no centro da
+        # imagem" acertaria um canto do monitor real.
+        try:
+            from PIL import Image
+            iw, ih = Image.open(io.BytesIO(image_bytes)).size
+        except Exception:
+            iw, ih = sw, sh
+    except Exception as e:
+        print(f"[ComputerControl] ⚠️ screenshot falhou: {e}")
         return None
 
-    try:
-        from google import genai
-        from google.genai import types as gtypes
+    prompt = (
+        f"This is a screenshot of size {iw}×{ih} pixels. "
+        f"Locate the UI element described as: '{description}'. "
+        f"Reply with ONLY the center coordinates inside THIS image, as: x,y "
+        f"If the element is not visible, reply: NOT_FOUND"
+    )
 
-        _require_pyautogui()
-        w, h  = pyautogui.size()
-        img   = pyautogui.screenshot()
-        buf   = io.BytesIO()
-        img.save(buf, format="PNG")
-        image_bytes = buf.getvalue()
+    answer = ""
+    st = _load_brain_st()
+    if st.get("vision_local", st.get("provider") == "custom"):
+        try:
+            from core import brain as _b
+            answer = _b.vision_describe(image_bytes, mime, prompt, st) or ""
+        except Exception as e:
+            print(f"[ComputerControl] ⚠️ visão local falhou: {e}")
 
-        prompt = (
-            f"This is a screenshot of a {w}×{h} pixel screen. "
-            f"Locate the UI element described as: '{description}'. "
-            f"Reply with ONLY the center coordinates as: x,y "
-            f"If the element is not visible, reply: NOT_FOUND"
-        )
-
-        from core import gemini
-        response = gemini.call(
-            [gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"), prompt],
-            tier=gemini.FAST, timeout_ms=20_000,
-        )
-        if response is None:
+    if not answer:
+        api_key = _get_api_key()
+        if not api_key:
+            print("[ComputerControl] ⚠️ sem visão: nem cérebro local nem Gemini disponíveis")
+            return None
+        try:
+            from google import genai
+            from google.genai import types as gtypes
+            from core import gemini
+            response = gemini.call(
+                [gtypes.Part.from_bytes(data=image_bytes, mime_type=mime), prompt],
+                tier=gemini.FAST, timeout_ms=20_000,
+            )
+            answer = ((response.text if response else "") or "").strip()
+        except Exception as e:
+            print(f"[ComputerControl] ⚠️ screen_find (Gemini) failed: {e}")
             return None
 
-        text = (response.text or "").strip()
-        if "NOT_FOUND" in text.upper():
-            return None
-
-        match = re.search(r"(\d+)\s*,\s*(\d+)", text)
-        if match:
-            return int(match.group(1)), int(match.group(2))
-
-    except Exception as e:
-        print(f"[ComputerControl] ⚠️ screen_find failed: {e}")
-
+    if "NOT_FOUND" in answer.upper():
+        return None
+    match = re.search(r"(\d+)\s*,\s*(\d+)", answer)
+    if match:
+        # Volta para a grade real do monitor: as coordenadas vieram no espaço
+        # da imagem comprimida (iw×ih), e o clique acontece em sw×sh.
+        ix, iy = int(match.group(1)), int(match.group(2))
+        if iw and ih and (iw, ih) != (sw, sh):
+            ix = int(round(ix * sw / iw))
+            iy = int(round(iy * sh / ih))
+        return max(0, min(sw - 1, ix)), max(0, min(sh - 1, iy))
+    print(f"[ComputerControl] ⚠️ screen_find: resposta sem coordenada — {answer[:80]!r}")
     return None
 
 def computer_control(
@@ -516,7 +563,24 @@ def computer_control(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "computer_control",
-    "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen.",
+    "description": (
+        "Direct keyboard, mouse and screen control of THIS PC — the universal "
+        "fallback whenever no dedicated tool covers what the user asked. Use "
+        "it to: (a) type into any focused window, (b) click / double-click / "
+        "right-click anywhere, including buttons and links the app-specific "
+        "tool cannot reach, (c) press hotkeys and shortcuts, (d) scroll, drag, "
+        "move the mouse, (e) bring a window to the front (focus_window), (f) "
+        "see the screen and locate an element by natural description "
+        "(screen_find / screen_click — works offline through the local vision "
+        "model), (g) take a screenshot, (h) read or write the clipboard. If "
+        "the user says 'clica em…', 'digita…', 'aperta…', 'rola a página', "
+        "'procura na tela', 'vê o que está na tela' and there is no dedicated "
+        "tool for that exact action, call this one. Prefer a dedicated tool "
+        "when it clearly covers the request (e.g. whatsapp_control for "
+        "WhatsApp messages, browser_control for Chrome), but reach for this "
+        "as soon as the app-specific action does not exist — it can drive any "
+        "GUI."
+    ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
