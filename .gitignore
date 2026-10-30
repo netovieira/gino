@@ -5,19 +5,43 @@
 # never be.
 
 # ── Secrets. Committing any of these publishes them. ──────────────────────────
-config/api_keys.json          # your Gemini API key, plus per-plugin credentials
-config/certs/                 # the dashboard's TLS private key and certificate
-config/whatsapp_web/          # a LINKED WhatsApp session — committing it hands
-                              # somebody your WhatsApp account, not just a key
-**/token*.json                # Google OAuth tokens (Gmail / Calendar plugins)
-**/client_secret*.json        # Google OAuth client secrets
+# (Git does not understand trailing comments: every pattern below sits alone on
+#  its line. Explaining them inline silently disabled all of them.)
+# Your Gemini API key, plus per-plugin credentials:
+config/api_keys.json
+# The dashboard's TLS private key and certificate:
+config/certs/
+# A LINKED WhatsApp session — committing it hands somebody your account:
+config/whatsapp_web/
+# Google OAuth tokens (Gmail / Calendar plugins):
+**/token*.json
+# Google OAuth client secrets:
+**/client_secret*.json
 *credentials*.json
 .env
 .env.*
+.qoder-proxy.env
 
 # ── Personal data the assistant accumulates about you ─────────────────────────
 memory/long_term.json
 memory/*.db
+# WhatsApp messages it kept (the session itself lives in config/whatsapp_web/):
+memory/whatsapp_inbox.jsonl
+# Attachments received on WhatsApp (photos, voice notes, documents):
+memory/whatsapp_media/
+# Screenshots captured from the Mac and voice samples of the owner:
+memory/mac/
+amostra-voz.mp3
+
+# ── Local tooling ─────────────────────────────────────────────────────────────
+# Qoder CLI session data and per-machine permission settings:
+.qoder/
+
+# ── Binaries installed without root ──────────────────────────────────────────
+# ffmpeg/ffprobe extraídos dos .deb do Ubuntu (tools/ffmpeg/bin + lib). Para
+# recriar: apt-get download ffmpeg libavdevice62 libplacebo360 libopenal1
+# libdc1394-25 && dpkg -x cada .deb e copiar usr/bin/* + usr/lib/x86_64-linux-gnu/*
+tools/ffmpeg/
 
 # ── Python build noise ────────────────────────────────────────────────────────
 __pycache__/
