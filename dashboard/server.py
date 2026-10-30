@@ -37,7 +37,26 @@ except Exception:
 
 BASE_DIR    = Path(__file__).resolve().parent.parent
 STATIC_DIR  = Path(__file__).parent / "static"
-PORT        = 8000
+
+
+def _configured_port() -> int:
+    """Port from config/api_keys.json ("dashboard_port"), else 8000.
+
+    Port 8000 is a common default and may already belong to another service on
+    the machine; without this the dashboard died with EADDRINUSE at every start.
+    """
+    try:
+        import json
+        cfg = json.loads((BASE_DIR / "config" / "api_keys.json").read_text(encoding="utf-8"))
+        port = int(cfg.get("dashboard_port") or 0)
+        if 1024 <= port <= 65535:
+            return port
+    except Exception:
+        pass
+    return 8000
+
+
+PORT        = _configured_port()
 MAX_UPLOAD_MB = 500
 
 
