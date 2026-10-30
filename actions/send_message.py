@@ -316,11 +316,14 @@ def send_message(
 TOOL = {
     "name": "send_message",
     "description": (
-        "Sends a text message via WhatsApp, Telegram, or another messaging "
-        "platform. Write 'message_text' in the USER'S OWN LANGUAGE, exactly "
-        "what they asked to be said. If the result says the message was NOT "
-        "sent, repeat that plainly along with the reason it gives — never "
-        "tell the user a message was sent unless the result said it was."
+        "Sends a text message by DRIVING THE APP'S WINDOW (keystrokes) on "
+        "Telegram, Instagram, Signal, Discord or Messenger. Do NOT use this for "
+        "WhatsApp — WhatsApp has its own connected tool (`whatsapp_control`) "
+        "that reads replies and does not depend on a window being focused. "
+        "Write 'message_text' in the USER'S OWN LANGUAGE, exactly what they "
+        "asked to be said. If the result says the message was NOT sent, repeat "
+        "that plainly along with the reason it gives — never tell the user a "
+        "message was sent unless the result said it was."
     ),
     "parameters": {
         "type": "OBJECT",
