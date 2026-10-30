@@ -14,7 +14,7 @@ from core.groq_stt import MODELS, NAMESPACE, test_connection
 PLUGIN = {
     "name": "groq_listen_status",
     "description": (
-        "Reports whether JARVIS is currently transcribing the user's speech with "
+        "Reports whether the assistant is currently transcribing the user's speech with "
         "Whisper on Groq (text in) or hearing it natively through Gemini Live "
         "(audio in), and whether a Groq key is configured. Use when the user asks "
         "how they are being heard or whether Groq listening is on. Switching is "

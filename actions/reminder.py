@@ -441,8 +441,8 @@ def reminder(
 TOOL = {
     "name": "reminder",
     "description": ("Sets a timed reminder for an appointment or task. When it "
-                    "comes due, JARVIS announces it aloud, by voice, naming the "
-                    "appointment; if JARVIS is not running at that moment the "
+                    "comes due, the assistant announces it aloud, by voice, naming the "
+                    "appointment; if the assistant is not running at that moment the "
                     "system shows a notification instead."),
     "parameters": {
         "type": "OBJECT",
