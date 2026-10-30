@@ -21,6 +21,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -30,6 +31,50 @@ WAKE_MODEL = "hey_jarvis"
 DEFAULT_THRESHOLD = 0.5
 # Mic frames arrive at 16 kHz int16; this is just the detector's input rate.
 SAMPLE_RATE = 16000
+# openwakeword only predicts on multiples of 80 ms — 1280 samples at 16 kHz.
+# The microphone hands over 1024-sample blocks, so the thread regroups them
+# instead of feeding an odd-sized window the model was not trained for.
+FRAME_SAMPLES = 1280
+
+
+def _models_dir() -> Path | None:
+    """Where openwakeword keeps its .onnx files, or None if it has none."""
+    try:
+        import openwakeword
+        d = Path(openwakeword.__file__).resolve().parent / "resources" / "models"
+        return d if d.is_dir() else None
+    except Exception:
+        return None
+
+
+def _model_paths() -> list[str]:
+    """Absolute paths of the wake model files, both extensions."""
+    d = _models_dir()
+    if d is None:
+        return []
+    paths = sorted(str(p) for p in d.glob(f"{WAKE_MODEL}*.onnx"))
+    if not paths:
+        paths = sorted(str(p) for p in d.glob(f"{WAKE_MODEL}*.tflite"))
+    return paths
+
+
+def _load_model():
+    """Construct the detector across openwakeword versions.
+
+    The package changed its constructor between 0.4 and 0.6: the old one takes
+    `wakeword_model_paths` (and knows nothing about the framework), the new one
+    takes `wakeword_models` by phrase name plus `inference_framework`. Trying the
+    new form first and falling back on TypeError means a later `pip install -U`
+    does not silently break the wake word.
+    """
+    from openwakeword.model import Model
+    try:
+        return Model(wakeword_models=[WAKE_MODEL], inference_framework="onnx")
+    except TypeError:
+        paths = _model_paths()
+        if not paths:
+            raise
+        return Model(wakeword_model_paths=paths)
 
 
 def is_installed() -> bool:
@@ -71,10 +116,14 @@ def install_and_download(logger: Callable[[str], None] = print,
                          notify: Callable[[str], None] | None = None) -> tuple[bool, str]:
     """
     One-click setup for the UI button: pip-install openwakeword if missing, then
-    download the wake model. Returns (ok, message). Never raises — every failure
-    is reported through the returned message and the logger.
+    make sure the wake model is on disk. Returns (ok, message). Never raises —
+    every failure is reported through the returned message and the logger.
     """
     _tell = notify or (lambda _msg: None)
+    if is_ready():
+        # Most installs ship the models inside the package; nothing to download.
+        logger("Wake word: already installed and ready.")
+        return True, "Wake word already installed and ready."
     try:
         if not is_installed():
             logger("Wake word: installing openwakeword (one-time)…")
@@ -86,15 +135,22 @@ def install_and_download(logger: Callable[[str], None] = print,
             if r.returncode != 0:
                 tail = (r.stderr or r.stdout or "").strip().splitlines()[-1:] or [""]
                 return False, f"pip install failed: {tail[0][:160]}"
-        # Download the pretrained melspectrogram/embedding + wake models.
+        if is_ready():
+            logger("Wake word: ready.")
+            return True, "Wake word installed and ready."
+
+        # Not shipped with this version: ask the package for the model files.
         logger("Wake word: downloading models…")
         _tell("Wake word: downloading models…")
+        download = getattr(__import__("openwakeword.utils", fromlist=["utils"]),
+                           "download_models", None)
+        if download is None:
+            return False, ("this openwakeword version ships no download helper and "
+                           f"no '{WAKE_MODEL}' model files were found.")
         try:
-            import openwakeword.utils as _u
-            try:
-                _u.download_models([WAKE_MODEL])
-            except TypeError:
-                _u.download_models()   # older signature downloads the default set
+            download([WAKE_MODEL])
+        except TypeError:
+            download()            # older signature downloads the default set
         except Exception as e:
             return False, f"model download failed: {e}"
 
@@ -112,6 +168,11 @@ class WakeWordDetector:
     raw int16 frames; detections invoke on_detect() (called from this thread —
     the callback must marshal to whatever loop/UI it needs).
     """
+
+    # Silence between two accepted detections: the phrase lights up several
+    # consecutive windows, and waking JARVIS four times for one "hey jarvis"
+    # would also mean four log lines and four session nudges.
+    REFRACTORY_S = 2.5
 
     def __init__(self, on_detect: Callable[[], None],
                  threshold: float = DEFAULT_THRESHOLD,
@@ -135,18 +196,18 @@ class WakeWordDetector:
         if self._running:
             return True
         try:
-            from openwakeword.model import Model
-            self._model = Model(wakeword_models=[WAKE_MODEL], inference_framework="onnx")
+            self._model = _load_model()
         except Exception as e:
-            self._logger(f"Wake word: could not load model — {e}")
-            self._notify("Wake word unavailable — use the WAKE NOW button.")
+            self._logger(f"Palavra de ativação: não deu para carregar o modelo — {e}")
+            self._notify("Palavra de ativação indisponível — use o botão WAKE NOW.")
             self._model = None
             return False
         self._running = True
         self._ready = True
         self._thread = threading.Thread(target=self._loop, daemon=True, name="WakeWordThread")
         self._thread.start()
-        self._logger("Wake word: listening for 'Hey Jarvis'.")
+        self._logger("Palavra de ativação: escutando 'Hey Jarvis' (acústica) "
+                     "e o nome escolhido (por texto).")
         return True
 
     def stop(self) -> None:
@@ -179,27 +240,42 @@ class WakeWordDetector:
 
     def _loop(self) -> None:
         import numpy as np
+        pending = np.zeros(0, dtype=np.int16)
+        last_fire = 0.0
         while self._running:
             try:
                 frame = self._queue.get()
                 if frame is None or not self._running:
                     break
-                scores = self._model.predict(np.asarray(frame, dtype=np.int16))
-                score = 0.0
-                if isinstance(scores, dict):
-                    # match the jarvis model regardless of exact key suffix
-                    for k, v in scores.items():
-                        if "jarvis" in k.lower():
-                            score = max(score, float(v))
-                    if score == 0.0 and scores:
-                        score = max(float(v) for v in scores.values())
-                if score >= self._threshold:
-                    # drain any backlog so we don't double-fire on the same utterance
-                    self._drain()
-                    try:
-                        self._on_detect()
-                    except Exception as e:
-                        self._logger(f"Wake word: on_detect error — {e}")
+                pending = np.concatenate((pending, np.asarray(frame, dtype=np.int16)))
+                # The mic delivers 1024-sample blocks, the model wants 80 ms
+                # (1280). Regrouping here keeps the audio callback untouched and
+                # the windows the shape the model was trained on.
+                while pending.size >= FRAME_SAMPLES:
+                    window, pending = pending[:FRAME_SAMPLES], pending[FRAME_SAMPLES:]
+                    scores = self._model.predict(window)
+                    score = 0.0
+                    if isinstance(scores, dict):
+                        # match the jarvis model regardless of exact key suffix
+                        for k, v in scores.items():
+                            if "jarvis" in k.lower():
+                                score = max(score, float(v))
+                        if score == 0.0 and scores:
+                            score = max(float(v) for v in scores.values())
+                    if score >= self._threshold:
+                        if time.monotonic() - last_fire < self.REFRACTORY_S:
+                            # The same phrase crosses the threshold on several
+                            # consecutive windows; one "hey jarvis" is one wake.
+                            continue
+                        last_fire = time.monotonic()
+                        # drain any backlog so we don't double-fire on the same utterance
+                        self._drain()
+                        pending = np.zeros(0, dtype=np.int16)
+                        try:
+                            self._on_detect()
+                        except Exception as e:
+                            self._logger(f"Wake word: on_detect error — {e}")
+                        break
             except Exception as e:
                 self._logger(f"Wake word: inference error — {e}")
 

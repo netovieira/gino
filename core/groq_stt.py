@@ -23,6 +23,7 @@ Settings live in config/api_keys.json under plugin_config.groq, written by the
 from __future__ import annotations
 
 import io
+import os
 import queue
 import threading
 import time
@@ -32,6 +33,8 @@ from typing import Callable
 import numpy as np
 import requests
 
+from core import duck as _duck
+
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 MODELS = ("whisper-large-v3-turbo", "whisper-large-v3")
 NAMESPACE = "groq"
@@ -39,13 +42,23 @@ NAMESPACE = "groq"
 # Segmenter, in 64 ms blocks at 16 kHz (CHUNK_SIZE 1024 in main.py).
 _START_BLOCKS = 3        # ~190 ms above threshold opens an utterance
 _END_BLOCKS = 11         # ~700 ms below closes it
-_PREROLL = 8             # ~500 ms kept from before the start
+# ~1.2 s kept from before the start. Long on purpose: while asleep the block is
+# cut by TIME (see _SLEEP_CAP_BLOCKS), and the cut can land in the middle of the
+# name — this overlap is what makes a call split across two blocks arrive whole.
+_PREROLL = 19
 _MIN_SPEECH = 6          # ~380 ms of voiced blocks, else dropped as noise
 _MAX_BLOCKS = 390        # ~25 s hard cap, then sent as-is
+# Asleep, the 25 s cap is worthless: it only closes on 700 ms of silence, and a
+# room with music or a fan never gives that. The block grew to the full 25 s and
+# was then thrown away for being "too long for a wake call" — every single time.
+# Cutting on time instead gives one chance to hear the name every ~3.8 s, which
+# is just under _SLEEP_MAX_S so the block is never discarded unseen.
+_SLEEP_CAP_BLOCKS = 59
 _FLOOR_MIN = 0.003       # the quietest floor we believe
 _THRESH_MIN = 0.008      # the quietest threshold we accept (≈ -42 dBFS)
 _FLOOR_MULT = 2.5        # speech must be this many times the room floor
 _LEVEL_LOG_S = 5.0       # console line with the mic level, to tune the above
+_SLEEP_MAX_S = 4.0        # asleep, longer "utterances" are music/TV, not a call
 
 # Whisper hallucinates on silence, and does so with a short list of
 # favourites. Anything that is only one of these is dropped.
@@ -132,9 +145,24 @@ class GroqListener:
     def __init__(self, api_key: str, model: str, language: str,
                  on_text: Callable[[str], None],
                  on_status: Callable[[str], None] | None = None,
-                 sample_rate: int = 16000, prompt: str = "") -> None:
+                 sample_rate: int = 16000, prompt: str = "",
+                 transcribe_fn: Callable[[bytes], str] | None = None,
+                 engine_label: str = "Groq",
+                 usage_key: str = "groq",
+                 fallback_transcribe: Callable[[bytes], str] | None = None) -> None:
         self._key, self._model, self._lang = api_key, model, language
         self.prompt = prompt
+        # Optional local transcriber (core.local_stt): same segmentation and
+        # worker thread, no network call. None keeps the Groq HTTP path.
+        self._transcribe_fn = transcribe_fn
+        # The rung behind a local transcriber: if faster-whisper fails (model
+        # gone, a package updated, the machine loaded) the same utterance goes
+        # up to Groq instead of being lost. None means "no plan B".
+        self._fallback_fn = fallback_transcribe
+        self._fallback_used = False
+        self.label = engine_label
+
+        self._usage_key = usage_key
         self._on_text = on_text
         self._on_status = on_status or (lambda m: None)
         self._sr = sample_rate
@@ -150,8 +178,18 @@ class GroqListener:
         self._worker = threading.Thread(target=self._run, name="groq-stt", daemon=True)
         self._worker.start()
         self.speaking = False          # True while an utterance is open
+        # True while the assistant sleeps: utterances are still cut and
+        # transcribed (locally only) so a sentence that calls the assistant by
+        # name can wake it — but nothing leaves the machine, nothing reaches
+        # the panel and the speakers are not ducked for room noise.
+        self.sleeping = False
         self._peak = 0.0
         self._peak_t = time.monotonic()
+
+    @property
+    def local(self) -> bool:
+        """True when transcription happens on this machine (core.local_stt)."""
+        return self._transcribe_fn is not None
 
     # ── audio thread ────────────────────────────────────────────────────────
 
@@ -195,6 +233,12 @@ class GroqListener:
                     self._pre = []
                     self._voiced = self._above
                     self._below = 0
+                    # The room includes the speakers: while a sentence is open
+                    # the music drops, and comes back when it closes — without
+                    # this, Whisper transcribes the lyrics along with the user.
+                    # Asleep, every cough would pump the volume: don't.
+                    if not self.sleeping:
+                        _duck.down()
             else:
                 self._above = 0
             return
@@ -205,19 +249,65 @@ class GroqListener:
             self._below = 0
         else:
             self._below += 1
-        if self._below >= _END_BLOCKS or len(self._seg) >= _MAX_BLOCKS:
-            self._close()
+        cap = _SLEEP_CAP_BLOCKS if self.sleeping else _MAX_BLOCKS
+        if self._below >= _END_BLOCKS or len(self._seg) >= cap:
+            self._close(capped=len(self._seg) >= cap)
 
-    def _close(self) -> None:
+    def _close(self, capped: bool = False) -> None:
         seg, voiced = self._seg, self._voiced
         self._seg, self._active, self.speaking = [], False, False
         self._above = self._below = self._voiced = 0
+        # Cut by time while asleep: the tail becomes the opening of the next
+        # window, so "Gino" ending at the boundary is still heard once.
+        if capped and self.sleeping and len(seg) > _PREROLL:
+            self._pre = seg[-_PREROLL:]
+        # NOTE: no _duck.up() here — the apps stay ducked through the reply and
+        # are restored when the turn ends (main.set_speaking / worker finally).
         if voiced >= _MIN_SPEECH:
             pcm = b"".join(seg)
-            self._on_status(f"Heard {len(pcm) / (2 * self._sr):.1f}s — transcribing on Groq…")
-            self._q.put(pcm)
+            secs = len(pcm) / (2 * self._sr)
+            if self.sleeping and secs > _SLEEP_MAX_S:
+                # Asleep, a wake call is a short sentence; eight seconds of
+                # "speech" is the song or the TV, and transcribing it would burn
+                # CPU to learn that nobody called her.
+                print(f"[Groq] asleep — ignored a {secs:.0f}s utterance "
+                      f"(wake calls are short)")
+            else:
+                if not self.sleeping:
+                    self._on_status(f"Ouvi {secs:.1f}s — transcrevendo no {self.label}…")
+                self._q.put(pcm)
         else:
             print(f"[Groq] dropped a {voiced}-block blip as noise")
+            _duck.up()          # it opened an utterance (and ducked) for nothing
+
+    def _is_prompt_echo(self, text: str) -> bool:
+        """True when the transcription is really a piece of the vocabulary hint.
+
+        Compared fragment by fragment: the hint is a paragraph, so a whole-text
+        ratio would dilute a single regurgitated sentence below any threshold.
+
+        ASLEEP THIS FILTER IS OFF, on purpose. The hint is built from the phrases
+        people use to call ("<name>, tá aí?") — so an honest wake call is
+        character-for-character a fragment of the prompt and was dropped as an
+        echo. She could not answer to her own name. While asleep the worst case
+        of letting an echo through is one unnecessary "estou aqui"; while awake
+        it is a whole invented turn, which is what this filter exists to stop.
+        """
+        import difflib
+        import re as _re
+        if self.sleeping:
+            return False
+        hint = (self.prompt or "").lower()
+        if not hint or len(text) < 8:
+            return False
+        norm = " ".join(text.lower().split())
+        for frag in _re.split(r"[.?!]+", hint):
+            frag = " ".join(frag.split())
+            if len(frag) < 8:
+                continue
+            if difflib.SequenceMatcher(None, norm, frag).ratio() > 0.8:
+                return True
+        return False
 
     def flush(self) -> None:
         """Push-to-talk released: whatever is open is an utterance."""
@@ -233,29 +323,89 @@ class GroqListener:
             except queue.Empty:
                 continue
             t0 = time.monotonic()
+            # Debug aid: keep the last asleep utterance on disk so a misheard
+            # wake call can be re-transcribed offline with and without hints.
+            if self.sleeping and os.environ.get("JARVIS_DUMP_SLEEP_UTTERANCE"):
+                try:
+                    import wave as _wave
+                    from pathlib import Path as _Path
+                    p = _Path(__file__).resolve().parents[1] / "logs" / "ultima-fala-dormindo.wav"
+                    with _wave.open(str(p), "wb") as _w:
+                        _w.setnchannels(1)
+                        _w.setsampwidth(2)
+                        _w.setframerate(self._sr)
+                        _w.writeframes(pcm)
+                except Exception:
+                    pass
             try:
-                text = transcribe(pcm, self._key, self._model, self._lang, self._sr,
-                                  prompt=self.prompt)
+                if self._transcribe_fn is not None:
+                    try:
+                        text = self._transcribe_fn(pcm)
+                    except Exception as e:
+                        # Asleep, room audio neither leaves the machine nor
+                        # reaches the panel: a local failure drops quietly.
+                        if self.sleeping:
+                            print(f"[{self.label}] asleep — local STT failed "
+                                  f"({e.__class__.__name__}), utterance dropped")
+                            continue
+                        # Local model failed. Say so once, then keep listening
+                        # through the network rung instead of dropping speech.
+                        if self._fallback_fn is None:
+                            raise
+                        if not self._fallback_used:
+                            self._fallback_used = True
+                            self._on_status(f"{self.label} falhou ({e.__class__.__name__}) — "
+                                            "transcrevendo no Groq até resolver.")
+                        text = self._fallback_fn(pcm)
+                else:
+                    text = transcribe(pcm, self._key, self._model, self._lang, self._sr,
+                                      prompt=self.prompt)
             except requests.HTTPError as e:
                 code = e.response.status_code if e.response is not None else "?"
-                self._on_status(f"Groq transcription failed ({code}).")
+                self._on_status(f"{self.label}: transcrição falhou ({code}).")
+                _duck.up()
                 continue
             except Exception as e:
-                self._on_status(f"Groq transcription failed: {e.__class__.__name__}.")
+                if self.sleeping:
+                    print(f"[{self.label}] asleep — utterance dropped "
+                          f"({e.__class__.__name__})")
+                    continue
+                self._on_status(f"{self.label}: transcrição falhou: {e.__class__.__name__}.")
+                _duck.up()
                 continue
             clean = text.strip()
+            if self._is_prompt_echo(clean):
+                # Whisper regurgitates its conditioning prompt when the audio is
+                # silence or our own reverberant tail: the "utterance" comes back
+                # as a sentence of the name hint, over and over. Drop it before
+                # it reaches the blocklist, the gate or the brain.
+                print(f"[{self.label}] discarded a prompt echo: {clean[:60]!r}")
+                _duck.up()
+                continue
             if len(clean) < 2 or clean.lower() in _NOISE:
-                self._on_status("Groq heard nothing recognisable in that.")
+                if not self.sleeping:
+                    self._on_status(f"{self.label} não reconheceu nada nisso.")
+                    _duck.up()  # no text reaches main: close the exchange here
                 continue
             secs = len(pcm) / (2 * self._sr)
-            print(f"[Groq] {secs:.1f}s of speech → {len(clean)} chars in "
+            print(f"[{self.label}] {secs:.1f}s of speech → {len(clean)} chars in "
                   f"{time.monotonic() - t0:.2f}s")
             try:
                 from core import usage as _usage
-                _usage.note("groq", utterances=1, audio_s=secs)
+                _usage.note(self._usage_key, utterances=1, audio_s=secs)
             except Exception:
                 pass
-            self._on_text(clean)
+            # The handler runs the whole conversation (gates, brain, tools).
+            # An exception there used to end this thread, and a dead consumer
+            # means the assistant keeps hearing audio forever and answers
+            # nothing — the microphone meters in the log stay alive, so it looks
+            # like "it only listens". One bad turn must cost one turn.
+            try:
+                self._on_text(clean)
+            except Exception as e:
+                print(f"[{self.label}] handler falhou ({e!r}) — seguindo vivo")
+                self._on_status("Tive um erro neste turno (detalhes no terminal).")
 
     def stop(self) -> None:
         self._stop.set()
+        _duck.up()

@@ -219,14 +219,17 @@ def save_brain_engine(engine: str) -> None:
     _save_flag("brain_engine", e if e in BRAIN_ENGINES else "gemini")
 
 
-STT_ENGINES = ("gemini", "groq")
+STT_ENGINES = ("gemini", "groq", "whisper")
 
 
 def get_stt_engine() -> str:
     """How the user's speech reaches the assistant: "gemini" streams the
     microphone into the Live session (native audio); "groq" transcribes each
-    utterance with Whisper on Groq and sends the text instead."""
+    utterance with Whisper on Groq and sends the text instead; "whisper" does
+    the same locally with faster-whisper, with no network at all."""
     v = str(load_api_keys().get("stt_engine", "gemini")).strip().lower()
+    if v in ("local", "offline", "faster-whisper"):
+        v = "whisper"
     return v if v in STT_ENGINES else "gemini"
 
 
