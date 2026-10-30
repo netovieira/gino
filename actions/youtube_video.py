@@ -289,6 +289,24 @@ def _handle_play(parameters: dict, player) -> str:
     if player:
         player.write_log(f"[YouTube] Searching: {query}")
 
+    # The controlled window is the preferred path: the video plays on screen,
+    # in a browser this assistant can actually pause and skip, and the profile
+    # keeps whatever Google account was signed in there.
+    try:
+        from core import youtube_browser as _ytb
+        title = _ytb.play(query)
+        if title:
+            print(f"[YouTube] ▶️ playing in the controlled window: {title}")
+            # Saying it played while the window is anonymous is the kind of
+            # half-truth that costs trust later: the user asked for the account
+            # to be in play. Name the gap and how to close it.
+            if _ytb.signed_in():
+                return f"Tocando no YouTube: {title}."
+            return (f"Tocando no YouTube: {title}. Esta janela ainda não está "
+                    f"logada — diga 'faz login no youtube' para entrar uma vez.")
+    except Exception as e:
+        print(f"[YouTube] controlled window failed ({e}); falling back")
+
     print(f"[YouTube] 🔍 Scraping first non-Shorts video for: {query}")
 
     video_url = _scrape_first_video_url(query)
@@ -306,6 +324,15 @@ def _handle_play(parameters: dict, player) -> str:
     )
     _open_url(fallback_url)
     return f"Opened YouTube search for: {query} (manual selection required)"
+
+
+def _handle_login(parameters: dict, player) -> str:
+    """Sign in to the YouTube window once; the profile keeps the session."""
+    try:
+        from core import youtube_browser as _ytb
+        return _ytb.open_login()
+    except Exception as e:
+        return f"Não consegui abrir a janela do YouTube: {e}"
 
 
 def _handle_summarize(parameters: dict, player, speak) -> str:
@@ -405,6 +432,7 @@ def _handle_trending(parameters: dict, player, speak) -> str:
 
 _ACTION_MAP = {
     "play":      _handle_play,
+    "login":     _handle_login,
     "summarize": _handle_summarize,
     "get_info":  _handle_get_info,
     "trending":  _handle_trending,
@@ -444,13 +472,25 @@ def youtube_video(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "youtube_video",
-    "description": "Controls YouTube. Use for: playing videos, summarizing a video's content, getting video info, or showing trending videos.",
+    "description": (
+        "Plays and controls YouTube. THE tool to use whenever the user asks "
+        "to hear, watch or PLAY something specific — 'toca a música X', "
+        "'bota um vídeo de Y', 'coloca o clipe Z', 'quero ouvir tal banda', "
+        "'toca tal playlist'. action='play' searches YouTube and plays the "
+        "first result in a Chrome window this assistant controls, on screen. "
+        "action='login' opens that window at the Google sign-in so the user's "
+        "account is used — offer it once when a play happens on a window that "
+        "is not signed in. Also handles 'summarize' (transcript + Gemini "
+        "summary of a specific URL), 'get_info' and 'trending'. Do NOT use "
+        "music_control to start a song — that one only controls music that is "
+        "already playing."
+    ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "play | summarize | get_info | trending (default: play)"
+                "description": "play | login | summarize | get_info | trending (default: play)"
             },
             "query": {
                 "type": "STRING",

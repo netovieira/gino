@@ -10,13 +10,16 @@ lives in the HUD; this plugin only relays through JarvisLive.
 PLUGIN = {
     "name": "music_control",
     "description": (
-        "Controls the background music that JARVIS itself is playing (the "
-        "morning track or the Focus Protocol playlist): pause, resume, stop, "
-        "next track, make it quieter/louder (volume), or say what is playing "
-        "(status). ALWAYS use this — never the computer's volume or mute — when "
-        "the user says 'pausa/para/continua a música', 'próxima', 'abaixa/aumenta "
-        "a música', 'o que está tocando'. Only use computer_settings for the "
-        "system volume when the user explicitly says 'volume do computador'."
+        "Controls the background music that the assistant itself is ALREADY playing "
+        "(the morning track or the Focus Protocol playlist): pause, resume, "
+        "stop, next track, make it quieter/louder (volume), or say what is "
+        "playing (status). Use this ONLY for the transport of music that is "
+        "already running — 'pausa/para/continua a música', 'próxima', "
+        "'abaixa/aumenta a música', 'o que está tocando'. To PLAY a specific "
+        "song the user asks for ('toca X', 'bota uma música do Y', 'coloca "
+        "um funk'), use `youtube_video` with action='play' and query=<a "
+        "música>, NOT this tool. Only use computer_settings for the system "
+        "volume when the user explicitly says 'volume do computador'."
     ),
     "parameters": {
         "type": "OBJECT",

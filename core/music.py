@@ -58,7 +58,17 @@ def cookies_browser() -> str:
     return v if v in ("edge", "chrome", "firefox", "brave", "chromium", "opera", "vivaldi") else ""
 
 
-def _ydl_opts(**extra) -> dict:
+def _ydl_opts(use_cookies: bool = True, **extra) -> dict:
+    """yt-dlp options.
+
+    `use_cookies` is not cosmetic. SEARCH runs better signed in (personalised
+    results, no "confirm you're not a bot" page), but PLAYBACK breaks when the
+    browser's YouTube session is attached: the signed-in web client answers with
+    formats that require a PO token and yt-dlp cannot select any of them —
+    "Requested format is not available" on every video, verified here on the
+    same URL that plays fine anonymously. So search borrows the login and the
+    actual stream does not.
+    """
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
             "socket_timeout": 15, "retries": 2, "extractor_retries": 1,
             # Only MP4/AAC audio: it is what the Windows media backend demuxes
@@ -67,10 +77,45 @@ def _ydl_opts(**extra) -> dict:
             # Clients that are not asked for a sign-in as often as the web one.
             "extractor_args": {"youtube": {"player_client": ["default", "android", "ios"]}}}
     b = cookies_browser()
-    if b:
+    if b and use_cookies:
         opts["cookiesfrombrowser"] = (b,)
     opts.update(extra)
     return opts
+
+
+def search(query: str, limit: int = 5) -> list[dict]:
+    """[{title, url, duration, channel}] straight from YouTube, signed in.
+
+    extract_flat is what makes it cheap and what makes the login usable: the
+    entries come back as titles and URLs without yt-dlp touching media formats,
+    which is the part the signed-in session breaks (see _ydl_opts).
+    """
+    import yt_dlp
+    q = str(query or "").strip()
+    if not q:
+        return []
+    opts = _ydl_opts(extract_flat="in_playlist", noplaylist=False,
+                     playlistend=int(limit))
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{int(limit)}:{q}", download=False) or {}
+    except Exception as e:
+        print(f"[Music] busca falhou ({str(e)[:120]})")
+        return []
+    out: list[dict] = []
+    for e in (info.get("entries") or []):
+        if not isinstance(e, dict):
+            continue
+        vid = e.get("id") or video_id(e.get("url") or "")
+        if not vid:
+            continue
+        out.append({
+            "title": str(e.get("title") or ""),
+            "url": f"https://www.youtube.com/watch?v={vid}",
+            "channel": str(e.get("uploader") or e.get("channel") or ""),
+            "duration": e.get("duration"),
+        })
+    return out
 
 
 def volume() -> float:
@@ -119,7 +164,8 @@ def download_audio(url: str) -> tuple[str, str]:
     import yt_dlp
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     have = cached_file(url)
-    opts = _ydl_opts(outtmpl=str(CACHE_DIR / "%(id)s.%(ext)s"), skip_download=bool(have))
+    opts = _ydl_opts(use_cookies=False, outtmpl=str(CACHE_DIR / "%(id)s.%(ext)s"),
+                     skip_download=bool(have))
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=not have)
     if info and info.get("entries"):
@@ -140,7 +186,7 @@ def download_audio(url: str) -> tuple[str, str]:
 def resolve_audio(url: str) -> tuple[str, str]:
     """(audio_stream_url, title) for one video. Raises with a reason."""
     import yt_dlp
-    opts = _ydl_opts(skip_download=True)
+    opts = _ydl_opts(use_cookies=False, skip_download=True)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if info and info.get("entries"):
