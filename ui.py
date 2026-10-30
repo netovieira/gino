@@ -5,6 +5,7 @@ import math
 import os
 import platform
 import random
+import re
 import subprocess
 import sys
 import threading
@@ -28,12 +29,13 @@ os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.*=false")
 
 from PyQt6.QtCore import (
     QEasingCurve, QLineF, QMimeData, QObject, QParallelAnimationGroup, QPointF,
-    QPoint, QPropertyAnimation, QRect, QRectF, QSize, QSizeF, Qt, QTimer,
-    QUrl, pyqtSignal,
+    QPoint, QPropertyAnimation, QRect, QRectF, QBuffer, QMetaObject, QSize,
+    QSizeF, Qt, QTimer,
+    QUrl, pyqtSignal, pyqtSlot, Q_ARG,
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
-    QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
+    QFontDatabase, QIcon, QKeySequence, QLinearGradient, QPainter, QPainterPath,
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
 # Video playback for the HUD. Part of PyQt6, so it costs no new dependency —
@@ -52,7 +54,7 @@ except Exception as _e:            # noqa: BLE001 - reported, never fatal
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
-    QGraphicsScene, QGraphicsView,
+    QGraphicsScene, QGraphicsView, QMenu, QSystemTrayIcon,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
@@ -67,6 +69,27 @@ try:
 except Exception as _e:          # noqa: BLE001 — a intro é cosmética
     _IntroAnimation = None
     print(f"[Intro] unavailable ({_e}).")
+
+try:
+    from core import autostart as _autostart
+except Exception as _e:          # noqa: BLE001 — bandeja não pode derrubar a UI
+    class _autostart:            # type: ignore[no-redef]
+        @staticmethod
+        def supported() -> bool:
+            return False
+
+        @staticmethod
+        def is_enabled() -> bool:
+            return False
+
+        @staticmethod
+        def enable():
+            return False, f"autostart indisponível ({_e})"
+
+        @staticmethod
+        def disable():
+            return False, f"autostart indisponível ({_e})"
+    print(f"[Autostart] unavailable ({_e}).")
 
 
 def _base_dir() -> Path:
@@ -85,6 +108,32 @@ def _read_full_config() -> dict:
         return json.loads(API_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+# The name shown before the user picks one in the ⚙ panel, and the fallback
+# whenever config is missing or unreadable. Never hardcode the name in a label
+# — read it through _aname().
+_DEFAULT_NAME = "JARVIS"
+
+
+def _aname() -> str:
+    """The assistant's current name — the single source of truth for every
+    user-visible string that mentions it. Reads config/api_keys.json fresh, so
+    a rename in the ⚙ panel reaches dialogs and tooltips built after it without
+    a restart; persistent widgets (tray, FAB) re-read it in their periodic
+    refresh. Never hardcode the name in a label — call this instead."""
+    return (_read_full_config().get("assistant_name") or _DEFAULT_NAME).strip() or _DEFAULT_NAME
+
+
+def _fish_voice() -> str:
+    """Fish Audio voice id — the same key core/brain.py reads (plugin_config →
+    brain → fish_voice_id). Kept here so the customise form opens with the
+    value that is actually in effect, not with a constant that drifted from it."""
+    try:
+        brain = (_read_full_config().get("plugin_config") or {}).get("brain") or {}
+        return str(brain.get("fish_voice_id") or "").strip()
+    except Exception:
+        return ""
 
 
 # Single source of truth for the release name — the window title, the header
@@ -1254,7 +1303,7 @@ class FileDropZone(QWidget):
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select a file for JARVIS", str(Path.home()),
+            self, f"Select a file for {_aname()}", str(Path.home()),
             "All Files (*.*);;"
             "Images (*.jpg *.jpeg *.png *.gif *.webp *.bmp *.svg);;"
             "Documents (*.pdf *.docx *.txt *.md *.pptx);;"
@@ -1673,11 +1722,12 @@ class HueWheel(QWidget):
 class CustomizeOverlay(QWidget):
     """Floating overlay — change assistant name, user name, UI colour and voice."""
 
-    saved = pyqtSignal(str, str, str, str)   # assistant_name, user_name, ui_color, voice
-    _OW, _OH = 400, 588
+    # assistant_name, user_name, ui_color, gemini/edge voice, fish voice id
+    saved = pyqtSignal(str, str, str, str, str)
+    _OW, _OH = 400, 664
 
-    def __init__(self, assistant_name="JARVIS", user_name="",
-                 ui_color=DEFAULT_UI_COLOR, voice="", parent=None):
+    def __init__(self, assistant_name=None, user_name="",
+                 ui_color=DEFAULT_UI_COLOR, voice="", fish_voice="", parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
@@ -1709,7 +1759,7 @@ class CustomizeOverlay(QWidget):
 
         lay.addWidget(_lbl("ASSISTANT NAME", 8, color=C.TEXT_DIM,
                             align=Qt.AlignmentFlag.AlignLeft))
-        self._name_input = QLineEdit(assistant_name)
+        self._name_input = QLineEdit(assistant_name or _aname())
         self._name_input.setFont(QFont("Courier New", 10))
         self._name_input.setFixedHeight(32)
         self._name_input.setStyleSheet(_fs)
@@ -1772,6 +1822,25 @@ class CustomizeOverlay(QWidget):
         more_row.addWidget(self._voice_combo, 1)
         lay.addLayout(more_row)
         self._refresh_voice_btns()
+
+        # ── Fish Audio voice — the timbre, as an id ──────────────────────────
+        # Typed rather than picked: the Fish library has thousands of voices and
+        # only the id (or the page link) is stable across sessions. Accepts
+        # either — core/brain.py normalises both to the 32-character id. Blank
+        # is meaningful: it asks Fish for the model's own default voice.
+        lay.addSpacing(4)
+        lay.addWidget(_lbl("FISH AUDIO VOICE  —  id or fish.audio link", 8,
+                            color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft))
+        self._fish_input = QLineEdit(fish_voice)
+        self._fish_input.setPlaceholderText(
+            "5566fffe8b8046bc85e576aa9813b9bd   ·   https://fish.audio/m/<id>")
+        self._fish_input.setFont(QFont("Courier New", 9))
+        self._fish_input.setFixedHeight(32)
+        self._fish_input.setStyleSheet(_fs)
+        lay.addWidget(self._fish_input)
+        lay.addWidget(_lbl("aplicada na próxima frase, quando a voz for Fish Audio "
+                           "·  em branco = voz padrão do modelo", 7,
+                           color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft))
 
         # ── UI colour — colour wheel ─────────────────────────────────────────
         lay.addSpacing(4)
@@ -1919,9 +1988,10 @@ class CustomizeOverlay(QWidget):
         self.hide()
 
     def _save(self):
-        name = self._name_input.text().strip() or "JARVIS"
+        name = self._name_input.text().strip() or _aname()
         user = self._user_input.text().strip()
-        self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR, self._sel_voice)
+        self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR,
+                        self._sel_voice, self._fish_input.text().strip())
         self.hide()
 
 
@@ -2211,10 +2281,10 @@ class AudioDeviceOverlay(_HudOverlay):
             lay.addWidget(box)
             return box
 
-        self._in_box  = _row("MICROPHONE — what JARVIS hears you with",
+        self._in_box  = _row(f"MICROPHONE — what {_aname()} hears you with",
                              "input", get_input_device())
         lay.addSpacing(4)
-        self._out_box = _row("SPEAKERS — what JARVIS talks through",
+        self._out_box = _row(f"SPEAKERS — what {_aname()} talks through",
                              "output", get_output_device())
 
         note = QLabel("Applying reconnects the session. Your conversation is kept.")
@@ -2362,7 +2432,7 @@ class MemoryOverlay(_HudOverlay):
 
         from memory.memory_manager import all_entries_for_ui
 
-        hdr = QLabel("🧠  WHAT JARVIS REMEMBERS")
+        hdr = QLabel(f"🧠  WHAT {_aname().upper()} REMEMBERS")
         hdr.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
         hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         self._lay.addWidget(hdr)
@@ -2616,7 +2686,7 @@ class AgendaOverlay(QWidget):
         self._ed_time = QLineEdit(); self._ed_time.setPlaceholderText("HH:MM"); self._ed_time.setFixedWidth(64)
         self._ed_title = QLineEdit(); self._ed_title.setPlaceholderText("Título do compromisso")
         self._ed_lead = QLineEdit(); self._ed_lead.setPlaceholderText("aviso min"); self._ed_lead.setFixedWidth(76)
-        self._ed_lead.setToolTip("Minutos antes para o JARVIS avisar por voz (0 = sem aviso)")
+        self._ed_lead.setToolTip(f"Minutos antes para o {_aname()} avisar por voz (0 = sem aviso)")
         for w in (self._ed_date, self._ed_time, self._ed_title, self._ed_lead):
             w.setFont(QFont("Courier New", 9)); w.setFixedHeight(30)
         ed.addWidget(self._ed_date); ed.addWidget(self._ed_time); ed.addWidget(self._ed_title, 1); ed.addWidget(self._ed_lead)
@@ -3364,7 +3434,7 @@ class RemoteKeyOverlay(QWidget):
         self._qr_label.setStyleSheet(
             "color: #00ff88; background: #001a0d; border-radius: 10px;"
         )
-        self._timer_lbl.setText("Phone connected — JARVIS ready")
+        self._timer_lbl.setText(f"Phone connected — {_aname()} ready")
         self._timer_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent;")
 
     def _refresh_key(self):
@@ -3437,7 +3507,7 @@ class MainWindow(QMainWindow):
 
         # Load customization from config
         _cfg = _read_full_config()
-        self._assistant_name: str = (_cfg.get("assistant_name") or "JARVIS").strip()
+        self._assistant_name: str = (_cfg.get("assistant_name") or _DEFAULT_NAME).strip()
         _display = self._assistant_name.upper()
 
         # Apply the saved UI colour BEFORE panels/stylesheets are built
@@ -3459,6 +3529,7 @@ class MainWindow(QMainWindow):
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
         self.on_interrupt      = None   # callable: () -> None — stop JARVIS mid-speech
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
+        self.on_identity_change = None  # callable: () -> None — rebuild session after a rename
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
@@ -4453,7 +4524,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_open_mode_btn"):
             self._open_mode_btn.setText(self._OPEN_LABELS[self.open_mode()])
             self._open_mode_btn.setToolTip(
-                "Applied the next time JARVIS is opened. NORMAL WINDOW = the size it "
+                f"Applied the next time {_aname()} is opened. NORMAL WINDOW = the size it "
                 "has now; MAXIMISED = fills the screen, taskbar visible; FULL SCREEN = "
                 "nothing else on screen (F11 leaves it).")
 
@@ -4467,7 +4538,7 @@ class MainWindow(QMainWindow):
             self._log.append_log(f"ERR: Could not save the open mode — {e}")
             return
         self._refresh_open_mode_btn()
-        self._log.append_log(f"SYS: Next time, JARVIS opens as {nxt}.")
+        self._log.append_log(f"SYS: Next time, {_aname()} opens as {nxt}.")
 
     def show_as_configured(self):
         """First show: honour the saved OPEN AS choice."""
@@ -4478,6 +4549,20 @@ class MainWindow(QMainWindow):
             self.showMaximized()
         else:
             self.show()
+
+    def closeEvent(self, event):
+        """Fechar a janela esconde, não encerra.
+
+        Com a bandeja ligada, o "X" precisa deixar o assistente vivo ouvindo o
+        "Hey Jarvis" — quem quer sair usa SAIR no menu da bandeja. Sem bandeja,
+        o comportamento é o de sempre: fecha e encerra.
+        """
+        to_tray = getattr(self, "_to_tray", None)
+        if to_tray is not None:
+            event.ignore()
+            to_tray()
+            return
+        super().closeEvent(event)
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
@@ -4609,7 +4694,7 @@ class MainWindow(QMainWindow):
         self._fab_stop = QPushButton("✋", cw)
         self._fab_stop.setFixedSize(52, 52)
         self._fab_stop.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._fab_stop.setToolTip("Interrupt — stop JARVIS mid-sentence  [ESC]")
+        self._fab_stop.setToolTip(f"Interrupt — stop {_aname()} mid-sentence  [ESC]")
         self._fab_stop.setStyleSheet(self._ICON_BTN.format(fg=C.MUTED_C, bd=C.MUTED_C, fgh="#ff6688"))
         self._fab_stop.clicked.connect(self._do_interrupt)
 
@@ -6027,7 +6112,7 @@ class MainWindow(QMainWindow):
                               else "◉  HUD: REACTOR CORE")
         self._hud_btn.setStyleSheet(style)
         self._hud_btn.setToolTip(
-            "An animated head that speaks your words and shows what JARVIS is "
+            f"An animated head that speaks your words and shows what {_aname()} is "
             "doing. Tap to switch to the reactor core."
             if face else
             "A reactor core that turns with the state and moves with your voice. "
@@ -6076,7 +6161,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._refresh_hud_btn()
-            self._log.append_log("SYS: HUD switched to the animated face.")
+            self._log.append_log("SYS: HUD mudou para o rosto animado.")
         try:
             if self.hud._avatar is not None:
                 self.hud._avatar.style = want
@@ -6099,37 +6184,44 @@ class MainWindow(QMainWindow):
             pass
         self._refresh_hud_btn()
         self._log.append_log(
-            "SYS: HUD switched to the animated face." if want == "face"
-            else "SYS: HUD switched to the reactor core.")
+            "SYS: HUD mudou para o rosto animado." if want == "face"
+            else "SYS: HUD mudou para o núcleo do reator.")
 
     def _refresh_stt_btn(self):
         if not hasattr(self, "_stt_btn"):
             return
         from memory.config_manager import get_stt_engine
-        groq = get_stt_engine() == "groq"
+        engine = get_stt_engine()
         style = f"""
             QPushButton {{ background: {C.PANEL2}; color: {C.PRI};
                 border: 1px solid {C.BORDER_A}; border-radius: 3px;
                 text-align: left; padding: 0 8px; }}
             QPushButton:hover {{ color: {C.WHITE}; border: 1px solid {C.BORDER_B}; }}"""
-        self._stt_btn.setText("👂  LISTEN WITH: GROQ WHISPER" if groq
-                              else "👂  LISTEN WITH: GEMINI LIVE")
+        self._stt_btn.setText({
+            "groq":    "👂  LISTEN WITH: GROQ WHISPER",
+            "whisper": "👂  LISTEN WITH: WHISPER LOCAL",
+        }.get(engine, "👂  LISTEN WITH: GEMINI LIVE"))
         self._stt_btn.setStyleSheet(style)
-        self._stt_btn.setToolTip(
-            "Your speech is cut into sentences here and transcribed by Whisper on "
-            "Groq; Gemini receives text and still answers by voice. Free on Groq, "
-            "and Gemini stops billing audio input. Needs a Groq key in PLUGIN "
-            "SETTINGS. Tap to go back to native Gemini listening."
-            if groq else
+        self._stt_btn.setToolTip({
+            "groq":
+                "Your speech is cut into sentences here and transcribed by Whisper on "
+                "Groq; Gemini receives text and still answers by voice. Free on Groq, "
+                "and Gemini stops billing audio input. Needs a Groq key in PLUGIN "
+                "SETTINGS. Tap to switch to local Whisper.",
+            "whisper":
+                "Your speech is cut into sentences here and transcribed by faster-"
+                "whisper running on this machine. No key, no network — nothing leaves "
+                "the computer. The first use downloads the model once. Tap to switch.",
+        }.get(engine,
             "The microphone streams straight into Gemini Live (native audio, "
-            "lowest latency). Tap to transcribe with Whisper on Groq instead.")
+            "lowest latency). Tap to transcribe locally with Whisper instead."))
 
     def _refresh_name_gate_btn(self):
         if not hasattr(self, "_gate_btn"):
             return
         from memory.config_manager import get_name_gate_enabled, get_stt_engine
         on = get_name_gate_enabled()
-        name = (getattr(self, "_assistant_name", "") or "JARVIS").upper()
+        name = (getattr(self, "_assistant_name", "") or _aname()).upper()
         _on = f"""
             QPushButton {{ background: #001a08; color: {C.GREEN};
                 border: 1px solid {C.GREEN_D}; border-radius: 3px;
@@ -6146,10 +6238,10 @@ class MainWindow(QMainWindow):
         self._gate_btn.setToolTip(
             "Only sentences that contain the assistant's name are answered; the "
             "rest is dropped on this machine and never sent. One exception: when "
-            "JARVIS ends with a question, your next sentence within 25 s counts as "
-            "the answer, no name needed. Works with LISTEN WITH: GROQ WHISPER "
-            "(with Gemini Live listening, use WAKE WORD instead)."
-            + ("" if get_stt_engine() == "groq" else
+            f"{_aname()} ends with a question, your next sentence within 25 s counts as "
+            "the answer, no name needed. Works with LISTEN WITH: GROQ WHISPER or "
+            "WHISPER LOCAL (with Gemini Live listening, use WAKE WORD instead)."
+            + ("" if get_stt_engine() in ("groq", "whisper") else
                "\nNOTE: listening is currently Gemini Live, so this has no effect yet."))
 
     def _refresh_humor_btn(self):
@@ -6173,7 +6265,7 @@ class MainWindow(QMainWindow):
             "ON: sharp, sarcastic, deadpan wit after each answer (never on anything "
             "serious). OFF: the usual dry butler. Applies on the next reconnect, which "
             "happens automatically; the conversation is kept. By voice: "
-            "'Jarvis, ativa o modo ácido' / 'desativa o modo ácido'.")
+            f"'{_aname()}, ativa o modo ácido' / 'desativa o modo ácido'.")
 
     def _apply_humor(self, want: bool, delay: float = 0.0):
         """Save the switch, repaint the button and ask the brain to rebuild its
@@ -6202,10 +6294,10 @@ class MainWindow(QMainWindow):
         want = not get_name_gate_enabled()
         save_name_gate_enabled(want)
         self._refresh_name_gate_btn()
-        name = (getattr(self, "_assistant_name", "") or "JARVIS")
-        if want and get_stt_engine() != "groq":
+        name = (getattr(self, "_assistant_name", "") or _aname())
+        if want and get_stt_engine() not in ("groq", "whisper"):
             self._log.append_log(f"SYS: Name filter saved, but it only applies with "
-                                 f"LISTEN WITH: GROQ WHISPER. Switch listening to use it.")
+                                 f"LISTEN WITH: WHISPER LOCAL (or Groq). Switch listening to use it.")
         else:
             self._log.append_log(f"SYS: {'Answering only when called ' + name + '.' if want else 'Answering everything again.'}")
 
@@ -6257,15 +6349,28 @@ class MainWindow(QMainWindow):
                 self._log.append_log(f"ERR: Could not switch brain — {e}")
 
     def _toggle_stt(self):
-        from memory.config_manager import get_stt_engine, save_stt_engine
-        want = "gemini" if get_stt_engine() == "groq" else "groq"
+        from memory.config_manager import (get_stt_engine, save_stt_engine,
+                                           get_brain_engine, get_plugin_config)
+        cur = get_stt_engine()
+        if get_brain_engine() == "economy":
+            # No economy brain sem transcriber: Gemini Live is off, so keep the
+            # ears local instead of letting the button silence the assistant.
+            want = "whisper"
+        else:
+            order = ["gemini", "whisper"]
+            try:
+                if (get_plugin_config("groq") or {}).get("api_key"):
+                    order.insert(1, "groq")
+            except Exception:
+                pass
+            want = order[(order.index(cur) + 1) % len(order)] if cur in order else "whisper"
         used = want
         if self.on_stt_change:
             try:
                 used = self.on_stt_change(want) or want
             except Exception as e:
                 self._log.append_log(f"ERR: Could not switch listening — {e}")
-                used = "gemini"
+                used = cur
         save_stt_engine(used)
         self._refresh_stt_btn()
 
@@ -6402,10 +6507,11 @@ class MainWindow(QMainWindow):
             self._customize_overlay.hide()
         cw = self.centralWidget()
         ov = CustomizeOverlay(
-            cfg.get("assistant_name", "JARVIS") or "JARVIS",
+            cfg.get("assistant_name", _DEFAULT_NAME) or _DEFAULT_NAME,
             cfg.get("user_name", ""),
             cfg.get("ui_color", "") or DEFAULT_UI_COLOR,
             cfg.get("voice_name", ""),
+            _fish_voice(),
             parent=cw,
         )
         ow, oh = CustomizeOverlay._OW, CustomizeOverlay._OH
@@ -6427,9 +6533,9 @@ class MainWindow(QMainWindow):
             retheme_all_widgets(old, current_palette())
 
     def _apply_name_update(self, name: str, user_name: str, ui_color: str = "",
-                           voice: str = ""):
+                           voice: str = "", fish_voice: str | None = None):
         """Update all name/theme-dependent UI elements and persist to config."""
-        self._assistant_name = name.strip() or "JARVIS"
+        self._assistant_name = name.strip() or _aname()
         display = self._assistant_name.upper()
         self.setWindowTitle(f"{display} — {APP_VERSION}")
         self._title_lbl.setText(display)
@@ -6439,6 +6545,15 @@ class MainWindow(QMainWindow):
             self._sub_lbl.setText("Personal AI Assistant")
         self._log._ai_name_lc = self._assistant_name.lower()
         self.hud._assistant_name = display
+        # Persistent widgets built once at construction: the FAB tooltip and
+        # the drag-file hint. The tray re-reads _aname() in its own 1.5 s poll,
+        # so it needs nothing here. Dialogs built on demand read _aname() at
+        # open time and pick the new name up for free.
+        try:
+            self._fab_stop.setToolTip(
+                f"Interrupt — stop {self._assistant_name} mid-sentence  [ESC]")
+        except Exception:
+            pass
 
         color_changed = False
         if ui_color:
@@ -6457,23 +6572,66 @@ class MainWindow(QMainWindow):
                 save_voice(voice)
                 voice_changed = True
 
+        # Fish Audio voice → the timbre of the TTS engine, a different setting
+        # from the Gemini/Edge voice above. Normalised through the same helper
+        # the brain uses (a pasted link becomes the id in both places) and
+        # written in the same pass as the rest of the form, so the file is
+        # touched once. None means "the form did not send this field".
+        fish_changed = False
+        fish_new = ""
+        if fish_voice is not None:
+            from core.brain import fish_voice_id as _fvid
+            fish_new = _fvid(fish_voice)
+            fish_changed = fish_new != _fvid(_fish_voice())
+
         try:
             data = _read_full_config()
             data["assistant_name"] = self._assistant_name
             data["user_name"] = user_name.strip()
             if ui_color:
                 data["ui_color"] = ui_color.strip().lower()
+            if fish_voice is not None:
+                pc = data.get("plugin_config")
+                if not isinstance(pc, dict):
+                    pc = data["plugin_config"] = {}
+                br = pc.get("brain")
+                if not isinstance(br, dict):
+                    br = pc["brain"] = {}
+                br["fish_voice_id"] = fish_new
             API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
-            self._log.append_log(f"SYS: Identity updated — {display}")
+            self._log.append_log(f"SYS: Identidade atualizada — {display}")
             if color_changed:
-                self._log.append_log(f"SYS: UI colour applied — {ui_color}")
+                self._log.append_log(f"SYS: Cor da interface aplicada — {ui_color}")
             if voice_changed:
-                self._log.append_log(f"SYS: Voice set — {voice}")
+                self._log.append_log(f"SYS: Voz definida — {voice}")
+            if fish_changed:
+                self._log.append_log(
+                    "SYS: Voz Fish Audio definida — "
+                    + (fish_new or "padrão do modelo"))
+                if fish_new and not re.fullmatch(r"[0-9a-f]{32}", fish_new):
+                    self._log.append_log(
+                        f"ERR: «{fish_new}» não parece um id do Fish "
+                        f"(32 caracteres hex) — salvei assim mesmo.")
         except Exception as e:
-            self._log.append_log(f"ERR: Config save failed — {e}")
+            self._log.append_log(f"ERR: Falha ao salvar a configuração — {e}")
+
+        # The session holds a snapshot of the brain settings; keep it honest so
+        # anything reading it before the next sentence sees the new id too.
+        # (brain.synth_pcm24k re-reads config anyway — this is belt and braces.)
+        if fish_changed:
+            try:
+                if getattr(self, "_brain_st", None) is not None:
+                    self._brain_st["fish_voice_id"] = fish_new
+            except Exception:
+                pass
 
         if voice_changed and self.on_voice_change:
             self.on_voice_change()
+
+        # The brain bakes the name into its prompt and its wake gate, so a
+        # rename only reaches it through a rebuild — same as the voice.
+        if self.on_identity_change:
+            self.on_identity_change()
 
     def _centre_overlay(self, ov) -> None:
         """Place a floating overlay in the middle of the HUD and show it."""
@@ -6574,6 +6732,46 @@ class MainWindow(QMainWindow):
         self._plugin_settings_overlay = ov   # keep a reference so it isn't GC'd
 
     # ── Clipboard intelligence ───────────────────────────────────────────────────
+
+    @pyqtSlot(object)
+    def _run_on_main(self, fn) -> None:
+        """Queued from worker threads: run `fn` here, where Qt allows it."""
+        fn()
+
+    def clipboard_grab(self):
+        """Thread-safe clipboard read for the brain's tools.
+
+        Returns ('image', png_bytes) | ('text', utf8) | ('empty', b'') |
+        ('error', msg). The clipboard belongs to the main thread, so the grab
+        is queued to it through _run_on_main and awaited — a tool call runs on
+        a worker thread, and touching QApplication from there is undefined.
+        """
+        import threading as _th
+        ev = _th.Event()
+        out: list = []
+
+        def _grab() -> None:
+            try:
+                cb = QApplication.clipboard()
+                img = cb.image()
+                if img is not None and not img.isNull():
+                    buf = QBuffer()
+                    buf.open(QBuffer.OpenModeFlag.WriteOnly)
+                    img.save(buf, "PNG")
+                    out.append(("image", bytes(buf.data())))
+                else:
+                    t = cb.text().strip()
+                    out.append(("text", t.encode("utf-8")) if t else ("empty", b""))
+            except Exception as e:
+                out.append(("error", str(e).encode("utf-8", "replace")))
+            finally:
+                ev.set()
+
+        QMetaObject.invokeMethod(self, "_run_on_main",
+                                 Qt.ConnectionType.QueuedConnection,
+                                 Q_ARG(object, _grab))
+        ev.wait(5.0)
+        return out[0] if out else ("error", b"clipboard grab timed out")
 
     def _on_clipboard_changed(self):
         try:
@@ -6691,8 +6889,198 @@ class MainWindow(QMainWindow):
             self._overlay = None
         self._apply_state("LISTENING")
         self.hud.start_intro()
-        self._assistant_name = _read_full_config().get("assistant_name", "JARVIS") or "JARVIS"
+        self._assistant_name = _read_full_config().get("assistant_name", _DEFAULT_NAME) or _DEFAULT_NAME
         self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. {self._assistant_name} online.")
+
+
+class _TrayIcon(QObject):
+    """O JARVIS na bandeja do sistema.
+
+    A janela é o rosto do assistente; a bandeja é a ausência dele. Com o ícone
+    aqui, fechar a janela deixa o JARVIS vivo — ouvindo o "Hey Jarvis" — sem
+    ocupar a tela. O menu carrega o que só faz sentido nesse estado: acordar e
+    dormir sem falar nada, ligar e desligar a palavra de ativação, e escolher se
+    ele abre junto com o sistema.
+
+    Os callbacks (on_wake_toggle, on_wake_manual, wake_get_state) são atribuídos
+    ao JarvisUI pelo main.py DEPOIS que a sessão sobe, então tudo aqui é lido no
+    clique, nunca guardado no __init__ — o menu pode ser usado antes de existir
+    sessão, e aí ele responde que ainda está conectando em vez de estourar.
+    """
+
+    _TICK_MS = 1500
+
+    def __init__(self, ui: "JarvisUI"):
+        super().__init__(ui._win)
+        self._ui = ui
+        self._win = ui._win
+
+        icon = QIcon(str(CONFIG_DIR / "jarvis.ico"))
+        if icon.isNull():
+            icon = self._fallback_icon()
+        self._icon = QSystemTrayIcon(icon, self)
+        self._icon.setToolTip(_aname())
+
+        menu = QMenu()
+        self._act_show = menu.addAction("Esconder", self.toggle_window)
+        self._act_wake = menu.addAction("Dormir", self.toggle_awake)
+        menu.addSeparator()
+        self._act_wake_word = menu.addAction(f"Palavra de ativação ({_aname()})")
+        self._act_wake_word.setCheckable(True)
+        self._act_wake_word.triggered.connect(self._toggle_wake_word)
+        self._act_autostart = menu.addAction("Iniciar com o sistema")
+        self._act_autostart.setCheckable(True)
+        self._act_autostart.triggered.connect(self._toggle_autostart)
+        menu.addSeparator()
+        self._act_quit = menu.addAction(f"Sair do {_aname()}", ui.quit)
+        self._menu = menu
+        self._icon.setContextMenu(menu)
+        self._icon.activated.connect(self._on_activated)
+        self._icon.show()
+
+        # Sem sinal de mudança de estado vindo do áudio, o menu se atualiza
+        # sozinho: é mais honesto do que depender de cada caminho que acorda ou
+        # dorme o assistente avisar a bandeja.
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self.refresh)
+        self._timer.start(self._TICK_MS)
+        self.refresh()
+
+    # ── aparência ────────────────────────────────────────────────────────────
+
+    def _fallback_icon(self):
+        """Círculo ciano, caso config/jarvis.ico suma do disco."""
+        pm = QPixmap(64, 64)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 200, 255))
+        painter.drawEllipse(8, 8, 48, 48)
+        painter.end()
+        return QIcon(pm)
+
+    def _state(self) -> dict:
+        getter = getattr(self._ui, "wake_get_state", None)
+        if getter is None:
+            return {}
+        try:
+            return dict(getter() or {})
+        except Exception:
+            return {}
+
+    def refresh(self) -> None:
+        st = self._state()
+        name = _aname()
+        visible = self._win.isVisible() and not self._win.isMinimized()
+        self._act_show.setText("Esconder" if visible else f"Mostrar {name}")
+        # Os itens de menu são criados uma vez no __init__; renomear sem
+        # reiniciar só pega aqui, no poll de 1,5 s.
+        self._act_wake_word.setText(f"Palavra de ativação ({name})")
+        self._act_quit.setText(f"Sair do {name}")
+
+        enabled = bool(st.get("enabled"))
+        awake = bool(st.get("awake"))
+        self._act_wake.setEnabled(enabled)
+        self._act_wake.setText("Dormir" if awake else "Acordar")
+
+        can_toggle_wake = getattr(self._ui, "on_wake_toggle", None) is not None
+        self._act_wake_word.setEnabled(can_toggle_wake)
+        self._act_wake_word.setChecked(enabled)
+        if enabled and not st.get("ready", True):
+            self._act_wake_word.setToolTip(
+                "o modelo da palavra de ativação não está mais no disco")
+        else:
+            self._act_wake_word.setToolTip("")
+
+        self._act_autostart.setEnabled(_autostart.supported())
+        self._act_autostart.setChecked(_autostart.is_enabled())
+
+        if enabled and not awake:
+            self._icon.setToolTip(f"{name} — dormindo (diga \"{name}\")")
+        else:
+            self._icon.setToolTip(f"{name} — acordado")
+
+    def message(self, title: str, body: str) -> None:
+        try:
+            self._icon.showMessage(title, body,
+                                   QSystemTrayIcon.MessageIcon.Information, 4000)
+        except Exception:
+            pass
+
+    # ── janela ───────────────────────────────────────────────────────────────
+
+    def toggle_window(self) -> None:
+        if self._win.isVisible() and not self._win.isMinimized():
+            self.hide_window()
+        else:
+            self.show_window()
+
+    def show_window(self) -> None:
+        self._win.showNormal()
+        self._win.raise_()
+        self._win.activateWindow()
+        self.refresh()
+
+    def hide_window(self) -> None:
+        self._win.hide()
+        self.refresh()
+
+    def _on_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.toggle_window()
+
+    # ── ações do menu ────────────────────────────────────────────────────────
+
+    def toggle_awake(self) -> None:
+        cb = getattr(self._ui, "on_wake_manual", None)
+        if cb is None:
+            self._log("Ainda conectando — espere a sessão subir.")
+            return
+        try:
+            cb()
+        except Exception as e:
+            self._log(f"Não consegui acordar/dormir: {e}")
+        self.refresh()
+
+    def _toggle_wake_word(self, checked: bool) -> None:
+        cb = getattr(self._ui, "on_wake_toggle", None)
+        if cb is None:
+            self._log("Ainda conectando — espere a sessão subir.")
+            self.refresh()
+            return
+        try:
+            result = cb(bool(checked))
+        except Exception as e:
+            self._log(f"Não consegui mudar a palavra de ativação: {e}")
+            self.refresh()
+            return
+        if result == "need_download":
+            self._log("O modelo da palavra de ativação não está instalado — "
+                      "ative em ⚙ → WAKE WORD.")
+            self.message("Palavra de ativação", "Instale o modelo em ⚙ → WAKE WORD.")
+        elif checked:
+            self.message("Palavra de ativação ligada",
+                         f"Diga \"{_aname()}\" para me chamar.")
+        self.refresh()
+
+    def _toggle_autostart(self, checked: bool) -> None:
+        ok, msg = (_autostart.enable() if checked else _autostart.disable())
+        self._log(msg)
+        if ok:
+            self.message("Iniciar com o sistema", msg)
+        self.refresh()
+
+    def _log(self, msg: str) -> None:
+        print(f"[Tray] {msg}")
+        try:
+            self._win.write_log(f"SYS: {msg}")
+        except Exception:
+            pass
+
+    def hide(self) -> None:
+        self._timer.stop()
+        self._icon.hide()
 
 
 class _RootShim:
@@ -6710,7 +7098,97 @@ class JarvisUI:
         self._app.setStyle("Fusion")
         self._win = MainWindow(face_path)
         self.root = _RootShim(self._app)
+        self._tray: _TrayIcon | None = None
+        self._setup_tray()
         self._win.show_as_configured()
+        self._setup_show_signal()
+
+    # ── "abrir de novo" traz a janela de volta ───────────────────────────────
+
+    def _setup_show_signal(self) -> None:
+        """SIGUSR1 mostra a janela escondida na bandeja.
+
+        O atalho do menu de aplicativos, quando vê o JARVIS já rodando, manda
+        SIGUSR1 em vez de abrir uma segunda instância (que disputaria microfone
+        e wake word). O handler de sinal só levanta uma flag — chamar Qt de
+        dentro dele não é seguro enquanto o mainloop está preso no C; um QTimer
+        na thread principal vê a flag e mostra a janela (pior caso, ~1,5 s).
+        """
+        import signal
+        self._show_requested = False
+        try:
+            signal.signal(signal.SIGUSR1, lambda *_: setattr(self, "_show_requested", True))
+        except (ValueError, OSError, AttributeError):
+            return          # sem SIGUSR1 nesta plataforma; o tray ainda funciona
+        self._show_timer = QTimer(self._win)
+        self._show_timer.setInterval(1500)
+        self._show_timer.timeout.connect(self._poll_show_signal)
+        self._show_timer.start()
+
+    def _poll_show_signal(self) -> None:
+        if not getattr(self, "_show_requested", False):
+            return
+        self._show_requested = False
+        if not self._win_alive():
+            return
+        try:
+            self._win.showNormal()
+            self._win.show()
+            self._win.raise_()
+            self._win.activateWindow()
+        except Exception:
+            pass
+
+    # ── bandeja do sistema ───────────────────────────────────────────────────
+
+    def _setup_tray(self) -> None:
+        """Cria o ícone da bandeja, se este desktop tiver uma.
+
+        No GNOME/Wayland a bandeja depende da extensão "AppIndicator and
+        KStatusNotifierItem Support"; sem ela o Qt responde que não há bandeja.
+        Nesse caso a janela continua exatamente como era — fechar fecha — em
+        vez de fingir que tem um ícone que o usuário nunca vai ver.
+        """
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            print("[Tray] Este desktop não expõe bandeja de sistema — o JARVIS "
+                  "abre na janela normal. No GNOME, instale a extensão "
+                  "'AppIndicator and KStatusNotifierItem Support' para ter o ícone.")
+            return
+        # Com bandeja, fechar a janela não pode encerrar o app: o X esconde.
+        self._app.setQuitOnLastWindowClosed(False)
+        self._win._to_tray = self.hide_to_tray
+        self._tray = _TrayIcon(self)
+
+    def hide_to_tray(self) -> None:
+        """O "X" da janela: some da tela e continua ouvindo."""
+        if self._tray is None:
+            self._win.close()
+            self._app.quit()
+            return
+        self._win.hide()
+        self._tray.refresh()
+        st = self._tray._state()
+        if st.get("enabled"):
+            self._tray.message("Continuo aqui",
+                               f"Diga \"{_aname()}\" para me chamar. Para sair: "
+                               f"menu da bandeja → Sair do {_aname()}.")
+
+    def start_hidden(self) -> None:
+        """Abre direto na bandeja — é o que o autostart e o `--tray` pedem."""
+        if self._tray is not None:
+            self._win.hide()
+            self._tray.refresh()
+
+    def quit(self) -> None:
+        """Sair de verdade: solta o fechamento-para-bandeja e encerra."""
+        self._win._to_tray = None
+        if self._tray is not None:
+            self._tray.hide()
+        self._app.quit()
+
+    @property
+    def tray(self):
+        return self._tray
 
     @property
     def muted(self) -> bool:
@@ -6892,11 +7370,27 @@ class JarvisUI:
     def notify_phone_connected(self) -> None:
         self._win.notify_phone_connected()
 
+    def _win_alive(self) -> bool:
+        """True while the Qt window still exists. After the user closes it to
+        the tray — or if the compositor ever destroys it — the C++ side can go
+        away while the Python reference lingers; emitting a signal on it then
+        raises 'wrapped C/C++ object ... has been deleted'. The brain's worker
+        threads call set_state/write_log on their own schedule, so every one of
+        them has to be able to hit a dead window. Guarding here turns that
+        crash into a no-op instead of a traceback storm in the log."""
+        try:
+            import shiboken6
+            return shiboken6.isValid(self._win)
+        except Exception:
+            return self._win is not None
+
     def set_state(self, state: str):
-        self._win._state_sig.emit(state)
+        if self._win_alive():
+            self._win._state_sig.emit(state)
 
     def write_log(self, text: str):
-        self._win._log_sig.emit(text)
+        if self._win_alive():
+            self._win._log_sig.emit(text)
 
     def wait_for_api_key(self):
         while not self._win._ready:
@@ -7036,6 +7530,24 @@ class JarvisUI:
     def on_music_control(self, cb):
         self._win.on_music_control = cb
 
+    @property
+    def on_play_youtube(self):
+        return getattr(self._win, "on_play_youtube", None)
+
+    @on_play_youtube.setter
+    def on_play_youtube(self, cb):
+        self._win.on_play_youtube = cb
+
+    @property
+    def on_say_now(self):
+        """Speak a sentence outside any turn — used by long-running tools that
+        need to narrate progress ("vou olhar o arquivo…")."""
+        return getattr(self._win, "on_say_now", None)
+
+    @on_say_now.setter
+    def on_say_now(self, cb):
+        self._win.on_say_now = cb
+
     def music_is_playing(self) -> bool:
         return bool(getattr(self._win, "_music_on", False))
 
@@ -7079,4 +7591,4 @@ class JarvisUI:
 
     def stop_speaking(self):
         if not self.muted:
-            self.set_state("LISTENING")
+            self.set_state("LISTENING")
