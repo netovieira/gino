@@ -653,6 +653,38 @@ def _live_call(contents, config, timeout_ms: int, key: str):
     return _Reply(text) if text else None
 
 
+def _key_usable(key: str) -> bool:
+    """Is this a key worth calling Gemini with? A Gemini-free install stores a
+    placeholder there ("economy-mode-no-gemini"), and calling with it is a 401
+    that takes a second to arrive on every single side call."""
+    k = (key or "").strip()
+    return len(k) >= 20 and not k.lower().startswith("economy-mode")
+
+
+def _qoder_call(contents, timeout_ms: int):
+    """The rung for an install with no Gemini key: ask the local Qoder proxy.
+
+    Every side call in the app goes through call(), so routing it here means
+    the screenshot reader, the file summariser and the dev agent keep working
+    when the conversation itself runs on Qoder. Returns a _Reply, or None when
+    Qoder is not reachable — the caller then reports what it did before.
+    """
+    try:
+        from core import qoder
+    except Exception:
+        return None
+    prompt = qoder.flatten(contents)
+    if not prompt.strip():
+        return None
+    try:
+        text = qoder.ask(prompt, max_tokens=2048, temperature=0.2,
+                         timeout=max(30.0, timeout_ms / 1000.0))
+    except Exception as e:
+        print(f"[Gemini] no Gemini key, and Qoder could not answer: {e}")
+        return None
+    return _Reply(text) if text else None
+
+
 def call(contents, tier: str = FAST, config=None,
          timeout_ms: int = DEFAULT_TIMEOUT_MS, key: str = ""):
     """Run one generation, walking the ladder until one answers.
@@ -673,9 +705,13 @@ def call(contents, tier: str = FAST, config=None,
         ladder = (tier,) + tuple(m for m in _LADDERS[SMART] if m != tier)
 
     resolved_key = key or api_key()
-    if not resolved_key:
+    if not _key_usable(resolved_key):
+        reply = _qoder_call(contents, timeout_ms)
+        if reply is not None:
+            return reply
         print("[Gemini] no Gemini API key is configured")
         return None
+
     try:
         from core import usage as _usage
         _usage.note("gemini", calls=1)
