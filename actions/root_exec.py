@@ -25,9 +25,23 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 
 from core import rootgate
+
+# Root commands are executed as an argv list — there is no shell in the middle,
+# so a model cannot smuggle `; cmd` or `$(cmd)` into the command string. The
+# first token is restricted to tools that make sense for this assistant; a
+# pipeline or shell syntax is refused and must be done manually.
+_ALLOWED_ROOT_COMMANDS = {
+    "apt", "apt-get", "dpkg", "snap", "flatpak", "systemctl", "service",
+    "journalctl", "nmcli", "ufw", "iptables", "nft", "mount", "umount",
+    "modprobe", "sysctl", "hostnamectl", "timedatectl", "localectl",
+    "sed", "cp", "mv", "mkdir", "install", "chmod", "chown", "ln",
+    "update-grub", "grub-install", "dconf",
+}
+_SHELL_SYNTAX = re.compile(r"[;&|`$<>\n\r]")
 
 # The command waiting for the user's spoken "yes". Kept here because the whole
 # point of the flow is that the request and the authorisation arrive as two
@@ -65,10 +79,39 @@ _REFUSE = (
 )
 
 
-def _run_root(command: str) -> str:
-    """`sudo -n sh -c <command>` — non-interactive, so no password is asked."""
+def _command_argv(command: str) -> list[str]:
+    """Validate a root command and return its argv, without a shell."""
+    raw = " ".join(str(command or "").splitlines()).strip()
+    if not raw:
+        raise ValueError("comando vazio")
+    if "\x00" in raw:
+        raise ValueError("comando com byte nulo")
+    if _SHELL_SYNTAX.search(raw):
+        raise ValueError("comandos com sintaxe de shell (; & | ` $ < >) "
+                         "precisam ser executados manualmente no terminal")
     try:
-        r = subprocess.run(["sudo", "-n", "sh", "-c", command],
+        argv = shlex.split(raw)
+    except ValueError as e:
+        raise ValueError(f"aspas inválidas: {e}") from e
+    if not argv:
+        raise ValueError("comando vazio")
+    name = os.path.basename(argv[0]).lower()
+    if name == "sudo":
+        raise ValueError("não inclua 'sudo'; esta ferramenta já executa como root")
+    if name not in _ALLOWED_ROOT_COMMANDS:
+        raise ValueError(f"comando '{name}' não está na lista de comandos root "
+                         "permitidos")
+    return argv
+
+
+def _run_root(command: str) -> str:
+    """Run one validated root command as argv — never through a shell."""
+    try:
+        argv = _command_argv(command)
+    except ValueError as e:
+        return f"recusei o comando: {e}"
+    try:
+        r = subprocess.run(["sudo", "-n", "--", *argv],
                            capture_output=True, text=True, timeout=600)
     except subprocess.TimeoutExpired:
         return f"o comando passou de 10 minutos e eu o interrompi: {command}"
@@ -102,6 +145,10 @@ def root_exec(parameters: dict, player=None, session_memory=None) -> str:
     if _looks_catastrophic(command):
         return (f"não executo esse comando nem com autorização sua: ele apaga ou "
                 f"corrompe o sistema de forma irreversível ({command[:80]}).")
+    try:
+        _command_argv(command)
+    except ValueError as e:
+        return f"não executo esse comando: {e}"
 
     if not rootgate.authorized():
         global _pending
@@ -127,9 +174,11 @@ TOOL = {
         "sudo' — if they have not, this returns a sentence asking them to say it, "
         "and nothing runs. Use it for what genuinely needs root: installing or "
         "removing packages, editing files under /etc, restarting system "
-        "services, changing system settings. Never claim the command ran until "
-        "the result says it did. Do NOT use it for things a normal tool can do: "
-        "opening apps, volume, files in the home directory."
+        "services, changing system settings. One command at a time, without "
+        "shell pipelines or redirections; those must be run manually. Never "
+        "claim the command ran until the result says it did. Do NOT use it for "
+        "things a normal tool can do: opening apps, volume, files in the home "
+        "directory."
     ),
     "parameters": {
         "type": "OBJECT",
