@@ -1,0 +1,20 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+exclude = [".venv", "qoder_live/node_modules", "memory", "models"]
+# The project predates ruff; start with the rules that catch real bugs and
+# leave style-only rules out until the baseline is clean.
+lint.select = ["E9", "F63", "F7", "F82"]
+lint.ignore = []
+
+[tool.mypy]
+python_version = "3.14"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = false
+exclude = ['(?x)(^|/)(\.venv|qoder_live/node_modules|memory|models)/']

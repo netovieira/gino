@@ -91,6 +91,23 @@ PyPDF2                       # file_processor — PDF fallback reader
 python-docx                  # file_processor — .docx reading
 pynvml                       # system_monitor + the HUD's GPU meter (NVIDIA)
 
+# ── Voice stack: STT, VAD, turn detection and diarization ────────────────────
+# The models themselves live in models/ (git-ignored) and are downloaded by the
+# setup/Phase 0 script. These are the runtime libraries that load them.
+faster-whisper>=1.0,<2
+onnxruntime>=1.16,<2
+sherpa-onnx==2.0.1
+transformers>=4.48,<5
+scipy>=1.11,<2
+
+# ── Opt-in voice unlock (Secret Service / keyring) ───────────────────────────
+keyring>=25
+
+# ── Structured logs, retries and schemas for the tool bridge ──────────────────
+structlog>=24,<27
+tenacity>=8,<10
+pydantic>=2,<3
+
 # ── Optional: heavy extras, install only if you want the feature ──────────────
 # Left out on purpose — together they are several hundred megabytes, which is a
 # lot to download for a fresh clone that may never use them.

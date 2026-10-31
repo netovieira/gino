@@ -1,0 +1,10 @@
+# ── Development / verification only ──────────────────────────────────────────
+# Runtime dependencies stay in requirements.txt. These are the tools used to
+# test, lint and benchmark the voice stack; they are not needed to run Gino.
+-r requirements.txt
+
+pytest>=8
+ruff>=0.6
+mypy>=1.11
+soundfile>=0.12
+edge-tts>=7

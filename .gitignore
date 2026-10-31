@@ -24,6 +24,10 @@ config/whatsapp_web/
 
 # ── Personal data the assistant accumulates about you ─────────────────────────
 memory/long_term.json
+memory/continuity.json
+# The continuous conversation index and speaker voiceprints:
+memory/chat/
+memory/voices/
 memory/*.db
 # WhatsApp messages it kept (the session itself lives in config/whatsapp_web/):
 memory/whatsapp_inbox.jsonl
@@ -36,6 +40,8 @@ amostra-voz.mp3
 # ── Local tooling ─────────────────────────────────────────────────────────────
 # Qoder CLI session data and per-machine permission settings:
 .qoder/
+# Node sidecar dependencies (the lockfile stays tracked):
+qoder_live/node_modules/
 
 # ── Binaries installed without root ──────────────────────────────────────────
 # ffmpeg/ffprobe extraídos dos .deb do Ubuntu (tools/ffmpeg/bin + lib). Para
@@ -79,3 +85,4 @@ memory/usage.json
 memory/briefing_state.json
 memory/music_cache/
 *.lnk
+models/
