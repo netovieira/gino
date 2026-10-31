@@ -47,7 +47,7 @@ _END_BLOCKS = 11         # ~700 ms below closes it
 # name — this overlap is what makes a call split across two blocks arrive whole.
 _PREROLL = 19
 _MIN_SPEECH = 6          # ~380 ms of voiced blocks, else dropped as noise
-_MAX_BLOCKS = 390        # ~25 s hard cap, then sent as-is
+_MAX_BLOCKS = 600        # ~38 s hard cap, then sent as-is
 # Asleep, the 25 s cap is worthless: it only closes on 700 ms of silence, and a
 # room with music or a fan never gives that. The block grew to the full 25 s and
 # was then thrown away for being "too long for a wake call" — every single time.
@@ -59,6 +59,15 @@ _THRESH_MIN = 0.008      # the quietest threshold we accept (≈ -42 dBFS)
 _FLOOR_MULT = 2.5        # speech must be this many times the room floor
 _LEVEL_LOG_S = 5.0       # console line with the mic level, to tune the above
 _SLEEP_MAX_S = 4.0        # asleep, longer "utterances" are music/TV, not a call
+
+# Endpointing: a pause is not necessarily the end of a turn. Smart Turn v3.2
+# looks at the last 8 s and decides; if it says "incomplete", the next segment
+# is merged with this one before transcription. This is what prevents
+# "…mas" from becoming a whole turn while the user is still talking.
+_ENDPOINT_THRESHOLD = 0.5
+_ENDPOINT_MIN_S = 0.6      # very short commands close immediately
+_CONTINUE_WINDOW_S = 3.0   # how long to wait for the rest of the sentence
+_MAX_PENDING_S = 18.0      # never hold a fragment forever
 
 # Whisper hallucinates on silence, and does so with a short list of
 # favourites. Anything that is only one of these is dropped.
@@ -149,7 +158,8 @@ class GroqListener:
                  transcribe_fn: Callable[[bytes], str] | None = None,
                  engine_label: str = "Groq",
                  usage_key: str = "groq",
-                 fallback_transcribe: Callable[[bytes], str] | None = None) -> None:
+                 fallback_transcribe: Callable[[bytes], str] | None = None,
+                 on_utterance: Callable[[str, bytes], None] | None = None) -> None:
         self._key, self._model, self._lang = api_key, model, language
         self.prompt = prompt
         # Optional local transcriber (core.local_stt): same segmentation and
@@ -164,6 +174,11 @@ class GroqListener:
 
         self._usage_key = usage_key
         self._on_text = on_text
+        # Optional richer sink: receives the text AND the int16 PCM of the same
+        # utterance, so the caller can diarize/identify the voice before the
+        # turn reaches the brain. When None (the default), behavior is exactly
+        # on_text(text) as before — main.py and core.local_stt keep working.
+        self._on_utterance = on_utterance
         self._on_status = on_status or (lambda m: None)
         self._sr = sample_rate
         self._q: queue.Queue = queue.Queue()
@@ -263,6 +278,12 @@ class GroqListener:
             self._pre = seg[-_PREROLL:]
         # NOTE: no _duck.up() here — the apps stay ducked through the reply and
         # are restored when the turn ends (main.set_speaking / worker finally).
+        if capped and not self.sleeping:
+            # A long answer is transcribed, but the tail may be missing. Say so
+            # on the console: the user's request was cut mid-sentence once and
+            # the model answered the fragment as if it were complete.
+            print(f"[{self.label}] utterance hit the {_MAX_BLOCKS}-block cap — "
+                  f"transcribing the captured part only")
         if voiced >= _MIN_SPEECH:
             pcm = b"".join(seg)
             secs = len(pcm) / (2 * self._sr)
@@ -314,97 +335,181 @@ class GroqListener:
         if self._active:
             self._close()
 
+    def transcribe_pcm(self, pcm: bytes) -> str:
+        """Transcribe one PCM slice without segmentation or echo filtering.
+
+        Used by full diarization to re-transcribe each speaker segment. It runs
+        on the same worker thread that called ``on_utterance``, so it never
+        races the listener's own model.
+        """
+        try:
+            if self._transcribe_fn is not None:
+                return str(self._transcribe_fn(pcm) or "").strip()
+            if self._key:
+                return str(transcribe(pcm, self._key, self._model, self._lang,
+                                      self._sr, prompt=self.prompt) or "").strip()
+            if self._fallback_fn is not None:
+                return str(self._fallback_fn(pcm) or "").strip()
+        except Exception as e:
+            print(f"[{self.label}] segment transcription failed: {e}")
+        return ""
+
     # ── worker thread ───────────────────────────────────────────────────────
 
+    def _endpoint_complete(self, pcm: bytes) -> bool:
+        """True when the utterance is a complete turn, not a mid-sentence pause."""
+        secs = len(pcm) / (2 * self._sr)
+        if self.sleeping or secs < _ENDPOINT_MIN_S or secs >= _MAX_PENDING_S:
+            return True
+        try:
+            from core import smart_turn
+            if not smart_turn.available():
+                return True
+            result = smart_turn.predict_endpoint(pcm)
+            probability = float(result.get("probability", 1.0))
+            if probability < _ENDPOINT_THRESHOLD:
+                print(f"[{self.label}] pausa no meio da fala "
+                      f"(smart turn {probability:.2f}) — aguardando continuação")
+                return False
+        except Exception as e:
+            # A broken endpoint model must not make the assistant deaf: fall
+            # back to the fixed silence rule.
+            print(f"[{self.label}] smart turn falhou "
+                  f"({e.__class__.__name__}) — fechando o turno")
+        return True
+
     def _run(self) -> None:
+        pending = b""
+        pending_at = 0.0
         while not self._stop.is_set():
             try:
                 pcm = self._q.get(timeout=0.25)
             except queue.Empty:
+                if pending and time.monotonic() - pending_at >= _CONTINUE_WINDOW_S:
+                    print(f"[{self.label}] continuação não veio — transcrevendo o trecho")
+                    self._process_utterance(pending)
+                    pending, pending_at = b"", 0.0
                 continue
-            t0 = time.monotonic()
-            # Debug aid: keep the last asleep utterance on disk so a misheard
-            # wake call can be re-transcribed offline with and without hints.
-            if self.sleeping and os.environ.get("JARVIS_DUMP_SLEEP_UTTERANCE"):
-                try:
-                    import wave as _wave
-                    from pathlib import Path as _Path
-                    p = _Path(__file__).resolve().parents[1] / "logs" / "ultima-fala-dormindo.wav"
-                    with _wave.open(str(p), "wb") as _w:
-                        _w.setnchannels(1)
-                        _w.setsampwidth(2)
-                        _w.setframerate(self._sr)
-                        _w.writeframes(pcm)
-                except Exception:
-                    pass
-            try:
-                if self._transcribe_fn is not None:
-                    try:
-                        text = self._transcribe_fn(pcm)
-                    except Exception as e:
-                        # Asleep, room audio neither leaves the machine nor
-                        # reaches the panel: a local failure drops quietly.
-                        if self.sleeping:
-                            print(f"[{self.label}] asleep — local STT failed "
-                                  f"({e.__class__.__name__}), utterance dropped")
-                            continue
-                        # Local model failed. Say so once, then keep listening
-                        # through the network rung instead of dropping speech.
-                        if self._fallback_fn is None:
-                            raise
-                        if not self._fallback_used:
-                            self._fallback_used = True
-                            self._on_status(f"{self.label} falhou ({e.__class__.__name__}) — "
-                                            "transcrevendo no Groq até resolver.")
-                        text = self._fallback_fn(pcm)
-                else:
-                    text = transcribe(pcm, self._key, self._model, self._lang, self._sr,
-                                      prompt=self.prompt)
-            except requests.HTTPError as e:
-                code = e.response.status_code if e.response is not None else "?"
-                self._on_status(f"{self.label}: transcrição falhou ({code}).")
-                _duck.up()
+            if self._stop.is_set():
+                break
+            if self.sleeping:
+                self._process_utterance(pcm)
                 continue
-            except Exception as e:
-                if self.sleeping:
-                    print(f"[{self.label}] asleep — utterance dropped "
-                          f"({e.__class__.__name__})")
+
+            now = time.monotonic()
+            if pending:
+                age = now - pending_at
+                if age <= _CONTINUE_WINDOW_S:
+                    merged = (pending + (b"\x00\x00" * int(0.20 * self._sr)) + pcm)
+                    pending = b""
+                    if (len(merged) < int(_MAX_PENDING_S * 2 * self._sr)
+                            and not self._endpoint_complete(merged)):
+                        pending, pending_at = merged, now
+                        continue
+                    self._process_utterance(merged)
                     continue
-                self._on_status(f"{self.label}: transcrição falhou: {e.__class__.__name__}.")
-                _duck.up()
+                # The user waited too long to continue: the old fragment is a
+                # real turn. Send it before evaluating the new one.
+                self._process_utterance(pending)
+                pending, pending_at = b"", 0.0
+
+            if (len(pcm) < int(_MAX_PENDING_S * 2 * self._sr)
+                    and not self._endpoint_complete(pcm)):
+                pending, pending_at = pcm, now
                 continue
-            clean = text.strip()
-            if self._is_prompt_echo(clean):
-                # Whisper regurgitates its conditioning prompt when the audio is
-                # silence or our own reverberant tail: the "utterance" comes back
-                # as a sentence of the name hint, over and over. Drop it before
-                # it reaches the blocklist, the gate or the brain.
-                print(f"[{self.label}] discarded a prompt echo: {clean[:60]!r}")
-                _duck.up()
-                continue
-            if len(clean) < 2 or clean.lower() in _NOISE:
-                if not self.sleeping:
-                    self._on_status(f"{self.label} não reconheceu nada nisso.")
-                    _duck.up()  # no text reaches main: close the exchange here
-                continue
-            secs = len(pcm) / (2 * self._sr)
-            print(f"[{self.label}] {secs:.1f}s of speech → {len(clean)} chars in "
-                  f"{time.monotonic() - t0:.2f}s")
+            self._process_utterance(pcm)
+
+    def _process_utterance(self, pcm: bytes) -> None:
+        t0 = time.monotonic()
+        # Debug aid: keep the last asleep utterance on disk so a misheard
+        # wake call can be re-transcribed offline with and without hints.
+        if self.sleeping and os.environ.get("JARVIS_DUMP_SLEEP_UTTERANCE"):
             try:
-                from core import usage as _usage
-                _usage.note(self._usage_key, utterances=1, audio_s=secs)
+                import wave as _wave
+                from pathlib import Path as _Path
+                p = _Path(__file__).resolve().parents[1] / "logs" / "ultima-fala-dormindo.wav"
+                with _wave.open(str(p), "wb") as _w:
+                    _w.setnchannels(1)
+                    _w.setsampwidth(2)
+                    _w.setframerate(self._sr)
+                    _w.writeframes(pcm)
             except Exception:
                 pass
-            # The handler runs the whole conversation (gates, brain, tools).
-            # An exception there used to end this thread, and a dead consumer
-            # means the assistant keeps hearing audio forever and answers
-            # nothing — the microphone meters in the log stay alive, so it looks
-            # like "it only listens". One bad turn must cost one turn.
-            try:
+        try:
+            if self._transcribe_fn is not None:
+                try:
+                    text = self._transcribe_fn(pcm)
+                except Exception as e:
+                    # Asleep, room audio neither leaves the machine nor
+                    # reaches the panel: a local failure drops quietly.
+                    if self.sleeping:
+                        print(f"[{self.label}] asleep — local STT failed "
+                              f"({e.__class__.__name__}), utterance dropped")
+                        return
+                    # Local model failed. Say so once, then keep listening
+                    # through the network rung instead of dropping speech.
+                    if self._fallback_fn is None:
+                        raise
+                    if not self._fallback_used:
+                        self._fallback_used = True
+                        self._on_status(f"{self.label} falhou ({e.__class__.__name__}) — "
+                                        "transcrevendo no Groq até resolver.")
+                    text = self._fallback_fn(pcm)
+            else:
+                text = transcribe(pcm, self._key, self._model, self._lang, self._sr,
+                                  prompt=self.prompt)
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else "?"
+            self._on_status(f"{self.label}: transcrição falhou ({code}).")
+            _duck.up()
+            return
+        except Exception as e:
+            if self.sleeping:
+                print(f"[{self.label}] asleep — utterance dropped "
+                      f"({e.__class__.__name__})")
+                return
+            self._on_status(f"{self.label}: transcrição falhou: {e.__class__.__name__}.")
+            _duck.up()
+            return
+        clean = text.strip()
+        secs = len(pcm) / (2 * self._sr)
+        # A real sentence the user spoke is never a prompt echo. Whisper
+        # regurgitates the hint on silence/tail blips, which are short; a
+        # 3-second utterance that happens to match a hint fragment is the
+        # user talking to us (that case was being thrown away).
+        if secs < 1.5 and self._is_prompt_echo(clean):
+            # Whisper regurgitates its conditioning prompt when the audio is
+            # silence or our own reverberant tail: the "utterance" comes back
+            # as a sentence of the name hint, over and over. Drop it before
+            # it reaches the blocklist, the gate or the brain.
+            print(f"[{self.label}] discarded a prompt echo: {clean[:60]!r}")
+            _duck.up()
+            return
+        if len(clean) < 2 or clean.lower() in _NOISE:
+            if not self.sleeping:
+                self._on_status(f"{self.label} não reconheceu nada nisso.")
+                _duck.up()  # no text reaches main: close the exchange here
+            return
+        print(f"[{self.label}] {secs:.1f}s of speech → {len(clean)} chars in "
+              f"{time.monotonic() - t0:.2f}s")
+        try:
+            from core import usage as _usage
+            _usage.note(self._usage_key, utterances=1, audio_s=secs)
+        except Exception:
+            pass
+        # The handler runs the whole conversation (gates, brain, tools).
+        # An exception there used to end this thread, and a dead consumer
+        # means the assistant keeps hearing audio forever and answers
+        # nothing — the microphone meters in the log stay alive, so it looks
+        # like "it only listens". One bad turn must cost one turn.
+        try:
+            if self._on_utterance is not None:
+                self._on_utterance(clean, pcm)
+            else:
                 self._on_text(clean)
-            except Exception as e:
-                print(f"[{self.label}] handler falhou ({e!r}) — seguindo vivo")
-                self._on_status("Tive um erro neste turno (detalhes no terminal).")
+        except Exception as e:
+            print(f"[{self.label}] handler falhou ({e!r}) — seguindo vivo")
+            self._on_status("Tive um erro neste turno (detalhes no terminal).")
 
     def stop(self) -> None:
         self._stop.set()
