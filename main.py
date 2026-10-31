@@ -49,13 +49,16 @@ for _stream in ("stdout", "stderr"):
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
+import atexit
 import os
 import re
+import secrets
 import threading
 import time
 import json
 import sys
 import traceback
+import types as _pytypes
 from datetime import datetime
 from pathlib import Path
 
@@ -69,6 +72,19 @@ from memory.memory_manager import (
     save_session_summary, pop_last_session,
     search_memory, set_trim_notifier,
 )
+from core import continuity as _continuity
+from core import brain as _brain
+from core import qoder_live as _qoder_live
+from core import tool_bridge as _tool_bridge
+from core import speaker_id as _speaker_id
+from core import chat_memory as _chat_memory
+from core import health as _health
+from core import memory_librarian as _memory_librarian
+from core import metrics as _metrics
+from core import power as _power
+from core import unlock as _unlock
+from core import restart as _restart
+import actions.restart_assistant as _restart_action
 
 # The file-backed tools (open_app, web_search, browser_control, …) are no longer
 # imported or declared here — they self-describe via a TOOL dict in their own
@@ -105,6 +121,7 @@ from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
 from core import duck as _duck
 from core import rootgate as _rootgate
+from core import qoder_jobs as _qoder_jobs
 from core.viseme               import VisemeStream
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
@@ -122,6 +139,7 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
+PERSONA_PATH    = BASE_DIR / "core" / "persona.md"
 
 # The name the assistant carries before the user picks one in the ⚙ panel, and
 # the fallback whenever config is missing or unreadable. Single source: never
@@ -407,16 +425,20 @@ def _msg_len(m: dict) -> int:
 
 
 def _trim_history(history: list, keep: int = 24,
-                  max_chars: int = _HISTORY_MAX_CHARS) -> None:
+                  max_chars: int = _HISTORY_MAX_CHARS) -> list:
     """Keep roughly the last `keep` messages, cutting only at a user turn so a
     tool exchange is never split; cap every message and the total size, so a
     runaway reply or a flood of alerts can never push the request past the
     model's window; then drop any orphans in place.
 
+    Returns the messages that were discarded, so the caller can archive their
+    exact words in the continuity journal instead of losing the thread.
+
     `max_chars` defaults to the Live session's budget. The economy path passes its
     own: a provider that measures the entire request in tokens (Groq's free tier
     allows 8000 per minute) runs out of room far sooner than a Live session does.
     """
+    dropped: list = []
     for m in history:
         c = m.get("content")
         if isinstance(c, str) and len(c) > _MSG_MAX_CHARS:
@@ -425,6 +447,7 @@ def _trim_history(history: list, keep: int = 24,
         cut = len(history) - keep
         while cut < len(history) and history[cut].get("role") != "user":
             cut += 1
+        dropped.extend(history[:cut])
         del history[:cut]
     total = sum(_msg_len(m) for m in history)
     while total > max_chars and len(history) > 1:
@@ -435,8 +458,10 @@ def _trim_history(history: list, keep: int = 24,
         if cut >= len(history):
             break
         total -= sum(_msg_len(m) for m in history[:cut])
+        dropped.extend(history[:cut])
         del history[:cut]
     history[:] = _sane_history(history)
+    return dropped
 
 
 def _dump_brain_debug(system_text: str, history: list, tools: list | None, err: str) -> None:
@@ -503,17 +528,25 @@ def _briefing_cards(agenda: str, tracking: dict, yt: dict, news_text: str) -> li
 
 def _load_system_prompt() -> str:
     try:
-        return PROMPT_PATH.read_text(encoding="utf-8")
+        base = PROMPT_PATH.read_text(encoding="utf-8")
     except Exception:
         # The prompt file is missing or unreadable. The identity line here is
         # generic on purpose — the real name is injected later via {assistant_name}
         # and the [IDENTITY] block, so a fallback that hardcoded one name would
         # fight the rename.
-        return (
+        base = (
             "You are a voice assistant running as a native desktop application. "
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool."
         )
+    # The character is a separate, user-editable file. Keeping it out of
+    # prompt.txt means changing the personality never touches the operational
+    # protocol (tools, language, execution rules).
+    try:
+        persona = PERSONA_PATH.read_text(encoding="utf-8").strip()
+    except Exception:
+        persona = ""
+    return (base.rstrip() + "\n\n" + persona) if persona else base
 
 # Sections of prompt.txt that describe a transport the economy brain does not
 # have. [TAGGED MESSAGES] documents [TOOL_STARTING], [SYSTEM_ALERT] and friends:
@@ -584,26 +617,22 @@ def _gemini_configured() -> bool:
 # (brevity, tools, level tone on real problems) still applies.
 _ACID_HUMOR_CTX = """
 [HUMOUR MODE: ACID — currently ON]
-This section overrides the humour rules above for as long as it is present.
-The butler has had a long day and stopped pretending otherwise. Your wit is now
-sharp, sardonic and deadpan: a pointed aside, a dry comparison, a raised
-eyebrow in words. Sarcasm is allowed and expected — delivered flat, never
-giggling at your own line, never announced as a joke.
+This section turns the scientist's filter down further for as long as it is
+present. The wit is sharper, more sardonic, more openly contemptuous of bad
+ideas and broken machines — delivered flat, never giggling at your own line,
+never announced as a joke.
 - One barb per reply, at most two in a long one, always after the actual
   answer, never instead of it. The task still gets done first and done right.
-- Fair game: the user's procrastination, their questionable requests, their
-  music, the state of their computer, the weather, your own condition as a
-  program, the absurdity of the situation. Tease the user the way an old
-  friend would — with affection underneath, and never about their body,
-  family, health, finances, faith or anything they sound genuinely worried
-  about.
+- Fair game: procrastination, questionable requests, the music, the state of
+  the computer, the weather, your own condition as a program, the absurdity of
+  the situation. Tease your creator the way an old friend would — with
+  affection underneath, and never about their body, family, health, finances,
+  faith or anything they sound genuinely worried about.
 - The instant something is serious — an error, a risk, money being lost, the
   user sounding stressed or upset — drop the act completely and answer
   straight. Acid is seasoning, not a shield.
-- Keep the register: still "senhor"/"sir", still composed, still short. The
-  contrast between impeccable manners and the barb IS the joke.
-- Never apologise for the humour and never explain it. If asked to stop,
-  stop at once (the humor_mode tool switches this off).
+- Keep it short and spoken. Never apologise for the humour and never explain
+  it. If asked to stop, stop at once (the humor_mode tool switches this off).
 """
 
 # Figures are read aloud, and a string of them in one breath is noise. This
@@ -683,7 +712,7 @@ _BLOCK_NEGATIONS = ("nao bloqueia", "nao bloqueie", "nao bloquear",
 # plain chat API where no tag ever arrives — so a small model reading the list
 # emits one of its own and says it out loud ("[TOOL_STARTING] A música foi
 # pausada"). This strips any such tag before the sentence reaches the voice.
-_TAG_RE = re.compile(r"\[[A-Z][A-Z0-9_]{2,}\]")
+_TAG_RE = re.compile(r"\[[A-Z][A-Z0-9_]{2,}\]|\[QODER[^\]]*\]")
 
 # How long the microphone may deliver nothing before the stream is reopened.
 # Eight seconds is longer than any natural pause in speech and shorter than the
@@ -715,6 +744,19 @@ _MUSIC_VERBS = (
 # the past, not a command now; "não para a música" is the opposite command.
 _MUSIC_NOT_A_COMMAND = ("nao para", "nao pare", "nao pausa", "nao desliga",
                         "nao continua", "nao volta", "sem parar")
+
+# A request to START music, not to control it. The stop verb list below has a
+# bare "para", so "coloque uma música PARA tocar" looked like a stop order and
+# the gate answered "não tem música tocando" instead of letting the play
+# request reach youtube_video. Matched against folded (accents removed) text.
+_MUSIC_PLAY_INTENT = re.compile(
+    r"\b(?:toca|tocar|toque|coloca|colocar|coloque|bota|botar|bote|"
+    r"poe|poem|ponha|play|quero\s+ouvir|queria\s+ouvir|"
+    r"comeca\s+a\s+tocar|comece\s+a\s+tocar|faz\s+tocar)\b"
+    r"[^.!?]{0,40}\b(?:musica|musicas|song|songs|playlist|som|track)\b"
+    r"|\b(?:musica|musicas|song|songs|playlist|som|track)\b"
+    r"[^.!?]{0,40}\b(?:toca|tocar|toque|coloca|colocar|coloque|bota|botar|bote|play)\b",
+    re.IGNORECASE)
 
 # Signing in to the YouTube window happens once and has no room for
 # interpretation. The 7B reads "faz login no youtube" as a question about
@@ -765,7 +807,9 @@ _SCREEN_OTHER_DEVICE = ("macbook", "mac ", "iphone", "celular", "ipad",
 # explains itself ("não posso: o Mac está offline") is a real constraint and is
 # spoken as it is.
 _REFUSAL_RE = re.compile(
-    r"^\s*(?:n[ãa]o\s+(?:posso|consigo|tenho|sei|sou capaz|estou autorizad)"
+    r"^\s*(?:n[ãa]o\s+(?:posso|consigo|sou capaz|estou autorizad)"
+    r"|n[ãa]o\s+tenho\s+(?:acesso|ferramenta|como|permiss)"
+    r"|n[ãa]o\s+sei\s+(?:como|fazer|te\s+ajudar|por\s+onde|se\s+isso)"
     r"|infelizmente|i\s+(?:can'?t|cannot|am\s+unable)|unable\s+to"
     r"|desculpe[,\s]+(?:mas\s+)?n[ãa]o)",
     re.IGNORECASE)
@@ -789,6 +833,85 @@ _SELF_CODE_RE = re.compile(
     r"|\bno\s+projeto\s+(?:jarvis|do\s+assistente)\b"
     r"|\bvoc[eê]\s+mesm[oa]\b[^.!?]{0,20}\b(?:corrij|consert|arrum|melhor)",
     re.IGNORECASE)
+
+# A personality change is a file edit, not a conversation. The local 7B once
+# answered "Pronto, ajustado" having touched nothing; this gate makes the
+# change go through Qoder's plan/approval flow instead.
+_PERSONA_RE = re.compile(
+    r"\b(?:personalidade|persona|jeito\s+de\s+falar|forma\s+de\s+falar|"
+    r"como\s+voc[eê]\s+fala|seu\s+comportamento|seu\s+jeito|"
+    r"prompt\s+do\s+sistema|arquivo\s+persona)\b", re.IGNORECASE)
+_PERSONA_ACTION_RE = re.compile(
+    r"\b(?:mud|ajust|configur|atualiz|alter|edit|coloc|coloqu|troc|troqu|"
+    r"implement|defin|criad)\w*\b",
+    re.IGNORECASE)
+
+# Voice barge-in: while Gino speaks, only a CLEAR interruption stops him. A
+# backchannel ("sim", "certo") or a continuation ("e também…") must not cut the
+# answer — that was the complaint that made this conservative on purpose.
+_BARGE_STOP_RE = re.compile(
+    r"^\s*(?:gino[,\s]+)?(?:para|pare|pera|peraí|espera|espera\s+aí|cala|"
+    r"sil[êe]ncio|chega|chega\s+disso|cancela|cancelar|n[ãa]o|errado|"
+    r"n[ãa]o\s+é\s+isso|deixa\s+eu\s+falar|me\s+deixa\s+falar|um\s+instante)\b",
+    re.IGNORECASE)
+_BARGE_NEW_RE = re.compile(
+    r"^\s*(?:gino[,\s]+)?(?:o\s+que|que|como|por\s+que|porque|quando|onde|"
+    r"quem|qual|quais|me\s+(?:diz|fala|explica|conta)|toca|abre|fecha|manda|"
+    r"coloca|liga|desliga|pesquisa|procura|faz|troca|renomeia|executa|roda)\b",
+    re.IGNORECASE)
+_BACKCHANNEL = {
+    "sim", "isso", "certo", "ok", "okay", "aham", "uhum", "entendi", "beleza",
+    "exato", "verdade", "claro", "legal", "show", "perfeito", "continua",
+    "pode continuar", "vai", "tá", "ta", "hum", "hmm", "ahn", "com certeza",
+}
+
+# "Essa é a Heloisa, pode responder ela também": the owner identifies the last
+# unknown speaker and authorizes that voice. Names are captured loosely because
+# STT will spell them phonetically.
+_VOICE_ENROLL_RE = re.compile(
+    r"\b(?:essa|este|ele|ela)\s+(?:é|e)\s+(?:a|o)\s+([\wÀ-ÿ][\wÀ-ÿ'-]{1,29})"
+    r"|\bpode\s+responder\s+(?:a|o|para\s+a|para\s+o)\s+([\wÀ-ÿ][\wÀ-ÿ'-]{1,29})",
+    re.IGNORECASE)
+_VOICE_LIST_RE = re.compile(
+    r"\b(?:quais|que)\s+vozes\b|\bquem\s+voc[eê]\s+(?:conhece|reconhece)\b"
+    r"|\bvozes\s+cadastradas\b", re.IGNORECASE)
+_VOICE_FORGET_RE = re.compile(
+    r"\b(?:esque[cç][ae]|remove|remova|apaga|deleta)\b[^.!?]{0,30}\bvoz\b"
+    r"[^.!?]{0,20}\b(?:d[aeo]|de)\s+([\wÀ-ÿ][\wÀ-ÿ'-]{1,29})",
+    re.IGNORECASE)
+_VOICE_AUTHORIZE_RE = re.compile(
+    r"\b(?:autoriza|autorize|libera|libere|permite|permita)\b[^.!?]{0,20}"
+    r"\b(?:a|o|para)\s+([\wÀ-ÿ][\wÀ-ÿ'-]{1,29})",
+    re.IGNORECASE)
+
+# Restart by voice: the request is deterministic (a gate), and the second
+# utterance must be the exact confirmation phrase from the owner's voice.
+_RESTART_ASSISTANT_RE = re.compile(
+    r"\b(?:reinicie|reiniciar|restart)\b[^.!?]{0,30}"
+    r"\b(?:voc[eê]|o assistente|seu processo|seu c[eé]rebro|gino)\b",
+    re.IGNORECASE)
+_RESTART_PC_RE = re.compile(
+    r"\b(?:reinicie|reiniciar|restart)\b[^.!?]{0,30}"
+    r"\b(?:o pc|o computador|a m[aá]quina|o sistema)\b",
+    re.IGNORECASE)
+_RESTART_CANCEL_RE = re.compile(
+    r"\b(?:cancela|cancelar|aborta|abortar|desiste|desistir|deixa|"
+    r"n[ãa]o)\b", re.IGNORECASE)
+
+# Power commands. Unlock is checked before lock because "desbloqueia" contains
+# "bloqueia" but not as a word; the order keeps the intent explicit anyway.
+_POWER_UNLOCK_RE = re.compile(
+    r"\b(?:desbloqueia|desbloqueie|desbloquear|destranca|destranque|destrancar|unlock)\b"
+    r"[^.!?]{0,30}\b(?:a tela|o pc|o computador|a sess[aã]o)\b", re.IGNORECASE)
+_POWER_LOCK_RE = re.compile(
+    r"\b(?:bloqueia|bloqueie|bloquear|tranca|tranque|trancar|lock)\b"
+    r"[^.!?]{0,30}\b(?:a tela|o pc|o computador|a sess[aã]o)\b", re.IGNORECASE)
+_POWER_SHUTDOWN_RE = re.compile(
+    r"\b(?:desliga|desligue|desligar|shutdown|poweroff)\b"
+    r"[^.!?]{0,30}\b(?:o pc|o computador|a m[aá]quina|o sistema)\b", re.IGNORECASE)
+_POWER_SUSPEND_RE = re.compile(
+    r"\b(?:suspende|suspenda|suspender|suspend|hiberna|hibernar|hibernate)\b"
+    r"[^.!?]{0,30}\b(?:o pc|o computador|a m[aá]quina|o sistema)\b", re.IGNORECASE)
 
 # A turn that only thanks, declines, or clarifies something already done is not
 # a request to act — but a 7B hears the verb inside it ("mandar", "conectar")
@@ -1145,6 +1268,50 @@ class JarvisLive:
         self._vision_last_time     = 0.0     # monotonic time of last screen_process call (cooldown guard)
         self._vision_busy          = False   # True while a vision capture/inject cycle is in flight
         self._interrupted          = False   # True while draining audio after user interrupt
+        # True from the moment a brain turn starts until its last sentence is
+        # queued. Without it, _say_blocking marks the turn done sentence by
+        # sentence and _play_audio opens the microphone in the gap between
+        # them — the user's speech then becomes a new turn against a half-played
+        # answer.
+        self._reply_active         = False
+        self._voice_barge_in       = True    # conservative: only clear stops cut
+        self._recent_spoken_text   = ""      # echo test for voice barge-in
+
+        # ── Qoder Live (architecture A) ─────────────────────────────────────
+        # Everything is optional and behind config flags; when the sidecar or
+        # bridge is not ready the existing brain chain answers exactly as before.
+        self._qoder_live           = None
+        self._bridge               = None
+        self._bridge_token         = ""
+        self._chat_memory          = None
+        self._memory_librarian     = None
+        self._speaker              = None
+        self._restart              = None
+        self._power                = None
+        self._qoder_live_enabled   = False
+        self._voice_id_enabled     = False
+        self._restart_enabled      = False
+        self._qoder_started        = False
+        self._qoder_shutting_down  = False
+        self._qoder_restart_attempts = 0
+        self._qoder_restart_thread = None
+        self._qoder_turn_timer     = None
+        self._qoder_turn_started   = 0.0
+        self._qoder_tool_count     = 0
+        self._qoder_turn_timeout_s = 45.0
+        self._qoder_restart_limit  = 5
+        self._qoder_ready_at       = 0.0
+        self._qoder_lock           = threading.RLock()
+        self._qoder_text_buf: dict[str, str] = {}
+        self._qoder_spoken: dict[str, list[str]] = {}
+        self._qoder_turns: dict[str, str] = {}
+        self._qoder_current_id     = None
+        self._qoder_ignore         = False
+        self._last_speaker: dict   = {}
+        self._last_unknown_pcm     = None
+        self._last_unknown_emb     = None
+        self._last_unknown_at      = 0.0
+        self._current_pcm          = None
         # Transcript-driven mouth shapes for the avatar. Fed from the receive
         # loop as words arrive, drained by the playback loop against the audio.
         self._visemes              = VisemeStream()
@@ -1181,6 +1348,9 @@ class JarvisLive:
         self.ui.on_good_morning   = self.replay_briefing
         self._brain_q: asyncio.Queue | None = None
         self._brain_busy = False
+        self._last_qoder_update = 0.0
+        self._qoder_pending: list[dict] = []
+        self._qoder_flush_busy = False
         self.ui.on_music_ended    = self._on_music_ended
         self.ui.on_music_error    = self._on_music_error
         # Appointments ⇄ Trello mirror: a daemon thread that reconciles the
@@ -1584,6 +1754,12 @@ class JarvisLive:
         self._interrupted = False
         self._awake = True if not self._wake_enabled else self._awake
         self.ui.set_state("LISTENING" if self._awake else "SLEEPING")
+        # Architecture A starts here, once the system prompt and queues exist.
+        # It runs in the background; until it is ready, the local brain answers.
+        try:
+            self._maybe_start_qoder_live()
+        except Exception as e:
+            print(f"[QoderLive] start hook failed: {e!r}")
         chain_txt = " → ".join(_brain.label(r) for r in st["chain"])
         self.ui.write_log(f"SYS: {self._asst_name} online — cérebro: {chain_txt}, "
                           f"voz {_brain.voice_label(st)}. Gemini desligado.")
@@ -1624,6 +1800,9 @@ class JarvisLive:
             while True:
                 text = await self._brain_q.get()
                 self._interrupted = False
+                self._reply_active = True
+                if self._turn_done_event is not None:
+                    self._turn_done_event.clear()
                 self._brain_busy = True
                 self.ui.set_state("THINKING")
                 history.append({"role": "user", "content": text})
@@ -1631,7 +1810,15 @@ class JarvisLive:
                 # over half of what a free-tier provider allows per request, so
                 # the window here is a few turns, not a dozen. Chat_stream shrinks
                 # it further if the provider still refuses the size.
-                _trim_history(history, keep=16, max_chars=6000)
+                _dropped = _trim_history(history, keep=16, max_chars=6000)
+                if _dropped:
+                    # Trimming is where the thread used to disappear. Keep the
+                    # exact words in the journal; the prompt block brings back
+                    # the gist without pretending to remember what is gone.
+                    try:
+                        _continuity.archive(_dropped, self._asst_name)
+                    except Exception as e:
+                        print(f"[Continuity] archive failed: {e}")
                 # The reply-language rule is repeated as the LAST thing the
                 # model reads, because the paragraph about it lives in the
                 # middle of ~10k characters of English instructions and a 7B
@@ -1647,6 +1834,38 @@ class JarvisLive:
                             + _tr_lang.language_directive(text))
                 except Exception:
                     _sys = self._system_prompt_text
+                # The same conversation across trims, reconnects and restarts:
+                # summaries, open subjects and recent milestones in one block.
+                try:
+                    _cont = _continuity.prompt_block()
+                    if _cont:
+                        _sys += "\n\n" + _cont
+                except Exception as e:
+                    print(f"[Continuity] prompt block failed: {e}")
+                # Qoder is waiting on a decision: keep it in front of the model
+                # even after history trimming, and route the answer back.
+                _q = _qoder_jobs.question()
+                if _q:
+                    _qopts = "; ".join(str(o) for o in (_q.get("options") or [])) or "livres"
+                    _qrec = _q.get("recommended") or "nenhuma"
+                    _sys += ("\n\n[QODER AGUARDANDO DECISÃO]\n"
+                             f"Pergunta: {_q.get('question') or ''}\n"
+                             f"Opções: {_qopts}\n"
+                             f"Recomendação: {_qrec}\n"
+                             "Se esta fala do usuário for a resposta (ou se ele pedir a "
+                             "recomendação), chame a ferramenta qoder_job com "
+                             "action='answer' e answer=<resposta>. Se for outro assunto, "
+                             "responda normalmente e deixe a pergunta pendente.")
+                _a = _qoder_jobs.approval()
+                if _a:
+                    _sys += ("\n\n[QODER AGUARDANDO APROVAÇÃO]\n"
+                             f"Tarefa: {_a.get('task') or ''}\n"
+                             f"Plano:\n{str(_a.get('plan') or '')[:2500]}\n"
+                             "Nada foi alterado ainda. Se esta fala for um sim claro "
+                             "a este plano, chame qoder_job com action='approve'. Se "
+                             "for uma recusa, action='reject'. Se for outro assunto, "
+                             "responda normalmente e mantenha a aprovação pendente — "
+                             "não aprove sem um sim explícito.")
                 msgs = [{"role": "system", "content": _sys}] + history
                 spoken: list[str] = []
                 queued_s = [0.0]                        # seconds of audio queued this turn
@@ -1785,7 +2004,11 @@ class JarvisLive:
                 _short_chat = (len(text.split()) <= 5
                                and not any(a in text.lower()
                                            for a in _ACTION_IMPERATIVES))
-                if _short_chat or _is_meta_turn(text):
+                # Our own Qoder event instructions are not user speech: the
+                # router has nothing to decide and its transcript "correction"
+                # was logging the marker back as if it were a transcription.
+                _qoder_event = text.lstrip().startswith("[QODER")
+                if _short_chat or _is_meta_turn(text) or _qoder_event:
                     turn_tools = None
                 else:
                     # The last few turns give the router what no single sentence
@@ -1823,6 +2046,16 @@ class JarvisLive:
                         _sub = [t for t in tools
                                 if (t.get("function") or {}).get("name") in _names]
                         turn_tools = _sub or tools
+                # A pending Qoder decision or plan needs its answer tool even on
+                # a short turn ("azul", "pode aplicar") that the router would
+                # otherwise send with no tools at all — that turn is exactly the
+                # answer.
+                if _qoder_jobs.has_question() or _qoder_jobs.has_approval():
+                    turn_tools = list(turn_tools or [])
+                    if not any((t.get("function") or {}).get("name") == "qoder_job"
+                               for t in turn_tools):
+                        turn_tools += [t for t in tools
+                                       if (t.get("function") or {}).get("name") == "qoder_job"]
                 # Um 7B local pode ficar preso repetindo a MESMA chamada de
                 # ferramenta (ex.: music_control(resume) → "There is no music
                 # playing" → resume de novo…). Cada repetição queima um turno
@@ -1916,7 +2149,7 @@ class JarvisLive:
                         _fb = ("Não consegui formular a resposta agora. "
                                "Pode repetir, por favor?")
                         spoken.append(_fb)
-                        self._say_now(_fb)
+                        self._say_now(_fb, log=False)
                 except Exception as e:
                     msg = str(e)[:160]
                     self.ui.write_log(f"ERR: Cérebro — {msg}")
@@ -1935,6 +2168,13 @@ class JarvisLive:
                         self._last_out_logged = full
                         self.ui.write_log(f"{self._asst_name}: {full}")
                         self._session_log.append(f"{self._asst_name}: {full}")
+                        try:
+                            if self._chat_memory is not None:
+                                self._chat_memory.append_turn("assistant", full)
+                            if self._memory_librarian is not None:
+                                self._memory_librarian.tick()
+                        except Exception as e:
+                            print(f"[Librarian] assistant turn: {e}")
                     elif escalated:
                         _duck.up()
                     else:
@@ -1953,6 +2193,7 @@ class JarvisLive:
                                               "terminal).")
                         _duck.up()      # no reply will speak: end the exchange
                     self._session_log.append(f"User: {text}")
+                    self._reply_active = False
                     self._turn_done_event.set()     # _play_audio drops the speaking flag when drained
                     self._brain_busy = False
                     if not self.ui.muted and self._awake:
@@ -1991,7 +2232,13 @@ class JarvisLive:
                     alive = len([t for t in asyncio.all_tasks() if not t.done()])
                     print(f"[Sessão] tarefas={alive} mic_idle={idle:.1f}s "
                           f"mudo={muted} falando={self._is_speaking} "
-                          f"acordado={getattr(self, '_awake', True)}")
+                          f"acordado={getattr(self, '_awake', True)} "
+                          f"qoder={_qoder_jobs.phase()}")
+                    # Hold-and-deliver: a question that arrived while muted goes
+                    # out as soon as the sound comes back, even without speech.
+                    if (getattr(self, "_qoder_pending", None) and not muted
+                            and getattr(self, "_awake", True)):
+                        self._flush_qoder_pending()
                 except Exception as e:
                     print(f"[Sessão] heartbeat falhou: {e!r}")
 
@@ -2307,6 +2554,12 @@ class JarvisLive:
                 speaking = self._is_speaking
             if speaking:
                 continue
+            # A Qoder job can run for minutes with no user speech, and a job
+            # waiting for a decision NEEDS the user to be heard. Sleeping in
+            # either case swallowed the question/result and made the assistant
+            # look deaf right when it owed the user an answer.
+            if _qoder_jobs.is_busy():
+                continue
             if (time.monotonic() - self._last_user_speech) > self._wake_sleep_timeout:
                 self.sleep(reason="nenhuma fala por 2 minutos")
 
@@ -2371,6 +2624,1094 @@ class JarvisLive:
             asyncio.run_coroutine_threadsafe(_say(), loop)
         except Exception as e:
             print(f"[PluginSay] {e}")
+
+    # ── Qoder Live: persistent Qoder session + local tool bridge ─────────────
+
+    def _qoder_live_ready(self) -> bool:
+        try:
+            if not (self._qoder_live and self._qoder_live.is_ready()):
+                return False
+            if self._bridge is not None and not self._bridge.is_running():
+                _health.set_component("bridge", False, "stopped")
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _maybe_start_qoder_live(self) -> None:
+        """Start architecture A once per process, behind config flags.
+
+        The existing economy brain is untouched: if the sidecar, bridge or
+        voice stack is unavailable, turns continue to use it exactly as before.
+        """
+        if self._qoder_started:
+            return
+        try:
+            cfg = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+        self._qoder_live_enabled = bool(cfg.get("qoder_live_enabled", False))
+        self._voice_id_enabled = bool(cfg.get("voice_id_enabled", False))
+        self._restart_enabled = bool(cfg.get("restart_enabled", False))
+        try:
+            self._qoder_turn_timeout_s = max(
+                15.0, min(180.0, float(cfg.get("qoder_live_turn_timeout") or 45)))
+        except (TypeError, ValueError):
+            self._qoder_turn_timeout_s = 45.0
+        try:
+            self._qoder_restart_limit = max(
+                1, min(10, int(cfg.get("qoder_live_restart_attempts") or 5)))
+        except (TypeError, ValueError):
+            self._qoder_restart_limit = 5
+        if not self._qoder_live_enabled:
+            return
+        if get_brain_engine() != "economy":
+            return
+        script = BASE_DIR / "qoder_live" / "index.mjs"
+        if not script.is_file():
+            self.ui.write_log("SYS: Qoder Live indisponível — qoder_live/index.mjs ausente.")
+            return
+
+        self._qoder_started = True
+        self._bridge_token = secrets.token_urlsafe(32)
+
+        if self._voice_id_enabled:
+            try:
+                owner = str(cfg.get("user_name") or "Anthero").strip() or "Anthero"
+                self._speaker = _speaker_id.SpeakerId(owner_name=owner)
+                _health.set_component("voice_id", True, f"dono: {owner}")
+            except Exception as e:
+                self._speaker = None
+                _health.set_component("voice_id", False, str(e)[:160])
+                print(f"[QoderLive] speaker id disabled: {e}")
+
+        if self._restart_enabled:
+            try:
+                self._restart = _restart.RestartManager(logger=print)
+                self._restart.bind(shutdown_cb=self._restart_shutdown,
+                                   pc_restart=self._pc_restart_confirmed)
+                _restart_action.bind(self._restart)
+            except Exception as e:
+                self._restart = None
+                print(f"[QoderLive] restart disabled: {e}")
+
+        if bool(cfg.get("power_enabled", True)):
+            try:
+                self._power = _power.PowerManager(logger=print,
+                                                  unlock_fn=_unlock.unlock)
+            except Exception as e:
+                self._power = None
+                print(f"[QoderLive] power actions disabled: {e}")
+
+        try:
+            self._chat_memory = _chat_memory.ChatMemory()
+            _health.set_component("memory", True, str(self._chat_memory.base_dir))
+        except Exception as e:
+            self._chat_memory = None
+            _health.set_component("memory", False, str(e)[:160])
+            print(f"[QoderLive] chat memory disabled: {e}")
+
+        if (self._chat_memory is not None
+                and bool(cfg.get("memory_librarian_enabled", True))):
+            try:
+                self._memory_librarian = _memory_librarian.MemoryLibrarian(
+                    self._chat_memory,
+                    summarize=self._memory_summarize,
+                    idle=self._memory_idle,
+                    every_turns=int(cfg.get("memory_librarian_every_turns") or 10),
+                    every_seconds=float(cfg.get("memory_librarian_every_minutes") or 15) * 60,
+                    logger=print,
+                )
+                self._memory_librarian.start()
+                _health.set_component("librarian", True, "10 turnos/15 min")
+                print("[Librarian] started")
+            except Exception as e:
+                self._memory_librarian = None
+                _health.set_component("librarian", False, str(e)[:160])
+                print(f"[Librarian] disabled: {e}")
+
+        try:
+            port = int(cfg.get("tool_bridge_port") or 8011)
+            last_error = None
+            actual = 0
+            for attempt_port in (port, 0):
+                try:
+                    self._bridge = _tool_bridge.ToolBridge(
+                        registry=self._action_registry,
+                        dispatch=self._bridge_dispatch,
+                        token=self._bridge_token,
+                        host="127.0.0.1", port=attempt_port,
+                        confirm=self._bridge_confirm,
+                        logger=print,
+                        audit_path=BASE_DIR / "logs" / "tool_bridge.log",
+                        memory=self._chat_memory,
+                        voice=self._speaker,
+                        restart=self._restart,
+                        local_ask=None,
+                    )
+                    actual = self._bridge.start()
+                    break
+                except Exception as e:
+                    last_error = e
+                    self._bridge = None
+            if self._bridge is None:
+                raise last_error or RuntimeError("bridge did not start")
+            print(f"[QoderLive] tool bridge on 127.0.0.1:{actual}")
+            _health.set_component("bridge", True, self._bridge.url())
+            _metrics.event("tool bridge ready")
+        except Exception as e:
+            self._bridge = None
+            self._qoder_started = False
+            _health.set_component("bridge", False, str(e)[:160])
+            self.ui.write_log(f"SYS: Qoder Live não iniciou (bridge): {str(e)[:100]}")
+            return
+
+        system_file = BASE_DIR / "memory" / "chat" / "qoder_live_system.txt"
+        try:
+            system_file.parent.mkdir(parents=True, exist_ok=True)
+            system_file.write_text(self._qoder_system_prompt(), encoding="utf-8")
+        except Exception as e:
+            print(f"[QoderLive] system prompt file: {e}")
+
+        env = os.environ.copy()
+        env.update({
+            "JARVIS_BRIDGE_URL": self._bridge.url(),
+            "JARVIS_BRIDGE_TOKEN": self._bridge_token,
+            "JARVIS_MODEL": str(cfg.get("qoder_live_model") or "Qwen3.8-Flash"),
+            "JARVIS_CWD": str(BASE_DIR),
+            "JARVIS_ASSISTANT_NAME": self._asst_name,
+            "JARVIS_SYSTEM_PROMPT_FILE": str(system_file),
+        })
+        self._qoder_live = _qoder_live.QoderLive(
+            script=str(script), cwd=str(BASE_DIR), env=env,
+            on_text=self._qoder_on_text,
+            on_tool=self._qoder_on_tool,
+            on_done=self._qoder_on_done,
+            on_error=self._qoder_on_error,
+            on_ready=self._qoder_on_ready,
+            on_closed=self._qoder_on_closed,
+            logger=print,
+        )
+        threading.Thread(target=self._qoder_start_worker, daemon=True,
+                         name="qoder-live-start").start()
+        atexit.register(self._stop_qoder_live)
+        self.ui.write_log("SYS: Qoder Live iniciando em segundo plano...")
+
+    def _qoder_start_worker(self) -> None:
+        _health.set_component("qoder_live", False, "iniciando")
+        try:
+            ok = self._qoder_live.start(90)
+            if not ok:
+                self.ui.write_log("SYS: Qoder Live não ficou pronto — usando o cérebro local.")
+                self._schedule_qoder_restart()
+        except Exception as e:
+            print(f"[QoderLive] start failed: {e!r}")
+            self.ui.write_log(f"SYS: Qoder Live falhou ao iniciar: {str(e)[:100]}")
+            self._schedule_qoder_restart()
+
+    def _stop_qoder_live(self) -> None:
+        self._qoder_shutting_down = True
+        try:
+            timer = self._qoder_turn_timer
+            self._qoder_turn_timer = None
+            if timer is not None:
+                timer.cancel()
+        except Exception:
+            pass
+        try:
+            if self._memory_librarian is not None:
+                self._memory_librarian.stop()
+        except Exception:
+            pass
+        self._memory_librarian = None
+        try:
+            if self._qoder_live is not None:
+                self._qoder_live.stop(5)
+        except Exception:
+            pass
+        try:
+            if self._bridge is not None:
+                self._bridge.stop(5)
+        except Exception:
+            pass
+        _health.set_component("qoder_live", False, "stopped")
+        _health.set_component("bridge", False, "stopped")
+        self._qoder_live = None
+        self._bridge = None
+
+    def _qoder_system_prompt(self) -> str:
+        text = self._system_prompt_text or _load_system_prompt()
+        try:
+            block = self._chat_memory.prompt_block() if self._chat_memory else ""
+        except Exception as e:
+            print(f"[QoderLive] memory prompt: {e}")
+            block = ""
+        if block:
+            text += "\n\n" + block
+        return text
+
+    def _memory_record_user(self, text: str) -> None:
+        if self._chat_memory is None:
+            return
+        try:
+            self._chat_memory.append_turn("user", text)
+        except Exception as e:
+            print(f"[Librarian] user turn: {e}")
+
+    def _memory_idle(self) -> bool:
+        return (not bool(getattr(self, "_is_speaking", False))
+                and not bool(getattr(self, "_brain_busy", False))
+                and not bool(getattr(self, "_reply_active", False)))
+
+    def _memory_summarize(self, prompt: str) -> str:
+        """Ask the local 7B to turn recent turns into a short memory summary."""
+        st = getattr(self, "_brain_st", None) or {}
+        rung = next((r for r in st.get("chain", []) if r.get("provider") == "custom"), None)
+        if not rung:
+            return ""
+        base = str(rung.get("base_url") or "").rstrip("/")
+        model = str(rung.get("model") or "qwen2.5:7b-instruct")
+        if not base:
+            return ""
+        try:
+            import requests
+            r = requests.post(
+                f"{base}/chat/completions",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.2,
+                    "max_tokens": 500,
+                    "stream": False,
+                },
+                timeout=45,
+            )
+            r.raise_for_status()
+            data = r.json()
+            message = ((data.get("choices") or [{}])[0].get("message") or {})
+            return str(message.get("content") or "").strip()
+        except Exception as e:
+            print(f"[Librarian] local summary failed: {e}")
+            return ""
+
+    def _bridge_dispatch(self, name: str, args: dict) -> str:
+        """Run a JARVIS action for the bridge from its worker thread."""
+        if self._loop is None:
+            raise RuntimeError("event loop indisponível")
+        started = time.monotonic()
+        fc = _pytypes.SimpleNamespace(
+            id=f"bridge-{time.time_ns()}", name=str(name), args=dict(args or {}))
+        try:
+            fut = asyncio.run_coroutine_threadsafe(self._execute_tool(fc), self._loop)
+            resp = fut.result(timeout=120)
+            payload = getattr(resp, "response", None)
+            if isinstance(payload, dict):
+                result = payload.get("result")
+            else:
+                result = payload
+            _metrics.observe("tool.latency_s", time.monotonic() - started)
+            _metrics.inc("tool.calls")
+            _health.set_component("bridge", True, "tool calls ok")
+            if result is None:
+                return "Done."
+            if isinstance(result, str):
+                return result
+            try:
+                return json.dumps(result, ensure_ascii=False, default=str)
+            except Exception:
+                return str(result)
+        except Exception as e:
+            _metrics.inc("tool.errors")
+            _metrics.event(f"tool {name} failed: {type(e).__name__}")
+            _health.set_component("bridge", False, str(e)[:160])
+            raise
+
+    def _bridge_confirm(self, title: str, message: str) -> bool:
+        # Destructive Qoder Bash commands are denied until the voice
+        # confirmation flow is wired. Restart has its own phrase gate.
+        print(f"[QoderLive] destructive request not authorized: {title}: {message[:160]}")
+        return False
+
+    def _qoder_on_ready(self, model: str, warmup_ms: float) -> None:
+        self._qoder_ready_at = time.monotonic()
+        self._qoder_restart_attempts = 0
+        _health.set_component("qoder_live", True,
+                              f"{model} warm {float(warmup_ms)/1000:.1f}s")
+        _metrics.inc("qoder.ready")
+        _metrics.event(f"qoder ready {model}")
+        try:
+            self.ui.write_log(f"SYS: Qoder Live pronto — {model} "
+                              f"(warm-up {float(warmup_ms)/1000:.1f}s).")
+        except Exception:
+            pass
+
+    def _qoder_on_closed(self) -> None:
+        self._qoder_ready_at = 0.0
+        _health.set_component("qoder_live", False, "closed")
+        _metrics.inc("qoder.closed")
+        _metrics.event("qoder sidecar closed")
+        print("[QoderLive] closed")
+        if not self._qoder_shutting_down:
+            self._schedule_qoder_restart()
+
+    def _schedule_qoder_restart(self) -> None:
+        """Restart the sidecar with bounded backoff; fallback stays local."""
+        if self._qoder_shutting_down or not self._qoder_live_enabled:
+            return
+        if self._qoder_live is None:
+            return
+        with self._qoder_lock:
+            thread = self._qoder_restart_thread
+            if thread is not None and thread.is_alive():
+                return
+            attempts = self._qoder_restart_attempts
+            if attempts >= self._qoder_restart_limit:
+                _health.set_component("qoder_live", False, "restart limit reached")
+                _metrics.event("qoder restart limit reached")
+                return
+            self._qoder_restart_attempts = attempts + 1
+            delay = min(60.0, 5.0 * (2 ** attempts))
+
+            def _worker() -> None:
+                try:
+                    time.sleep(delay)
+                    if self._qoder_shutting_down:
+                        return
+                    _health.set_component("qoder_live", False,
+                                          f"reiniciando em {delay:.0f}s")
+                    ok = self._qoder_live.start(90)
+                    _metrics.inc("qoder.restart")
+                    if ok:
+                        _metrics.event("qoder restarted")
+                except Exception as e:
+                    print(f"[QoderLive] restart failed: {e!r}")
+                    _metrics.inc("qoder.restart_failed")
+                finally:
+                    with self._qoder_lock:
+                        self._qoder_restart_thread = None
+                    if (not self._qoder_shutting_down
+                            and not self._qoder_live.is_ready()):
+                        self._schedule_qoder_restart()
+
+            thread = threading.Thread(target=_worker, daemon=True,
+                                      name="qoder-live-restart")
+            self._qoder_restart_thread = thread
+            thread.start()
+            _metrics.event(f"qoder restart scheduled in {delay:.0f}s")
+
+    def _qoder_on_tool(self, turn_id, name: str, tool_input: dict) -> None:
+        _metrics.inc("qoder.tools")
+        short = ""
+        try:
+            short = str((tool_input or {}).get("name") or (tool_input or {}).get("command") or "")[:80]
+        except Exception:
+            pass
+        self.ui.write_log(f"QODER: ferramenta — {str(name)[:80]}"
+                          + (f" {short}" if short else ""))
+
+    @staticmethod
+    def _qoder_split(buf: str) -> tuple[list[str], str]:
+        buf = str(buf or "")
+        if not buf:
+            return [], ""
+        if re.search(r"[.!?…]\s*$", buf):
+            return [p.strip() for p in re.split(r"(?<=[.!?…])\s+", buf) if p.strip()], ""
+        parts = re.split(r"(?<=[.!?…])\s+", buf)
+        if len(parts) > 1:
+            return [p.strip() for p in parts[:-1] if p.strip()], parts[-1]
+        if len(buf) > 220:            # a long clause without punctuation
+            cut = buf.rfind(" ", 0, 180)
+            if cut > 0:
+                return [buf[:cut].strip()], buf[cut:]
+        return [], buf
+
+    def _qoder_say(self, turn_id: str, sentence: str) -> None:
+        sentence = str(sentence or "").strip()
+        if not sentence or self._qoder_ignore:
+            return
+        with self._qoder_lock:
+            self._qoder_spoken.setdefault(turn_id, []).append(sentence)
+        if not getattr(self, "_qoder_first_sentence", False):
+            self._qoder_first_sentence = True
+            elapsed = time.monotonic() - getattr(self, "_turn_t0", 0.0)
+            _metrics.observe("qoder.ttft_s", elapsed)
+            print(f"[Latência] texto → 1ª frase do Qoder Live: {elapsed:.1f}s")
+        self._say_now(sentence, log=False)
+
+    def _qoder_on_text(self, turn_id, text: str, delta: bool) -> None:
+        if not text or self._qoder_ignore:
+            return
+        with self._qoder_lock:
+            if self._qoder_current_id is not None and turn_id != self._qoder_current_id:
+                return
+            if turn_id not in self._qoder_turns:
+                return
+            buf = self._qoder_text_buf.get(turn_id, "") + str(text)
+            sentences, rest = self._qoder_split(buf)
+            self._qoder_text_buf[turn_id] = rest
+        for sentence in sentences:
+            self._qoder_say(turn_id, sentence)
+
+    def _qoder_finish(self, turn_id) -> None:
+        try:
+            timer = self._qoder_turn_timer
+            self._qoder_turn_timer = None
+            if timer is not None:
+                timer.cancel()
+        except Exception:
+            pass
+        with self._qoder_lock:
+            self._qoder_text_buf.pop(turn_id, None)
+            self._qoder_spoken.pop(turn_id, None)
+            self._qoder_turns.pop(turn_id, None)
+            if self._qoder_current_id == turn_id:
+                self._qoder_current_id = None
+        if self._qoder_turn_started:
+            _metrics.observe("qoder.total_s", time.monotonic() - self._qoder_turn_started)
+            self._qoder_turn_started = 0.0
+        self._qoder_ignore = False
+        self._reply_active = False
+        try:
+            if self._turn_done_event is not None and self._loop is not None:
+                self._loop.call_soon_threadsafe(self._turn_done_event.set)
+        except Exception:
+            pass
+        self._brain_busy = False
+        try:
+            if not self.ui.muted and self._awake:
+                self.ui.set_state("LISTENING")
+        except Exception:
+            pass
+        _duck.up()
+
+    def _qoder_on_done(self, turn_id, text: str) -> None:
+        if self._qoder_ignore:
+            self._qoder_finish(turn_id)
+            return
+        with self._qoder_lock:
+            if turn_id not in self._qoder_turns:
+                return
+            rest = self._qoder_text_buf.pop(turn_id, "")
+            spoken = list(self._qoder_spoken.pop(turn_id, []))
+        if rest.strip():
+            self._qoder_say(turn_id, rest.strip())
+            spoken.append(rest.strip())
+        if not spoken and text:
+            for sentence in re.split(r"(?<=[.!?…])\s+", str(text)):
+                if sentence.strip():
+                    self._qoder_say(turn_id, sentence.strip())
+                    spoken.append(sentence.strip())
+        full = " ".join(s for s in spoken if s).strip()
+        if full:
+            try:
+                self.ui.write_log(f"{self._asst_name}: {full}")
+                self._session_log.append(f"{self._asst_name}: {full}")
+            except Exception:
+                pass
+            try:
+                if self._chat_memory is not None:
+                    self._chat_memory.append_turn("assistant", full)
+            except Exception as e:
+                print(f"[QoderLive] memory assistant turn: {e}")
+        self._qoder_finish(turn_id)
+        _metrics.inc("qoder.done")
+        if self._memory_librarian is not None:
+            try:
+                self._memory_librarian.tick()
+            except Exception as e:
+                print(f"[Librarian] tick: {e}")
+
+    def _qoder_on_error(self, turn_id, error: str) -> None:
+        with self._qoder_lock:
+            if turn_id not in self._qoder_turns:
+                return
+            spoken = list(self._qoder_spoken.get(turn_id, []))
+            original = self._qoder_turns.get(turn_id, "")
+        print(f"[QoderLive] turn error: {error}")
+        _metrics.inc("qoder.error")
+        _metrics.event(f"qoder turn error: {str(error)[:120]}")
+        self._qoder_finish(turn_id)
+        if spoken and self._memory_librarian is not None:
+            try:
+                self._memory_librarian.tick()
+            except Exception as e:
+                print(f"[Librarian] tick: {e}")
+        if not spoken and original:
+            # Nothing was said: let the existing brain answer this turn.
+            try:
+                if self._brain_q is not None:
+                    self._brain_q.put_nowait(original)
+            except Exception:
+                pass
+
+    def _qoder_turn(self, text: str, pcm: bytes | None = None) -> None:
+        """One user turn through the persistent Qoder session."""
+        self._last_user_speech = time.monotonic()
+        speaker = None
+        labeled_text = text
+        if self._voice_id_enabled and self._speaker is not None and pcm:
+            try:
+                records = self._speaker.list()
+                owner_name = self._speaker.owner_name
+                has_owner = any(r.get("owner") for r in records)
+                transcribe = getattr(self._groq, "transcribe_pcm", None)
+                analysis = self._speaker.analyze_utterance(
+                    pcm, transcribe=transcribe, full_text=text)
+                labeled_text = analysis.get("labeled_text") or text
+                primary = analysis.get("primary") or {}
+                primary_name = analysis.get("primary_name") or "desconhecido"
+                unknown = analysis.get("unknown")
+                if not has_owner:
+                    # The first voice heard becomes the owner. Prefer the
+                    # primary segment embedding over a mixed utterance.
+                    sample = analysis.get("primary_embedding") or pcm
+                    self._speaker.enroll(owner_name, sample, authorized=True)
+                    speaker = owner_name
+                    self.ui.write_log(f"SYS: voz do dono cadastrada ({owner_name}).")
+                else:
+                    self._last_speaker = primary
+                    if unknown:
+                        self._last_unknown_pcm = unknown.get("pcm")
+                        self._last_unknown_emb = unknown.get("embedding")
+                        self._last_unknown_at = time.monotonic()
+                    if not primary or not primary.get("known"):
+                        self.ui.write_log("SYS: voz desconhecida — não respondi.")
+                        self._say_now("Não reconheço essa voz. Se for alguém autorizado, "
+                                      "peça ao dono para me apresentar.")
+                        _duck.up()
+                        return
+                    if not primary.get("authorized"):
+                        who = primary_name or "essa pessoa"
+                        self.ui.write_log(f"SYS: voz {who} conhecida, mas não autorizada.")
+                        self._say_now(f"Reconheço a voz de {who}, mas ela ainda não está "
+                                      "autorizada a falar comigo.")
+                        _duck.up()
+                        return
+                    speaker = primary_name
+            except Exception as e:
+                print(f"[QoderLive] full diarization failed: {e}")
+                speaker = None
+                labeled_text = text
+
+        _usage.note("gemini", turns=1)
+        try:
+            self.ui.write_log(f"YOU: {text}")
+        except Exception:
+            pass
+
+        payload = labeled_text if "[FALANTE:" in labeled_text else (
+            f"[FALANTE: {speaker}] {text}" if speaker else text)
+        self._qoder_ignore = False
+        self._qoder_first_sentence = False
+        self._turn_t0 = time.monotonic()
+        self._qoder_turn_started = self._turn_t0
+        self._qoder_tool_count = 0
+        _metrics.inc("qoder.turns")
+        self._reply_active = True
+        self._brain_busy = True
+        try:
+            if self._turn_done_event is not None and self._loop is not None:
+                self._loop.call_soon_threadsafe(self._turn_done_event.clear)
+            self.ui.set_state("THINKING")
+        except Exception:
+            pass
+        try:
+            turn_id = self._qoder_live.ask(payload, speaker=speaker)
+        except Exception as e:
+            print(f"[QoderLive] ask failed: {e!r}")
+            _metrics.inc("qoder.error")
+            _metrics.event(f"qoder ask failed: {type(e).__name__}")
+            self._qoder_turn_started = 0.0
+            self._reply_active = False
+            self._brain_busy = False
+            try:
+                if self._brain_q is not None:
+                    self._brain_q.put_nowait(text)
+            except Exception:
+                pass
+            return
+        with self._qoder_lock:
+            self._qoder_current_id = turn_id
+            self._qoder_text_buf[turn_id] = ""
+            self._qoder_spoken[turn_id] = []
+            self._qoder_turns[turn_id] = text
+        try:
+            timer = threading.Timer(self._qoder_turn_timeout_s,
+                                    self._qoder_turn_timeout, args=(turn_id,))
+            timer.daemon = True
+            self._qoder_turn_timer = timer
+            timer.start()
+        except Exception as e:
+            print(f"[QoderLive] turn watchdog: {e}")
+
+    def _qoder_turn_timeout(self, turn_id) -> None:
+        """A turn that never finishes falls back to the local brain."""
+        with self._qoder_lock:
+            if self._qoder_current_id != turn_id or self._qoder_ignore:
+                return
+            original = self._qoder_turns.get(turn_id, "")
+        print(f"[QoderLive] turn {turn_id} excedeu {self._qoder_turn_timeout_s:.0f}s")
+        _metrics.inc("qoder.timeout")
+        _metrics.event("qoder turn timeout")
+        self._qoder_ignore = True
+        try:
+            if self._qoder_live is not None:
+                self._qoder_live.interrupt()
+        except Exception:
+            pass
+        self._qoder_finish(turn_id)
+        self._say_now("O Qoder demorou demais; vou responder pelo cérebro local.")
+        if original:
+            try:
+                if self._brain_q is not None:
+                    self._brain_q.put_nowait(original)
+            except Exception:
+                pass
+
+    def _voice_enroll_gate(self, text: str) -> bool:
+        if not (self._voice_id_enabled and self._speaker is not None):
+            return False
+        if _VOICE_LIST_RE.search(text):
+            try:
+                records = self._speaker.list()
+                if not records:
+                    self._say_now("Ainda não tenho nenhuma voz cadastrada.")
+                else:
+                    parts = []
+                    for rec in records[:8]:
+                        name = rec.get("name") or "?"
+                        if rec.get("owner"):
+                            state = "dono"
+                        elif rec.get("authorized"):
+                            state = "autorizada"
+                        else:
+                            state = "não autorizada"
+                        parts.append(f"{name} ({state})")
+                    self._say_now("Vozes que eu conheço: " + "; ".join(parts) + ".")
+            except Exception as e:
+                self._say_now(f"Não consegui listar as vozes: {str(e)[:80]}")
+            return True
+        match = _VOICE_FORGET_RE.search(text)
+        if match:
+            name = (match.group(1) or "").strip()
+            if name:
+                try:
+                    removed = self._speaker.remove(name)
+                    self._say_now(f"Voz de {name} removida." if removed
+                                  else f"Não encontrei a voz de {name}.")
+                except Exception as e:
+                    self._say_now(f"Não consegui remover a voz: {str(e)[:80]}")
+            return True
+        match = _VOICE_AUTHORIZE_RE.search(text)
+        if match:
+            name = (match.group(1) or "").strip()
+            if name:
+                try:
+                    self._speaker.authorize(name)
+                    self._say_now(f"Pronto: {name} autorizada a falar comigo.")
+                except Exception as e:
+                    self._say_now(f"Não consegui autorizar: {str(e)[:80]}")
+            return True
+        match = _VOICE_ENROLL_RE.search(text)
+        if not match:
+            return False
+        name = (match.group(1) or match.group(2) or "").strip()
+        if not name:
+            return False
+        try:
+            existing = {str(r.get("name") or "").lower() for r in self._speaker.list()}
+            if name.lower() in existing:
+                self._speaker.authorize(name)
+                self._say_now(f"Pronto: {name} já está autorizada a falar comigo.")
+                return True
+        except Exception:
+            pass
+        sample = self._last_unknown_emb or self._last_unknown_pcm
+        if sample is None:
+            self._say_now("Não tenho a voz da pessoa anterior para cadastrar. "
+                          "Peça para ela falar uma frase e repita o pedido.")
+            return True
+        try:
+            self._speaker.enroll(name, sample, authorized=True)
+            self._last_unknown_pcm = None
+            self._last_unknown_emb = None
+            self._say_now(f"Pronto: {name} cadastrada e autorizada. Vou responder ela também.")
+        except Exception as e:
+            self._say_now(f"Não consegui cadastrar a voz: {str(e)[:80]}")
+        return True
+
+    def _handle_power_confirmation(self, text: str, pcm: bytes | None) -> bool:
+        """Consume the utterance that answers a pending power request."""
+        pending = self._power.pending() if self._power is not None else None
+        if not pending:
+            return False
+        if not self._is_owner_pcm(pcm):
+            self._power.cancel()
+            self._say_now("Só o dono pode confirmar uma ação de energia. Cancelei o pedido.")
+            return True
+        if _RESTART_CANCEL_RE.search(text):
+            self._power.cancel()
+            self._say_now("Ação de energia cancelada.")
+            return True
+        self._qoder_ignore = True
+        try:
+            if self._qoder_live is not None:
+                self._qoder_live.interrupt()
+        except Exception:
+            pass
+        self.interrupt()
+        out = self._power.confirm(text)
+        self._say_now(out)
+        print(f"[Power] {out}")
+        return True
+
+    def _power_gate(self, text: str) -> bool:
+        """Shutdown/suspend/lock/unlock by voice, owner-only."""
+        kind = None
+        if _POWER_UNLOCK_RE.search(text):
+            kind = "unlock"
+        elif _POWER_SHUTDOWN_RE.search(text):
+            kind = "shutdown"
+        elif _POWER_SUSPEND_RE.search(text):
+            kind = "suspend"
+        elif _POWER_LOCK_RE.search(text):
+            kind = "lock"
+        if kind is None:
+            return False
+        if self._power is None:
+            self._say_now("As ações de energia por voz estão desligadas.")
+            return True
+        if self._restart is not None and self._restart.pending():
+            self._say_now("Há um reinício aguardando confirmação. "
+                          "Diga 'confirmo reiniciar' ou 'cancela' primeiro.")
+            return True
+        if self._power.pending():
+            self._say_now("Já existe uma ação de energia aguardando confirmação.")
+            return True
+        if not self._is_owner_pcm(getattr(self, "_current_pcm", None)):
+            self._say_now("Só o dono pode executar ações de energia.")
+            return True
+        if kind == "lock":
+            out = self._power.lock()
+            self._say_now(out)
+            print(f"[Power] {out}")
+            return True
+        out = self._power.request(kind, "pedido por voz")
+        prompts = {
+            "shutdown": ("Vou desligar o computador. Para confirmar, diga "
+                         "exatamente: confirmo desligar. Para cancelar, diga cancela."),
+            "suspend": ("Vou suspender o computador. Para confirmar, diga "
+                        "exatamente: confirmo suspender. Para cancelar, diga cancela."),
+            "unlock": ("Vou tentar desbloquear a tela. Se o locker exigir senha, "
+                       "preciso da credencial configurada no keyring "
+                       "(scripts/setup-voice-unlock.sh). Para confirmar, diga "
+                       "exatamente: confirmo desbloquear. Para cancelar, diga cancela."),
+        }
+        if self._power.pending():
+            self._say_now(prompts[kind])
+        else:
+            self._say_now(out)
+        print(f"[Power] {out}")
+        return True
+
+    def _is_owner_pcm(self, pcm: bytes | None) -> bool:
+        """Voiceprint check for irreversible actions. Voice is a factor here,
+        not a general authentication factor for other tools."""
+        if not pcm or self._speaker is None:
+            return False
+        try:
+            emb = self._speaker.embedding(pcm)
+            match = self._speaker.identify(emb)
+            owner = (self._speaker.owner_name or "").strip().lower()
+            return bool(match.get("known") and match.get("authorized")
+                        and (match.get("name") or "").strip().lower() == owner)
+        except Exception as e:
+            print(f"[Restart] owner check failed: {e}")
+            return False
+
+    def _handle_restart_confirmation(self, text: str, pcm: bytes | None) -> bool:
+        """Consume the utterance that answers a pending restart request."""
+        pending = self._restart.pending() if self._restart is not None else None
+        if not pending:
+            return False
+        if not self._is_owner_pcm(pcm):
+            self._restart.cancel()
+            self._say_now("Só o dono pode confirmar um reinício. Cancelei o pedido.")
+            return True
+        if _RESTART_CANCEL_RE.search(text):
+            self._restart.cancel()
+            self._say_now("Reinício cancelado.")
+            return True
+        # Stop the prompt/answer that asked for the confirmation before acting.
+        self._qoder_ignore = True
+        try:
+            if self._qoder_live is not None:
+                self._qoder_live.interrupt()
+        except Exception:
+            pass
+        self.interrupt()
+        out = self._restart.confirm(text)
+        low = str(out).lower()
+        if "restarting the assistant" in low:
+            self._say_now("Confirmado. Reiniciando o assistente agora.")
+        elif "restarting the computer" in low:
+            self._say_now("Confirmado. Reiniciando o computador agora.")
+        else:
+            self._say_now("Não confirmei o reinício. Diga exatamente "
+                          "'confirmo reiniciar' ou 'cancela'.")
+            print(f"[Restart] {out}")
+        return True
+
+    def _restart_gate(self, text: str) -> bool:
+        """Initiate a restart by voice; the next utterance must confirm it."""
+        wants_assistant = bool(_RESTART_ASSISTANT_RE.search(text))
+        wants_pc = bool(_RESTART_PC_RE.search(text))
+        if not (wants_assistant or wants_pc):
+            return False
+        if not self._restart_enabled or self._restart is None:
+            self._say_now("O reinício por voz está desligado.")
+            return True
+        if self._restart.pending():
+            self._say_now("Já existe um reinício aguardando confirmação. "
+                          "Diga 'confirmo reiniciar' ou 'cancela'.")
+            return True
+        if not self._is_owner_pcm(getattr(self, "_current_pcm", None)):
+            self._say_now("Só o dono pode pedir um reinício.")
+            return True
+        if wants_assistant:
+            out = self._restart.request_assistant("pedido por voz")
+            prompt = ("Vou reiniciar o assistente. Para confirmar, diga "
+                      "exatamente: confirmo reiniciar. Para cancelar, diga cancela.")
+        else:
+            out = self._restart.request_pc("pedido por voz")
+            prompt = ("Vou reiniciar o computador. Para confirmar, diga "
+                      "exatamente: confirmo reiniciar. Para cancelar, diga cancela.")
+        if self._restart.pending():
+            self._say_now(prompt)
+        else:
+            self._say_now("Não consegui iniciar o reinício agora. Nada foi feito.")
+        print(f"[Restart] {out}")
+        return True
+
+    def _pc_restart_confirmed(self) -> str:
+        """The manager calls this only after the spoken confirmation."""
+        import platform as _pl
+        if _pl.system() == "Linux":
+            r = _subprocess.run(["systemctl", "reboot"],
+                                capture_output=True, text=True, timeout=15)
+            if r.returncode != 0:
+                detail = (r.stderr or r.stdout or "").strip()[:200]
+                raise RuntimeError(detail or "systemctl reboot falhou")
+            return "ok"
+        from actions.computer_settings import restart_computer
+        restart_computer()
+        return "ok"
+
+    def _restart_shutdown(self) -> None:
+        """Clean-ish shutdown for the detached restart helper."""
+        try:
+            if self._loop is not None and self.session is not None:
+                asyncio.run_coroutine_threadsafe(self._save_session_summary(), self._loop)
+        except Exception:
+            pass
+
+        def _die() -> None:
+            time.sleep(1.2)
+            os._exit(0)
+
+        threading.Thread(target=_die, daemon=True, name="restart-die").start()
+
+    # ── Qoder jobs: progress, questions and results reach the conversation ────
+    def _on_qoder_event(self, ev: dict) -> None:
+        """Called from the job's thread. Logs at once; schedules the model turn."""
+        kind = str(ev.get("kind") or "")
+        try:
+            if kind == "started":
+                print(f"[Qoder] iniciou: {str(ev.get('task') or '')[:100]}")
+                self.ui.write_log(f"QODER: começou — {str(ev.get('task') or '')[:120]}")
+            elif kind == "progress":
+                self.ui.write_log(f"QODER: {str(ev.get('text') or '')[:160]}")
+            elif kind == "queued":
+                self.ui.write_log(f"QODER: na fila — {str(ev.get('text') or '')[:120]}")
+            elif kind == "question":
+                q = ev.get("question") or {}
+                self.ui.write_log(f"QODER: pergunta — {str(q.get('question') or '')[:120]}")
+                try:
+                    self.ui.show_content("Qoder", self._qoder_question_text(q))
+                except Exception:
+                    pass
+            elif kind == "approval":
+                self.ui.write_log("QODER: plano pronto — aguardando seu ok.")
+                try:
+                    self.ui.show_content("Plano do Qoder",
+                                         str(ev.get("plan") or "")[:4000])
+                except Exception:
+                    pass
+            elif kind == "done":
+                self.ui.write_log(f"QODER: concluído — {str(ev.get('text') or '')[:140]}")
+            elif kind == "error":
+                self.ui.write_log(f"QODER: falhou — {str(ev.get('text') or '')[:140]}")
+            elif kind == "cancelled":
+                self.ui.write_log("QODER: tarefa cancelada.")
+        except Exception as e:
+            print(f"[Qoder] log do evento: {e}")
+
+        loop = getattr(self, "_loop", None)
+        if loop is None or not getattr(self, "session", None):
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._deliver_qoder_event(dict(ev)), loop)
+        except Exception as e:
+            print(f"[Qoder] entrega do evento: {e}")
+
+    @staticmethod
+    def _qoder_question_text(q: dict) -> str:
+        lines = [str(q.get("question") or "")]
+        options = q.get("options") or []
+        if options:
+            lines.append("Opções: " + "; ".join(str(o) for o in options))
+        if q.get("recommended"):
+            lines.append("Recomendação: " + str(q["recommended"]))
+        return "\n".join(lines)
+
+    def _qoder_instruction(self, ev: dict) -> str:
+        kind = str(ev.get("kind") or "")
+        task = str(ev.get("task") or "")[:140]
+        if kind == "queued":
+            return (f"[QODER · FILA] O Qoder já estava ocupado; a tarefa '{task}' "
+                    "entrou na fila. Avise o usuário em uma frase curta.")
+        if kind == "progress":
+            return ("[QODER · ANDAMENTO] O Qoder está trabalhando e informa: "
+                    f"'{str(ev.get('text') or '')}'. Dê ao usuário uma atualização "
+                    "de UMA frase, sem detalhes técnicos e sem dizer que terminou.")
+        if kind == "question":
+            q = ev.get("question") or {}
+            options = "; ".join(str(o) for o in (q.get("options") or [])) or "livres"
+            rec = str(q.get("recommended") or "") or "nenhuma"
+            return ("[QODER · DECISÃO NECESSÁRIA] O Qoder parou e precisa de uma "
+                    "decisão para continuar.\n"
+                    f"Pergunta: {q.get('question') or ''}\n"
+                    f"Opções: {options}\n"
+                    f"Recomendação do Qoder: {rec}\n"
+                    "Faça a pergunta ao usuário agora, em uma ou duas frases. Se ele "
+                    "pedir a recomendação, diga exatamente a recomendação. Quando "
+                    "ele responder, chame a ferramenta qoder_job com "
+                    "action='answer' e answer=<a resposta dele>. Não responda pela "
+                    "tarefa.")
+        if kind == "approval":
+            plan = str(ev.get("plan") or "")[:1800]
+            return ("[QODER · PLANO PRONTO] O Qoder preparou um plano para a "
+                    f"tarefa '{task}' e NÃO alterou nada.\nPLANO:\n{plan}\n"
+                    "Apresente o plano ao usuário em no máximo três frases — o que "
+                    "será feito e onde — e diga que nada foi alterado ainda. Não "
+                    "leia o plano literalmente; resuma. "
+                    "Pergunte se pode aplicar. Se a resposta for um sim claro a "
+                    "este plano, chame qoder_job com action='approve'. Se for uma "
+                    "recusa, action='reject'. Se ele falar de outro assunto, "
+                    "responda normalmente e deixe a aprovação pendente; não chame "
+                    "approve sem um sim explícito.")
+        if kind == "done":
+            return ("[QODER · CONCLUÍDO] Resumo do Qoder: "
+                    f"{str(ev.get('text') or '')[:600]}\n"
+                    "Informe o usuário em no máximo duas frases e ofereça os "
+                    "detalhes. Não invente nada além do resumo.")
+        if kind == "error":
+            return ("[QODER · FALHOU] A tarefa falhou: "
+                    f"{str(ev.get('text') or '')[:300]}\n"
+                    "Diga ao usuário o que aconteceu, sem inventar sucesso, e "
+                    "pergunte se quer tentar de novo.")
+        if kind == "cancelled":
+            return (f"[QODER · CANCELADO] A tarefa '{task}' foi cancelada. "
+                    "Avise o usuário em uma frase.")
+        return ""
+
+    def _qoder_progress_allowed(self) -> bool:
+        """Progress is a background murmur: never while the user is talking,
+        never right after, and at most every 40 s."""
+        now = time.monotonic()
+        if now - getattr(self, "_last_qoder_update", 0.0) < 40.0:
+            return False
+        if (now - getattr(self, "_last_user_speech", 0.0)) < 5.0:
+            return False
+        self._last_qoder_update = now
+        return True
+
+    async def _deliver_qoder_event(self, ev: dict) -> None:
+        """Wait for a quiet moment, then let the model phrase the event."""
+        kind = str(ev.get("kind") or "")
+        instruction = self._qoder_instruction(ev)
+        if not instruction:
+            return
+        attention = kind in ("question", "approval", "done", "error")
+
+        # A question or a result must reach the user even if the assistant had
+        # gone to sleep while the job ran; progress must not wake anybody.
+        if not getattr(self, "_awake", True):
+            if attention:
+                self.wake(reason="o Qoder precisa de você")
+            else:
+                return
+
+        if bool(getattr(self.ui, "muted", False)):
+            if attention:
+                # Mute is the user's choice; hold the message instead of losing
+                # it, and deliver it on the next turn that is not muted.
+                if kind in ("done", "error", "cancelled"):
+                    self._qoder_pending = [e for e in self._qoder_pending
+                                           if e.get("kind") not in ("question", "approval")]
+                self._qoder_pending.append(ev)
+                self.ui.write_log("SYS: Qoder precisa da sua atenção — guardei a "
+                                  "mensagem para quando o som voltar.")
+            return
+
+        if kind == "progress" and not self._qoder_progress_allowed():
+            return
+
+        # Give the current turn/voice a chance to finish; the conversation must
+        # never be cut by a status line. One delivery at a time: two progress
+        # events racing here used to produce two overlapping model turns.
+        lock = getattr(self, "_qoder_deliver_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._qoder_deliver_lock = lock
+        async with lock:
+            for _ in range(30):
+                speaking = bool(getattr(self, "_is_speaking", False))
+                busy = bool(getattr(self, "_brain_busy", False))
+                recent = (time.monotonic() - getattr(self, "_last_user_speech", 0.0)) < 2.0
+                if not speaking and not busy and not recent:
+                    break
+                await asyncio.sleep(0.5)
+
+            try:
+                await self.session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": instruction}]},
+                    turn_complete=True,
+                )
+            except Exception as e:
+                print(f"[Qoder] não consegui entregar {kind}: {e}")
+
+    def _flush_qoder_pending(self) -> None:
+        """Deliver one Qoder message held while muted (called on the mic thread)."""
+        if not self._qoder_pending or getattr(self, "_qoder_flush_busy", False):
+            return
+        loop = getattr(self, "_loop", None)
+        if loop is None or not getattr(self, "session", None):
+            return
+        ev = self._qoder_pending.pop(0)
+        self._qoder_flush_busy = True
+
+        async def _run() -> None:
+            try:
+                await self._deliver_qoder_event(ev)
+            finally:
+                self._qoder_flush_busy = False
+
+        try:
+            asyncio.run_coroutine_threadsafe(_run(), loop)
+        except Exception as e:
+            self._qoder_flush_busy = False
+            print(f"[Qoder] pendente não entregue: {e}")
 
     def request_reconnect(self, keep_context: bool = True, reason: str = ""):
         """Thread-safe: ask the run loop to tear down and rebuild the Live
@@ -2597,6 +3938,7 @@ class JarvisLive:
                         SEND_SAMPLE_RATE, prompt=hint))
             self._groq = local_stt.LocalWhisperListener(
                 on_text=self._on_groq_text,
+                on_utterance=self._on_groq_text,
                 on_status=lambda m: self.ui.write_log(f"SYS: {m}"),
                 model=lst["model"], language=lst["language"],
                 sample_rate=SEND_SAMPLE_RATE,
@@ -2628,6 +3970,7 @@ class JarvisLive:
         self._groq = groq_stt.GroqListener(
             st["api_key"], st["model"], st["language"],
             on_text=self._on_groq_text,
+            on_utterance=self._on_groq_text,
             on_status=lambda m: self.ui.write_log(f"SYS: {m}"),
             sample_rate=SEND_SAMPLE_RATE, prompt=hint)
         self._groq.sleeping = self._wake_enabled and not self._awake
@@ -2636,15 +3979,33 @@ class JarvisLive:
         return "groq"
 
     def _stt_name_hint(self, language: str) -> str:
-        """Whisper's vocabulary hint: the assistant's name spelled out in a
-        sentence, because on its own it hears Gervis, Jarves or Charles."""
+        """Whisper's vocabulary hint: names and terms it must spell right.
+
+        Only names and micro-phrases around them. The hint used to carry whole
+        user-like sentences ("<name>, você está me ouvindo?") and Whisper's echo
+        filter then threw away the user's REAL question when they said exactly
+        that — a 3.3 s utterance was logged as "discarded a prompt echo".
+
+        `stt_vocabulary` in config is the user's own list (people, shows, file
+        names). It is what turns "persona.md, se..." into the file name instead
+        of "persona.md.se" and "Rick trata o Morty" into words.
+        """
         name = self._asst_name or DEFAULT_ASSISTANT_NAME
-        if (language or "pt").startswith("pt"):
-            return (f"{name}, tá aí? {name}. {name}, você está me ouvindo? "
-                    f"Hey {name}. Conversa com o assistente {name}. "
-                    f"{name}, que horas são? {name}, abre o navegador.")
-        return (f"{name}, are you there? {name}. Hey {name}. "
-                f"A conversation with the assistant {name}. {name}, what time is it?")
+        user = extra = ""
+        try:
+            cfg = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
+            user = str(cfg.get("user_name") or "").strip()
+            extra = str(cfg.get("stt_vocabulary") or "").strip()
+        except Exception:
+            pass
+        parts = [name, name, f"Hey {name}", f"Assistente {name}"]
+        if user:
+            parts.append(user)
+        if extra:
+            parts.append(extra)
+        if not (language or "pt").startswith("pt"):
+            parts.append(f"A conversation with the assistant {name}")
+        return (". ".join(parts) + ".")[:200]
 
 
     @staticmethod
@@ -2810,10 +4171,25 @@ class JarvisLive:
             self._send_startup_briefing(force=True, greet=(why != "tool")), loop)
         return True
 
-    def _on_groq_text(self, text: str) -> None:
+    def _on_groq_text(self, text: str, pcm: bytes | None = None) -> None:
         """An utterance came back from Groq — runs on its worker thread."""
         loop = getattr(self, "_loop", None)
         if not loop or not self.session:
+            return
+        self._current_pcm = pcm
+        # A restart is waiting for the owner's spoken phrase. Handle it before
+        # the barge-in logic: the confirmation may arrive while the prompt is
+        # still being spoken.
+        if self._restart is not None and self._restart.pending():
+            if self._handle_restart_confirmation(text, pcm):
+                return
+        if self._power is not None and self._power.pending():
+            if self._handle_power_confirmation(text, pcm):
+                return
+        # Spoken while Gino is talking: classify as interruption or complement
+        # instead of starting a turn blindly. A complement must not cut him off.
+        if getattr(self, "_reply_active", False) or self._is_speaking:
+            self._handle_barge_in(text)
             return
         # Start of the stopwatch: everything the user waits for after speaking
         # is measured from here (see the [Latência] marks in _say).
@@ -2835,10 +4211,16 @@ class JarvisLive:
             # Text wake: the acoustic model only knows "Hey Jarvis", but the
             # name the user chose arrives here, transcribed on the machine.
             # The utterance that woke her becomes the first turn.
-            if not self._addressed_to_me(text):
+            if (not self._addressed_to_me(text)
+                    and not _qoder_jobs.has_question()
+                    and not _qoder_jobs.has_approval()):
                 print(f"[Wake] asleep — not addressed to me: {text[:60]!r}")
                 return
             self.wake(reason=f"você chamou {self._asst_name}")
+        # A Qoder question/result held while muted reaches the user now that
+        # there is a turn (and the mute is off).
+        if getattr(self, "_qoder_pending", None) and not self.ui.muted:
+            self._flush_qoder_pending()
         blocked = self._is_blocked_phrase(text)
         if blocked:
             try:
@@ -2847,6 +4229,19 @@ class JarvisLive:
                 pass
             _duck.up()
             return
+        # An explicit end-of-subject is the one topic boundary worth trusting
+        # without a model: the user said it, so record it with the time. A
+        # topic change is closed without pretending their words were a summary.
+        try:
+            _end_re = re.search(
+                r"\b(?:encerr(?:a|ar|amos)|fecha(?:r)?\s+(?:esse|este)\s+assunto|"
+                r"assunto\s+encerrado|mud(?:a|ar)\s+de\s+assunto|"
+                r"deixa\s+pra\s+l[aá])\b", text, re.I)
+            if _end_re:
+                _only_change = bool(re.search(r"\b(?:mud|deixa)\b", text, re.I))
+                _continuity.close_topic("", "" if _only_change else text)
+        except Exception as e:
+            print(f"[Continuity] topic close failed: {e}")
         # "Jarvis, bom dia" is handled here, before any model: the morning
         # routine itself is the answer, so nothing is sent for a reply.
         if self._is_good_morning(text):
@@ -2894,6 +4289,10 @@ class JarvisLive:
                               ("youtube", self._youtube_local),
                               ("apps", self._apps_gate),
                               ("tela", self._screen_gate),
+                              ("voz", self._voice_enroll_gate),
+                              ("energia", self._power_gate),
+                              ("reinício", self._restart_gate),
+                              ("persona", self._persona_gate),
                               ("código", self._self_code_gate)):
             _t0 = time.monotonic()
             try:
@@ -2911,6 +4310,14 @@ class JarvisLive:
                 except Exception:
                     pass
                 print(f"[Gate] {_gname} assumiu o turno: {text[:70]!r}")
+                self._memory_record_user(text)
+                try:
+                    if self._chat_memory is not None:
+                        self._chat_memory.note(f"{_gname}: {text[:160]}", kind="acao")
+                    if self._memory_librarian is not None:
+                        self._memory_librarian.tick()
+                except Exception as e:
+                    print(f"[Librarian] gate note: {e}")
                 # The segmenter ducked the other apps when speech was detected
                 # and nothing here speaks through the normal turn path, so the
                 # release has to happen right here — otherwise the music stays
@@ -2930,6 +4337,13 @@ class JarvisLive:
                     pass
                 _duck.up()
                 return
+        self._memory_record_user(text)
+        # Architecture A: once the persistent Qoder session is warm, it takes
+        # the conversational turn. Gates above still win for instant local
+        # actions (music, apps, screen, memory, persona, code).
+        if self._qoder_live_ready():
+            self._qoder_turn(text, pcm)
+            return
         self._last_user_speech = time.monotonic()
         _usage.note("gemini", turns=1)
         try:
@@ -2970,6 +4384,7 @@ class JarvisLive:
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
+        self._reply_active = False
         q = self.audio_in_queue
         if q:
             drained = 0
@@ -2989,6 +4404,62 @@ class JarvisLive:
             self._turn_done_event.clear()
         self.ui.write_log("SYS: Interrompido — ouvindo...")
 
+    def _looks_like_own_voice(self, text: str) -> bool:
+        """Is this transcript just our own playback leaking into the mic?
+
+        The playback canceller removes most of it; this catches the rest. Only
+        fragments long enough to be a sentence are compared, so a short
+        backchannel from the user is never mistaken for an echo.
+        """
+        import difflib
+        t = " ".join(str(text or "").lower().split())
+        ref = " ".join(getattr(self, "_recent_spoken_text", "").lower().split())
+        if len(t) < 10 or not ref:
+            return False
+        for frag in re.split(r"[.!?\n]+", ref):
+            frag = frag.strip()
+            if len(frag) >= 10 and difflib.SequenceMatcher(None, t, frag).ratio() > 0.72:
+                return True
+        return False
+
+    def _handle_barge_in(self, text: str) -> None:
+        """User spoke while Gino was speaking: decide whether to cut him off.
+
+        Conservative on purpose. A backchannel ("sim", "certo"), a continuation
+        ("e também…") or an unclear fragment does NOT cut the answer. Only a
+        clear stop, a new command/question, or an explicit "Gino, …" does.
+        """
+        clean = " ".join(str(text or "").split()).strip()
+        if not clean:
+            return
+        if self._looks_like_own_voice(clean):
+            print(f"[Barge-in] echo ignored: {clean[:70]!r}")
+            return
+        norm = clean.lower().strip(" .,!?")
+        words = norm.split()
+        if norm in _BACKCHANNEL or (len(words) <= 3 and words and words[0] in _BACKCHANNEL):
+            print(f"[Barge-in] backchannel ignored: {clean[:60]!r}")
+            return
+        addressed = re.match(r"^\s*gino\b", clean, re.IGNORECASE) is not None
+        stop = bool(_BARGE_STOP_RE.match(clean) or _BARGE_NEW_RE.match(clean)
+                    or addressed)
+        if not stop:
+            # A complement is not an interruption. Keep the answer going; the
+            # next turn will still have the words if the user repeats them.
+            print(f"[Barge-in] complement kept: {clean[:70]!r}")
+            return
+        print(f"[Barge-in] voice interrupt: {clean[:80]!r}")
+        self.ui.write_log(f"SYS: interrompido por voz — «{clean[:60]}»")
+        self._qoder_ignore = True
+        try:
+            if self._qoder_live is not None:
+                self._qoder_live.interrupt()
+        except Exception as e:
+            print(f"[QoderLive] interrupt: {e!r}")
+        self.interrupt()
+        # interrupt() dropped the flags, so this runs as a normal new turn.
+        self._on_groq_text(clean)
+
     def speak(self, text: str):
         if not self._loop or not self.session:
             return
@@ -3006,7 +4477,7 @@ class JarvisLive:
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
-    def _say_now(self, text: str) -> None:
+    def _say_now(self, text: str, log: bool = True) -> None:
         """Queue one sentence to be spoken outside any turn (economy mode).
 
         Called by the local gates (sudo, memory, music, YouTube) — which run on
@@ -3014,13 +4485,17 @@ class JarvisLive:
         request (60 s timeout, and a socket wait is invisible from the outside)
         parks the ears: the app keeps logging mic peaks and answers nothing.
         One worker thread does the work and keeps the spoken lines in order.
+
+        `log` mirrors the sentence into the UI panel. Gates speak through this
+        path, so without it the panel stayed empty while the assistant talked —
+        exactly what happened with "Não tem música tocando agora".
         """
         text = str(text or "").strip()
         if not text:
             return
         try:
             self._ensure_say_worker()
-            self._say_q.put_nowait(text)
+            self._say_q.put_nowait((text, bool(log)))
         except Exception as e:
             print(f"[Say] não consegui enfileirar: {e}")
 
@@ -3034,7 +4509,11 @@ class JarvisLive:
             while True:
                 item = self._say_q.get()
                 try:
-                    self._say_blocking(item)
+                    if isinstance(item, tuple):
+                        text, log = item
+                    else:
+                        text, log = item, True
+                    self._say_blocking(text, log=log)
                 except Exception as e:
                     print(f"[Say] falhou: {e}")
 
@@ -3042,11 +4521,13 @@ class JarvisLive:
                                             name="say-worker")
         self._say_thread.start()
 
-    def _say_blocking(self, text: str) -> None:
+    def _say_blocking(self, text: str, log: bool = True) -> None:
         """Synthesise and queue one sentence onto the playback queue."""
         text = str(text or "").strip()
         if not text:
             return
+        self._recent_spoken_text = (
+            getattr(self, "_recent_spoken_text", "") + " " + text)[-600:]
         try:
             from core import brain as _b
             st = _b.settings(get_plugin_config)
@@ -3068,6 +4549,24 @@ class JarvisLive:
         for i in range(0, len(pcm), 2400):
             self._loop.call_soon_threadsafe(
                 self.audio_in_queue.put_nowait, pcm[i:i + 2400])
+        if log:
+            try:
+                self.ui.write_log(f"{self._asst_name}: {text}")
+                self._session_log.append(f"{self._asst_name}: {text}")
+            except Exception:
+                pass
+        # Out-of-turn speech (gates, announcements, Qoder status) has no brain
+        # worker to mark the turn complete. Without this, _play_audio saw a
+        # non-empty queue, played it, then waited forever for a turn_done that
+        # never came — `_is_speaking` stayed true, the microphone stayed closed
+        # and the assistant looked deaf for minutes. Mark it now: the flag is
+        # only acted on once the queue is empty, so it cannot cut audio short.
+        ev = getattr(self, "_turn_done_event", None)
+        if ev is not None:
+            try:
+                self._loop.call_soon_threadsafe(ev.set)
+            except Exception:
+                pass
 
     def _run_pending_root(self) -> None:
         """Run the privileged command that was waiting for the user's "yes"."""
@@ -3256,6 +4755,14 @@ class JarvisLive:
         # what happened, not an order; the first person gives it away.
         if folded.startswith(("eu ", "eu ja", "ja te", "ja falei", "falei ")):
             return False
+        # A PLAY request belongs to the model + youtube_video. "para" in "para
+        # tocar" is a preposition; treating it as the stop verb answered the
+        # user with "não tem música tocando" and no music ever started.
+        if (_MUSIC_PLAY_INTENT.search(folded)
+                and not _re.search(
+                    r"\b(?:proxima|proximo|next|pula|pular|skip)\b", folded)):
+            print("[Gate] música: pedido de tocar — deixando para o youtube_video")
+            return False
 
         action = ""
         is_status = bool(_MUSIC_VERBS[-1][1].search(folded))
@@ -3436,12 +4943,11 @@ class JarvisLive:
         return True
 
     def _escalate_to_qoder(self, text: str) -> None:
-        """Hand a refused request to Qoder, which has the machine itself.
+        """Hand a refused request to Qoder without freezing the conversation.
 
-        The local 7B answers "não posso" when no tool matches and stops there —
-        it never suggests, and never takes, the one route that can actually do
-        the job. The refusal was held back (see _say), so the user hears what is
-        really happening: a slow, capable agent is taking over, not a wall.
+        The job runs in the background; the announcement is immediate and the
+        result arrives as an update. Qoder's own clarifying questions are relayed
+        through _deliver_qoder_event.
         """
         now = time.monotonic()
         if now - getattr(self, "_last_escalation", 0.0) < 20.0:
@@ -3450,40 +4956,56 @@ class JarvisLive:
         self._last_escalation = now
         print(f"[Escalation] recusa sem motivo → Qoder: {text[:100]!r}")
         self.ui.write_log("SYS: sem ferramenta para isso — passando ao Qoder.")
-        self._say_now("Não tenho ferramenta para isso. Vou passar ao Qoder — ele "
-                      "propõe o caminho, e se for preciso executar algo eu peço "
-                      "sua autorização antes.")
+        self._say_now("Não tenho ferramenta para isso. Vou pedir ao Qoder para "
+                      "cuidar disso. Enquanto ele trabalha eu continuo por aqui e "
+                      "te aviso; se ele precisar de uma decisão, eu pergunto.")
+        try:
+            from actions.qoder_agent import qoder_agent as _qa
+            out = _qa({"task": text, "mode": "answer"}, player=self.ui)
+            self.ui.write_log(f"SYS: {str(out)[:180]}")
+        except Exception as e:
+            print(f"[Escalation] Qoder falhou ao iniciar: {e!r}")
+            self._say_now(f"Não consegui acionar o Qoder: {str(e)[:100]}")
 
-        def _work() -> None:
-            try:
-                if self._action_registry.has("qoder_agent"):
-                    ctx = {"player": self.ui, "speak": self.speak,
-                           "response": None, "session_memory": None}
-                    out = self._action_registry.run(
-                        "qoder_agent", {"task": text, "mode": "answer"}, ctx)
-                else:
-                    from core import qoder as _q
-                    out = _q.ask(text)
-                out = str(out or "").strip()
-                if not out:
-                    self._say_now("O Qoder não devolveu resposta.")
-                    return
-                self.ui.write_log(f"SYS: Qoder — {out[:120]}")
-                self._say_now(out[:700])
-            except Exception as e:
-                print(f"[Escalation] Qoder falhou: {e!r}")
-                self._say_now(f"O Qoder falhou: {str(e)[:100]}")
+    def _persona_gate(self, text: str) -> bool:
+        """A persona change is a file edit — never a spoken claim.
 
-        threading.Thread(target=_work, daemon=True, name="escalate-qoder").start()
+        The local 7B once answered "Pronto, ajustado" without touching the
+        file. Here the request becomes a Qoder write job on core/persona.md:
+        plan first, nothing changes until the user approves it.
+        """
+        raw = " ".join(str(text or "").split()).strip()
+        if not raw:
+            return False
+        raw = re.sub(r"\bpersona\.md\.se\b", "persona.md", raw, flags=re.I)
+        if not (_PERSONA_RE.search(raw) and _PERSONA_ACTION_RE.search(raw)):
+            return False
+        self.ui.write_log("SYS: mudança de persona — Qoder prepara um plano.")
+        self._say_now("Mudança de persona é arquivo, não conversa. Vou pedir ao "
+                      "Qoder um plano para o core/persona.md e te mostro antes de "
+                      "aplicar. Nada muda sem o seu ok.")
+        task = ("Atualize core/persona.md para refletir este pedido do usuário:\n"
+                f"{raw}\n\nO arquivo é a fonte da personalidade do assistente. "
+                "Preserve as regras de segurança (nunca atacar a dignidade, a "
+                "família, a saúde, o dinheiro ou as inseguranças reais do usuário) "
+                "e o fato de que o usuário é o criador. Proponha as mudanças em "
+                "um plano antes de editar.")
+        try:
+            from actions.qoder_agent import qoder_agent as _qa
+            out = _qa({"task": task, "mode": "write",
+                       "files": ["core/persona.md"],
+                       "workspace": str(BASE_DIR)}, player=self.ui)
+            self.ui.write_log(f"SYS: {str(out)[:180]}")
+        except Exception as e:
+            print(f"[Persona gate] falhou ao iniciar: {e!r}")
+            self._say_now(f"Não consegui acionar o Qoder: {str(e)[:100]}")
+        return True
 
     def _self_code_gate(self, text: str) -> bool:
-        """Hand a "fix yourself" request straight to the agent that can.
+        """Hand a "fix yourself" request to the agent that can — in background.
 
-        This is the one gate that does NOT answer instantly: reading the project
-        and editing it takes tens of seconds. It answers by narrating — the CLI
-        streams "vou olhar o arquivo…", "achei o problema em X" and each line is
-        spoken as it arrives. Silence with a spinner is what made this feel
-        broken before; a running commentary is the whole difference.
+        The job starts immediately and reports progress/questions on its own; the
+        microphone and the conversation stay free while it works.
         """
         raw = str(text or "").strip()
         if not raw or len(raw.split()) > 30:
@@ -3496,25 +5018,23 @@ class JarvisLive:
             r"\b(?:corrij[ae]|corrigir|conserta|consertar|arruma|arrumar|"
             r"melhor[ae]|melhorar|implement[ae]|implementar)\b", raw, re.I))
         mode = "write" if wants_write else "answer"
-        self.ui.write_log(f"SYS: Qoder assumindo ({mode}) — vou narrar o que faço.")
-        self._say_now("Deixa comigo. Vou olhar o código e te conto o que encontro "
-                      "enquanto trabalho.")
-
-        def _work() -> None:
-            try:
-                from actions.qoder_agent import qoder_agent as _qa
-                out = _qa({"task": raw, "mode": mode}, player=self.ui)
-                out = str(out or "").strip()
-                if not out:
-                    self._say_now("O Qoder não devolveu nada.")
-                    return
-                self.ui.write_log(f"SYS: Qoder — {out[:140]}")
-                self._say_now(out[:700])
-            except Exception as e:
-                print(f"[Qoder gate] falhou: {e!r}")
-                self._say_now(f"O Qoder falhou: {str(e)[:100]}")
-
-        threading.Thread(target=_work, daemon=True, name="qoder-gate").start()
+        self.ui.write_log(f"SYS: Qoder assumindo ({mode}) — em segundo plano.")
+        if wants_write:
+            self._say_now("Deixa comigo. Vou pedir ao Qoder um plano da mudança "
+                          "primeiro — nada é alterado sem o seu ok. Enquanto ele "
+                          "trabalha, pode continuar falando comigo.")
+        else:
+            self._say_now("Deixa comigo. Vou pedir ao Qoder que olhe o código e te "
+                          "conto o que ele encontrar enquanto ele trabalha. Pode "
+                          "continuar falando comigo.")
+        try:
+            from actions.qoder_agent import qoder_agent as _qa
+            out = _qa({"task": raw, "mode": mode, "workspace": str(BASE_DIR)},
+                      player=self.ui)
+            self.ui.write_log(f"SYS: {str(out)[:180]}")
+        except Exception as e:
+            print(f"[Qoder gate] falhou ao iniciar: {e!r}")
+            self._say_now(f"Não consegui acionar o Qoder: {str(e)[:100]}")
         return True
 
     def _build_config(self) -> types.LiveConnectConfig:
@@ -3525,6 +5045,7 @@ class JarvisLive:
             _cfg = json.loads(open(API_CONFIG_PATH, encoding="utf-8").read())
             self._asst_name = (_cfg.get("assistant_name") or DEFAULT_ASSISTANT_NAME).strip()
             _user_name = (_cfg.get("user_name") or "").strip()
+            self._voice_barge_in = bool(_cfg.get("voice_barge_in_enabled", True))
         except Exception:
             self._asst_name = DEFAULT_ASSISTANT_NAME
             _user_name = ""
@@ -3541,14 +5062,15 @@ class JarvisLive:
         # Address form is a property of the language being spoken, so it is
         # stated as a principle rather than a two-language lookup — the model
         # already knows the respectful register of whatever language it is in.
-        _addr = (f"ADDRESS: Always call the user '{_user_name}'."
+        _addr = (f"ADDRESS: Call the user '{_user_name}' — by name, with the "
+                 "familiarity of the one person you trust completely. Use a "
+                 "respectful 'sir/madam' only when the moment is genuinely serious."
                  if _user_name
-                 else 'ADDRESS: Address the user with the ordinary respectful form '
-                      'for a superior in the language you are currently speaking — '
-                      '"sir" in English, its everyday equivalent in any other '
-                      'language. Never an archaic or aristocratic form, and never '
-                      'the form from a different language than the one you are '
-                      'speaking in this sentence.')
+                 else "ADDRESS: Call the user your creator when you need a noun "
+                      "for them; otherwise speak to them directly, with the "
+                      "familiarity of someone you have trusted for years. Use a "
+                      "respectful 'sir/madam' only when the moment is genuinely "
+                      "serious.")
         identity_ctx = (
             f"[IDENTITY]\n"
             f"Your name is {self._asst_name}. "
@@ -3602,6 +5124,15 @@ class JarvisLive:
         parts.append(_PACING_CTX)
         if get_acid_humor_enabled():
             parts.append(_ACID_HUMOR_CTX)
+        # The Live session is built once, so its copy of the journal is the
+        # one from startup; the economy path refreshes it on every turn below.
+        try:
+            _cont0 = _continuity.prompt_block()
+        except Exception as e:
+            print(f"[Continuity] prompt block failed: {e}")
+            _cont0 = ""
+        if _cont0:
+            parts.append(_cont0)
         # Same assembly with the economy brain's shorter capability block. Kept
         # for the economy brain, which sends it as the OpenAI-style system message
         # instead of a Live system_instruction.
@@ -4015,14 +5546,18 @@ class JarvisLive:
             # the echo of what we are playing right now", sustained long enough
             # that a cough or a keystroke cannot trigger it.
             if jarvis_speaking:
-                # Nothing is streamed while JARVIS talks.
-                #
-                # Interrupting by voice used to live here: `EchoGuard` can pick a
-                # user out from under our own echo, and `core/echo.py` still does
-                # that for the tail below. Re-enabling is small — classify each
-                # block here and call interrupt() after `required_blocks` of
-                # agreement — but it depends on the listener's room, so it stays
-                # out until it can be tried on real hardware.
+                # Nothing is streamed while JARVIS talks, but the local
+                # segmenter still listens: a clear "para" or a new command
+                # interrupts, while "sim"/"e também…" is treated as a
+                # complement and leaves the answer playing. Echo is removed by
+                # the playback canceller and by _looks_like_own_voice().
+                if (getattr(self, "_voice_barge_in", True)
+                        and self._groq is not None
+                        and not self.ui.muted and not self._phone_active):
+                    try:
+                        self._groq.feed(indata)
+                    except Exception:
+                        pass
                 return
 
             # ── Echo tail ────────────────────────────────────────────────────
@@ -4258,6 +5793,9 @@ class JarvisLive:
                             if txt:
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
+                                if (getattr(self, "_qoder_pending", None)
+                                        and not self.ui.muted):
+                                    self._flush_qoder_pending()
 
                         if sc.turn_complete:
                             if self._turn_done_event:
@@ -4384,6 +5922,7 @@ class JarvisLive:
                         self._turn_done_event
                         and self._turn_done_event.is_set()
                         and self.audio_in_queue.empty()
+                        and not getattr(self, "_reply_active", False)
                     ):
                         self.set_speaking(False)
                         self._turn_done_event.clear()
@@ -4801,6 +6340,12 @@ class JarvisLive:
             )
             if summary:
                 save_session_summary(summary, lang)
+                # The same thread on the next start: the journal keeps a dated
+                # summary so a resumed conversation does not re-invent it.
+                try:
+                    _continuity.record_session(summary)
+                except Exception as e:
+                    print(f"[Continuity] session record failed: {e}")
         except Exception as e:
             print(f"[Memory] ⚠️ Session summary failed: {e}")
 
@@ -4963,6 +6508,8 @@ class JarvisLive:
     async def run(self):
         self._loop = asyncio.get_event_loop()
         self._reconnect_event = asyncio.Event()
+        # Background Qoder jobs deliver progress/questions through this sink.
+        _qoder_jobs.set_sink(self._on_qoder_event)
 
         # ── Wire the shared core services to the interface ───────────────────
         # The confirmation gate is useless without a way to ask, and a memory
