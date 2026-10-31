@@ -88,6 +88,7 @@ class QoderLive:
         on_error: Optional[Callable[[Optional[str], str], None]] = None,
         on_ready: Optional[Callable[[Optional[str], Optional[int]], None]] = None,
         on_closed: Optional[Callable[[], None]] = None,
+        on_task: Optional[Callable[[dict[str, Any]], None]] = None,
         logger: Optional[Callable[[str], None]] = print,
     ) -> None:
         self.script = str(script) if script is not None else str(DEFAULT_SCRIPT)
@@ -103,6 +104,7 @@ class QoderLive:
         self.on_error = on_error
         self.on_ready = on_ready
         self.on_closed = on_closed
+        self.on_task = on_task
         self.logger = logger or NOOP_LOGGER
 
         self._lock = threading.Lock()          # readiness + process state
@@ -232,12 +234,15 @@ class QoderLive:
 
     # ── conversation ─────────────────────────────────────────────────────────
 
-    def ask(self, text: str, speaker: Optional[str] = None, id: Optional[str] = None) -> str:
+    def ask(self, text: str, speaker: Optional[str] = None, id: Optional[str] = None,
+            priority: Optional[str] = None) -> str:
         """Queue a turn on the warm session and return its id.
 
         Returns immediately; ``on_text``/``on_tool``/``on_done``/``on_error``
-        deliver the answer. Raises ``RuntimeError`` (message from
-        ``last_error`` when known) if the sidecar is not ready or has died.
+        deliver the answer. ``priority='now'`` preempts the active turn in the
+        sidecar (background agents keep running). Raises ``RuntimeError``
+        (message from ``last_error`` when known) if the sidecar is not ready or
+        has died.
         """
         if not isinstance(text, str) or not text.strip():
             raise ValueError("ask() needs non-empty text")
@@ -246,6 +251,8 @@ class QoderLive:
         payload: dict[str, Any] = {"type": "ask", "id": message_id, "text": text}
         if speaker:
             payload["speaker"] = str(speaker)
+        if priority in ("now", "next", "later"):
+            payload["priority"] = priority
         self._send(payload, raise_errors=True)
         return message_id
 
@@ -476,6 +483,8 @@ class QoderLive:
                 str(message.get("name") or ""),
                 tool_input if isinstance(tool_input, dict) else {},
             )
+        elif kind == "task":
+            self._emit("on_task", message)
         elif kind == "done":
             self._emit("on_done", message.get("id"), str(message.get("text") or ""))
         elif kind == "error":

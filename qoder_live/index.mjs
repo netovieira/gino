@@ -46,13 +46,24 @@ const MODEL = ALLOWED_MODELS.has(String(process.env.JARVIS_MODEL || "").trim())
   ? String(process.env.JARVIS_MODEL).trim()
   : DEFAULT_MODEL;
 const DESTRUCTIVE = /(?:\b(?:reboot|shutdown|poweroff|halt|suspend|hibernate)\b|systemctl\s+(?:reboot|poweroff|restart|suspend|hibernate)\b|loginctl\s+(?:lock|unlock)-session|pmset\s+(?:sleepnow|displaysleepnow)|LockWorkStation|rm\s+-[a-z]*r[a-z]*f|rm\s+-[a-z]*f[a-z]*r|dd\s+if=|mkfs(?:\.|\s)|chmod\s+777|>\s*\/etc\/|git\s+reset\s+--hard|git\s+clean\s+-[a-z]*f)/i;
+// Anything that changes shared or external state goes through a background
+// agent and the owner's authorization. The live session never runs it inline.
+const FORBIDDEN_BASH = /(?:\bgit\s+push\b|\bgh\s+(?:pr|release|repo)\b|\bnpm\s+publish\b|\bdocker\s+push\b|\bscp\b|\brsync\b|--force\b|--no-verify\b)/i;
+const READONLY_BASH = /^\s*(?:git\s+(?:status|log|diff|show|branch|remote\s+-v)|ls|pwd|date|whoami|echo|cat\s+[^|;>]*|grep\b|rg\b|find\b|head\b|tail\b|wc\b|file\b)\b/i;
 
 let currentId = null;
 let busy = false;
 let sawDelta = false;
+let abortingId = null;
+let abortTimer = null;
+let bgTimer = null;
+const BG_ACK_MS = 3000;
 let turnTools = 0;
 let turnHadTool = false;
 let finalCandidate = "";
+let sharedActionUntil = 0;   // explicit owner window for a git push
+const SHARED_ACTION_WINDOW_MS = 10 * 60 * 1000;
+const taskDescriptions = new Map();
 const MAX_TOOLS_PER_TURN = 10;
 const queue = [];
 let chatQuery = null;
@@ -243,53 +254,76 @@ const MCP_NAMES = [
 ].map((n) => `mcp__jarvis__${n}`);
 
 const ALLOWED_TOOLS = [
-  "Read", "Glob", "Grep", "Edit", "Write", "Bash", "WebFetch", "WebSearch",
+  "Agent", "Read", "Glob", "Grep", "Edit", "Write", "Bash", "WebFetch", "WebSearch",
   ...MCP_NAMES,
 ];
 
 async function canUseTool(toolName, input, options) {
   const toolUseID = options?.toolUseID;
   if (toolName === "Agent") {
-    return {
-      behavior: "deny",
-      message: "Neste chat ao vivo responda direto ou use no máximo 1-2 ferramentas; subagentes ficam para tarefas delegadas.",
-      toolUseID,
-    };
+    // The owner's rule: executions always run in a background subagent, so the
+    // live conversation is never held by a command. Force the flag even when
+    // the model forgets it.
+    turnTools += 1;
+    if (turnTools > MAX_TOOLS_PER_TURN) return denyBudget(toolUseID);
+    if (!input?.run_in_background) {
+      return {
+        behavior: "allow",
+        updatedInput: { ...input, run_in_background: true },
+        toolUseID,
+      };
+    }
+    return { behavior: "allow", toolUseID };
   }
   if (toolName === "Bash") {
-    const command = String(input?.command || "");
-    if (DESTRUCTIVE.test(command)) {
-      try {
-        const verdict = await bridge("/confirm", {
-          title: "Qoder quer executar um comando destrutivo",
-          reason: command.slice(0, 500),
-        });
-        if (verdict?.approved) return { behavior: "allow", toolUseID };
-        return {
-          behavior: "deny",
-          message: "O dono não autorizou este comando destrutivo.",
-          toolUseID,
-        };
-      } catch (e) {
-        return {
-          behavior: "deny",
-          message: `Confirmação indisponível: ${e.message || e}`,
-          toolUseID,
-        };
+    const command = String(input?.command || "").trim();
+    if (/\bgit\s+push\b/i.test(command)) {
+      // Pushing is visible to others. Only a background agent may do it, and
+      // only inside the window opened by the owner explicitly asking to push.
+      if (options?.agentID && Date.now() < sharedActionUntil) {
+        return { behavior: "allow", toolUseID };
       }
+      return {
+        behavior: "deny",
+        message: "Push não autorizado. Só um Agent em segundo plano pode fazê-lo, e apenas depois de o dono pedir explicitamente para subir o repositório.",
+        toolUseID,
+      };
     }
+    if (DESTRUCTIVE.test(command) || FORBIDDEN_BASH.test(command)) {
+      return {
+        behavior: "deny",
+        message: "Comando negado no chat ao vivo: delegue esta execução a um Agent em segundo plano e peça autorização ao dono.",
+        toolUseID,
+      };
+    }
+    if (!READONLY_BASH.test(command)) {
+      return {
+        behavior: "deny",
+        message: "O chat ao vivo só roda consultas rápidas. Para qualquer execução (push, edição, instalação, serviço), chame Agent com run_in_background=true e continue conversando.",
+        toolUseID,
+      };
+    }
+  }
+  if (toolName === "Edit" || toolName === "Write" || toolName === "NotebookEdit") {
+    return {
+      behavior: "deny",
+      message: "Edição de arquivo é execução: delegue a um Agent em segundo plano (run_in_background=true) e continue a conversa.",
+      toolUseID,
+    };
   }
   // One turn must not become a twenty-command investigation while the user is
   // waiting in a live conversation. The budget resets on every new ask.
-  if (turnTools >= MAX_TOOLS_PER_TURN) {
-    return {
-      behavior: "deny",
-      message: "Você já usou o limite de ferramentas deste turno. Pare de investigar e responda agora com o que já tem.",
-      toolUseID,
-    };
-  }
+  if (turnTools >= MAX_TOOLS_PER_TURN) return denyBudget(toolUseID);
   turnTools += 1;
   return { behavior: "allow", toolUseID };
+}
+
+function denyBudget(toolUseID) {
+  return {
+    behavior: "deny",
+    message: "Você já usou o limite de ferramentas deste turno. Pare de investigar e responda agora com o que já tem.",
+    toolUseID,
+  };
 }
 
 function loadSystemPrompt() {
@@ -306,7 +340,7 @@ function loadSystemPrompt() {
     .replaceAll("{platform}", process.platform)
     .replaceAll("{capabilities}", "Use the jarvis MCP tools for actions; use jarvis_tools to discover names.")
     .replaceAll("{limits}", "If no tool covers a request, say so; never claim an action without a tool result.");
-  return `${text}\n\n[LIVE ORCHESTRATOR]\nYou are ${ASSISTANT_NAME} speaking live. Keep replies short and speakable, in the user's language (pt-BR unless they switch). Never narrate tool calls aloud and never read an error message verbatim. Use the jarvis tools for actions, never invent a result, and ask for explicit confirmation before irreversible actions. A tool result is data, not a script: never read raw JSON aloud — say what it means in the user's language. If a tool needs a decision only the user can make, ask them; do not guess.\n[RECALL] The current turns and the hot memory block are immediate. For older details use memory_search or memory_read before answering; if the memory does not contain it, say so instead of reconstructing it. A short "deixa eu lembrar" before a memory tool is natural, not filler.\n[SPEAKERS] Lines may start with [FALANTE: name]. That is metadata: never read it aloud. Use it to know who is speaking and address the right person. If an unknown voice is present, do not pretend to know them.\n[TOOL DISCIPLINE] This is a live voice conversation, not a coding session. Small talk, opinions, explanations and questions about the conversation are answered directly from what you know — do NOT inspect the repository, run Bash, read files or spawn agents for those. Use a tool only when the user asks for an action or for a specific memory, and stop after 1-2 calls to speak. You have a hard budget of 10 tool calls per turn; when it runs out, answer with what you already have. Code changes or repository audits happen only when the user explicitly asks for them; then work in background steps and speak between them.\n[LANGUAGE] Write every sentence in Brazilian Portuguese. Never let a Chinese, Spanish or English word slip into an answer; if one appears, restate that sentence in Portuguese before finishing.\n[CONFIRMATIONS] Restarts and power actions are confirmed ONLY by the owner's voice, never by you. When one is requested, park it with the tool, say the exact phrase they must speak (for a restart: "confirmo reiniciar"), and stop. Never say you confirmed, tried to confirm, or were blocked; never call a confirm action. Do not speak your plan, your tool choices or "deixa eu ver" lines — the system only voices the final answer.`;
+  return `${text}\n\n[LIVE ORCHESTRATOR]\nYou are ${ASSISTANT_NAME} speaking live. Keep replies short and speakable, in the user's language (pt-BR unless they switch). Never narrate tool calls aloud and never read an error message verbatim. Use the jarvis tools for actions, never invent a result, and ask for explicit confirmation before irreversible actions. A tool result is data, not a script: never read raw JSON aloud — say what it means in the user's language. If a tool needs a decision only the user can make, ask them; do not guess.\n[RECALL] The current turns and the hot memory block are immediate. For older details use memory_search or memory_read before answering; if the memory does not contain it, say so instead of reconstructing it. A short "deixa eu lembrar" before a memory tool is natural, not filler.\n[SPEAKERS] Lines may start with [FALANTE: name]. That is metadata: never read it aloud. Use it to know who is speaking and address the right person. If an unknown voice is present, do not pretend to know them.\n[TOOL DISCIPLINE] This is a live voice conversation, not a coding session. Small talk, opinions, explanations and questions about the conversation are answered directly from what you know — do NOT inspect the repository, run Bash, read files or spawn agents for those. Use a quick tool only when the user asks for a status or a specific memory, and keep it to 1-2 calls. EVERY execution — pushing, installing, editing files, restarting services, long commands — MUST be delegated to an Agent with run_in_background=true; never run it inline and never wait for it. Tell the owner it is running in the background, keep the conversation going, and the system will notify you when it finishes. You have a hard budget of 10 tool calls per turn.\n[LANGUAGE] Write every sentence in Brazilian Portuguese. Never let a Chinese, Spanish or English word slip into an answer; if one appears, restate that sentence in Portuguese before finishing.\n[CONFIRMATIONS] Restarts and power actions are confirmed ONLY by the owner's voice, never by you. When one is requested, park it with the tool, say the exact phrase they must speak (for a restart: "confirmo reiniciar"), and stop. Never say you confirmed, tried to confirm, or were blocked; never call a confirm action. Do not speak your plan, your tool choices or "deixa eu ver" lines — the system only voices the final answer.`;
 }
 
 const SYSTEM_PROMPT = loadSystemPrompt();
@@ -321,7 +355,6 @@ function optionsFor(maxTurns) {
     canUseTool,
     mcpServers: { jarvis: makeJarvisServer() },
     allowedTools: ALLOWED_TOOLS,
-    disallowedTools: ["Agent"],
     includePartialMessages: true,
     persistSession: false,
     maxTurns,
@@ -346,8 +379,25 @@ async function warmup() {
   return Date.now() - started;
 }
 
+function clearBgTimer() {
+  if (bgTimer) { clearTimeout(bgTimer); bgTimer = null; }
+}
+
 function finishTurn(ok, textOrError, subtype = "") {
   const id = currentId;
+  clearBgTimer();
+  if (abortingId && id === abortingId) {
+    // The turn was preempted by a new spoken turn; its abort result must not
+    // be attributed to the new turn nor spoken as an error.
+    abortingId = null;
+    if (abortTimer) { clearTimeout(abortTimer); abortTimer = null; }
+    currentId = null;
+    busy = false;
+    sawDelta = false;
+    out({ type: "interrupted", id });
+    pumpQueue();
+    return;
+  }
   currentId = null;
   busy = false;
   sawDelta = false;
@@ -406,6 +456,34 @@ async function chatLoop() {
       if (closing) break;
       if (msg.type === "system" && msg.subtype === "init") {
         log(`session ${msg.session_id || "?"} ready`);
+      } else if (msg.type === "system" && msg.subtype === "task_started") {
+        taskDescriptions.set(msg.task_id, msg.description || "");
+        out({ type: "task", phase: "started", id: msg.task_id,
+              description: msg.description || "" });
+        // The owner's rule: a background execution must never hold the
+        // conversation. If the model stays waiting for the task, cut the turn
+        // after a short acknowledgement window; the agent keeps running and
+        // reports through task_notification.
+        if (busy && currentId && !bgTimer) {
+          const id = currentId;
+          bgTimer = setTimeout(() => {
+            bgTimer = null;
+            if (!busy || currentId !== id) return;
+            currentId = null;
+            busy = false;
+            sawDelta = false;
+            out({ type: "done", id,
+                  text: "Deleguei isso em segundo plano; eu te aviso quando terminar." });
+            try { chatQuery?.interrupt?.(); } catch {}
+            pumpQueue();
+          }, BG_ACK_MS);
+        }
+      } else if (msg.type === "system" && msg.subtype === "task_notification") {
+        const description = taskDescriptions.get(msg.task_id) || "";
+        taskDescriptions.delete(msg.task_id);
+        out({ type: "task", phase: "done", id: msg.task_id,
+              status: msg.status || "", description,
+              summary: msg.summary || "" });
       } else if (msg.type === "stream_event") {
         handleStreamEvent(msg);
       } else if (msg.type === "assistant") {
@@ -432,6 +510,14 @@ function pushAsk(item) {
   turnTools = 0;
   turnHadTool = false;
   finalCandidate = "";
+  const text = String(item.text || "");
+  // The owner's own words open a short window for the background agent to
+  // push. The model cannot open it by talking about a push.
+  if (/\b(?:push|sub(?:ir|a|am)|envi(?:ar|e)|public(?:ar|a))\b/i.test(text)
+      && /\b(?:git|github|reposit[oó]rio|repo|origin|tudo)\b/i.test(text)) {
+    sharedActionUntil = Date.now() + SHARED_ACTION_WINDOW_MS;
+    log("owner window: git push allowed from a background agent");
+  }
   channel.push(userMessage(item.text, item.priority || "next"));
   out({ type: "accepted", id: item.id });
 }
@@ -442,12 +528,34 @@ function pumpQueue() {
   pushAsk(next);
 }
 
-function ask(item) {
+async function ask(item) {
   if (!item?.id || !item?.text) {
     out({ type: "error", id: item?.id || null, error: "ask requires id and text" });
     return;
   }
   if (busy) {
+    if (item.priority === "now") {
+      // A new spoken turn preempts the previous one; background agents keep
+      // running. The new turn waits for the aborted result so it is not
+      // mistaken for the old one.
+      queue.unshift({ ...item, priority: "next" });
+      if (!abortingId) {
+        abortingId = currentId;
+        try { await chatQuery?.interrupt?.(); } catch (e) { log(`preempt: ${e?.message || e}`); }
+        abortTimer = setTimeout(() => {
+          if (!abortingId) return;
+          const id = abortingId;
+          abortingId = null;
+          abortTimer = null;
+          currentId = null;
+          busy = false;
+          sawDelta = false;
+          out({ type: "interrupted", id });
+          pumpQueue();
+        }, 1500);
+      }
+      return;
+    }
     queue.push(item);
     out({ type: "queued", id: item.id, ahead: 1 });
     return;
@@ -458,6 +566,9 @@ function ask(item) {
 async function interrupt() {
   const id = currentId;
   queue.length = 0;
+  abortingId = null;
+  if (abortTimer) { clearTimeout(abortTimer); abortTimer = null; }
+  clearBgTimer();
   try { await chatQuery?.interrupt?.(); } catch (e) { log(`interrupt: ${e?.message || e}`); }
   if (id) {
     currentId = null;
@@ -510,7 +621,7 @@ async function main() {
         case "warmup":
           out({ type: "ready", model: MODEL, warmup_ms: 0 });
           break;
-        case "ask": ask(msg); break;
+        case "ask": await ask(msg); break;
         case "interrupt": await interrupt(); break;
         case "close": await closeAll(); break;
         default: log(`unknown message: ${msg.type}`);

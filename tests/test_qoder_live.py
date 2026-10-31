@@ -298,6 +298,17 @@ def test_callback_exception_is_logged_and_does_not_kill_reader(make_live):
     assert any("on_text callback failed" in line and "callback exploded" in line for line in logs)
 
 
+def test_task_events_are_forwarded_to_the_owner():
+    seen = []
+    live = QoderLive(on_task=seen.append, logger=lambda *_a: None)
+    live._dispatch({"type": "task", "phase": "started", "id": "t1",
+                    "description": "push"})
+    live._dispatch({"type": "task", "phase": "done", "id": "t1",
+                    "status": "completed", "summary": "ok"})
+    assert [e["phase"] for e in seen] == ["started", "done"]
+    assert seen[1]["status"] == "completed"
+
+
 def test_interrupt_does_not_clear_inflight_delivery(make_live):
     rec = Recorder()
     live = make_live(env={"FAKE_MODE": "slow"}, **rec.handlers())

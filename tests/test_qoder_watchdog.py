@@ -96,18 +96,16 @@ class QoderWatchdogTest(unittest.TestCase):
         self.assertEqual(obj._qoder_live.interrupted, 1)
         self.assertEqual(obj.finished, ["t1"])
 
-    def test_new_turn_waits_while_qoder_is_busy(self):
+    def test_new_turn_preempts_the_busy_one(self):
         obj = object.__new__(main.JarvisLive)
         obj._qoder_lock = threading.RLock()
         obj._qoder_current_id = "t1"
-        obj._qoder_retry_used = False
-        obj._last_user_speech = 0.0
-        obj.said = []
-        obj.held = []
-        obj._qoder_hold = lambda text, pcm=None, reason="", announce=True: \
-            obj.held.append((text, reason))
-        main.JarvisLive._qoder_turn(obj, "nova fala")
-        self.assertEqual(obj.held, [("nova fala", "turno em andamento")])
+        obj._qoder_live = FakeLive()
+        obj.finished = []
+        obj._qoder_finish = lambda turn_id, flush=True: obj.finished.append(turn_id)
+        main.JarvisLive._qoder_preempt(obj, "t1")
+        self.assertEqual(obj.finished, ["t1"])
+        self.assertEqual(obj._qoder_live.interrupted, 0)  # done by ask(priority=now)
 
 
 if __name__ == "__main__":

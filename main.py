@@ -757,6 +757,21 @@ _MUSIC_PLAY_INTENT = re.compile(
     r"|\b(?:musica|musicas|song|songs|playlist|som|track)\b"
     r"[^.!?]{0,40}\b(?:toca|tocar|toque|coloca|colocar|coloque|bota|botar|bote|play)\b",
     re.IGNORECASE)
+# An imperative play request with a named target: "coloca Tiago York pra
+# tocar". This is an action, not a conversation; running it here keeps the
+# request working even while the Qoder session is busy with a background task.
+_PLAY_REQUEST_RE = re.compile(
+    r"^\s*(?:gino[,\s]+)?(?:coloca|coloque|colocar|toca|toque|tocar|bota|bote|"
+    r"botar|p[oõ]e|poem|ponha|play)\s+(?P<query>.+?)"
+    r"(?:\s+(?:pra|para)\s+(?:tocar|ouvir|rodar|tocando)|\s+no\s+youtube)?"
+    r"\s*[.!?]*$",
+    re.IGNORECASE)
+_PLAY_STOPWORDS = {
+    "ai", "mais alto", "mais baixo", "de novo", "outra", "outro", "proxima",
+    "proximo", "anterior", "pausa", "para", "isso", "aquilo", "algo",
+    "alguma coisa", "uma musica", "musica", "alarme", "campainha", "telefone",
+}
+_PLAY_ACTION = None    # test seam; the app uses actions.youtube_video
 
 # Signing in to the YouTube window happens once and has no room for
 # interpretation. The 7B reads "faz login no youtube" as a question about
@@ -2855,6 +2870,7 @@ class JarvisLive:
             on_error=self._qoder_on_error,
             on_ready=self._qoder_on_ready,
             on_closed=self._qoder_on_closed,
+            on_task=self._qoder_on_task,
             logger=print,
         )
         threading.Thread(target=self._qoder_start_worker, daemon=True,
@@ -3081,6 +3097,44 @@ class JarvisLive:
             pass
         self._qoder_flush_pending()
 
+    def _qoder_on_task(self, event: dict) -> None:
+        """A background subagent started or finished — never blocks the chat."""
+        phase = str(event.get("phase") or "")
+        description = str(event.get("description") or "").strip()
+        label = description[:120] or "tarefa"
+        if phase == "started":
+            _metrics.inc("qoder.tasks")
+            try:
+                self.ui.write_log(f"QODER: segundo plano — {label}")
+            except Exception:
+                pass
+            return
+        if phase != "done":
+            return
+        status = str(event.get("status") or "")
+        summary = str(event.get("summary") or "").strip()
+        if summary:
+            print(f"[QoderLive] task {status or 'done'}: {summary[:300]}")
+        try:
+            if status == "completed":
+                _metrics.inc("qoder.tasks.done")
+                self.ui.write_log(f"QODER: concluído — {label}")
+            else:
+                _metrics.inc("qoder.tasks.failed")
+                self.ui.write_log(f"QODER: {status or 'encerrado'} — {label}")
+        except Exception:
+            pass
+        try:
+            if (self._memory_idle() and getattr(self, "_awake", True)
+                    and not getattr(self.ui, "muted", False)):
+                if status == "completed":
+                    self._say_now(f"Terminei em segundo plano: {label}.")
+                else:
+                    self._say_now("A tarefa em segundo plano falhou. "
+                                  "Os detalhes estão no log.")
+        except Exception:
+            pass
+
     def _qoder_on_closed(self) -> None:
         self._qoder_ready_at = 0.0
         _health.set_component("qoder_live", False, "closed")
@@ -3290,6 +3344,18 @@ class JarvisLive:
                 self._say_now("O Qoder falhou neste turno. Pode repetir?")
                 self._qoder_flush_pending()
 
+    def _qoder_preempt(self, old_id) -> None:
+        """Drop the active turn's hold on the conversation, keep its agents.
+
+        The sidecar itself aborts the turn when the new ask arrives with
+        priority='now'; calling interrupt() here would race that abort and make
+        the abort result land on the new turn.
+        """
+        print(f"[QoderLive] novo turno — interrompendo {old_id} para responder")
+        _metrics.inc("qoder.preempt")
+        if old_id:
+            self._qoder_finish(old_id, flush=False)
+
     def _qoder_turn(self, text: str, pcm: bytes | None = None,
                     retry: bool = False) -> None:
         """One user turn through the persistent Qoder session."""
@@ -3298,11 +3364,13 @@ class JarvisLive:
             self._qoder_retry_used = False
         with self._qoder_lock:
             busy = self._qoder_current_id is not None
+            old_id = self._qoder_current_id
+        preempt = busy
         if busy:
-            # Qoder is still answering the previous turn. Queue this one for
-            # the same session instead of overwriting its streaming state.
-            self._qoder_hold(text, pcm, "turno em andamento", announce=False)
-            return
+            # The owner's rule: the conversation never waits for an execution.
+            # Preempt the active turn; background agents keep running and report
+            # back on their own.
+            self._qoder_preempt(old_id)
         speaker = None
         labeled_text = text
         if self._voice_id_enabled and self._speaker is not None and pcm:
@@ -3384,7 +3452,8 @@ class JarvisLive:
         except Exception:
             pass
         try:
-            turn_id = self._qoder_live.ask(payload, speaker=speaker)
+            turn_id = self._qoder_live.ask(
+                payload, speaker=speaker, priority="now" if preempt else None)
         except Exception as e:
             print(f"[QoderLive] ask failed: {e!r}")
             _metrics.inc("qoder.error")
@@ -5101,6 +5170,35 @@ class JarvisLive:
 
         return False
 
+    @staticmethod
+    def _clean_play_query(query: str) -> str:
+        import re as _re
+        q = str(query or "").strip(" .,!?")
+        q = _re.sub(r"^(?:a|o|as|os|um|uma)\s+", "", q, flags=_re.IGNORECASE)
+        q = _re.sub(r"^(?:m[uú]sica|can[cç][aã]o|v[ií]deo|clipe|faixa|som|"
+                    r"playlist)\s+(?:d[oa]s?\s+|de\s+)?", "", q, flags=_re.IGNORECASE)
+        q = _re.sub(r"\s+(?:pra|para)\s+(?:tocar|ouvir|rodar|tocando)\s*$", "",
+                    q, flags=_re.IGNORECASE)
+        q = _re.sub(r"\s+no\s+youtube\s*$", "", q, flags=_re.IGNORECASE)
+        return q.strip(" .,!?")
+
+    def _play_local(self, query: str) -> bool:
+        """Start a named song/video without waking the conversational model."""
+        self.ui.write_log(f"SYS: tocando «{query}» no YouTube…")
+        self._say_now(f"Colocando {query} pra tocar.")
+
+        def _run() -> None:
+            try:
+                action = _PLAY_ACTION
+                if action is None:
+                    from actions.youtube_video import youtube_video as action
+                out = action({"action": "play", "query": query}, player=self.ui)
+                print(f"[Play] {str(out)[:200]}")
+            except Exception as e:
+                print(f"[Play] falhou: {e!r}")
+        threading.Thread(target=_run, daemon=True, name="play-local").start()
+        return True
+
     def _music_gate(self, text: str) -> bool:
         """Pause/resume/stop/next on the assistant's own player, without a model.
 
@@ -5129,6 +5227,17 @@ class JarvisLive:
         # "eu já te falei três vezes que era para parar a música" — a report on
         # what happened, not an order; the first person gives it away.
         if folded.startswith(("eu ", "eu ja", "ja te", "ja falei", "falei ")):
+            return False
+        play = _PLAY_REQUEST_RE.match(raw)
+        if play:
+            query = self._clean_play_query(play.group("query"))
+            import unicodedata as _ud
+            key = "".join(
+                c for c in _ud.normalize("NFKD", query.lower())
+                if not _ud.combining(c))
+            key = " ".join(key.split())
+            if query and key not in _PLAY_STOPWORDS and len(query) <= 80:
+                return self._play_local(query)
             return False
         # A PLAY request belongs to the model + youtube_video. "para" in "para
         # tocar" is a preposition; treating it as the stop verb answered the
