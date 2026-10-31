@@ -1209,8 +1209,20 @@ class _EconomySession:
             text = " ".join(str(p.get("text") or "") for p in parts if isinstance(p, dict)).strip()
         except Exception:
             text = ""
+        if not text:
+            return
+        # With the Qoder session live, every injected turn belongs to that one
+        # conversation — typed commands, reminders and proactive lines included.
+        # The local brain is only reached when Qoder itself delegates.
+        if getattr(self._owner, "_qoder_live_enabled", False):
+            self._owner._memory_record_user(text)
+            if self._owner._qoder_live_ready():
+                self._owner._qoder_turn(text)
+            else:
+                self._owner._qoder_hold(text)
+            return
         q = self._owner._brain_q
-        if text and q is not None:
+        if q is not None:
             q.put_nowait(text)
 
     async def send_realtime_input(self, **_):
@@ -1319,7 +1331,11 @@ class JarvisLive:
         self._qoder_turns: dict[str, str] = {}
         self._qoder_current_id     = None
         self._qoder_ignore         = False
-        self._local_fallback_pending = False
+        # Turns spoken while the sidecar is warming or restarting wait here and
+        # are answered by the same Qoder session once it is back — never by the
+        # local model.
+        self._qoder_turn_backlog: list[dict] = []
+        self._qoder_retry_used     = False
         self._last_speaker: dict   = {}
         self._last_unknown_pcm     = None
         self._last_unknown_emb     = None
@@ -1814,8 +1830,6 @@ class JarvisLive:
             loop = asyncio.get_event_loop()
             while True:
                 text = await self._brain_q.get()
-                fallback_turn = bool(getattr(self, "_local_fallback_pending", False))
-                self._local_fallback_pending = False
                 self._interrupted = False
                 self._reply_active = True
                 if self._turn_done_event is not None:
@@ -1861,12 +1875,10 @@ class JarvisLive:
                         _cont = self._chat_memory.prompt_block()
                     if not _cont:
                         _cont = _continuity.prompt_block()
-                    if fallback_turn:
-                        _cont += ("\n[FALLBACK] O Qoder não respondeu; quem fala "
-                                  "agora é o cérebro local. Use só o que está "
-                                  "nesta conversa e no bloco de memória. Não "
-                                  "invente nomes, arquivos, viagens, tarefas ou "
-                                  "lembranças; se não souber, diga que não sabe.")
+                    _cont += ("\n[FIDELIDADE] Use só o que está nesta conversa e "
+                              "no bloco de memória. Não invente nomes, arquivos, "
+                              "viagens, tarefas ou lembranças; se não souber, "
+                              "diga que não sabe.")
                     if _cont:
                         _sys += "\n\n" + _cont
                 except Exception as e:
@@ -2198,10 +2210,7 @@ class JarvisLive:
                         self.ui.write_log(f"{self._asst_name}: {full}")
                         self._session_log.append(f"{self._asst_name}: {full}")
                         try:
-                            # A fallback answer may be improvised; the user
-                            # turn is still recorded, but the reply is not
-                            # promoted to memory as a fact.
-                            if self._chat_memory is not None and not fallback_turn:
+                            if self._chat_memory is not None:
                                 self._chat_memory.append_turn("assistant", full)
                             if self._memory_librarian is not None:
                                 self._memory_librarian.tick()
@@ -2270,6 +2279,9 @@ class JarvisLive:
                     if (getattr(self, "_qoder_pending", None) and not muted
                             and getattr(self, "_awake", True)):
                         self._flush_qoder_pending()
+                    if (getattr(self, "_qoder_turn_backlog", None) and not muted
+                            and getattr(self, "_awake", True)):
+                        self._qoder_flush_pending()
                 except Exception as e:
                     print(f"[Sessão] heartbeat falhou: {e!r}")
 
@@ -2672,8 +2684,9 @@ class JarvisLive:
     def _maybe_start_qoder_live(self) -> None:
         """Start architecture A once per process, behind config flags.
 
-        The existing economy brain is untouched: if the sidecar, bridge or
-        voice stack is unavailable, turns continue to use it exactly as before.
+        With the flag on, the Qoder session is the only conversational brain:
+        the economy model keeps handling only the gates that never reach a
+        model, plus tasks Qoder explicitly delegates through ``local_ask``.
         """
         if self._qoder_started:
             return
@@ -2778,7 +2791,7 @@ class JarvisLive:
                         memory=self._chat_memory,
                         voice=self._speaker,
                         restart=self._restart,
-                        local_ask=None,
+                        local_ask=self._local_ask,
                     )
                     actual = self._bridge.start()
                     break
@@ -2798,12 +2811,7 @@ class JarvisLive:
             return
 
         system_file = BASE_DIR / "memory" / "chat" / "qoder_live_system.txt"
-        try:
-            system_file.parent.mkdir(parents=True, exist_ok=True)
-            system_file.write_text(self._qoder_system_prompt(), encoding="utf-8")
-        except Exception as e:
-            print(f"[QoderLive] system prompt file: {e}")
-
+        self._write_qoder_system_prompt()
         env = os.environ.copy()
         env.update({
             "JARVIS_BRIDGE_URL": self._bridge.url(),
@@ -2831,9 +2839,11 @@ class JarvisLive:
     def _qoder_start_worker(self) -> None:
         _health.set_component("qoder_live", False, "iniciando")
         try:
+            self._write_qoder_system_prompt()
             ok = self._qoder_live.start(90)
             if not ok:
-                self.ui.write_log("SYS: Qoder Live não ficou pronto — usando o cérebro local.")
+                self.ui.write_log("SYS: Qoder Live não ficou pronto — vou tentar "
+                                  "de novo; sem respostas do modelo local.")
                 self._schedule_qoder_restart()
         except Exception as e:
             print(f"[QoderLive] start failed: {e!r}")
@@ -2870,6 +2880,15 @@ class JarvisLive:
         self._qoder_live = None
         self._bridge = None
 
+    def _write_qoder_system_prompt(self) -> None:
+        """Freeze the current memory snapshot for the next session start."""
+        system_file = BASE_DIR / "memory" / "chat" / "qoder_live_system.txt"
+        try:
+            system_file.parent.mkdir(parents=True, exist_ok=True)
+            system_file.write_text(self._qoder_system_prompt(), encoding="utf-8")
+        except Exception as e:
+            print(f"[QoderLive] system prompt file: {e}")
+
     def _qoder_system_prompt(self) -> str:
         text = self._system_prompt_text or _load_system_prompt()
         try:
@@ -2894,8 +2913,9 @@ class JarvisLive:
                 and not bool(getattr(self, "_brain_busy", False))
                 and not bool(getattr(self, "_reply_active", False)))
 
-    def _memory_summarize(self, prompt: str) -> str:
-        """Ask the local 7B to turn recent turns into a short memory summary."""
+    def _local_complete(self, prompt: str, *, system: str = "",
+                        max_tokens: int = 500, timeout: float = 45) -> str:
+        """One direct call to the local 7B, with no tools and no speech."""
         st = getattr(self, "_brain_st", None) or {}
         rung = next((r for r in st.get("chain", []) if r.get("provider") == "custom"), None)
         if not rung:
@@ -2904,26 +2924,44 @@ class JarvisLive:
         model = str(rung.get("model") or "qwen2.5:7b-instruct")
         if not base:
             return ""
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
         try:
             import requests
             r = requests.post(
                 f"{base}/chat/completions",
                 json={
                     "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
+                    "messages": messages,
                     "temperature": 0.2,
-                    "max_tokens": 500,
+                    "max_tokens": max_tokens,
                     "stream": False,
                 },
-                timeout=45,
+                timeout=timeout,
             )
             r.raise_for_status()
             data = r.json()
             message = ((data.get("choices") or [{}])[0].get("message") or {})
             return str(message.get("content") or "").strip()
         except Exception as e:
-            print(f"[Librarian] local summary failed: {e}")
+            print(f"[Local] completion failed: {e}")
             return ""
+
+    def _local_ask(self, prompt: str) -> str:
+        """Local model used only when the Qoder session delegates a small task."""
+        out = self._local_complete(
+            str(prompt or ""),
+            system=("Você é o modelo local do Gino, chamado pelo Qoder para uma "
+                    "tarefa pontual. Responda curto, em português, e não invente "
+                    "fatos que não estejam no pedido."),
+            max_tokens=400, timeout=30)
+        return out or "o modelo local não respondeu"
+
+    def _memory_summarize(self, prompt: str) -> str:
+        """Ask the local 7B to turn recent turns into a short memory summary."""
+        return self._local_complete(prompt, max_tokens=500, timeout=45)
 
     def _bridge_dispatch(self, name: str, args: dict) -> str:
         """Run a JARVIS action for the bridge from its worker thread."""
@@ -2963,6 +3001,41 @@ class JarvisLive:
         print(f"[QoderLive] destructive request not authorized: {title}: {message[:160]}")
         return False
 
+    def _qoder_hold(self, text, pcm=None, reason: str = "") -> None:
+        """Keep a turn for the warm session instead of answering locally."""
+        clean = str(text or "").strip()
+        if not clean:
+            return
+        with self._qoder_lock:
+            if len(self._qoder_turn_backlog) >= 5:
+                self._qoder_turn_backlog.pop(0)
+            first = not self._qoder_turn_backlog
+            self._qoder_turn_backlog.append({"text": clean, "pcm": pcm,
+                                             "at": time.monotonic()})
+        _metrics.inc("qoder.held")
+        print(f"[QoderLive] turno guardado ({reason or 'sidecar indisponível'})")
+        try:
+            self.ui.write_log("SYS: Qoder indisponível — fala guardada para a "
+                              "mesma sessão.")
+        except Exception:
+            pass
+        if first:
+            self._say_now("Estou sem o cérebro do Qoder agora; guardei o que você "
+                          "disse e respondo assim que ele voltar.")
+
+    def _qoder_flush_pending(self) -> None:
+        if (not self._qoder_live_enabled or self._qoder_shutting_down
+                or not self._qoder_live_ready()):
+            return
+        with self._qoder_lock:
+            if self._qoder_current_id is not None:
+                return
+            item = (self._qoder_turn_backlog.pop(0)
+                    if self._qoder_turn_backlog else None)
+        if item:
+            self._last_user_speech = time.monotonic()
+            self._qoder_turn(item["text"], item.get("pcm"))
+
     def _qoder_on_ready(self, model: str, warmup_ms: float) -> None:
         self._qoder_ready_at = time.monotonic()
         self._qoder_restart_attempts = 0
@@ -2975,6 +3048,7 @@ class JarvisLive:
                               f"(warm-up {float(warmup_ms)/1000:.1f}s).")
         except Exception:
             pass
+        self._qoder_flush_pending()
 
     def _qoder_on_closed(self) -> None:
         self._qoder_ready_at = 0.0
@@ -2986,7 +3060,7 @@ class JarvisLive:
             self._schedule_qoder_restart()
 
     def _schedule_qoder_restart(self) -> None:
-        """Restart the sidecar with bounded backoff; fallback stays local."""
+        """Restart the sidecar with bounded backoff; turns wait, not fall back."""
         if self._qoder_shutting_down or not self._qoder_live_enabled:
             return
         if self._qoder_live is None:
@@ -3010,6 +3084,7 @@ class JarvisLive:
                         return
                     _health.set_component("qoder_live", False,
                                           f"reiniciando em {delay:.0f}s")
+                    self._write_qoder_system_prompt()
                     ok = self._qoder_live.start(90)
                     _metrics.inc("qoder.restart")
                     if ok:
@@ -3032,6 +3107,7 @@ class JarvisLive:
 
     def _qoder_on_tool(self, turn_id, name: str, tool_input: dict) -> None:
         self._qoder_touch()
+        self._qoder_tool_count += 1
         _metrics.inc("qoder.tools")
         short = ""
         try:
@@ -3085,7 +3161,7 @@ class JarvisLive:
         for sentence in sentences:
             self._qoder_say(turn_id, sentence)
 
-    def _qoder_finish(self, turn_id) -> None:
+    def _qoder_finish(self, turn_id, flush: bool = True) -> None:
         try:
             timer = self._qoder_turn_timer
             self._qoder_turn_timer = None
@@ -3118,6 +3194,8 @@ class JarvisLive:
         except Exception:
             pass
         _duck.up()
+        if flush:
+            self._qoder_flush_pending()
 
     def _qoder_on_done(self, turn_id, text: str) -> None:
         if self._qoder_ignore:
@@ -3165,24 +3243,27 @@ class JarvisLive:
         print(f"[QoderLive] turn error: {error}")
         _metrics.inc("qoder.error")
         _metrics.event(f"qoder turn error: {str(error)[:120]}")
-        self._qoder_finish(turn_id)
+        self._qoder_finish(turn_id, flush=False)
         if spoken and self._memory_librarian is not None:
             try:
                 self._memory_librarian.tick()
             except Exception as e:
                 print(f"[Librarian] tick: {e}")
         if not spoken and original:
-            # Nothing was said: let the existing brain answer this turn.
-            try:
-                if self._brain_q is not None:
-                    self._local_fallback_pending = True
-                    self._brain_q.put_nowait(original)
-            except Exception:
-                pass
+            # The local model is not a conversational fallback in this
+            # architecture: keep the turn for Qoder or say it failed.
+            if not self._qoder_live_ready():
+                self._qoder_hold(original, None, "erro no turno")
+            else:
+                self._say_now("O Qoder falhou neste turno. Pode repetir?")
+                self._qoder_flush_pending()
 
-    def _qoder_turn(self, text: str, pcm: bytes | None = None) -> None:
+    def _qoder_turn(self, text: str, pcm: bytes | None = None,
+                    retry: bool = False) -> None:
         """One user turn through the persistent Qoder session."""
         self._last_user_speech = time.monotonic()
+        if not retry:
+            self._qoder_retry_used = False
         speaker = None
         labeled_text = text
         if self._voice_id_enabled and self._speaker is not None and pcm:
@@ -3260,12 +3341,7 @@ class JarvisLive:
             self._qoder_turn_started = 0.0
             self._reply_active = False
             self._brain_busy = False
-            try:
-                if self._brain_q is not None:
-                    self._local_fallback_pending = True
-                    self._brain_q.put_nowait(text)
-            except Exception:
-                pass
+            self._qoder_hold(text, pcm, "ask falhou")
             return
         with self._qoder_lock:
             self._qoder_current_id = turn_id
@@ -3317,15 +3393,18 @@ class JarvisLive:
                 self._qoder_live.interrupt()
         except Exception:
             pass
-        self._qoder_finish(turn_id)
-        self._say_now("O Qoder demorou demais; vou responder pelo cérebro local.")
+        no_tools = self._qoder_tool_count == 0
+        self._qoder_finish(turn_id, flush=False)
+        if original and no_tools and not self._qoder_retry_used:
+            # A retry in the same session is the only fallback: the local
+            # model never takes over the conversation here.
+            self._qoder_retry_used = True
+            self._say_now("O Qoder travou nesse turno; vou tentar de novo.")
+            self._qoder_turn(original, retry=True)
+            return
         if original:
-            try:
-                if self._brain_q is not None:
-                    self._local_fallback_pending = True
-                    self._brain_q.put_nowait(original)
-            except Exception:
-                pass
+            self._say_now("O Qoder travou nesse turno. Pode repetir?")
+        self._qoder_flush_pending()
 
     def _voice_enroll_gate(self, text: str) -> bool:
         if not (self._voice_id_enabled and self._speaker is not None):
@@ -4420,9 +4499,17 @@ class JarvisLive:
                 _duck.up()
                 return
         self._memory_record_user(text)
-        # Architecture A: once the persistent Qoder session is warm, it takes
-        # the conversational turn. Gates above still win for instant local
-        # actions (music, apps, screen, memory, persona, code).
+        # Architecture A: the persistent Qoder session is the one
+        # conversational brain. Gates above still win for instant local
+        # actions (music, apps, screen, memory, persona, code); the local 7B
+        # answers only when Qoder itself delegates a task to it.
+        if self._qoder_live_enabled:
+            self._qoder_retry_used = False
+            if self._qoder_live_ready():
+                self._qoder_turn(text, pcm)
+            else:
+                self._qoder_hold(text, pcm)
+            return
         if self._qoder_live_ready():
             self._qoder_turn(text, pcm)
             return

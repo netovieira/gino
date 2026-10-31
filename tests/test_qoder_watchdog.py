@@ -34,21 +34,39 @@ class QoderWatchdogTest(unittest.TestCase):
         obj._qoder_ignore = False
         obj._qoder_live = FakeLive()
         obj._qoder_turn_timeout_s = 45.0
+        obj._qoder_tool_count = 0
+        obj._qoder_retry_used = False
+        obj._qoder_live_enabled = True
+        obj._qoder_turn_backlog = []
         obj._brain_q = FakeQueue()
         obj.said = []
         obj.finished = []
+        obj.retried = []
         obj._say_now = lambda text, log=True: obj.said.append(text)
-        obj._qoder_finish = lambda turn_id: obj.finished.append(turn_id)
+        obj._qoder_finish = lambda turn_id, flush=True: obj.finished.append(turn_id)
+        obj._qoder_turn = lambda text, pcm=None, retry=False: obj.retried.append(
+            (text, retry))
+        obj._qoder_flush_pending = lambda: None
         return obj
 
-    def test_timeout_interrupts_and_falls_back(self):
+    def test_timeout_retries_in_the_same_session(self):
         obj = self._obj()
         main.JarvisLive._qoder_turn_timeout(obj, "t1")
         self.assertEqual(obj._qoder_live.interrupted, 1)
         self.assertEqual(obj.finished, ["t1"])
-        self.assertEqual(obj._brain_q.items, ["texto original"])
+        self.assertEqual(obj.retried, [("texto original", True)])
+        self.assertEqual(obj._brain_q.items, [])     # never the local model
         self.assertTrue(obj.said)
         self.assertEqual(metrics.snapshot()["counters"].get("qoder.timeout"), 1)
+
+    def test_second_timeout_asks_the_user_instead_of_local(self):
+        obj = self._obj()
+        obj._qoder_retry_used = True
+        main.JarvisLive._qoder_turn_timeout(obj, "t1")
+        self.assertEqual(obj.finished, ["t1"])
+        self.assertEqual(obj.retried, [])
+        self.assertEqual(obj._brain_q.items, [])
+        self.assertTrue(any("Pode repetir" in s for s in obj.said))
 
     def test_stale_timeout_does_nothing(self):
         obj = self._obj(current="t2")
