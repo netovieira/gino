@@ -57,6 +57,27 @@ class QoderWatchdogTest(unittest.TestCase):
         self.assertEqual(obj.finished, [])
         self.assertEqual(obj._brain_q.items, [])
 
+    def test_recent_progress_rearms_instead_of_falling_back(self):
+        import time
+        obj = self._obj()
+        obj._qoder_turn_deadline = time.monotonic() + 60
+        obj._qoder_last_activity = time.monotonic()
+        armed = []
+        obj._arm_qoder_watchdog = lambda turn_id: armed.append(turn_id)
+        main.JarvisLive._qoder_turn_timeout(obj, "t1")
+        self.assertEqual(armed, ["t1"])
+        self.assertEqual(obj._qoder_live.interrupted, 0)
+        self.assertEqual(obj.finished, [])
+
+    def test_hard_deadline_falls_back_even_with_progress(self):
+        import time
+        obj = self._obj()
+        obj._qoder_turn_deadline = time.monotonic() - 1
+        obj._qoder_last_activity = time.monotonic()
+        main.JarvisLive._qoder_turn_timeout(obj, "t1")
+        self.assertEqual(obj._qoder_live.interrupted, 1)
+        self.assertEqual(obj.finished, ["t1"])
+
 
 if __name__ == "__main__":
     unittest.main()

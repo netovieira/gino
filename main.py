@@ -883,6 +883,14 @@ _VOICE_AUTHORIZE_RE = re.compile(
     r"\b(?:autoriza|autorize|libera|libere|permite|permita)\b[^.!?]{0,20}"
     r"\b(?:a|o|para)\s+([\wÀ-ÿ][\wÀ-ÿ'-]{1,29})",
     re.IGNORECASE)
+_VOICE_SELF_ENROLL_RE = re.compile(
+    r"\b(?:registra|registre|registrar|cadastra|cadastre|cadastrar|"
+    r"adiciona|adicione|adicionar|salva|salve|salvar)\b"
+    r"[^.!?]{0,40}\b(?:essa|esta)\s+(?:voz|amostra)\b"
+    r"|\b(?:registra|registre|registrar)\s+(?:essa|esta)\s+tamb[eé]m\b"
+    r"|\b(?:essa|esta)\s+(?:voz\s+)?(?:é|e)\s+minha\b"
+    r"|\b(?:registra|registre|registrar)\s+ela\s+(?:pra|para)\s+mim\b",
+    re.IGNORECASE)
 
 # Restart by voice: the request is deterministic (a gate), and the second
 # utterance must be the exact confirmation phrase from the owner's voice.
@@ -1297,6 +1305,10 @@ class JarvisLive:
         self._qoder_restart_thread = None
         self._qoder_turn_timer     = None
         self._qoder_turn_started   = 0.0
+        # A watchdog only fires when the turn *stalls*: every text/tool event
+        # pushes the deadline forward, and a hard cap stops runaway tool chains.
+        self._qoder_last_activity  = 0.0
+        self._qoder_turn_deadline  = 0.0
         self._qoder_tool_count     = 0
         self._qoder_turn_timeout_s = 45.0
         self._qoder_restart_limit  = 5
@@ -1307,10 +1319,13 @@ class JarvisLive:
         self._qoder_turns: dict[str, str] = {}
         self._qoder_current_id     = None
         self._qoder_ignore         = False
+        self._local_fallback_pending = False
         self._last_speaker: dict   = {}
         self._last_unknown_pcm     = None
         self._last_unknown_emb     = None
         self._last_unknown_at      = 0.0
+        self._last_known_emb       = None
+        self._last_known_at        = 0.0
         self._current_pcm          = None
         # Transcript-driven mouth shapes for the avatar. Fed from the receive
         # loop as words arrive, drained by the playback loop against the audio.
@@ -1799,6 +1814,8 @@ class JarvisLive:
             loop = asyncio.get_event_loop()
             while True:
                 text = await self._brain_q.get()
+                fallback_turn = bool(getattr(self, "_local_fallback_pending", False))
+                self._local_fallback_pending = False
                 self._interrupted = False
                 self._reply_active = True
                 if self._turn_done_event is not None:
@@ -1836,8 +1853,20 @@ class JarvisLive:
                     _sys = self._system_prompt_text
                 # The same conversation across trims, reconnects and restarts:
                 # summaries, open subjects and recent milestones in one block.
+                # chat_memory is the current account; the legacy journal is
+                # only used when the files are unavailable.
                 try:
-                    _cont = _continuity.prompt_block()
+                    _cont = ""
+                    if self._chat_memory is not None:
+                        _cont = self._chat_memory.prompt_block()
+                    if not _cont:
+                        _cont = _continuity.prompt_block()
+                    if fallback_turn:
+                        _cont += ("\n[FALLBACK] O Qoder não respondeu; quem fala "
+                                  "agora é o cérebro local. Use só o que está "
+                                  "nesta conversa e no bloco de memória. Não "
+                                  "invente nomes, arquivos, viagens, tarefas ou "
+                                  "lembranças; se não souber, diga que não sabe.")
                     if _cont:
                         _sys += "\n\n" + _cont
                 except Exception as e:
@@ -2169,7 +2198,10 @@ class JarvisLive:
                         self.ui.write_log(f"{self._asst_name}: {full}")
                         self._session_log.append(f"{self._asst_name}: {full}")
                         try:
-                            if self._chat_memory is not None:
+                            # A fallback answer may be improvised; the user
+                            # turn is still recorded, but the reply is not
+                            # promoted to memory as a fact.
+                            if self._chat_memory is not None and not fallback_turn:
                                 self._chat_memory.append_turn("assistant", full)
                             if self._memory_librarian is not None:
                                 self._memory_librarian.tick()
@@ -2192,7 +2224,6 @@ class JarvisLive:
                                               "cérebro ou a voz recusou (detalhes no "
                                               "terminal).")
                         _duck.up()      # no reply will speak: end the exchange
-                    self._session_log.append(f"User: {text}")
                     self._reply_active = False
                     self._turn_done_event.set()     # _play_audio drops the speaking flag when drained
                     self._brain_busy = False
@@ -3000,6 +3031,7 @@ class JarvisLive:
             _metrics.event(f"qoder restart scheduled in {delay:.0f}s")
 
     def _qoder_on_tool(self, turn_id, name: str, tool_input: dict) -> None:
+        self._qoder_touch()
         _metrics.inc("qoder.tools")
         short = ""
         try:
@@ -3041,6 +3073,7 @@ class JarvisLive:
     def _qoder_on_text(self, turn_id, text: str, delta: bool) -> None:
         if not text or self._qoder_ignore:
             return
+        self._qoder_touch()
         with self._qoder_lock:
             if self._qoder_current_id is not None and turn_id != self._qoder_current_id:
                 return
@@ -3069,6 +3102,8 @@ class JarvisLive:
         if self._qoder_turn_started:
             _metrics.observe("qoder.total_s", time.monotonic() - self._qoder_turn_started)
             self._qoder_turn_started = 0.0
+        self._qoder_last_activity = 0.0
+        self._qoder_turn_deadline = 0.0
         self._qoder_ignore = False
         self._reply_active = False
         try:
@@ -3140,6 +3175,7 @@ class JarvisLive:
             # Nothing was said: let the existing brain answer this turn.
             try:
                 if self._brain_q is not None:
+                    self._local_fallback_pending = True
                     self._brain_q.put_nowait(original)
             except Exception:
                 pass
@@ -3188,16 +3224,16 @@ class JarvisLive:
                         _duck.up()
                         return
                     speaker = primary_name
+                    emb = analysis.get("primary_embedding")
+                    if emb:
+                        self._last_known_emb = emb
+                        self._last_known_at = time.monotonic()
             except Exception as e:
                 print(f"[QoderLive] full diarization failed: {e}")
                 speaker = None
                 labeled_text = text
 
         _usage.note("gemini", turns=1)
-        try:
-            self.ui.write_log(f"YOU: {text}")
-        except Exception:
-            pass
 
         payload = labeled_text if "[FALANTE:" in labeled_text else (
             f"[FALANTE: {speaker}] {text}" if speaker else text)
@@ -3226,6 +3262,7 @@ class JarvisLive:
             self._brain_busy = False
             try:
                 if self._brain_q is not None:
+                    self._local_fallback_pending = True
                     self._brain_q.put_nowait(text)
             except Exception:
                 pass
@@ -3235,7 +3272,17 @@ class JarvisLive:
             self._qoder_text_buf[turn_id] = ""
             self._qoder_spoken[turn_id] = []
             self._qoder_turns[turn_id] = text
+        self._qoder_last_activity = time.monotonic()
+        self._qoder_turn_deadline = (self._qoder_last_activity
+                                     + min(300.0, max(180.0,
+                                                      self._qoder_turn_timeout_s * 4)))
+        self._arm_qoder_watchdog(turn_id)
+
+    def _arm_qoder_watchdog(self, turn_id) -> None:
         try:
+            timer = self._qoder_turn_timer
+            if timer is not None:
+                timer.cancel()
             timer = threading.Timer(self._qoder_turn_timeout_s,
                                     self._qoder_turn_timeout, args=(turn_id,))
             timer.daemon = True
@@ -3244,15 +3291,26 @@ class JarvisLive:
         except Exception as e:
             print(f"[QoderLive] turn watchdog: {e}")
 
+    def _qoder_touch(self) -> None:
+        """Any text/tool event proves the turn is alive; push the watchdog."""
+        self._qoder_last_activity = time.monotonic()
+
     def _qoder_turn_timeout(self, turn_id) -> None:
-        """A turn that never finishes falls back to the local brain."""
+        """A stalled turn falls back; a busy one just gets more time."""
         with self._qoder_lock:
             if self._qoder_current_id != turn_id or self._qoder_ignore:
                 return
             original = self._qoder_turns.get(turn_id, "")
-        print(f"[QoderLive] turn {turn_id} excedeu {self._qoder_turn_timeout_s:.0f}s")
+        now = time.monotonic()
+        hard = getattr(self, "_qoder_turn_deadline", 0.0) or 0.0
+        stalled = now - (getattr(self, "_qoder_last_activity", 0.0) or 0.0)
+        if now < hard and stalled < self._qoder_turn_timeout_s:
+            self._arm_qoder_watchdog(turn_id)
+            return
+        why = "prazo máximo" if now >= hard else f"{stalled:.0f}s sem progresso"
+        print(f"[QoderLive] turn {turn_id} excedeu {why}")
         _metrics.inc("qoder.timeout")
-        _metrics.event("qoder turn timeout")
+        _metrics.event(f"qoder turn timeout ({why})")
         self._qoder_ignore = True
         try:
             if self._qoder_live is not None:
@@ -3264,6 +3322,7 @@ class JarvisLive:
         if original:
             try:
                 if self._brain_q is not None:
+                    self._local_fallback_pending = True
                     self._brain_q.put_nowait(original)
             except Exception:
                 pass
@@ -3271,6 +3330,23 @@ class JarvisLive:
     def _voice_enroll_gate(self, text: str) -> bool:
         if not (self._voice_id_enabled and self._speaker is not None):
             return False
+        if _VOICE_SELF_ENROLL_RE.search(text):
+            sample = (self._last_unknown_emb or self._last_known_emb
+                      or self._last_unknown_pcm)
+            if sample is None:
+                self._say_now("Não tenho uma amostra da sua voz para registrar. "
+                              "Fale uma frase e repita o pedido.")
+                return True
+            try:
+                owner = self._speaker.owner_name
+                self._speaker.enroll(owner, sample, authorized=True)
+                self._last_unknown_emb = None
+                self._last_unknown_pcm = None
+                self._last_known_emb = None
+                self._say_now(f"Registrei essa variação como sua voz, {owner}.")
+            except Exception as e:
+                self._say_now(f"Não consegui registrar a voz: {str(e)[:80]}")
+            return True
         if _VOICE_LIST_RE.search(text):
             try:
                 records = self._speaker.list()
@@ -3345,6 +3421,7 @@ class JarvisLive:
         pending = self._power.pending() if self._power is not None else None
         if not pending:
             return False
+        self._log_heard(text)
         if not self._is_owner_pcm(pcm):
             self._power.cancel()
             self._say_now("Só o dono pode confirmar uma ação de energia. Cancelei o pedido.")
@@ -3434,6 +3511,7 @@ class JarvisLive:
         pending = self._restart.pending() if self._restart is not None else None
         if not pending:
             return False
+        self._log_heard(text)
         if not self._is_owner_pcm(pcm):
             self._restart.cancel()
             self._say_now("Só o dono pode confirmar um reinício. Cancelei o pedido.")
@@ -4171,7 +4249,16 @@ class JarvisLive:
             self._send_startup_briefing(force=True, greet=(why != "tool")), loop)
         return True
 
-    def _on_groq_text(self, text: str, pcm: bytes | None = None) -> None:
+    def _log_heard(self, text: str) -> None:
+        """Every utterance the user actually said belongs in the panel."""
+        try:
+            self.ui.write_log(f"YOU: {text}")
+            self._session_log.append(f"User: {text}")
+        except Exception:
+            pass
+
+    def _on_groq_text(self, text: str, pcm: bytes | None = None,
+                      _heard: bool = False) -> None:
         """An utterance came back from Groq — runs on its worker thread."""
         loop = getattr(self, "_loop", None)
         if not loop or not self.session:
@@ -4191,6 +4278,8 @@ class JarvisLive:
         if getattr(self, "_reply_active", False) or self._is_speaking:
             self._handle_barge_in(text)
             return
+        if not _heard:
+            self._log_heard(text)
         # Start of the stopwatch: everything the user waits for after speaking
         # is measured from here (see the [Latência] marks in _say).
         self._turn_t0 = time.monotonic()
@@ -4245,10 +4334,6 @@ class JarvisLive:
         # "Jarvis, bom dia" is handled here, before any model: the morning
         # routine itself is the answer, so nothing is sent for a reply.
         if self._is_good_morning(text):
-            try:
-                self.ui.write_log(f"YOU: {text}")
-            except Exception:
-                pass
             self.replay_briefing()
             return
         # Spoken root authorisation. Handled here, before any model, because the
@@ -4262,10 +4347,6 @@ class JarvisLive:
         except Exception:
             _waiting = False
         if _rootgate.looks_like_authorization(text, pending=_waiting):
-            try:
-                self.ui.write_log(f"YOU: {text}")
-            except Exception:
-                pass
             secs = _rootgate.open_window()
             try:
                 self.ui.write_log(f"SYS: Autorização de administrador concedida "
@@ -4302,13 +4383,6 @@ class JarvisLive:
                 if _dt > 1.0:
                     print(f"[Gate] {_gname} levou {_dt:.1f}s neste turno")
             if _hit:
-                # The panel has to show what was heard, even when a gate — not
-                # the brain — answers. Without this line the user sees a reply
-                # to something they cannot verify they ever said.
-                try:
-                    self.ui.write_log(f"YOU: {text}")
-                except Exception:
-                    pass
                 print(f"[Gate] {_gname} assumiu o turno: {text[:70]!r}")
                 self._memory_record_user(text)
                 try:
@@ -4346,10 +4420,6 @@ class JarvisLive:
             return
         self._last_user_speech = time.monotonic()
         _usage.note("gemini", turns=1)
-        try:
-            self.ui.write_log(f"YOU: {text}")
-        except Exception:
-            pass
 
         async def _send():
             try:
@@ -4438,6 +4508,7 @@ class JarvisLive:
         norm = clean.lower().strip(" .,!?")
         words = norm.split()
         if norm in _BACKCHANNEL or (len(words) <= 3 and words and words[0] in _BACKCHANNEL):
+            self._log_heard(clean)
             print(f"[Barge-in] backchannel ignored: {clean[:60]!r}")
             return
         addressed = re.match(r"^\s*gino\b", clean, re.IGNORECASE) is not None
@@ -4446,9 +4517,11 @@ class JarvisLive:
         if not stop:
             # A complement is not an interruption. Keep the answer going; the
             # next turn will still have the words if the user repeats them.
+            self._log_heard(clean)
             print(f"[Barge-in] complement kept: {clean[:70]!r}")
             return
         print(f"[Barge-in] voice interrupt: {clean[:80]!r}")
+        self._log_heard(clean)
         self.ui.write_log(f"SYS: interrompido por voz — «{clean[:60]}»")
         self._qoder_ignore = True
         try:
@@ -4458,7 +4531,7 @@ class JarvisLive:
             print(f"[QoderLive] interrupt: {e!r}")
         self.interrupt()
         # interrupt() dropped the flags, so this runs as a normal new turn.
-        self._on_groq_text(clean)
+        self._on_groq_text(clean, _heard=True)
 
     def speak(self, text: str):
         if not self._loop or not self.session:

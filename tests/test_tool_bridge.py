@@ -384,8 +384,9 @@ class DelegationTests(unittest.TestCase):
         }
         self.voice = {
             "list": lambda: ["Anthero", "Heloisa"],
-            "enroll": lambda name, authorized=False: {"name": name,
-                                                      "authorized": authorized},
+            "enroll": lambda name, pcm16_or_embeddings, authorized=False: {
+                "name": name, "authorized": authorized,
+                "vector": list(pcm16_or_embeddings)},
             "authorize": lambda name: {"authorized": name},
         }
         self.restart = {
@@ -423,9 +424,16 @@ class DelegationTests(unittest.TestCase):
 
         response = self.client.post("/voice/enroll", headers=AUTH,
                                     json={"name": "Heloisa", "authorized": True})
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("microphone", response.json()["detail"])
+
+        response = self.client.post("/voice/enroll", headers=AUTH,
+                                    json={"name": "Heloisa", "authorized": True,
+                                          "embedding": [0.1, 0.2, 0.3]})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["result"],
-                         {"name": "Heloisa", "authorized": True})
+                         {"name": "Heloisa", "authorized": True,
+                          "vector": [0.1, 0.2, 0.3]})
 
         response = self.client.post("/voice/authorize", headers=AUTH,
                                     json={"name": "Heloisa"})

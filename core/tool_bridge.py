@@ -188,6 +188,7 @@ class MemoryNoteRequest(BaseModel):
 class VoiceEnrollRequest(BaseModel):
     name: str
     authorized: bool = False
+    embedding: list[float] | None = None
 
 
 class VoiceAuthorizeRequest(BaseModel):
@@ -368,7 +369,16 @@ class ToolBridge:
             fn = self._find_method(self._voice, ("enroll", "enroll_voice"))
             if fn is None:
                 return self._not_configured("voice", "Voice bridge is not configured.")
+            # Audio never travels through the bridge: the sample is captured by
+            # the app's microphone. Without one, say so instead of a 500.
+            if not payload.embedding:
+                raise HTTPException(
+                    status_code=400,
+                    detail=("voice enrollment needs a voice sample from the "
+                            "microphone; ask the owner to say 'registra essa voz' "
+                            "in the app instead of calling this endpoint"))
             return await self._delegate(fn, name=payload.name,
+                                        pcm16_or_embeddings=payload.embedding,
                                         authorized=payload.authorized)
 
         @app.post("/voice/authorize", dependencies=auth)

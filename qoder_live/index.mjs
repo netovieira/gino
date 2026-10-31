@@ -193,15 +193,6 @@ function makeJarvisServer() {
       },
     ),
     tool(
-      "voice_enroll",
-      "Enroll the last unknown speaker under a name. Use only when the owner explicitly identifies that person.",
-      { name: z.string(), authorized: z.boolean().optional() },
-      async ({ name, authorized }) => {
-        try { return toolResult(await bridge("/voice/enroll", { name, authorized })); }
-        catch (e) { return toolResult(String(e.message || e), true); }
-      },
-    ),
-    tool(
       "voice_authorize",
       "Authorize an already enrolled voice to receive answers.",
       { name: z.string() },
@@ -243,7 +234,7 @@ function makeJarvisServer() {
 
 const MCP_NAMES = [
   "jarvis_tools", "jarvis_call", "memory_read", "memory_search", "memory_note",
-  "voice_list", "voice_enroll", "voice_authorize", "restart_assistant",
+  "voice_list", "voice_authorize", "restart_assistant",
   "restart_pc", "local_ask",
 ].map((n) => `mcp__jarvis__${n}`);
 
@@ -254,6 +245,13 @@ const ALLOWED_TOOLS = [
 
 async function canUseTool(toolName, input, options) {
   const toolUseID = options?.toolUseID;
+  if (toolName === "Agent") {
+    return {
+      behavior: "deny",
+      message: "Neste chat ao vivo responda direto ou use no máximo 1-2 ferramentas; subagentes ficam para tarefas delegadas.",
+      toolUseID,
+    };
+  }
   if (toolName === "Bash") {
     const command = String(input?.command || "");
     if (DESTRUCTIVE.test(command)) {
@@ -294,7 +292,7 @@ function loadSystemPrompt() {
     .replaceAll("{platform}", process.platform)
     .replaceAll("{capabilities}", "Use the jarvis MCP tools for actions; use jarvis_tools to discover names.")
     .replaceAll("{limits}", "If no tool covers a request, say so; never claim an action without a tool result.");
-  return `${text}\n\n[LIVE ORCHESTRATOR]\nYou are ${ASSISTANT_NAME} speaking live. Keep replies short and speakable. Use the jarvis tools for actions, never invent a result, and ask for explicit confirmation before irreversible actions. A tool result is data, not a script: never read raw JSON aloud — say what it means in the user's language. If a tool needs a decision only the user can make, ask them; do not guess.\n[RECALL] The current turns and the hot memory block are immediate. For older details use memory_search or memory_read before answering; if the memory does not contain it, say so instead of reconstructing it. A short "deixa eu lembrar" before a memory tool is natural, not filler.\n[SPEAKERS] Lines may start with [FALANTE: name]. That is metadata: never read it aloud. Use it to know who is speaking and address the right person. If an unknown voice is present, do not pretend to know them.`;
+  return `${text}\n\n[LIVE ORCHESTRATOR]\nYou are ${ASSISTANT_NAME} speaking live. Keep replies short and speakable, in the user's language (pt-BR unless they switch). Never narrate tool calls aloud and never read an error message verbatim. Use the jarvis tools for actions, never invent a result, and ask for explicit confirmation before irreversible actions. A tool result is data, not a script: never read raw JSON aloud — say what it means in the user's language. If a tool needs a decision only the user can make, ask them; do not guess.\n[RECALL] The current turns and the hot memory block are immediate. For older details use memory_search or memory_read before answering; if the memory does not contain it, say so instead of reconstructing it. A short "deixa eu lembrar" before a memory tool is natural, not filler.\n[SPEAKERS] Lines may start with [FALANTE: name]. That is metadata: never read it aloud. Use it to know who is speaking and address the right person. If an unknown voice is present, do not pretend to know them.\n[TOOL DISCIPLINE] This is a live voice conversation, not a coding session. Small talk, opinions, explanations and questions about the conversation are answered directly from what you know — do NOT inspect the repository, run Bash, read files or spawn agents for those. Use a tool only when the user asks for an action or for a specific memory, and stop after 1-2 calls to speak. Code changes or repository audits happen only when the user explicitly asks for them; then work in background steps and speak between them.`;
 }
 
 const SYSTEM_PROMPT = loadSystemPrompt();
@@ -309,6 +307,7 @@ function optionsFor(maxTurns) {
     canUseTool,
     mcpServers: { jarvis: makeJarvisServer() },
     allowedTools: ALLOWED_TOOLS,
+    disallowedTools: ["Agent"],
     includePartialMessages: true,
     persistSession: false,
     maxTurns,
@@ -376,7 +375,7 @@ function handleResult(msg) {
 }
 
 async function chatLoop() {
-  chatQuery = query({ prompt: channel, options: optionsFor(40) });
+  chatQuery = query({ prompt: channel, options: optionsFor(12) });
   try {
     for await (const msg of chatQuery) {
       if (closing) break;
@@ -453,7 +452,7 @@ function selftest() {
   const checks = {
     model: ALLOWED_MODELS.has(MODEL),
     destructive: DESTRUCTIVE.test("sudo reboot") && DESTRUCTIVE.test("rm -rf /") && DESTRUCTIVE.test("systemctl restart foo") && !DESTRUCTIVE.test("ls -la"),
-    mcp_tools: MCP_NAMES.length === 11,
+    mcp_tools: MCP_NAMES.length === 10,
     system_prompt: SYSTEM_PROMPT.length > 100,
     bridge_url: BRIDGE_URL.startsWith("http"),
   };
