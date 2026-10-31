@@ -3331,8 +3331,16 @@ class JarvisLive:
         if not (self._voice_id_enabled and self._speaker is not None):
             return False
         if _VOICE_SELF_ENROLL_RE.search(text):
-            sample = (self._last_unknown_emb or self._last_known_emb
-                      or self._last_unknown_pcm)
+            # Only a recent sample counts: enrolling a voice captured many
+            # minutes ago could bind the wrong person's timbre to the owner.
+            now = time.monotonic()
+            fresh = 120.0
+            sample = self._last_unknown_emb or self._last_unknown_pcm
+            if now - (self._last_unknown_at or 0.0) > fresh:
+                sample = None
+            if (sample is None and self._last_known_emb is not None
+                    and now - (getattr(self, "_last_known_at", 0.0) or 0.0) <= fresh):
+                sample = self._last_known_emb
             if sample is None:
                 self._say_now("Não tenho uma amostra da sua voz para registrar. "
                               "Fale uma frase e repita o pedido.")
