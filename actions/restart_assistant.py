@@ -1,0 +1,115 @@
+"""
+The spoken-confirmation restart gate, as a tool.
+
+The actual protocol lives in core/restart.py: a request is only parked, and
+only an explicit "confirmo reiniciar" runs it. This file is a thin, safe shell
+around that manager so both the Live model (through auto-discovery) and the
+Qoder bridge can reach it.
+
+The module-level manager is bound once by main.py:
+
+    from actions.restart_assistant import bind
+    bind(restart_manager)
+
+With nothing bound every call returns a clear error — the tool never falls back
+to a restart nobody asked for.
+"""
+from __future__ import annotations
+
+from typing import Optional
+
+from core.restart import RestartManager
+
+_manager: Optional[RestartManager] = None
+
+_ASSISTANT_ACTIONS = {
+    "assistant", "assistente", "self", "me", "jarvis", "restart_assistant",
+}
+_PC_ACTIONS = {
+    "pc", "computer", "computador", "machine", "restart_pc",
+}
+_CONFIRM_ACTIONS = {"confirm", "confirmo", "confirmar"}
+_CANCEL_ACTIONS = {"cancel", "cancelar", "abort"}
+_STATUS_ACTIONS = {"status", "pending", "state"}
+
+
+def bind(manager: Optional[RestartManager]) -> None:
+    """Wire the tool to the app's RestartManager (None unbinds it)."""
+    global _manager
+    _manager = manager
+
+
+def _status_text(manager: RestartManager) -> str:
+    p = manager.pending()
+    if p is None:
+        return "No restart is awaiting confirmation."
+    return (f"The {p['kind']} restart is awaiting the spoken phrase "
+            f"'{p['phrase']}' ({p['expires_in']}s left). Nothing has restarted.")
+
+
+def restart_assistant(parameters: dict, player=None, speak=None,
+                      session_memory=None) -> str:
+    """Model-facing handler. Only ever returns words, never a side effect of
+    its own: the manager decides what a request and a confirmation mean."""
+    if _manager is None:
+        return ("Restart is not available: no RestartManager is bound to this "
+                "tool. Nothing was done.")
+
+    p = parameters or {}
+    action = str(p.get("action") or "status").strip().lower()
+    reason = str(p.get("reason") or "").strip()
+    phrase = str(p.get("phrase") or "").strip()
+
+    if action in _ASSISTANT_ACTIONS:
+        return _manager.request_assistant(reason=reason)
+    if action in _PC_ACTIONS:
+        return _manager.request_pc(reason=reason)
+    if action in _CONFIRM_ACTIONS:
+        return _manager.confirm(phrase)
+    if action in _CANCEL_ACTIONS:
+        return _manager.cancel()
+    if action in _STATUS_ACTIONS:
+        return _status_text(_manager)
+
+    return (f"Unknown action '{action}'. Use action='assistant', 'pc', "
+            f"'confirm', 'cancel' or 'status'. Nothing was done.")
+
+
+TOOL = {
+    "name": "restart_assistant",
+    "description": (
+        "Restart the assistant itself or the computer. Never happens on the "
+        "first call: action='assistant' or action='pc' only parks a request and "
+        "asks the user to say the phrase out loud. Then call action='confirm' "
+        "with exactly that phrase ('confirmo reiniciar o assistente' or "
+        "'confirmo reiniciar o computador'). Never claim a restart happened "
+        "before the confirmation is accepted. action='cancel' drops a pending "
+        "request; action='status' reports one. Never use the PC restart as part "
+        "of an automatic improvement."
+    ),
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "action": {
+                "type": "STRING",
+                "description": (
+                    "'assistant' | 'pc' | 'confirm' | 'cancel' | 'status'"
+                ),
+            },
+            "reason": {
+                "type": "STRING",
+                "description": "Short reason for the restart (optional).",
+            },
+            "phrase": {
+                "type": "STRING",
+                "description": (
+                    "For action='confirm': the owner's exact spoken phrase, "
+                    "'confirmo reiniciar o assistente' or "
+                    "'confirmo reiniciar o computador'."
+                ),
+            },
+        },
+        "required": ["action"],
+    },
+    "handler": restart_assistant,
+}
