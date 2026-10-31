@@ -28,6 +28,13 @@ class BoostQuietTest(unittest.TestCase):
         silent = bytes(32000)
         self.assertEqual(groq_stt._boost_quiet(silent), silent)
 
+    def test_boost_keeps_headroom_on_a_spike(self):
+        x = np.full(16000, 300, dtype=np.int16)
+        x[8000] = 25000
+        boosted = np.frombuffer(groq_stt._boost_quiet(x.tobytes()),
+                                dtype=np.int16)
+        self.assertLessEqual(int(np.max(np.abs(boosted))), int(0.96 * 32767))
+
 
 class SpeakingCapTest(unittest.TestCase):
     def setUp(self):

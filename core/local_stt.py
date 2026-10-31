@@ -244,7 +244,10 @@ class _Whisper:
         if audio.size:
             rms = float(np.sqrt(np.mean(audio * audio)))
             if 0.004 <= rms < 0.03:
-                audio = np.clip(audio * min(10.0, 0.055 / rms), -1.0, 1.0)
+                audio = audio * min(10.0, 0.055 / rms)
+                peak = float(np.max(np.abs(audio)))
+                if peak > 0.95:
+                    audio = audio * (0.95 / peak)
         # Greedy decoding is what turns a short command into a different short
         # command ("pela ajuda" came back as "pela futebol"): with beam 1 the
         # model commits to the first plausible token and never looks back. On a

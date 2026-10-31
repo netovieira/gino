@@ -104,8 +104,13 @@ def _boost_quiet(pcm16: bytes) -> bytes:
     gain = min(_MAX_GAIN, _TARGET_RMS / rms)
     if gain <= 1.2:
         return pcm16
-    y = np.clip(f * gain, -1.0, 1.0) * 32767.0
-    return y.astype(np.int16).tobytes()
+    y = f * gain
+    # Soft ceiling instead of hard clipping: a loud consonant on top of the
+    # boost is scaled down, so the extra input gain never turns into distortion.
+    peak = float(np.max(np.abs(y)))
+    if peak > 0.95:
+        y *= 0.95 / peak
+    return (y * 32767.0).astype(np.int16).tobytes()
 
 
 def settings(get_plugin_config: Callable[[str], dict]) -> dict:
