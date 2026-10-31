@@ -2,12 +2,11 @@
 Qoder bridge — the assistant's door to Qoder's models.
 
 WHAT THIS IS
-    Qoder is an IDE, and its models are reached through a small local server:
+    Qoder is an IDE, and its models are reached either through the CLI the
+    person already logged in to, or through a small local server:
     `qoder-proxy` (setup-qoder.sh), which speaks the OpenAI chat-completions
-    API and forwards each request to Qoder on the person's own paid plan. So
-    from this application's point of view Qoder is a LOCAL model server: it
-    listens on 127.0.0.1, it costs nothing per call, and it is already the
-    fastest thing reachable. That is why it leads the brain chain.
+    API. Only FREE models are allowed here (see FREE_MODELS): the assistant
+    must never be able to pick a paid model by accident.
 
     Two things use it:
 
@@ -30,7 +29,7 @@ SETTINGS
         thinking   adaptive | enabled | disabled | auto
         reasoning_effort  low | medium | high | max
         context_window    tokens (e.g. 1000000 for the 1M window)
-        workspace  ~/JarvisProjects              (where written files land)
+        workspace  the project folder                (default: this repo)
 
     TRANSPORTS
       cli    calls the `qoder` binary the person already has installed and
@@ -65,29 +64,32 @@ NAMESPACE = "qoder"
 CONTAINER = "qoder-proxy"
 DEFAULT_BASE_URL = "http://127.0.0.1:3000/v1"
 # Model ids for the CLI's --model flag (qoder --list-models).
-DEFAULT_MODEL = "DeepSeek-Flash"
+# FREE ONLY — the assistant may never select a paid model. "Auto" and
+# "Efficient" are deliberately absent: Auto can pick a paid model on its own.
+FREE_MODELS = ("DeepSeek-Flash", "Qwen3.8-Flash")
+HEAVY_MODEL = "DeepSeek-Flash"   # delegated work: deeper reasoning, 1M window
+FAST_MODEL = "Qwen3.8-Flash"     # conversation: quick, thinking off, small window
+DEFAULT_MODEL = HEAVY_MODEL
 CLI_DEFAULT_THINKING = "adaptive"      # auto | adaptive | enabled | disabled
 CLI_DEFAULT_EFFORT   = "max"           # low | medium | high | max
 CLI_DEFAULT_CONTEXT  = 1_000_000        # 1M-token window
-DEFAULT_WORKSPACE = "~/JarvisProjects"
+FAST_THINKING = "disabled"
+FAST_EFFORT = "low"
+FAST_CONTEXT = 32_768
 DEFAULT_TIMEOUT = 120
 
-# What the proxy advertises, by what each one is for. Labels only — the id on
-# the left is what goes on the wire. Offered in the settings form so nobody has
-# to remember ids like "gm51model".
+# Only the free models are offered. The id on the left is what goes on the
+# wire; the label says what each one is for.
 MODELS = {
-    "DeepSeek-Flash":      "DeepSeek Flash — free, 1M context (recomendado)",
-    "DeepSeek-V4-Pro":     "DeepSeek V4 Pro — raciocínio mais fundo",
-    "Qwen3.8-Max":         "Qwen 3.8 Max",
-    "Qwen3.8-Flash":       "Qwen 3.8 Flash — rápido",
-    "Kimi-K3.1-Pro":       "Kimi K3.1 Pro",
-    "Kimi-K2.8-Preview":   "Kimi K2.8 (preview)",
-    "GLM-5.3":             "GLM 5.3",
-    "GLM-5.3-Flash":       "GLM 5.3 Flash",
-    "MiniMax-M3.1-Flash":  "MiniMax M3.1 Flash",
-    "Efficient":           "Efficient — o mais barato",
-    "Auto":                "Auto — o Qoder escolhe por tarefa",
+    "DeepSeek-Flash": "DeepSeek Flash — free, 1M context (trabalho pesado)",
+    "Qwen3.8-Flash":  "Qwen 3.8 Flash — free, rápido (conversa)",
 }
+
+
+def free_model(model: str | None) -> str:
+    """The requested model if it is on the free allowlist, else the heavy one."""
+    m = str(model or "").strip()
+    return m if m in FREE_MODELS else HEAVY_MODEL
 
 # The answer to "why is the proxy not there": these two do not get better by
 # being retried within the same turn.
@@ -120,8 +122,16 @@ def _env_file() -> dict:
     return out
 
 
-def settings(get_plugin_config=None) -> dict:
-    """The effective Qoder settings: form values first, env file second."""
+def settings(get_plugin_config=None, profile: str = "work") -> dict:
+    """The effective Qoder settings: form values first, env file second.
+
+    `profile="fast"` is the conversation profile: a free fast model with
+    thinking off, low effort and a small context — a chat turn should not wait
+    on a 1M-token reasoning pass. `profile="work"` is the delegated-job
+    profile. Either way the model is clamped to FREE_MODELS and the CLI runs
+    with full access (`bypass_permissions`), because JARVIS calls it from a
+    non-interactive process where nobody could answer a permission prompt.
+    """
     cfg: dict = {}
     try:
         if get_plugin_config is None:
@@ -133,15 +143,16 @@ def settings(get_plugin_config=None) -> dict:
     env = _env_file()
 
     base = str(cfg.get("base_url") or "").strip().rstrip("/") or DEFAULT_BASE_URL
-    model = str(cfg.get("model") or "").strip() or str(env.get("MODEL") or "").strip() or DEFAULT_MODEL
-    workspace = str(cfg.get("workspace") or "").strip() or DEFAULT_WORKSPACE
+    model = free_model(str(cfg.get("model") or "").strip()
+                       or str(env.get("MODEL") or "").strip()
+                       or HEAVY_MODEL)
+    workspace = str(cfg.get("workspace") or "").strip() or str(BASE_DIR)
     try:
         timeout = int(cfg.get("timeout") or DEFAULT_TIMEOUT)
     except (TypeError, ValueError):
         timeout = DEFAULT_TIMEOUT
-    # The CLI is the default transport: it reaches the free DeepSeek-Flash with
-    # a 1M window and a real thinking budget, and it does not depend on the
-    # container. "proxy" keeps the old OpenAI-style path as an explicit choice.
+    # The CLI is the default transport: it reaches the free models without
+    # depending on the container. "proxy" keeps the OpenAI-style path.
     transport = str(cfg.get("transport") or "cli").strip().lower()
     thinking = str(cfg.get("thinking") or CLI_DEFAULT_THINKING).strip().lower()
     effort = str(cfg.get("reasoning_effort") or CLI_DEFAULT_EFFORT).strip().lower()
@@ -153,15 +164,21 @@ def settings(get_plugin_config=None) -> dict:
         think_budget = int(cfg.get("thinking_budget") or 0)
     except (TypeError, ValueError):
         think_budget = 0
-    # Full access is the default now, because the user asked for it. The two
-    # knobs that control it are read here so they can be taken back from the
-    # settings form without touching code: "default" tools + a permission mode
-    # of "default" restores the old pure-reply behaviour.
     tools_arg = cfg.get("tools")
     tools_arg = "default" if tools_arg is None else str(tools_arg)
-    perm = str(cfg.get("permission_mode") or "bypass_permissions").strip().lower()
-    if perm not in ("default", "accept_edits", "bypass_permissions", "dont_ask", "auto"):
-        perm = "bypass_permissions"
+
+    if profile == "fast":
+        model = FAST_MODEL
+        thinking = FAST_THINKING
+        effort = FAST_EFFORT
+        context = FAST_CONTEXT
+        tools_arg = ""
+        think_budget = 0
+
+    # Full access — always. JARVIS runs `qoder -p`: there is no terminal and
+    # nobody to approve a tool, so any other mode blocks until the watchdog
+    # kills the job. This is not configurable on purpose.
+    perm = "bypass_permissions"
     return {
         "base_url": base,
         "api_key": str(cfg.get("api_key") or env.get("PROXY_API_KEY") or "").strip(),
@@ -176,6 +193,7 @@ def settings(get_plugin_config=None) -> dict:
         "thinking_budget": think_budget,
         "tools": tools_arg,
         "permission_mode": perm,
+        "profile": "fast" if profile == "fast" else "work",
     }
 
 
@@ -264,46 +282,46 @@ def ensure_running(st: dict | None = None, wait: float = _START_TIMEOUT) -> bool
 # ── asking ──────────────────────────────────────────────────────────────────
 
 def ask_stream(prompt: str, st: dict | None = None,
-               on_text=None, on_tool=None,
+               on_text=None, on_tool=None, on_progress=None,
                model: str | None = None, system: str | None = None,
-               timeout: float | None = None) -> str:
-    """One CLI turn, narrated while it works — then the final answer.
+               timeout: float | None = None,
+               cwd: str | os.PathLike | None = None,
+               cancel_event: threading.Event | None = None) -> str:
+    """One CLI turn, with the events the caller needs to narrate progress.
 
-    The non-streamed call only speaks at the end, which for a coding task means
-    20–40 seconds of silence and then a wall of text. In `stream-json` the same
-    turn arrives as events, and the model's own progress lines are right there:
+    The turn arrives as line-delimited `stream-json`. Assistant text is handed
+    to `on_text` (the caller may choose not to speak it), tool use to
+    `on_tool`, and progress/summary events to `on_progress` as dicts — that is
+    how a background job knows what Qoder is doing without replaying its prose.
 
-        {"type":"assistant","content":[{"type":"text","text":"Vou olhar …"}]}
-        {"type":"assistant","content":[{"type":"tool_use","name":"Read", …}]}
-        {"type":"result","result":"…"}
-
-    `on_text` receives the sentences worth saying out loud (the model writes them
-    for the user); `on_tool` receives (name, input) so the caller can decide
-    whether a short "lendo tal arquivo" is useful. Returns the final result.
+    A missing result is an ERROR now, with the real reason (watchdog timeout,
+    last stderr lines), never an empty string. `cancel_event` kills the process
+    on request; `cwd` makes Qoder's own tools work inside the project.
     """
     cli = _find_cli()
     if not cli:
         raise RuntimeError("qoder CLI não encontrado no PATH nem em ~/.qodersec/bin")
     st = st or settings()
+    model = free_model(model or st["model"])
     full = prompt if not system else f"{system}\n\n---\n\n{prompt}"
     thinking = st.get("thinking") or CLI_DEFAULT_THINKING
     tools_arg = str(st.get("tools") if st.get("tools") is not None else "default")
-    perm = str(st.get("permission_mode") or "bypass_permissions").strip()
     cmd = [cli, "-p", "--output-format", "stream-json",
-           "--model", model or st["model"],
+           "--model", model,
            "--thinking", thinking,
            "--reasoning-effort", st.get("reasoning_effort") or CLI_DEFAULT_EFFORT,
            "--context-window", str(int(st.get("context_window") or CLI_DEFAULT_CONTEXT)),
            "--tools", tools_arg,
            "--max-output-tokens", "8192",
-           "--no-session-persistence"]
-    if perm:
-        cmd += ["--permission-mode", perm]
-    cmd += ["--", full]
+           "--no-session-persistence",
+           "--permission-mode", "bypass_permissions",
+           "--", full]
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, bufsize=1)
+                            text=True, bufsize=1,
+                            cwd=str(cwd) if cwd else None)
     limit = float(timeout or st.get("timeout") or DEFAULT_TIMEOUT)
+    timed_out = [False]
 
     def _kill() -> None:
         try:
@@ -311,13 +329,40 @@ def ask_stream(prompt: str, st: dict | None = None,
         except Exception:
             pass
 
-    watchdog = threading.Timer(limit, _kill)
+    def _on_timeout() -> None:
+        timed_out[0] = True
+        _kill()
+
+    watchdog = threading.Timer(limit, _on_timeout)
     watchdog.daemon = True
     watchdog.start()
+
+    stderr_lines: list[str] = []
+
+    def _drain_stderr() -> None:
+        try:
+            for line in proc.stderr:
+                line = line.strip()
+                if line:
+                    stderr_lines.append(line)
+                    if len(stderr_lines) > 20:
+                        del stderr_lines[:-20]
+        except Exception:
+            pass
+
+    threading.Thread(target=_drain_stderr, daemon=True, name="qoder-stderr").start()
+
+    if cancel_event is not None:
+        def _watch_cancel() -> None:
+            cancel_event.wait()
+            _kill()
+        threading.Thread(target=_watch_cancel, daemon=True, name="qoder-cancel").start()
 
     final = ""
     try:
         for line in proc.stdout:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             line = line.strip()
             if not line.startswith("{"):
                 continue
@@ -333,27 +378,51 @@ def ask_stream(prompt: str, st: dict | None = None,
                         txt = str(part.get("text") or "").strip()
                         if txt and on_text:
                             on_text(txt)
-                    elif kind == "tool_use" and on_tool:
-                        try:
-                            on_tool(str(part.get("name") or ""),
-                                    part.get("input") or {})
-                        except Exception:
-                            pass
+                    elif kind == "tool_use":
+                        name = str(part.get("name") or "")
+                        data = part.get("input") or {}
+                        if on_tool:
+                            try:
+                                on_tool(name, data)
+                            except Exception:
+                                pass
+                        if on_progress:
+                            try:
+                                on_progress({"kind": "tool", "name": name, "input": data})
+                            except Exception:
+                                pass
+            elif typ in ("progress", "tool_use_summary"):
+                if on_progress:
+                    try:
+                        on_progress({"kind": typ,
+                                     "data": ev.get("data") or ev.get("summary") or {},
+                                     "tool_use_id": ev.get("tool_use_id")})
+                    except Exception:
+                        pass
             elif typ == "result":
+                if _cli_failed(ev):
+                    raise _cli_error(ev)
                 final = str(ev.get("result") or "")
-                if ev.get("is_error"):
-                    raise RuntimeError(str(ev.get("result"))[:300])
-        proc.wait(timeout=5)
+                if not final.strip():
+                    raise RuntimeError("qoder CLI terminou sem resposta")
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            _kill()
     finally:
         watchdog.cancel()
         try:
             proc.stdout.close()
         except Exception:
             pass
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("cancelado")
     if not final:
-        err = (proc.stderr.read() or "").strip() if proc.stderr else ""
-        if err:
-            raise RuntimeError(err[:300])
+        detail = " / ".join(stderr_lines[-3:])
+        if timed_out[0]:
+            raise RuntimeError(f"o Qoder passou de {limit:.0f}s sem terminar")
+        raise RuntimeError("o Qoder terminou sem resposta" + (f": {detail}" if detail else ""))
     return final
 
 
@@ -389,33 +458,61 @@ def _find_cli() -> str | None:
     return str(cand) if cand.exists() else None
 
 
+def find_cli() -> str | None:
+    """Public check: is the CLI reachable? The job runner uses it to decide
+    whether write mode means "edit directly" or "return JSON for us to apply"."""
+    return _find_cli()
+
+
+def _cli_error(event: dict) -> RuntimeError:
+    """A human-readable error from a CLI result/error event.
+
+    The CLI reports failures as `{"type":"result","subtype":
+    "error_during_execution","errors":[...],"error_code":500}` — sometimes with
+    no "result" field at all. Returning that stdout as the assistant's answer is
+    how a raw JSON blob once got spoken aloud; every caller must raise instead.
+    """
+    errors = event.get("errors") or []
+    if isinstance(errors, str):
+        errors = [errors]
+    detail = str(errors[0]) if errors else str(event.get("result") or "").strip()
+    if not detail:
+        detail = str(event.get("subtype") or "erro sem detalhe")
+    code = event.get("error_code")
+    suffix = f" (código {code})" if code not in (None, "", 0) else ""
+    return RuntimeError(f"qoder CLI devolveu erro{suffix}: {detail[:300]}")
+
+
+def _cli_failed(event: dict) -> bool:
+    return bool(event.get("is_error")
+                or str(event.get("subtype") or "").startswith("error")
+                or event.get("error_code")
+                or event.get("errors"))
+
+
 def _ask_cli(prompt: str, st: dict, model: str | None = None,
              system: str | None = None, max_tokens: int = 1024,
-             timeout: float | None = None) -> str:
+             timeout: float | None = None,
+             cwd: str | os.PathLike | None = None) -> str:
     """One non-interactive `qoder -p` turn, returned as text.
 
     FULL ACCESS — deliberate, and asked for by the user. `--tools default` gives
     the CLI its whole built-in toolset (Bash, Read, Edit, Grep, …) and
     `--permission-mode bypass_permissions` stops it from blocking on an approval
     prompt that nobody is there to answer in `-p` mode. The consequence is
-    exactly what it sounds like: this agent can now change files and run shell
-    commands on this machine by itself.
-
-    To take it back, set plugin_config.qoder.permission_mode to "default" and
-    plugin_config.qoder.tools to "" (the values are read here on every call).
-
-    Thinking, effort and context come from settings so the same choices (free
-    DeepSeek-Flash, 1M window, max effort) hold for every delegated task.
+    exactly what it sounds like: this agent can change files and run shell
+    commands on this machine by itself. The model is clamped to the free
+    allowlist so "full access" never becomes "paid model".
     """
     cli = _find_cli()
     if not cli:
         raise RuntimeError("qoder CLI não encontrado no PATH nem em ~/.qodersec/bin")
     full = prompt if not system else f"{system}\n\n---\n\n{prompt}"
+    model = free_model(model or st["model"])
     thinking = st.get("thinking") or CLI_DEFAULT_THINKING
     tools_arg = str(st.get("tools") if st.get("tools") is not None else "default")
-    perm = str(st.get("permission_mode") or "bypass_permissions").strip()
     cmd = [cli, "-p", "--output-format", "json",
-           "--model", model or st["model"],
+           "--model", model,
            "--thinking", thinking]
     if thinking == "enabled" and int(st.get("thinking_budget") or 0) > 0:
         cmd += ["--thinking-budget", str(int(st["thinking_budget"]))]
@@ -423,16 +520,17 @@ def _ask_cli(prompt: str, st: dict, model: str | None = None,
             "--context-window", str(int(st.get("context_window") or CLI_DEFAULT_CONTEXT)),
             "--tools", tools_arg,
             "--max-output-tokens", str(max(64, int(max_tokens))),
-            "--no-session-persistence"]
-    if perm:
-        cmd += ["--permission-mode", perm]
-    cmd += ["--", full]
+            "--no-session-persistence",
+            "--permission-mode", "bypass_permissions",
+            "--", full]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout or st["timeout"])
+                           timeout=timeout or st["timeout"],
+                           cwd=str(cwd) if cwd else None)
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"qoder CLI não respondeu em {timeout or st['timeout']}s")
+        raise RuntimeError(f"o Qoder passou de {(timeout or st['timeout']):.0f}s sem terminar")
     out = (r.stdout or "").strip()
+    saw_json = False
     for line in out.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -441,14 +539,28 @@ def _ask_cli(prompt: str, st: dict, model: str | None = None,
             j = json.loads(line)
         except Exception:
             continue
-        if isinstance(j, dict) and "result" in j:
+        if not isinstance(j, dict):
+            continue
+        saw_json = True
+        # Any event that says it failed ends the turn as an error. Checking the
+        # whole object, not just `result`, covers the CLI's synthetic result
+        # event, which carries no answer text.
+        if _cli_failed(j) and j.get("type") in ("result", "error", None):
+            raise _cli_error(j)
+        if j.get("type") == "result" or "result" in j:
+            if _cli_failed(j):
+                raise _cli_error(j)
             text = str(j.get("result") or "").strip()
-            if j.get("is_error"):
-                raise RuntimeError(f"qoder CLI devolveu erro: {text[:300]}")
+            if not text:
+                raise RuntimeError("qoder CLI terminou sem resposta")
             return text
-    if r.returncode != 0 and not out:
-        raise RuntimeError(f"qoder CLI falhou (rc={r.returncode}): "
-                           f"{(r.stderr or '').strip()[:300]}")
+    if r.returncode != 0:
+        detail = (r.stderr or "").strip() or out[:300]
+        raise RuntimeError(f"qoder CLI falhou (rc={r.returncode}): {detail[:300]}")
+    if saw_json:
+        # A JSON stream that never produced a result is a broken turn, not an
+        # answer. Never hand the raw object to the voice.
+        raise RuntimeError(f"qoder CLI devolveu uma resposta inválida: {out[:200]}")
     return out
 
 
@@ -465,7 +577,7 @@ def _ask_proxy(prompt: str, st: dict, model: str | None = None,
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    payload = {"model": model or st["model"], "messages": messages,
+    payload = {"model": free_model(model or st["model"]), "messages": messages,
                "temperature": temperature, "max_tokens": max_tokens,
                "stream": False}
     try:

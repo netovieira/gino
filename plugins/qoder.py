@@ -38,7 +38,7 @@ PLUGIN_SETTINGS = {
         {"key": "model", "label": "Default model", "type": "choice",
          "options": list(MODELS), "default": DEFAULT_MODEL},
         {"key": "workspace", "label": "Workspace (where 'write' mode saves)", "type": "text",
-         "placeholder": "~/JarvisProjects"},
+         "placeholder": "/home/anthero/jarvis"},
         {"key": "auto_start", "label": "Start the container when it is down", "type": "toggle",
          "default": True},
     ],
