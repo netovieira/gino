@@ -260,7 +260,13 @@ const ALLOWED_TOOLS = [
 
 async function canUseTool(toolName, input, options) {
   const toolUseID = options?.toolUseID;
+  const inAgent = Boolean(options?.agentID);
   if (toolName === "Agent") {
+    if (inAgent) {
+      return { behavior: "deny",
+               message: "Não aninhe subagentes; termine esta tarefa no agente atual.",
+               toolUseID };
+    }
     // The owner's rule: executions always run in a background subagent, so the
     // live conversation is never held by a command. Force the flag even when
     // the model forgets it.
@@ -280,7 +286,7 @@ async function canUseTool(toolName, input, options) {
     if (/\bgit\s+push\b/i.test(command)) {
       // Pushing is visible to others. Only a background agent may do it, and
       // only inside the window opened by the owner explicitly asking to push.
-      if (options?.agentID && Date.now() < sharedActionUntil) {
+      if (inAgent && Date.now() < sharedActionUntil) {
         return { behavior: "allow", toolUseID };
       }
       return {
@@ -292,11 +298,11 @@ async function canUseTool(toolName, input, options) {
     if (DESTRUCTIVE.test(command) || FORBIDDEN_BASH.test(command)) {
       return {
         behavior: "deny",
-        message: "Comando negado no chat ao vivo: delegue esta execução a um Agent em segundo plano e peça autorização ao dono.",
+        message: "Comando destrutivo negado. Use uma ferramenta própria, com autorização falada do dono.",
         toolUseID,
       };
     }
-    if (!READONLY_BASH.test(command)) {
+    if (!inAgent && !READONLY_BASH.test(command)) {
       return {
         behavior: "deny",
         message: "O chat ao vivo só roda consultas rápidas. Para qualquer execução (push, edição, instalação, serviço), chame Agent com run_in_background=true e continue conversando.",
@@ -305,12 +311,16 @@ async function canUseTool(toolName, input, options) {
     }
   }
   if (toolName === "Edit" || toolName === "Write" || toolName === "NotebookEdit") {
-    return {
-      behavior: "deny",
-      message: "Edição de arquivo é execução: delegue a um Agent em segundo plano (run_in_background=true) e continue a conversa.",
-      toolUseID,
-    };
+    if (!inAgent) {
+      return {
+        behavior: "deny",
+        message: "Edição de arquivo é execução: delegue a um Agent em segundo plano (run_in_background=true) e continue a conversa.",
+        toolUseID,
+      };
+    }
+    return { behavior: "allow", toolUseID };
   }
+  if (inAgent) return { behavior: "allow", toolUseID };
   // One turn must not become a twenty-command investigation while the user is
   // waiting in a live conversation. The budget resets on every new ask.
   if (turnTools >= MAX_TOOLS_PER_TURN) return denyBudget(toolUseID);
@@ -326,9 +336,16 @@ function denyBudget(toolUseID) {
   };
 }
 
+function orchestrationPrompt() {
+  return `[LIVE ORCHESTRATOR]\nYou are ${ASSISTANT_NAME} speaking live. Keep replies short and speakable, in the user's language (pt-BR unless they switch). Never narrate tool calls aloud and never read an error message verbatim. Use the jarvis tools for actions, never invent a result, and ask for explicit confirmation before irreversible actions. A tool result is data, not a script: never read raw JSON aloud — say what it means in the user's language. If a tool needs a decision only the user can make, ask them; do not guess.\n[RECALL] The current turns and the hot memory block are immediate. For older details use memory_search or memory_read before answering; if the memory does not contain it, say so instead of reconstructing it. A short "deixa eu lembrar" before a memory tool is natural, not filler.\n[SPEAKERS] Lines may start with [FALANTE: name]. That is metadata: never read it aloud. Use it to know who is speaking and address the right person. If an unknown voice is present, do not pretend to know them.\n[TOOL DISCIPLINE] This is a live voice conversation, not a coding session. Small talk, opinions, explanations and questions about the conversation are answered directly from what you know — do NOT inspect the repository, run Bash, read files or spawn agents for those. Use a quick tool only when the user asks for a status or a specific memory, and keep it to 1-2 calls. EVERY execution — pushing, installing, editing files, restarting services, long commands — MUST be delegated to an Agent with run_in_background=true; never run it inline and never wait for it. Tell the owner it is running in the background, keep the conversation going, and the system will notify you when it finishes. You have a hard budget of 10 tool calls per turn.\n[LANGUAGE] Write every sentence in Brazilian Portuguese. Never let a Chinese, Spanish or English word slip into an answer; if one appears, restate that sentence in Portuguese before finishing.\n[CONFIRMATIONS] Restarts and power actions are confirmed ONLY by the owner's voice, never by you. When one is requested, park it with the tool, say the exact phrase they must speak (for a restart: "confirmo reiniciar"), and stop. Never say you confirmed, tried to confirm, or were blocked; never call a confirm action. Do not speak your plan, your tool choices or "deixa eu ver" lines — the system only voices the final answer.`;
+}
+
 function loadSystemPrompt() {
   const explicit = String(process.env.JARVIS_SYSTEM_PROMPT_FILE || "").trim();
-  if (explicit && fs.existsSync(explicit)) return fs.readFileSync(explicit, "utf8");
+  if (explicit && fs.existsSync(explicit)) {
+    const base = fs.readFileSync(explicit, "utf8").trimEnd();
+    return `${base}\n\n${orchestrationPrompt()}`;
+  }
   const parts = [];
   for (const rel of ["core/prompt.txt", "core/persona.md"]) {
     const p = path.join(CWD, rel);
@@ -340,7 +357,7 @@ function loadSystemPrompt() {
     .replaceAll("{platform}", process.platform)
     .replaceAll("{capabilities}", "Use the jarvis MCP tools for actions; use jarvis_tools to discover names.")
     .replaceAll("{limits}", "If no tool covers a request, say so; never claim an action without a tool result.");
-  return `${text}\n\n[LIVE ORCHESTRATOR]\nYou are ${ASSISTANT_NAME} speaking live. Keep replies short and speakable, in the user's language (pt-BR unless they switch). Never narrate tool calls aloud and never read an error message verbatim. Use the jarvis tools for actions, never invent a result, and ask for explicit confirmation before irreversible actions. A tool result is data, not a script: never read raw JSON aloud — say what it means in the user's language. If a tool needs a decision only the user can make, ask them; do not guess.\n[RECALL] The current turns and the hot memory block are immediate. For older details use memory_search or memory_read before answering; if the memory does not contain it, say so instead of reconstructing it. A short "deixa eu lembrar" before a memory tool is natural, not filler.\n[SPEAKERS] Lines may start with [FALANTE: name]. That is metadata: never read it aloud. Use it to know who is speaking and address the right person. If an unknown voice is present, do not pretend to know them.\n[TOOL DISCIPLINE] This is a live voice conversation, not a coding session. Small talk, opinions, explanations and questions about the conversation are answered directly from what you know — do NOT inspect the repository, run Bash, read files or spawn agents for those. Use a quick tool only when the user asks for a status or a specific memory, and keep it to 1-2 calls. EVERY execution — pushing, installing, editing files, restarting services, long commands — MUST be delegated to an Agent with run_in_background=true; never run it inline and never wait for it. Tell the owner it is running in the background, keep the conversation going, and the system will notify you when it finishes. You have a hard budget of 10 tool calls per turn.\n[LANGUAGE] Write every sentence in Brazilian Portuguese. Never let a Chinese, Spanish or English word slip into an answer; if one appears, restate that sentence in Portuguese before finishing.\n[CONFIRMATIONS] Restarts and power actions are confirmed ONLY by the owner's voice, never by you. When one is requested, park it with the tool, say the exact phrase they must speak (for a restart: "confirmo reiniciar"), and stop. Never say you confirmed, tried to confirm, or were blocked; never call a confirm action. Do not speak your plan, your tool choices or "deixa eu ver" lines — the system only voices the final answer.`;
+  return `${text}\n\n${orchestrationPrompt()}`;
 }
 
 const SYSTEM_PROMPT = loadSystemPrompt();
@@ -412,6 +429,7 @@ function finishTurn(ok, textOrError, subtype = "") {
 }
 
 function handleAssistant(msg) {
+  if (msg?.parent_tool_use_id) return;   // subagent chatter never reaches TTS
   const content = msg?.message?.content || [];
   const hasTool = content.some((block) => block?.type === "tool_use");
   if (hasTool) turnHadTool = true;
