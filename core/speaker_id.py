@@ -199,6 +199,10 @@ class SpeakerId:
         with self._lock:
             return self._threshold
 
+    @property
+    def sample_rate(self) -> int:
+        return self._sample_rate
+
     def set_owner(self, name: str) -> str:
         """Set the owner. The owner is always authorized when identified."""
         name = str(name or "").strip()
@@ -329,6 +333,7 @@ class SpeakerId:
         with self._lock:
             best_slug = None
             best_score = -1.0
+            best_sample = -1.0
             for slug, rec in self._speakers.items():
                 centroid = np.asarray(rec["centroid"], dtype=np.float64)
                 if centroid.shape != vec.shape:
@@ -337,7 +342,17 @@ class SpeakerId:
                 score = float(np.dot(vec, centroid))
                 if score > best_score:
                     best_slug, best_score = slug, score
-            known = best_slug is not None and best_score >= self._threshold
+                    # A single sample can match a new recording better than the
+                    # average does — the microphone, a cold or a different tone
+                    # moves one sample, not the whole centroid.
+                    best_sample = -1.0
+                    for sample in rec.get("samples") or []:
+                        sv = np.asarray(sample, dtype=np.float64)
+                        if sv.shape == vec.shape:
+                            best_sample = max(best_sample,
+                                              float(np.dot(vec, _normalize(sv))))
+            effective = max(best_score, best_sample)
+            known = best_slug is not None and effective >= self._threshold
             authorized = False
             name = None
             if known:
@@ -346,9 +361,11 @@ class SpeakerId:
                 authorized = authorized or best_slug == _slugify(self._owner_name)
             if best_slug is None:
                 best_score = 0.0
+                best_sample = 0.0
             return {
                 "name": name,
                 "score": float(round(best_score, 6)),
+                "sample_score": float(round(max(best_sample, 0.0), 6)),
                 "known": bool(known),
                 "authorized": bool(authorized),
             }

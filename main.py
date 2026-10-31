@@ -892,6 +892,23 @@ _VOICE_SELF_ENROLL_RE = re.compile(
     r"|\b(?:essa|esta)\s+(?:voz\s+)?(?:é|e)\s+minha\b"
     r"|\bminha\s+voz\b",
     re.IGNORECASE)
+# Guided enrollment ("Ok Google" style): the assistant asks for a handful of
+# short phrases, keeps only the embeddings and never the raw audio.
+_VOICE_TRAIN_RE = re.compile(
+    r"\b(?:cadastr\w*|registr\w*|trein\w*|aprend\w*)\b[^.!?]{0,50}"
+    r"\b(?:minha\s+voz|voz\s+do\s+dono|reconhecimento\s+de\s+voz)\b"
+    r"|\b(?:reconhe[çc]\w*|identific\w*)\b[^.!?]{0,40}\b(?:pela\s+)?voz\b"
+    r"|\b(?:ok\s+google|voice\s+match)\b",
+    re.IGNORECASE)
+_VOICE_TRAIN_CANCEL_RE = re.compile(
+    r"^\s*(?:cancela|cancelar|para|pare|depois|chega|deixa)\b", re.IGNORECASE)
+_VOICE_TRAIN_PROMPTS = (
+    "Gino, sou eu, o Anthero.",
+    "Quero que você reconheça a minha voz.",
+    "Agora fale um pouco mais baixo: Gino, essa voz é minha.",
+    "Agora um pouco mais alto: Gino, pode me ouvir?",
+    "Sou eu de novo, falando do jeito normal.",
+)
 
 # Restart by voice: the request is deterministic (a gate), and the second
 # utterance must be the exact confirmation phrase from the owner's voice.
@@ -1349,6 +1366,8 @@ class JarvisLive:
         self._last_unknown_at      = 0.0
         self._last_known_emb       = None
         self._last_known_at        = 0.0
+        self._voice_train          = None
+        self._voice_train_offered  = False
         self._current_pcm          = None
         # Transcript-driven mouth shapes for the avatar. Fed from the receive
         # loop as words arrive, drained by the playback loop against the audio.
@@ -3245,6 +3264,7 @@ class JarvisLive:
                 self._memory_librarian.tick()
             except Exception as e:
                 print(f"[Librarian] tick: {e}")
+        self._voice_training_hint()
 
     def _qoder_on_error(self, turn_id, error: str) -> None:
         with self._qoder_lock:
@@ -3311,19 +3331,31 @@ class JarvisLive:
                         self._last_unknown_emb = unknown.get("embedding")
                         self._last_unknown_at = time.monotonic()
                     if not primary or not primary.get("known"):
-                        self.ui.write_log("SYS: voz desconhecida — não respondi.")
-                        self._say_now("Não reconheço essa voz. Se for alguém autorizado, "
-                                      "peça ao dono para me apresentar.")
-                        _duck.up()
-                        return
-                    if not primary.get("authorized"):
+                        if self._only_owner_enrolled():
+                            # One enrolled person: a low score is more likely
+                            # the microphone than an intruder. Keep answering
+                            # as the owner; the guided enrollment fixes the
+                            # profile, and this stops once a guest exists.
+                            speaker = owner_name
+                            labeled_text = text
+                            self.ui.write_log(
+                                "SYS: confiança de voz baixa — único cadastrado "
+                                f"é o dono ({owner_name}); sigo como ele.")
+                        else:
+                            self.ui.write_log("SYS: voz desconhecida — não respondi.")
+                            self._say_now("Não reconheço essa voz. Se for alguém autorizado, "
+                                          "peça ao dono para me apresentar.")
+                            _duck.up()
+                            return
+                    elif not primary.get("authorized"):
                         who = primary_name or "essa pessoa"
                         self.ui.write_log(f"SYS: voz {who} conhecida, mas não autorizada.")
                         self._say_now(f"Reconheço a voz de {who}, mas ela ainda não está "
                                       "autorizada a falar comigo.")
                         _duck.up()
                         return
-                    speaker = primary_name
+                    else:
+                        speaker = primary_name
                     emb = analysis.get("primary_embedding")
                     if emb:
                         self._last_known_emb = emb
@@ -3424,6 +3456,111 @@ class JarvisLive:
         if original:
             self._say_now("O Qoder travou nesse turno. Pode repetir?")
         self._qoder_flush_pending()
+
+    def _has_owner_enrolled(self) -> bool:
+        try:
+            return any(r.get("owner") for r in self._speaker.list())
+        except Exception:
+            return True
+
+    def _owner_samples(self) -> int:
+        try:
+            for rec in self._speaker.list():
+                if rec.get("owner"):
+                    return int(rec.get("samples") or 0)
+        except Exception:
+            pass
+        return 0
+
+    def _start_voice_training(self, why: str = "") -> None:
+        owner = (self._speaker.owner_name or "Anthero") if self._speaker else "Anthero"
+        total = len(_VOICE_TRAIN_PROMPTS)
+        self._voice_train = {"done": 0, "total": total, "owner": owner}
+        self._voice_train_offered = True
+        self.ui.write_log("SYS: cadastro de voz guiado — "
+                          f"{total} frases ({why or 'pedido do dono'}).")
+        self._say_now(f"Vou fazer como o Ok Google, {owner}: {total} frases curtas "
+                      f"para eu aprender a sua voz. Repita: {_VOICE_TRAIN_PROMPTS[0]}")
+
+    def _voice_train_step(self, text: str, pcm: bytes | None) -> bool:
+        session = self._voice_train
+        if session is None:
+            return False
+        self._log_heard(text)
+        if _VOICE_TRAIN_CANCEL_RE.search(text):
+            self._voice_train = None
+            self._say_now("Cadastro de voz cancelado. Pode continuar normalmente.")
+            return True
+        if not pcm:
+            self._say_now("Não recebi o áudio dessa frase. Repita: "
+                          f"{_VOICE_TRAIN_PROMPTS[session['done']]}")
+            return True
+        rate = int(getattr(self._speaker, "sample_rate", 16000) or 16000)
+        secs = len(pcm) / float(2 * rate)
+        if secs < 0.8:
+            self._say_now("Essa frase foi curta demais. Repita: "
+                          f"{_VOICE_TRAIN_PROMPTS[session['done']]}")
+            return True
+        try:
+            emb = self._speaker.embedding(pcm)
+            self._speaker.enroll(session["owner"], emb, authorized=True)
+        except Exception as e:
+            self._say_now(f"Não consegui usar essa amostra: {str(e)[:80]}. "
+                          f"Repita: {_VOICE_TRAIN_PROMPTS[session['done']]}")
+            return True
+        session["done"] += 1
+        if session["done"] >= session["total"]:
+            total = session["total"]
+            self._voice_train = None
+            self._say_now(f"Pronto, {session['owner']}. Cadastrei {total} amostras "
+                          "da sua voz. Agora eu devo te reconhecer mesmo quando "
+                          "você fala baixo ou está com o nariz entupido.")
+            self.ui.write_log(f"SYS: voz de {session['owner']} reforçada — "
+                              f"{total} amostras novas.")
+            return True
+        self._say_now(f"Boa, {session['done']} de {session['total']}. Agora repita: "
+                      f"{_VOICE_TRAIN_PROMPTS[session['done']]}")
+        return True
+
+    def _voice_train_gate(self, text: str, pcm: bytes | None = None) -> bool:
+        """Guided enrollment, handled before barge-in so prompts don't eat it."""
+        if not (self._voice_id_enabled and self._speaker is not None):
+            return False
+        if self._voice_train is not None:
+            return self._voice_train_step(text, pcm)
+        if not self._has_owner_enrolled() and pcm:
+            # First run: the first voice heard becomes the owner, but through
+            # the guided flow instead of a single accidental sample.
+            self._log_heard(text)
+            self._start_voice_training("primeira voz")
+            return True
+        if _VOICE_TRAIN_RE.search(text):
+            self._log_heard(text)
+            self._start_voice_training("pedido do dono")
+            return True
+        return False
+
+    def _voice_training_hint(self) -> None:
+        """One short request per run when the owner profile is still thin."""
+        if (not self._voice_id_enabled or self._speaker is None
+                or self._voice_train is not None or self._voice_train_offered):
+            return
+        if self._qoder_current_id is not None:
+            return
+        if getattr(self.ui, "muted", False) or not getattr(self, "_awake", True):
+            return
+        if self._owner_samples() >= 5:
+            return
+        self._voice_train_offered = True
+        name = self._speaker.owner_name or "Anthero"
+        try:
+            self.ui.write_log("SYS: voz com poucas amostras — cadastro guiado "
+                              "disponível (\"cadastra minha voz\").")
+            self._say_now(f"{name}, eu ainda tenho poucas amostras da sua voz. "
+                          "Diga 'cadastra minha voz' quando quiser que eu faça "
+                          "como o Ok Google e peça cinco frases.")
+        except Exception:
+            pass
 
     def _voice_enroll_gate(self, text: str) -> bool:
         if not (self._voice_id_enabled and self._speaker is not None):
@@ -4425,6 +4562,11 @@ class JarvisLive:
         if self._power is not None and self._power.pending():
             if self._handle_power_confirmation(text, pcm):
                 return
+        # Guided voice enrollment answers the assistant's own prompt, so it is
+        # handled before barge-in classification — a sample must never be
+        # mistaken for a complement.
+        if self._voice_train_gate(text, pcm):
+            return
         # Spoken while Gino is talking: classify as interruption or complement
         # instead of starting a turn blindly. A complement must not cut him off.
         if getattr(self, "_reply_active", False) or self._is_speaking:

@@ -96,8 +96,18 @@ class SpeakerIdStoreTest(unittest.TestCase):
         result = self.sid.identify(_vec(3))
         self.assertEqual(
             result,
-            {"name": None, "score": 0.0, "known": False, "authorized": False},
+            {"name": None, "score": 0.0, "sample_score": 0.0,
+             "known": False, "authorized": False},
         )
+
+    def test_a_single_sample_can_confirm_above_the_centroid(self):
+        sid = speaker_id.SpeakerId(store_dir=self.store, threshold=0.8)
+        sid.enroll("Base", [np.array([1.0, 0.0, 0.0]),
+                            np.array([0.0, 1.0, 0.0])])
+        found = sid.identify(np.array([1.0, 0.0, 0.0]))
+        self.assertLess(found["score"], 0.8)
+        self.assertGreaterEqual(found["sample_score"], 0.8)
+        self.assertTrue(found["known"])
 
     def test_multiple_embeddings_become_one_centroid(self):
         first, second = _vec(4), _vec(5)
