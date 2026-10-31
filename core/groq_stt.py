@@ -311,14 +311,16 @@ class GroqListener:
             return
 
         self._seg.append(raw)
-        # The duck opened with this utterance; every mic block while the
-        # sentence is alive says so (a float assignment — never a dropout).
-        # Without this sign of life the watchdog in core/duck.py gives the
-        # volumes back once nobody is speaking.
-        _duck.heartbeat()
         if level > thresh:
             self._voiced += 1
             self._below = 0
+            # The duck opened with this utterance; a block with actual voice
+            # in it is what says the owner is speaking RIGHT NOW (a float
+            # assignment — never a dropout). Silence inside an open segment
+            # and the assistant's own tail must not refill the beat: the
+            # watchdog in core/duck.py gives the volumes back when nothing is
+            # voiced, and _close() releases them the moment the sentence ends.
+            _duck.heartbeat()
         else:
             self._below += 1
         if self.assistant_speaking:
@@ -336,11 +338,14 @@ class GroqListener:
         # window, so "Gino" ending at the boundary is still heard once.
         if capped and self.sleeping and len(seg) > _PREROLL:
             self._pre = seg[-_PREROLL:]
-        # NOTE: no _duck.up() here — the apps stay ducked through the reply and
-        # are restored when the turn ends (main.set_speaking / worker finally).
-        # If that close is ever skipped (held turn, early return, a handler
-        # that died), the watchdog in core/duck.py releases the duck once no
-        # mic block and no own playback stream has been seen for a while.
+        # Owner's spec (31/10): the volumes come back when the SPEECH stops,
+        # never waiting on the reply or on background jobs. If a reply is
+        # already playing the assistant is still talking — its playback keeps
+        # the duck alive (each batch re-asserts the beat) and the drain
+        # release in main.py closes the exchange when the speakers go quiet.
+        # The next sentence starting to play ducks again from fresh originals.
+        if not self.assistant_speaking:
+            _duck.up()
         if capped and not self.sleeping:
             # A long answer is transcribed, but the tail may be missing. Say so
             # on the console: the user's request was cut mid-sentence once and
@@ -575,8 +580,9 @@ class GroqListener:
             self._on_status("Tive um erro neste turno (detalhes no terminal).")
             # The exchange died inside the handler: nobody downstream will
             # close the duck the segmenter opened. Release it here unless a
-            # reply is actively playing — in that case the own-stream probe in
-            # core/duck.py keeps the apps ducked until the playback ends.
+            # reply is actively playing — in that case the playback heartbeat
+            # and the host speech probe keep the apps ducked until the audio
+            # really ends (main._duck_check_drain / set_speaking give it back).
             if not self.assistant_speaking:
                 _duck.up()
 

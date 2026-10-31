@@ -109,5 +109,64 @@ class SpokenConsentWindowTests(unittest.TestCase):
         self.assertTrue(actiongate.has_pending())
 
 
+class EconomyQoderTurnConsentTests(unittest.TestCase):
+    """FIX 1 (31/10/2026): the voice gates never ran in the mode the assistant
+    actually lives in.
+
+    _EconomySession.send_client_content injects the owner's words straight
+    into JarvisLive._qoder_turn — NOT through _on_groq_text, where the
+    restart/power/consent gates are called. 22 consecutive bridge calls ended
+    "approved: false" because the spoken "Pode enviar" never reached
+    _try_action_consent. The gates must run on that entry too.
+    """
+
+    def setUp(self):
+        actiongate.close()
+        rootgate.close()
+        self.addCleanup(actiongate.close)
+        self.addCleanup(rootgate.close)
+
+    def _obj(self):
+        obj = _obj(speaking=True)     # the refusal narration is still playing
+        obj._restart = None
+        obj._power = None
+        obj._qoder_lock = None        # words reaching the model => TypeError
+        return obj
+
+    def test_consent_words_entering_qoder_turn_open_the_window(self):
+        # The exact live scenario: the bridge refused, the words enter
+        # through the economy path (_qoder_turn(text), no pcm).
+        self.assertFalse(actiongate.confirm(
+            "Confirm 'whatsapp_control'",
+            "Risk: medium. Arguments: action=send contato=Vida"))
+        self.assertTrue(actiongate.has_pending())
+        obj = self._obj()
+        main.JarvisLive._qoder_turn(obj, "Pode enviar")
+        self.assertTrue(actiongate.authorized())
+        self.assertFalse(actiongate.has_pending())
+        # The following bridge call passes — this is what failed 22 times.
+        self.assertTrue(actiongate.confirm("Confirm 'whatsapp_control'", "retry"))
+        self.assertFalse(actiongate.authorized())   # window is single-use
+        self.assertIn("Pode, autorizado.", obj.said)
+
+    def test_retry_replay_does_not_run_the_gates(self):
+        # retry=True replays the SAME words to the model; re-gating them
+        # would let the assistant's own retried prompt authorise itself.
+        self.assertFalse(actiongate.confirm("Confirm 'whatsapp_control'", "x"))
+        obj = self._obj()
+        with self.assertRaises(Exception):
+            main.JarvisLive._qoder_turn(obj, "Pode enviar", retry=True)
+        self.assertFalse(actiongate.authorized())
+        self.assertTrue(actiongate.has_pending())   # still waiting for a voice
+
+    def test_stray_economy_text_opens_nothing_without_pending(self):
+        # A reminder/briefing line injected through the same entry: with no
+        # refused request on the table, nothing authorises.
+        obj = self._obj()
+        with self.assertRaises(Exception):   # reaches the model, as it should
+            main.JarvisLive._qoder_turn(obj, "pode")
+        self.assertFalse(actiongate.authorized())
+
+
 if __name__ == "__main__":
     unittest.main()

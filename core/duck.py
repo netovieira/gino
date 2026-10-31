@@ -113,10 +113,14 @@ def register_speech_probe(fn) -> None:
 
 
 def _own_stream_active() -> bool:
-    """The assistant's playback stream is alive: a reply is coming out of the
-    speakers right now (the stream is opened per playback, so absent = silent).
-    A stray second Python mono-24 kHz stream would only ever extend the grace
-    by one check interval — the watchdog never lowers a volume."""
+    """A fallback "the assistant may be talking" signal for hosts that never
+    registered a speech probe. NOT trustworthy on its own: main.py opens the
+    24 kHz playback stream once per session and leaves it started, so pactl
+    keeps listing it while the room is silent (measured live) — an idle stream
+    is not speech. Real playback refreshes the heartbeat itself (every ≤200 ms
+    batch runs set_speaking(True) → down()), which is why the watchdog asks
+    the probe first and never lowers a volume on its own.
+    """
     try:
         for _idx, _pid, _pct, name, spec in _inputs():
             if _is_own(name, spec):

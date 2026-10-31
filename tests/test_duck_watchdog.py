@@ -15,6 +15,9 @@ import threading
 import time
 import unittest
 
+import numpy as np
+
+import main
 from core import duck, groq_stt
 
 
@@ -175,7 +178,8 @@ class SttErrorPathTest(unittest.TestCase):
 
     def test_handler_exception_durante_reply_nao_corta_a_fala(self):
         """Se a reply JÁ está soando, soltar o duck agora desduckaria a fala
-        do assistente no meio — quem fecha é o probe/watchdog."""
+        do assistente no meio — quem fecha é o probe de fala do dono da casa
+        e o release do esvaziamento da fila (main._duck_check_drain)."""
         def explode(_t, _p):
             raise RuntimeError("barge-in morreu")
 
@@ -187,6 +191,157 @@ class SttErrorPathTest(unittest.TestCase):
                              "up() cortou a fala do assistente em andamento")
         finally:
             listener.stop()
+
+
+class UserSpeechEndTest(unittest.TestCase):
+    """Lado do usuário: o fim da frase solta o duck NA HORA (spec 16:57 —
+    devolver o volume quando a fala PARA, nunca esperando a troca ou jobs de
+    background) e o heartbeat do mic só vale em bloco COM voz."""
+
+    def setUp(self):
+        self.calls: list[str] = []
+        self._orig = (groq_stt._duck.up, groq_stt._duck.down,
+                      groq_stt._duck.heartbeat)
+        groq_stt._duck.up = lambda: self.calls.append("up")
+        groq_stt._duck.down = lambda: self.calls.append("down")
+        groq_stt._duck.heartbeat = lambda: self.calls.append("beat")
+
+    def tearDown(self):
+        (groq_stt._duck.up, groq_stt._duck.down,
+         groq_stt._duck.heartbeat) = self._orig
+
+    def _listener(self):
+        return groq_stt.GroqListener(
+            "", "test", "pt",
+            on_text=lambda _t: None,
+            on_utterance=lambda _t, _p: None,
+            on_status=lambda _m: None,
+            sample_rate=16000,
+            transcribe_fn=lambda _pcm: "abre o editor de texto agora",
+        )
+
+    def test_close_da_fala_solta_o_duck_sem_esperar_o_watchdog(self):
+        listener = self._listener()
+        try:
+            listener._seg = [b"\x00\x00" * 1024] * 8
+            listener._voiced = 8
+            listener._active = True
+            listener._close()
+            self.assertIn("up", self.calls,
+                          "a frase terminou e up() não foi chamado direto")
+        finally:
+            listener.stop()
+
+    def test_close_durante_reply_nao_corta_a_fala_do_assistente(self):
+        listener = self._listener()
+        try:
+            listener.assistant_speaking = True
+            listener._seg = [b"\x00\x00" * 1024] * 8
+            listener._voiced = 8
+            listener._active = True
+            listener._close()
+            self.assertNotIn("up", self.calls)
+        finally:
+            listener.stop()
+
+    def test_heartbeat_so_em_bloco_com_voz(self):
+        """(a) Mecanismo real: todo bloco do segmento aberto recheava o
+        _beat, inclusive silêncio e eco — o watchdog nunca vencia os 3 s.
+        Agora só bloco acima do threshold conta como fala do usuário; o
+        segmento continua vivo (ainda < _END_BLOCKS de silêncio)."""
+        listener = self._listener()
+        try:
+            loud = np.full(1024, 8000, dtype=np.int16)
+            silent = np.zeros(1024, dtype=np.int16)
+            for _ in range(6):        # 3 abrem o segmento; 3 com voz ativa
+                listener.feed(loud)
+            self.assertIn("down", self.calls)
+            self.assertGreaterEqual(self.calls.count("beat"), 1)
+            self.assertTrue(listener._active)
+            self.calls.clear()
+            for _ in range(5):        # pausa curta: segmento segue aberto
+                listener.feed(silent)
+            self.assertEqual(self.calls.count("beat"), 0,
+                             "silêncio dentro do segmento recheou o heartbeat")
+            self.assertTrue(listener._active)
+            for _ in range(6):        # 11 blocos baixos fecham a frase
+                listener.feed(silent)
+            self.assertFalse(listener._active)
+            self.assertIn("up", self.calls,
+                          "a frase fechou por silêncio e ninguém chamou up()")
+        finally:
+            listener.stop()
+
+
+class HostProbeTest(WatchdogBase):
+    """(b) Mecanismo real, medido ao vivo: o stream de playback do main.py é
+    aberto uma vez por sessão e fica listado no pactl mesmo em silêncio
+    absoluto ("PipeWire ALSA [python3.14]", 1ch 24000Hz). O watchdog não pode
+    ler stream-ocioso-como-fala: com a sonda registrada, ela é mandatória."""
+
+    def _ducked(self) -> bool:
+        with duck._SAVED_LOCK:
+            return bool(duck._saved)
+
+    def test_stream_ocioso_com_sonda_muda_devolve_os_volumes(self):
+        duck._probe = lambda: False     # host: ninguém está falando
+        self.own_stream = True          # o stream de playback ócio está lá
+        duck.down()
+        self.assertTrue(_wait(self._ducked))
+        self.assertTrue(_wait(lambda: not self._ducked()),
+                        "watchdog leu o stream ocioso como fala do assistente")
+        self.assertIn(("set-sink-input-volume", "12", "60%"), self.comandos)
+
+    def test_sonda_com_fala_mantem_o_duck_sem_stream(self):
+        duck._probe = lambda: True
+        self.own_stream = False
+        duck.down()
+        self.assertTrue(_wait(self._ducked))
+        time.sleep(duck.DUCK_STALE_S + 2 * duck.DUCK_CHECK_S)
+        self.assertTrue(self._ducked(),
+                        "watchdog cortou o duck com fala ativa na sonda")
+
+
+class DrainReleaseTest(unittest.TestCase):
+    """(c) Mecanismo real: reply terminou de soar mas o turno segue aberto
+    (agente Qoder em background) — `_reply_active` impede o set_speaking(False)
+    da fila e o watchdog ainda tinha a sonda mentirosa (`_is_speaking`).
+    O esvaziamento da fila chama up() direto, sem timer do watchdog."""
+
+    def _obj(self, age: float):
+        obj = object.__new__(main.JarvisLive)
+        obj._last_play_batch = time.monotonic() - age
+        obj._duck_released_on_drain = False
+        return obj
+
+    def test_dreno_chama_up_sem_esperar_o_watchdog(self):
+        calls: list[str] = []
+        orig = duck.up
+        duck.up = lambda: calls.append("up")
+        try:
+            obj = self._obj(main._DUCK_DRAIN_RELEASE_S + 0.2)
+            main.JarvisLive._duck_check_drain(obj)
+            self.assertEqual(calls, ["up"],
+                             "fila vazia e silenciosa: up() não rodou")
+            main.JarvisLive._duck_check_drain(obj)   # próximo tick de 100 ms
+            self.assertEqual(calls, ["up"])          # uma vez por dreno
+            obj._duck_released_on_drain = False      # chegou fala nova
+            obj._last_play_batch = time.monotonic()
+            main.JarvisLive._duck_check_drain(obj)
+            self.assertEqual(calls, ["up"])          # falando: não corta
+        finally:
+            duck.up = orig
+
+    def test_sonda_nao_mente_durante_turno_seguro(self):
+        # O cenário preso: turno em background segura _is_speaking=True com
+        # os alto-falantes mudos há minutos. A sonda olha o último batch.
+        obj = object.__new__(main.JarvisLive)
+        obj._is_speaking = True
+        obj._groq = None
+        obj._last_play_batch = time.monotonic() - 60.0
+        self.assertFalse(main.JarvisLive._duck_probe_speaking(obj))
+        obj._last_play_batch = time.monotonic()
+        self.assertTrue(main.JarvisLive._duck_probe_speaking(obj))
 
 
 if __name__ == "__main__":

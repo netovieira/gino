@@ -207,6 +207,15 @@ _FIRST_SOUND = CHUNK_SIZE / RECEIVE_SAMPLE_RATE      # ~43 ms
 # ahead, so anything beyond it plus a margin for clock error is impossible.
 _CURSOR_SLACK = 0.15
 
+# Duck release, the owner's spec of 31/10: the other apps get their volume
+# back as soon as the SPEECH stops, never waiting on a background job. A
+# playback batch older than _DUCK_PLAYBACK_HEARD_S is not "Gino is talking";
+# after _DUCK_DRAIN_RELEASE_S of an empty queue the reply has audibly ended
+# (covers the device buffer plus one synthesis gap between two sentences of
+# the same reply, so a real reply never pumps the volume mid-sentence).
+_DUCK_PLAYBACK_HEARD_S = 1.5
+_DUCK_DRAIN_RELEASE_S = 1.0
+
 # Erring early is the safe direction. A viewer tolerates a mouth that moves
 # slightly before the sound far better than one that moves after it — the
 # broadcast limits are about 45 ms of lag against 125 ms of lead — so where
@@ -1409,12 +1418,17 @@ class JarvisLive:
         self._ptt                  = None    # core.hotkey.PushToTalk
         self._out_level            = 0.0     # level of the audio being played right now
         self._echo                 = EchoGuard()
+        # Last moment the playback queue handed a batch to the device, and the
+        # once-per-drain flag for _duck_check_drain (see _play_audio). The duck
+        # watchdog and the drain release read these, not `_is_speaking`: a held
+        # turn keeps that flag true while the speakers are silent.
+        self._last_play_batch      = 0.0
+        self._duck_released_on_drain = False
         try:
             # The duck watchdog must not trust a playback stream that stays
-            # open while silent: this probe is the real "someone is speaking".
-            _duck.register_speech_probe(
-                lambda: bool(self._is_speaking)
-                or bool(getattr(self._groq, "speaking", False)))
+            # open while silent, nor a speaking flag that a held turn keeps
+            # raised: this probe is the real "someone is speaking".
+            _duck.register_speech_probe(self._duck_probe_speaking)
         except Exception:
             pass
         self._cancel               = None    # core.playback_cancel, opened with the mic
@@ -3411,6 +3425,19 @@ class JarvisLive:
         self._last_user_speech = time.monotonic()
         if not retry:
             self._qoder_retry_used = False
+        # In economy mode the owner's words arrive here directly (through
+        # _EconomySession.send_client_content) and never pass by
+        # _on_groq_text — the voice gates have to run on this entry too.
+        # retry=True replays the same words and must not re-run them.
+        if not retry:
+            if self._restart is not None and self._restart.pending():
+                if self._handle_restart_confirmation(text, pcm):
+                    return
+            if self._power is not None and self._power.pending():
+                if self._handle_power_confirmation(text, pcm):
+                    return
+            if self._try_action_consent(text):
+                return
         with self._qoder_lock:
             busy = self._qoder_current_id is not None
             old_id = self._qoder_current_id
@@ -6464,6 +6491,30 @@ class JarvisLive:
             traceback.print_exc()
             raise
 
+    def _duck_probe_speaking(self) -> bool:
+        """Host liveness test for the duck watchdog (core/duck.py): True only
+        while a voice is actually in the room. Our speakers were fed less than
+        a breath ago, or the microphone holds an open utterance. `_is_speaking`
+        alone lied during a held turn — the queue drained, the agents kept
+        working, and the watchdog read the stale flag as "Gino is talking"
+        forever, holding the apps at 20%."""
+        if time.monotonic() - getattr(self, "_last_play_batch", 0.0) < _DUCK_PLAYBACK_HEARD_S:
+            return True
+        return bool(getattr(self._groq, "speaking", False))
+
+    def _duck_check_drain(self) -> None:
+        """Playback tick with an empty queue: when the silence outlives the
+        gap between two sentences of one reply, the exchange has audibly ended
+        — give the volumes back NOW, not when the turn (or its background
+        jobs) finishes. Runs once per drain; the next batch re-arms it and
+        set_speaking(True) ducks again from the fresh originals."""
+        if getattr(self, "_duck_released_on_drain", True):
+            return
+        if time.monotonic() - getattr(self, "_last_play_batch", 0.0) < _DUCK_DRAIN_RELEASE_S:
+            return
+        self._duck_released_on_drain = True
+        _duck.up()
+
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
 
@@ -6524,6 +6575,9 @@ class JarvisLive:
                     ):
                         self.set_speaking(False)
                         self._turn_done_event.clear()
+                    # Turn still open (background job speaking was done): the
+                    # volumes come back with the SPEECH, not with the turn.
+                    self._duck_check_drain()
                     continue
 
                 self.set_speaking(True)
@@ -6592,6 +6646,11 @@ class JarvisLive:
                     await asyncio.to_thread(stream.write, bytes(batch))
                 except (RuntimeError, asyncio.CancelledError):
                     break   # executor shutting down — exit cleanly
+                # Proof the speakers just received voice: the duck probe and
+                # the drain release count silence from this instant, not from
+                # the speaking flag (a held turn never drops it).
+                self._last_play_batch = time.monotonic()
+                self._duck_released_on_drain = False
         except Exception as e:
             print(f"[JARVIS] ❌ Play: {e}")
             raise
