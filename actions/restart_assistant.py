@@ -58,14 +58,17 @@ def restart_assistant(parameters: dict, player=None, speak=None,
     p = parameters or {}
     action = str(p.get("action") or "status").strip().lower()
     reason = str(p.get("reason") or "").strip()
-    phrase = str(p.get("phrase") or "").strip()
 
     if action in _ASSISTANT_ACTIONS:
         return _manager.request_assistant(reason=reason)
     if action in _PC_ACTIONS:
         return _manager.request_pc(reason=reason)
     if action in _CONFIRM_ACTIONS:
-        return _manager.confirm(phrase)
+        # Confirmation belongs to the owner's voice, not to the model. The
+        # voice gate calls RestartManager.confirm directly; this tool never
+        # confirms on the user's behalf.
+        return ("Restart confirmation is voice-only: the owner must say the "
+                "phrase out loud. Nothing was confirmed.")
     if action in _CANCEL_ACTIONS:
         return _manager.cancel()
     if action in _STATUS_ACTIONS:
@@ -80,12 +83,11 @@ TOOL = {
     "description": (
         "Restart the assistant itself or the computer. Never happens on the "
         "first call: action='assistant' or action='pc' only parks a request and "
-        "asks the user to say the phrase out loud. Then call action='confirm' "
-        "with exactly that phrase ('confirmo reiniciar o assistente' or "
-        "'confirmo reiniciar o computador'). Never claim a restart happened "
-        "before the confirmation is accepted. action='cancel' drops a pending "
-        "request; action='status' reports one. Never use the PC restart as part "
-        "of an automatic improvement."
+        "asks the owner to say the phrase out loud ('confirmo reiniciar'). The "
+        "confirmation is voice-only; you cannot confirm it yourself. Never "
+        "claim a restart happened before the owner speaks the phrase. "
+        "action='cancel' drops a pending request; action='status' reports one. "
+        "Never use the PC restart as part of an automatic improvement."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -93,20 +95,12 @@ TOOL = {
             "action": {
                 "type": "STRING",
                 "description": (
-                    "'assistant' | 'pc' | 'confirm' | 'cancel' | 'status'"
+                    "'assistant' | 'pc' | 'cancel' | 'status'"
                 ),
             },
             "reason": {
                 "type": "STRING",
                 "description": "Short reason for the restart (optional).",
-            },
-            "phrase": {
-                "type": "STRING",
-                "description": (
-                    "For action='confirm': the owner's exact spoken phrase, "
-                    "'confirmo reiniciar o assistente' or "
-                    "'confirmo reiniciar o computador'."
-                ),
             },
         },
         "required": ["action"],

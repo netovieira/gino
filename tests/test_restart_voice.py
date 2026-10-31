@@ -99,7 +99,43 @@ class RestartVoiceTest(unittest.TestCase):
         self.assertTrue(main.JarvisLive._handle_restart_confirmation(
             obj, "confirmo reiniciar", b"\x01\x00" * 16000))
         self.assertEqual(obj._restart.confirmed, [])
-        self.assertEqual(obj._restart.cancelled, 1)
+        self.assertEqual(obj._restart.cancelled, 0)   # kept for a retry
+        self.assertIn("Não reconheci", obj.said[0])
+
+    def test_single_owner_fallback_accepts_the_exact_phrase(self):
+        obj = self._obj(owner=False,
+                        pending={"kind": "assistant",
+                                 "phrase": "confirmo reiniciar"})
+
+        class SingleOwner(FakeSpeaker):
+            def list(self):
+                return [{"name": "Anthero", "owner": True, "authorized": True}]
+
+        obj._speaker = SingleOwner(owner=False)
+        self.assertTrue(main.JarvisLive._handle_restart_confirmation(
+            obj, "confirmo reiniciar", b"\x01\x00" * 16000))
+        self.assertEqual(obj._restart.confirmed, ["confirmo reiniciar"])
+
+    def test_unrelated_speech_keeps_the_request_pending(self):
+        obj = self._obj(pending={"kind": "assistant", "phrase": "confirmo reiniciar"})
+        self.assertFalse(main.JarvisLive._handle_restart_confirmation(
+            obj, "que horas são?", b"\x01\x00" * 16000))
+        self.assertEqual(obj._restart.cancelled, 0)
+        self.assertEqual(obj._restart.confirmed, [])
+
+    def test_pc_confirmation_still_needs_the_voiceprint(self):
+        obj = self._obj(owner=False,
+                        pending={"kind": "pc", "phrase": "confirmo reiniciar"})
+
+        class SingleOwner(FakeSpeaker):
+            def list(self):
+                return [{"name": "Anthero", "owner": True, "authorized": True}]
+
+        obj._speaker = SingleOwner(owner=False)
+        self.assertTrue(main.JarvisLive._handle_restart_confirmation(
+            obj, "confirmo reiniciar", b"\x01\x00" * 16000))
+        self.assertEqual(obj._restart.confirmed, [])
+        self.assertEqual(obj._restart.cancelled, 0)
 
 
 if __name__ == "__main__":

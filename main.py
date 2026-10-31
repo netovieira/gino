@@ -904,8 +904,14 @@ _RESTART_PC_RE = re.compile(
     r"\b(?:o pc|o computador|a m[aá]quina|o sistema)\b",
     re.IGNORECASE)
 _RESTART_CANCEL_RE = re.compile(
-    r"\b(?:cancela|cancelar|aborta|abortar|desiste|desistir|deixa|"
-    r"n[ãa]o)\b", re.IGNORECASE)
+    r"^\s*(?:por\s+favor\s+)?(?:cancela|cancelar|aborta|abortar|desiste|desistir)\b"
+    r"|^\s*(?:n[ãa]o|deixa)\s*[.!]?\s*$"
+    r"|\b(?:cancela|cancelar|aborta|abortar)\b[^.!?]{0,20}\b(?:rein[ií]cio|reiniciar)\b",
+    re.IGNORECASE)
+# The phrase that answers a parked restart. The manager still validates the
+# exact marker; this only decides whether the utterance is an answer at all.
+_RESTART_CONFIRM_RE = re.compile(
+    r"\bconfirm(?:o|a|e|ar)\s+(?:o\s+)?rein[ií]ci(?:o|ar)\b", re.IGNORECASE)
 
 # Power commands. Unlock is checked before lock because "desbloqueia" contains
 # "bloqueia" but not as a word; the order keeps the intent explicit anyway.
@@ -3591,35 +3597,72 @@ class JarvisLive:
         print(f"[Power] {out}")
         return True
 
-    def _is_owner_pcm(self, pcm: bytes | None) -> bool:
-        """Voiceprint check for irreversible actions. Voice is a factor here,
-        not a general authentication factor for other tools."""
+    def _owner_voice(self, pcm: bytes | None) -> tuple[bool, str]:
+        """(is_owner, detail) for the voiceprint in this utterance."""
         if not pcm or self._speaker is None:
-            return False
+            return False, "sem áudio"
         try:
             emb = self._speaker.embedding(pcm)
             match = self._speaker.identify(emb)
             owner = (self._speaker.owner_name or "").strip().lower()
-            return bool(match.get("known") and match.get("authorized")
-                        and (match.get("name") or "").strip().lower() == owner)
+            name = (match.get("name") or "").strip()
+            ok = bool(match.get("known") and match.get("authorized")
+                      and name.lower() == owner)
+            return ok, f"voz={name or 'desconhecida'} score={float(match.get('score') or 0):.3f}"
         except Exception as e:
-            print(f"[Restart] owner check failed: {e}")
+            return False, f"erro na voz: {e}"
+
+    def _is_owner_pcm(self, pcm: bytes | None) -> bool:
+        """Voiceprint check for irreversible actions. Voice is a factor here,
+        not a general authentication factor for other tools."""
+        return self._owner_voice(pcm)[0]
+
+    def _only_owner_enrolled(self) -> bool:
+        """True when the index has exactly one voice and it is the owner.
+
+        With a single enrolled person there is nobody else to confuse the
+        check with; a failed score is then a microphone/enrollment problem,
+        not evidence of an intruder. The exact spoken phrase still applies.
+        """
+        try:
+            records = self._speaker.list() if self._speaker is not None else []
+            return (len(records) == 1 and bool(records[0].get("owner")))
+        except Exception:
             return False
+
+    def _owner_voice_ok(self, pcm: bytes | None, *, allow_single: bool = True) -> bool:
+        ok, detail = self._owner_voice(pcm)
+        if ok:
+            return True
+        if allow_single and self._only_owner_enrolled():
+            print(f"[Voice] voz não reconhecida ({detail}); aceito por ser o "
+                  f"único cadastrado e dono")
+            return True
+        print(f"[Voice] voz não reconhecida ({detail}); ação recusada")
+        return False
 
     def _handle_restart_confirmation(self, text: str, pcm: bytes | None) -> bool:
         """Consume the utterance that answers a pending restart request."""
         pending = self._restart.pending() if self._restart is not None else None
         if not pending:
             return False
-        self._log_heard(text)
-        if not self._is_owner_pcm(pcm):
-            self._restart.cancel()
-            self._say_now("Só o dono pode confirmar um reinício. Cancelei o pedido.")
-            return True
         if _RESTART_CANCEL_RE.search(text):
             self._restart.cancel()
+            self._log_heard(text)
             self._say_now("Reinício cancelado.")
             return True
+        if not _RESTART_CONFIRM_RE.search(text):
+            # Not an answer to the restart prompt: leave the request parked and
+            # let the conversation continue normally.
+            return False
+        if not self._owner_voice_ok(pcm, allow_single=(pending.get("kind") == "assistant")):
+            # Keep the request alive: a failed voiceprint is usually the
+            # microphone, not an intruder, and the owner can simply repeat.
+            self._log_heard(text)
+            self._say_now("Não reconheci sua voz como dono agora. Repita a "
+                          "frase 'confirmo reiniciar'.")
+            return True
+        self._log_heard(text)
         # Stop the prompt/answer that asked for the confirmation before acting.
         self._qoder_ignore = True
         try:
@@ -3653,7 +3696,8 @@ class JarvisLive:
             self._say_now("Já existe um reinício aguardando confirmação. "
                           "Diga 'confirmo reiniciar' ou 'cancela'.")
             return True
-        if not self._is_owner_pcm(getattr(self, "_current_pcm", None)):
+        if not self._owner_voice_ok(getattr(self, "_current_pcm", None),
+                                    allow_single=wants_assistant):
             self._say_now("Só o dono pode pedir um reinício.")
             return True
         if wants_assistant:

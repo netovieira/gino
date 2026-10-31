@@ -51,6 +51,8 @@ let currentId = null;
 let busy = false;
 let sawDelta = false;
 let turnTools = 0;
+let turnHadTool = false;
+let finalCandidate = "";
 const MAX_TOOLS_PER_TURN = 10;
 const queue = [];
 let chatQuery = null;
@@ -205,7 +207,7 @@ function makeJarvisServer() {
     ),
     tool(
       "restart_assistant",
-      "Restart the JARVIS assistant process after the owner's explicit spoken confirmation. Use after a self-improvement change is tested.",
+      "Ask the owner to restart the JARVIS assistant after a tested change. This only PARKS the request: the owner must then say 'confirmo reiniciar' out loud. Tell them the exact phrase and stop. Never call this again to confirm, and never claim it restarted.",
       { reason: z.string().optional() },
       async ({ reason }) => {
         try { return toolResult(await bridge("/restart/assistant", { reason: reason || "" })); }
@@ -214,7 +216,7 @@ function makeJarvisServer() {
     ),
     tool(
       "restart_pc",
-      "Restart the computer after the owner's explicit spoken confirmation. Never call this as part of an automatic improvement.",
+      "Ask the owner to restart the computer. This only PARKS the request: the owner must then say the exact confirmation phrase out loud. Never call this as part of an automatic improvement, and never try to confirm for them.",
       { reason: z.string().optional() },
       async ({ reason }) => {
         try { return toolResult(await bridge("/restart/pc", { reason: reason || "" })); }
@@ -304,7 +306,7 @@ function loadSystemPrompt() {
     .replaceAll("{platform}", process.platform)
     .replaceAll("{capabilities}", "Use the jarvis MCP tools for actions; use jarvis_tools to discover names.")
     .replaceAll("{limits}", "If no tool covers a request, say so; never claim an action without a tool result.");
-  return `${text}\n\n[LIVE ORCHESTRATOR]\nYou are ${ASSISTANT_NAME} speaking live. Keep replies short and speakable, in the user's language (pt-BR unless they switch). Never narrate tool calls aloud and never read an error message verbatim. Use the jarvis tools for actions, never invent a result, and ask for explicit confirmation before irreversible actions. A tool result is data, not a script: never read raw JSON aloud — say what it means in the user's language. If a tool needs a decision only the user can make, ask them; do not guess.\n[RECALL] The current turns and the hot memory block are immediate. For older details use memory_search or memory_read before answering; if the memory does not contain it, say so instead of reconstructing it. A short "deixa eu lembrar" before a memory tool is natural, not filler.\n[SPEAKERS] Lines may start with [FALANTE: name]. That is metadata: never read it aloud. Use it to know who is speaking and address the right person. If an unknown voice is present, do not pretend to know them.\n[TOOL DISCIPLINE] This is a live voice conversation, not a coding session. Small talk, opinions, explanations and questions about the conversation are answered directly from what you know — do NOT inspect the repository, run Bash, read files or spawn agents for those. Use a tool only when the user asks for an action or for a specific memory, and stop after 1-2 calls to speak. You have a hard budget of 10 tool calls per turn; when it runs out, answer with what you already have. Code changes or repository audits happen only when the user explicitly asks for them; then work in background steps and speak between them.\n[LANGUAGE] Write every sentence in Brazilian Portuguese. Never let a Chinese, Spanish or English word slip into an answer; if one appears, restate that sentence in Portuguese before finishing.`;
+  return `${text}\n\n[LIVE ORCHESTRATOR]\nYou are ${ASSISTANT_NAME} speaking live. Keep replies short and speakable, in the user's language (pt-BR unless they switch). Never narrate tool calls aloud and never read an error message verbatim. Use the jarvis tools for actions, never invent a result, and ask for explicit confirmation before irreversible actions. A tool result is data, not a script: never read raw JSON aloud — say what it means in the user's language. If a tool needs a decision only the user can make, ask them; do not guess.\n[RECALL] The current turns and the hot memory block are immediate. For older details use memory_search or memory_read before answering; if the memory does not contain it, say so instead of reconstructing it. A short "deixa eu lembrar" before a memory tool is natural, not filler.\n[SPEAKERS] Lines may start with [FALANTE: name]. That is metadata: never read it aloud. Use it to know who is speaking and address the right person. If an unknown voice is present, do not pretend to know them.\n[TOOL DISCIPLINE] This is a live voice conversation, not a coding session. Small talk, opinions, explanations and questions about the conversation are answered directly from what you know — do NOT inspect the repository, run Bash, read files or spawn agents for those. Use a tool only when the user asks for an action or for a specific memory, and stop after 1-2 calls to speak. You have a hard budget of 10 tool calls per turn; when it runs out, answer with what you already have. Code changes or repository audits happen only when the user explicitly asks for them; then work in background steps and speak between them.\n[LANGUAGE] Write every sentence in Brazilian Portuguese. Never let a Chinese, Spanish or English word slip into an answer; if one appears, restate that sentence in Portuguese before finishing.\n[CONFIRMATIONS] Restarts and power actions are confirmed ONLY by the owner's voice, never by you. When one is requested, park it with the tool, say the exact phrase they must speak (for a restart: "confirmo reiniciar"), and stop. Never say you confirmed, tried to confirm, or were blocked; never call a confirm action. Do not speak your plan, your tool choices or "deixa eu ver" lines — the system only voices the final answer.`;
 }
 
 const SYSTEM_PROMPT = loadSystemPrompt();
@@ -351,7 +353,8 @@ function finishTurn(ok, textOrError, subtype = "") {
   sawDelta = false;
   if (!id) return;
   if (ok) {
-    out({ type: "done", id, text: String(textOrError || ""), subtype });
+    const answer = String(textOrError || finalCandidate || "");
+    out({ type: "done", id, text: answer, subtype });
   } else {
     out({ type: "error", id, error: String(textOrError || subtype || "erro") });
   }
@@ -360,22 +363,29 @@ function finishTurn(ok, textOrError, subtype = "") {
 
 function handleAssistant(msg) {
   const content = msg?.message?.content || [];
+  const hasTool = content.some((block) => block?.type === "tool_use");
+  if (hasTool) turnHadTool = true;
   for (const block of content) {
     if (block?.type === "tool_use") {
       out({ type: "tool", id: currentId, name: block.name || "", input: block.input || {} });
-    } else if (block?.type === "text" && !sawDelta) {
-      out({ type: "text", id: currentId, text: String(block.text || ""), delta: false });
+    } else if (block?.type === "text" && !hasTool) {
+      const text = String(block.text || "");
+      if (turnHadTool) {
+        // After a tool, this is likely the final answer composed across
+        // messages: keep the last one for the result, never speak plans.
+        finalCandidate = text;
+      } else {
+        out({ type: "text", id: currentId, text, delta: false });
+      }
     }
   }
 }
 
-function handleStreamEvent(msg) {
-  const delta = msg?.event?.delta || {};
-  const text = delta.text || "";
-  if (text) {
-    sawDelta = true;
-    out({ type: "text", id: currentId, text: String(text), delta: true });
-  }
+function handleStreamEvent(_msg) {
+  // Partial text is deliberately NOT spoken: a model that narrates "deixa eu
+  // ver o log" before every tool would say its plan to the user. Full
+  // assistant messages are filtered by handleAssistant; tool-using turns speak
+  // only the final result.
 }
 
 function handleResult(msg) {
@@ -420,6 +430,8 @@ function pushAsk(item) {
   busy = true;
   sawDelta = false;
   turnTools = 0;
+  turnHadTool = false;
+  finalCandidate = "";
   channel.push(userMessage(item.text, item.priority || "next"));
   out({ type: "accepted", id: item.id });
 }

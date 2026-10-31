@@ -48,10 +48,10 @@ from typing import Callable, Optional
 
 RUN_SCRIPT = "/home/anthero/jarvis/run-jarvis.sh"
 
-# How long a pending request stays useful. Long enough for the model to finish
-# its sentence and the user to answer; short enough that a forgotten "confirmo
-# reiniciar" from ten minutes ago cannot fire.
-CONFIRM_TIMEOUT_SECONDS = 120.0
+# How long a pending request stays useful. Long enough for the prompt to finish
+# and the owner to repeat after a failed voiceprint; short enough that a
+# forgotten "confirmo reiniciar" cannot fire much later.
+CONFIRM_TIMEOUT_SECONDS = 300.0
 
 # One assistant restart per five minutes.
 RATE_LIMIT_SECONDS = 300.0
@@ -172,8 +172,9 @@ class RestartManager:
             current = self._pending
             if current is not None and now - current.at <= CONFIRM_TIMEOUT_SECONDS:
                 return (f"A confirmation is already pending for the "
-                        f"{current.kind} restart. Finish it with action='confirm' "
-                        f"or drop it with action='cancel' first. Nothing new was done.")
+                        f"{current.kind} restart. The owner must speak the "
+                        f"phrase, or it can be dropped with action='cancel'. "
+                        f"Nothing new was done.")
             self._pending = None
 
             if kind == "assistant" and self._last_assistant_at is not None:
@@ -205,9 +206,10 @@ class RestartManager:
 
         return (
             f"[CONFIRMATION_PENDING] A spoken confirmation is needed to restart "
-            f"the {kind}. Nothing has restarted. Ask the user to say exactly "
-            f"'{request.phrase}' out loud, then call action='confirm' with that "
-            f"phrase. Until the phrase is confirmed, do not claim it happened."
+            f"the {kind}. Nothing has restarted. Tell the owner to say exactly "
+            f"'{request.phrase}' out loud. The confirmation is voice-only: the "
+            f"assistant applies it when the owner speaks, and no tool call can "
+            f"confirm it for them. Until then, do not claim it happened."
         )
 
     def request_assistant(self, reason: str = "") -> str:

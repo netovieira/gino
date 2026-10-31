@@ -69,6 +69,7 @@ ACTION_TIERS: dict[str, str] = {
     "gemini_accounts_status": TIER_SAFE,
     "groq_listen_status": TIER_SAFE,
     "qoder_status": TIER_SAFE,
+    "runtime_status": TIER_SAFE,
     "rastracking": TIER_SAFE,
     "system_monitor": TIER_SAFE,
     "background_monitor": TIER_SAFE,
@@ -110,7 +111,10 @@ ACTION_TIERS: dict[str, str] = {
     "qoder_agent": TIER_HIGH,
     "qoder_job": TIER_HIGH,
     "phrase_blocklist": TIER_HIGH,
-    "restart_assistant": TIER_HIGH,
+    # Parking a restart is not the restart: the owner's spoken phrase is the
+    # only thing that executes it. The confirmation action is refused by the
+    # tool itself, so the bridge does not need a second, unusable gate.
+    "restart_assistant": TIER_LOW,
     "restart_pc": TIER_HIGH,
 }
 

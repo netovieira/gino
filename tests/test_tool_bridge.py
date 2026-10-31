@@ -119,6 +119,8 @@ class CatalogAndTierTests(unittest.TestCase):
         self.assertEqual(bridge.risk_tier("send_message"), "medium")
         self.assertEqual(bridge.risk_tier("email_control"), "medium")
         self.assertEqual(bridge.risk_tier("browser_control"), "medium")
+        self.assertEqual(bridge.risk_tier("runtime_status"), "safe")
+        self.assertEqual(bridge.risk_tier("restart_assistant"), "low")
         self.assertEqual(bridge.risk_tier("root_exec"), "high")
         self.assertEqual(bridge.risk_tier("phrase_blocklist"), "high")
         self.assertEqual(bridge.risk_tier("totally_unknown_action"), "high")
