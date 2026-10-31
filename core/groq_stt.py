@@ -46,17 +46,26 @@ _END_BLOCKS = 11         # ~700 ms below closes it
 # cut by TIME (see _SLEEP_CAP_BLOCKS), and the cut can land in the middle of the
 # name — this overlap is what makes a call split across two blocks arrive whole.
 _PREROLL = 19
-_MIN_SPEECH = 6          # ~380 ms of voiced blocks, else dropped as noise
+_MIN_SPEECH = 5          # ~320 ms of voiced blocks, else dropped as noise
 _MAX_BLOCKS = 600        # ~38 s hard cap, then sent as-is
+# While the assistant is speaking only echo-guard-approved blocks reach this
+# segmenter, but a stray one must not grow into a minute of self-audio: cut it
+# short so a barge-in phrase still works and a false start costs 2.5 s, not 38.
+_SPEAK_CAP_BLOCKS = 40
+# Quiet, distant microphones: Whisper sees a whisper and gives up. Level is
+# raised after the utterance is cut, never before the VAD, so the segmenter
+# still tracks the real room floor.
+_TARGET_RMS = 0.055
+_MAX_GAIN = 10.0
 # Asleep, the 25 s cap is worthless: it only closes on 700 ms of silence, and a
 # room with music or a fan never gives that. The block grew to the full 25 s and
 # was then thrown away for being "too long for a wake call" — every single time.
 # Cutting on time instead gives one chance to hear the name every ~3.8 s, which
 # is just under _SLEEP_MAX_S so the block is never discarded unseen.
 _SLEEP_CAP_BLOCKS = 59
-_FLOOR_MIN = 0.003       # the quietest floor we believe
-_THRESH_MIN = 0.008      # the quietest threshold we accept (≈ -42 dBFS)
-_FLOOR_MULT = 2.5        # speech must be this many times the room floor
+_FLOOR_MIN = 0.002       # the quietest floor we believe
+_THRESH_MIN = 0.006      # the quietest threshold we accept (≈ -44 dBFS)
+_FLOOR_MULT = 2.2        # speech must be this many times the room floor
 _LEVEL_LOG_S = 5.0       # console line with the mic level, to tune the above
 _SLEEP_MAX_S = 4.0        # asleep, longer "utterances" are music/TV, not a call
 
@@ -77,6 +86,26 @@ _NOISE = {
     "you", "bye", "bye.", "legendas pela comunidade amara.org",
     "legendas pela comunidade amara.org.", "amara.org",
 }
+
+
+def _boost_quiet(pcm16: bytes) -> bytes:
+    """Raise a quiet, distant utterance to a level Whisper can decode.
+
+    Applied only to the clip sent to transcription; the segmenter keeps seeing
+    the real room level, so a loud room does not become a loud false positive.
+    """
+    x = np.frombuffer(pcm16, dtype=np.int16)
+    if x.size == 0:
+        return pcm16
+    f = x.astype(np.float32) / 32768.0
+    rms = float(np.sqrt(np.mean(f * f)))
+    if rms >= 0.03 or rms < 0.004:
+        return pcm16
+    gain = min(_MAX_GAIN, _TARGET_RMS / rms)
+    if gain <= 1.2:
+        return pcm16
+    y = np.clip(f * gain, -1.0, 1.0) * 32767.0
+    return y.astype(np.int16).tobytes()
 
 
 def settings(get_plugin_config: Callable[[str], dict]) -> dict:
@@ -193,6 +222,8 @@ class GroqListener:
         self._worker = threading.Thread(target=self._run, name="groq-stt", daemon=True)
         self._worker.start()
         self.speaking = False          # True while an utterance is open
+        self.assistant_speaking = False  # True while a reply is playing
+        self._drop_segment = False
         # True while the assistant sleeps: utterances are still cut and
         # transcribed (locally only) so a sentence that calls the assistant by
         # name can wake it — but nothing leaves the machine, nothing reaches
@@ -206,6 +237,15 @@ class GroqListener:
         """True when transcription happens on this machine (core.local_stt)."""
         return self._transcribe_fn is not None
 
+    def set_assistant_speaking(self, value: bool) -> None:
+        """Called by the playback path: a reply is (not) coming out now."""
+        self.assistant_speaking = bool(value)
+        if value:
+            # Drop any stale segment on the next mic block instead of touching
+            # the segment list from the playback thread. A reply only starts
+            # after a turn, but no mixed-voice segment may survive into it.
+            self._drop_segment = True
+
     # ── audio thread ────────────────────────────────────────────────────────
 
     def feed(self, block) -> None:
@@ -214,6 +254,13 @@ class GroqListener:
             return
         level = float(np.sqrt(np.mean(x * x))) / 32768.0
         raw = np.asarray(block, dtype=np.int16).tobytes()
+
+        if self._drop_segment:
+            # The reply started: whatever was half-open belongs to the previous
+            # turn, not to a mixed utterance with the assistant's own voice.
+            self._seg, self._active, self.speaking = [], False, False
+            self._above = self._below = self._voiced = 0
+            self._drop_segment = False
 
         if not self._active:
             # Track the room while nobody speaks; follow drops quickly, rises slowly.
@@ -264,7 +311,10 @@ class GroqListener:
             self._below = 0
         else:
             self._below += 1
-        cap = _SLEEP_CAP_BLOCKS if self.sleeping else _MAX_BLOCKS
+        if self.assistant_speaking:
+            cap = _SPEAK_CAP_BLOCKS
+        else:
+            cap = _SLEEP_CAP_BLOCKS if self.sleeping else _MAX_BLOCKS
         if self._below >= _END_BLOCKS or len(self._seg) >= cap:
             self._close(capped=len(self._seg) >= cap)
 
@@ -296,7 +346,7 @@ class GroqListener:
             else:
                 if not self.sleeping:
                     self._on_status(f"Ouvi {secs:.1f}s — transcrevendo no {self.label}…")
-                self._q.put(pcm)
+                self._q.put(_boost_quiet(pcm))
         else:
             print(f"[Groq] dropped a {voiced}-block blip as noise")
             _duck.up()          # it opened an utterance (and ducked) for nothing

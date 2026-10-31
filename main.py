@@ -884,12 +884,13 @@ _VOICE_AUTHORIZE_RE = re.compile(
     r"\b(?:a|o|para)\s+([\wÀ-ÿ][\wÀ-ÿ'-]{1,29})",
     re.IGNORECASE)
 _VOICE_SELF_ENROLL_RE = re.compile(
-    r"\b(?:registra|registre|registrar|cadastra|cadastre|cadastrar|"
-    r"adiciona|adicione|adicionar|salva|salve|salvar)\b"
-    r"[^.!?]{0,40}\b(?:essa|esta)\s+(?:voz|amostra)\b"
-    r"|\b(?:registra|registre|registrar)\s+(?:essa|esta)\s+tamb[eé]m\b"
+    r"\b(?:registra|registre|registrar|registro|cadastra|cadastre|cadastrar|"
+    r"cadastro|adiciona|adicione|adicionar|salva|salve|salvar)\b"
+    r"[^.!?]{0,40}\b(?:voz|vozes|variação|variacao|amostra)\b"
+    r"|\b(?:registra|registre|registrar|registro)\s+(?:essa|esta|a|ela)\s+tamb[eé]m\b"
+    r"|\b(?:registra|registre|registrar)\s+ela\s+(?:pra|para)\s+mim\b"
     r"|\b(?:essa|esta)\s+(?:voz\s+)?(?:é|e)\s+minha\b"
-    r"|\b(?:registra|registre|registrar)\s+ela\s+(?:pra|para)\s+mim\b",
+    r"|\bminha\s+voz\b",
     re.IGNORECASE)
 
 # Restart by voice: the request is deterministic (a gate), and the second
@@ -3001,7 +3002,8 @@ class JarvisLive:
         print(f"[QoderLive] destructive request not authorized: {title}: {message[:160]}")
         return False
 
-    def _qoder_hold(self, text, pcm=None, reason: str = "") -> None:
+    def _qoder_hold(self, text, pcm=None, reason: str = "",
+                    announce: bool = True) -> None:
         """Keep a turn for the warm session instead of answering locally."""
         clean = str(text or "").strip()
         if not clean:
@@ -3015,11 +3017,15 @@ class JarvisLive:
         _metrics.inc("qoder.held")
         print(f"[QoderLive] turno guardado ({reason or 'sidecar indisponível'})")
         try:
-            self.ui.write_log("SYS: Qoder indisponível — fala guardada para a "
-                              "mesma sessão.")
+            if reason == "turno em andamento":
+                self.ui.write_log("SYS: fala guardada — o Qoder ainda está "
+                                  "respondendo o turno anterior.")
+            else:
+                self.ui.write_log("SYS: Qoder indisponível — fala guardada para a "
+                                  "mesma sessão.")
         except Exception:
             pass
-        if first:
+        if announce and first:
             self._say_now("Estou sem o cérebro do Qoder agora; guardei o que você "
                           "disse e respondo assim que ele voltar.")
 
@@ -3264,6 +3270,13 @@ class JarvisLive:
         self._last_user_speech = time.monotonic()
         if not retry:
             self._qoder_retry_used = False
+        with self._qoder_lock:
+            busy = self._qoder_current_id is not None
+        if busy:
+            # Qoder is still answering the previous turn. Queue this one for
+            # the same session instead of overwriting its streaming state.
+            self._qoder_hold(text, pcm, "turno em andamento", announce=False)
+            return
         speaker = None
         labeled_text = text
         if self._voice_id_enabled and self._speaker is not None and pcm:
@@ -4027,6 +4040,14 @@ class JarvisLive:
             # guard still lets a genuine reply through, so answering instantly
             # still works. Only our own echo is dropped.
             self._tail_until = time.monotonic() + self._out_latency + _TAIL_MARGIN
+        try:
+            if self._groq is not None:
+                # While a reply plays, only echo-guard-approved blocks reach
+                # the segmenter; this flag also caps any stray utterance so the
+                # assistant cannot transcribe minutes of its own voice.
+                self._groq.set_assistant_speaking(bool(value))
+        except Exception:
+            pass
         if not value:
             # The echo history is deliberately NOT cleared here: the tail above
             # still needs it to recognise our own voice. It is dropped when the
@@ -5715,15 +5736,17 @@ class JarvisLive:
             # that a cough or a keystroke cannot trigger it.
             if jarvis_speaking:
                 # Nothing is streamed while JARVIS talks, but the local
-                # segmenter still listens: a clear "para" or a new command
-                # interrupts, while "sim"/"e também…" is treated as a
-                # complement and leaves the answer playing. Echo is removed by
-                # the playback canceller and by _looks_like_own_voice().
+                # segmenter still listens for a clear interruption. The gate is
+                # content-based: only blocks the echo guard calls a real voice
+                # reach the segmenter, so the speakers' own sound never becomes
+                # a 38 s "utterance" of the assistant talking to itself.
                 if (getattr(self, "_voice_barge_in", True)
                         and self._groq is not None
                         and not self.ui.muted and not self._phone_active):
                     try:
-                        self._groq.feed(indata)
+                        if self._echo.is_user_speech(
+                                indata, SEND_SAMPLE_RATE, _pcm_level(indata)):
+                            self._groq.feed(indata)
                     except Exception:
                         pass
                 return

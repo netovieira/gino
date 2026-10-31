@@ -65,9 +65,16 @@ _BEAM_MAX_SECONDS = 8.0
 # came back as "Legendas pela comunidade de Amara.org", both with
 # no_speech_prob ≈ 0.88. Invented text is worse than no text: it becomes a turn
 # the user never spoke, and the assistant answers it.
-_NO_SPEECH_THRESHOLD = 0.6
-_LOGPROB_THRESHOLD = -1.0
+_NO_SPEECH_THRESHOLD = 0.75
+_LOGPROB_THRESHOLD = -1.2
 _COMPRESSION_THRESHOLD = 2.4
+# A quiet microphone is not silence: lower the internal Silero threshold so a
+# soft sentence survives, while keeping the model's own anti-hallucination.
+_VAD_PARAMETERS = {
+    "threshold": 0.30,
+    "min_speech_duration_ms": 150,
+    "min_silence_duration_ms": 300,
+}
 
 # What to transcribe with once the GPU is out: on CPU a medium/large model takes
 # seconds per sentence and the segmenter hands it ever-shorter clips, so the
@@ -232,6 +239,12 @@ class _Whisper:
         """int16 mono PCM at the listener's sample rate → text."""
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
         seconds = len(audio) / float(self._sr) if self._sr else 0.0
+        # Distant microphones deliver speech at a level the model reads as a
+        # whisper. Boost only quiet clips, and only for the decode.
+        if audio.size:
+            rms = float(np.sqrt(np.mean(audio * audio)))
+            if 0.004 <= rms < 0.03:
+                audio = np.clip(audio * min(10.0, 0.055 / rms), -1.0, 1.0)
         # Greedy decoding is what turns a short command into a different short
         # command ("pela ajuda" came back as "pela futebol"): with beam 1 the
         # model commits to the first plausible token and never looks back. On a
@@ -266,7 +279,8 @@ class _Whisper:
             # also triggers; Silero VAD is what tells speech from the rest. It
             # needs onnxruntime, hence the fallback — without it the per-segment
             # filter below still keeps the worst hallucinations out.
-            segments, _ = model.transcribe(audio, vad_filter=True, **kw)
+            segments, _ = model.transcribe(audio, vad_filter=True,
+                                           vad_parameters=_VAD_PARAMETERS, **kw)
             segments = list(segments)
         except Exception as e:
             if "vad" not in str(e).lower() and "onnx" not in str(e).lower():
