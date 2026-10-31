@@ -11,6 +11,8 @@ from pathlib import Path
 import httpx
 from fastapi.testclient import TestClient
 
+from core import rootgate
+from core import actiongate
 from core.tool_bridge import ACTION_TIERS, ToolBridge
 
 TOKEN = "test-token-123"
@@ -517,6 +519,67 @@ class LifecycleTests(unittest.TestCase):
 
     def test_stop_without_start_is_safe(self):
         make_bridge().stop()
+
+
+class VoiceConfirmTests(unittest.TestCase):
+    """The bridge confirm channel is the voice window in core/actiongate.py:
+    only a spoken consent opens it, it authorises exactly one action, and the
+    root (sudo) window never bleeds into it."""
+
+    def setUp(self):
+        actiongate.close()
+        rootgate.close()
+        self.addCleanup(actiongate.close)
+        self.addCleanup(rootgate.close)
+        self.registry = FakeRegistry()
+        self.dispatch = RecordingDispatch()
+        self.bridge = make_bridge(registry=self.registry, dispatch=self.dispatch,
+                                  confirm=actiongate.confirm)
+        self.client = TestClient(self.bridge.app)
+        self.addCleanup(self.client.close)
+
+    def _send(self):
+        return self.client.post("/call", headers=AUTH,
+                                json={"name": "send_message",
+                                      "args": {"text": "oi"}})
+
+    def test_medium_denied_without_window_and_marks_pending(self):
+        response = self._send()
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertEqual(response.json()["status"], "denied")
+        self.assertEqual(self.dispatch.calls, [])
+        # The refused request waits so the next short consent answers it.
+        self.assertTrue(actiongate.has_pending())
+
+    def test_short_consent_with_pending_opens_window_and_action_passes(self):
+        self._send()  # refused, now pending
+        self.assertTrue(actiongate.looks_like_consent("pode enviar"))
+        actiongate.open_window()
+        actiongate.clear_pending()
+        response = self._send()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.dispatch.calls[0][0], "send_message")
+
+    def test_window_is_consumed_by_the_first_action(self):
+        actiongate.open_window()
+        response = self._send()
+        self.assertEqual(response.status_code, 200, response.text)
+        # A second risky action needs a new spoken consent.
+        response = self._send()
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertEqual(len(self.dispatch.calls), 1)
+
+    def test_consent_without_pending_matches_nothing_and_window_stays_closed(self):
+        self.assertFalse(actiongate.has_pending())
+        response = self._send()
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertFalse(actiongate.authorized())
+
+    def test_root_window_does_not_authorise_common_actions(self):
+        rootgate.open_window()
+        response = self._send()
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertEqual(self.dispatch.calls, [])
 
 
 if __name__ == "__main__":

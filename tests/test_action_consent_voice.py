@@ -1,0 +1,113 @@
+"""Spoken consent for a refused bridge action (main._try_action_consent + actiongate).
+
+Reproduces the live bug of 31/10/2026: the bridge refused
+whatsapp_control/send (403 "was not confirmed"), Gino was still speaking the
+refusal when the owner answered "Pode enviar" — the barge-in classifier kept
+the words as a "complement" and the actiongate block never saw them, so the
+window was never opened and the retry was refused again.
+
+The fix matches the consent BEFORE the barge-in classification, still
+voice-only: the window opens only when (a) a request is pending (mark_pending
+runs only on a bridge refusal, core/actiongate.py confirm()) and (b) the
+owner's short utterance matches rootgate's consent matcher. A model never
+reaches this path; an echo of Gino's own voice never reaches it either.
+"""
+from __future__ import annotations
+
+import unittest
+
+import main
+from core import actiongate, rootgate
+
+
+class FakeUI:
+    def __init__(self):
+        self.logs: list[str] = []
+
+    def write_log(self, text):
+        self.logs.append(text)
+
+
+def _obj(speaking=False, own_echo=False):
+    """A JarvisLive bare enough for the consent matcher — no loop, no mic."""
+    obj = object.__new__(main.JarvisLive)
+    obj._is_speaking = speaking
+    obj._reply_active = speaking
+    obj.ui = FakeUI()
+    obj.said: list[str] = []
+    obj._say_now = lambda text, log=True: obj.said.append(text)
+    obj._log_heard = lambda text: obj.said.append(f"heard:{text}")
+    obj._looks_like_own_voice = lambda text: own_echo
+    return obj
+
+
+class SpokenConsentWindowTests(unittest.TestCase):
+    """Pending refusal -> spoken "pode enviar" -> window -> confirm() True."""
+
+    def setUp(self):
+        actiongate.close()
+        rootgate.close()
+        self.addCleanup(actiongate.close)
+        self.addCleanup(rootgate.close)
+
+    def _refuse_once(self):
+        """The bridge's refusal channel: confirm() parks the request."""
+        self.assertFalse(actiongate.confirm(
+            "Confirm 'whatsapp_control'",
+            "Risk: medium. Arguments: action=send contato=Vida"))
+        self.assertTrue(actiongate.has_pending())
+
+    def test_pode_enviar_spoken_while_gino_is_still_talking_opens_window(self):
+        # The exact live scenario: the answer arrives DURING the refusal
+        # narration. It must open the window, not be kept as a complement.
+        self._refuse_once()
+        obj = _obj(speaking=True)
+        self.assertTrue(main.JarvisLive._try_action_consent(obj, "Pode enviar"))
+        self.assertTrue(actiongate.authorized())
+        self.assertFalse(actiongate.has_pending())
+        self.assertIn("Pode, autorizado.", obj.said)
+        # The retry now passes: confirm() finds the open window and consumes it.
+        self.assertTrue(actiongate.confirm("Confirm 'whatsapp_control'", "again"))
+        self.assertFalse(actiongate.authorized())  # single use
+
+    def test_bare_pode_answers_a_pending_request(self):
+        self._refuse_once()
+        obj = _obj(speaking=False)
+        self.assertTrue(main.JarvisLive._try_action_consent(obj, "pode"))
+        self.assertTrue(actiongate.authorized())
+
+    def test_window_is_single_use(self):
+        self._refuse_once()
+        obj = _obj()
+        self.assertTrue(main.JarvisLive._try_action_consent(obj, "pode enviar"))
+        self.assertTrue(actiongate.confirm("Confirm 'whatsapp_control'", "first"))
+        # A second risky action needs a NEW spoken consent.
+        self.assertFalse(actiongate.confirm("Confirm 'send_message'", "second"))
+        self.assertFalse(actiongate.authorized())
+
+    def test_stray_consent_without_pending_opens_nothing(self):
+        # No refusal happened: nothing on the table, nothing authorisable.
+        obj = _obj()
+        self.assertFalse(main.JarvisLive._try_action_consent(obj, "pode"))
+        self.assertFalse(actiongate.authorized())
+
+    def test_echo_of_our_own_refusal_does_not_open_the_window(self):
+        # Gino's playback leaking into the mic must not self-authorise.
+        self._refuse_once()
+        obj = _obj(speaking=True, own_echo=True)
+        self.assertFalse(main.JarvisLive._try_action_consent(obj, "pode enviar"))
+        self.assertFalse(actiongate.authorized())
+        self.assertTrue(actiongate.has_pending())  # kept for the real answer
+
+    def test_long_sentence_containing_pode_is_not_an_answer(self):
+        self._refuse_once()
+        obj = _obj()
+        too_long = ("eu acho que voce pode me dizer depois que horas ficam "
+                    "quando o sol se poe la no horizonte")
+        self.assertFalse(main.JarvisLive._try_action_consent(obj, too_long))
+        self.assertFalse(actiongate.authorized())
+        self.assertTrue(actiongate.has_pending())
+
+
+if __name__ == "__main__":
+    unittest.main()

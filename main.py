@@ -121,6 +121,7 @@ from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
 from core import duck as _duck
 from core import rootgate as _rootgate
+from core import actiongate as _actiongate
 from core import qoder_jobs as _qoder_jobs
 from core.viseme               import VisemeStream
 from core.wake_word            import (
@@ -3038,9 +3039,22 @@ class JarvisLive:
             raise
 
     def _bridge_confirm(self, title: str, message: str) -> bool:
-        # Destructive Qoder Bash commands are denied until the voice
-        # confirmation flow is wired. Restart has its own phrase gate.
-        print(f"[QoderLive] destructive request not authorized: {title}: {message[:160]}")
+        """Voice-only confirmation for bridge actions (medium/high tier).
+
+        True only inside the single-use window core/actiongate.py opened from a
+        spoken consent phrase, and the window is consumed here. Otherwise the
+        request is parked as pending so the user's next short "pode" answers it,
+        and the bridge returns "was not confirmed". Restart keeps its own gate.
+        """
+        if _actiongate.confirm(title, message):
+            print(f"[QoderLive] ação de risco autorizada por voz: {title}")
+            try:
+                self.ui.write_log(f"SYS: Ação autorizada pela sua voz: {title}")
+            except Exception:
+                pass
+            return True
+        print(f"[QoderLive] destructive request aguardando consentimento por voz: "
+              f"{title}: {message[:160]}")
         return False
 
     def _qoder_hold(self, text, pcm=None, reason: str = "",
@@ -4636,6 +4650,17 @@ class JarvisLive:
         # mistaken for a complement.
         if self._voice_train_gate(text, pcm):
             return
+        # Spoken consent for a risky bridge action the assistant just asked
+        # about (send_message, whatsapp_control, ...). This runs BEFORE the
+        # barge-in classification on purpose: the refusal narration ("preciso
+        # da sua autorização") is usually still being spoken when the owner
+        # answers "pode enviar", and as a mere "complement" that answer was
+        # dropped — the next bridge call then found no window and was denied
+        # again. Same rule as root: matched here, before any model, and ONLY
+        # while a request is pending — it is the answer to the assistant's own
+        # question. The window is single-use and separate from the sudo window.
+        if self._try_action_consent(text):
+            return
         # Spoken while Gino is talking: classify as interruption or complement
         # instead of starting a turn blindly. A complement must not cut him off.
         if getattr(self, "_reply_active", False) or self._is_speaking:
@@ -4721,6 +4746,9 @@ class JarvisLive:
             else:
                 self._say_now("Autorizado.")
             return
+        # Spoken consent for a risky bridge action was already handled at the
+        # top of this method, before the barge-in classification (the owner
+        # typically answers while the refusal is still being spoken).
         # Local gates, in order, before any model: an explicit write to memory,
         # the blocked-phrase list, the music transport, the YouTube window. Each
         # one is a case where the user is editing state, not asking a question —
@@ -4862,6 +4890,47 @@ class JarvisLive:
             if len(frag) >= 10 and difflib.SequenceMatcher(None, t, frag).ratio() > 0.72:
                 return True
         return False
+
+    def _try_action_consent(self, text: str) -> bool:
+        """The owner's short spoken answer to a refused bridge action.
+
+        Opens the single-use actiongate window and consumes the utterance.
+        Matched on the microphone thread before any model sees the text — a
+        model can never reach this matcher, so it can never open the window.
+        Returns False, changing nothing, unless a bridge request is pending
+        (mark_pending runs only on a refusal) AND the words are a consent
+        phrase (rootgate's matcher). While Gino is speaking, the own-voice
+        echo guard applies first: the refusal prompt itself can contain
+        "pode", and his playback leaking into the mic must not authorise
+        anything.
+        """
+        try:
+            if not _actiongate.has_pending():
+                return False
+        except Exception:
+            return False
+        if (self._is_speaking or getattr(self, "_reply_active", False)) \
+                and self._looks_like_own_voice(text):
+            print(f"[ActionGate] eco ignorado: {text[:60]!r}")
+            return False
+        try:
+            if not _actiongate.looks_like_consent(text):
+                return False
+        except Exception:
+            return False
+        _asked = _actiongate.pending() or {}
+        secs = _actiongate.open_window()
+        _actiongate.clear_pending()
+        self._log_heard(text)
+        print(f"[ActionGate] consentimento por voz: «{text[:60]}» → janela "
+              f"{secs:.0f}s para «{_asked.get('title', '')}»")
+        try:
+            self.ui.write_log(f"SYS: Ação «{_asked.get('title', '')}» autorizada "
+                              f"pela sua voz ({secs:.0f}s).")
+        except Exception:
+            pass
+        self._say_now("Pode, autorizado.")
+        return True
 
     def _handle_barge_in(self, text: str) -> None:
         """User spoke while Gino was speaking: decide whether to cut him off.
