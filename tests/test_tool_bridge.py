@@ -399,7 +399,9 @@ class DelegationTests(unittest.TestCase):
         }
         self.bridge = make_bridge(memory=self.memory, voice=self.voice,
                                   restart=self.restart,
-                                  local_ask=lambda prompt: f"local:{prompt}")
+                                  local_ask=lambda prompt: f"local:{prompt}",
+                                  start_task=lambda task, mode="answer", approval=None:
+                                  f"task:{task}:{mode}:{approval}")
         self.client = TestClient(self.bridge.app)
         self.addCleanup(self.client.close)
 
@@ -460,6 +462,12 @@ class DelegationTests(unittest.TestCase):
                                     json={"prompt": "resuma isto"})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["result"], "local:resuma isto")
+
+    def test_task_start(self):
+        response = self.client.post("/task/start", headers=AUTH,
+                                    json={"task": "subir", "mode": "write"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["result"], "task:subir:write:None")
 
     def test_missing_components_return_501(self):
         bridge = make_bridge()

@@ -127,14 +127,14 @@ def _own_stream_active() -> bool:
 
 
 def _speech_alive() -> bool:
-    if _own_stream_active():
-        return True
-    try:
-        if _probe is not None and _probe():
-            return True
-    except Exception:
-        pass
-    return False
+    # A host probe is authoritative: a playback stream can stay open while
+    # silent, and "stream exists" then held the duck forever.
+    if _probe is not None:
+        try:
+            return bool(_probe())
+        except Exception:
+            pass
+    return _own_stream_active()
 
 
 def _watchdog_loop() -> None:

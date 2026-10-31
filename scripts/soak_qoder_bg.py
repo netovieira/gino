@@ -19,12 +19,14 @@ import json
 import os
 import queue
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,11 +34,84 @@ SIDECAR = ROOT / "qoder_live" / "index.mjs"
 DEFAULT_MODEL = "Qwen3.8-Flash"
 
 
+class StubBridge:
+    """Minimal /task/start bridge: the job runs outside the chat sidecar."""
+
+    def __init__(self, task_seconds: int):
+        self.task_seconds = task_seconds
+        self.lock = threading.Lock()
+        self.started = 0
+        self.done = 0
+        self.started_at = 0.0
+        self.done_at = 0.0
+        self.done_event = threading.Event()
+        bridge = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                except Exception:
+                    body = {}
+                if self.path == "/task/start":
+                    with bridge.lock:
+                        bridge.started += 1
+                        bridge.started_at = time.monotonic()
+                        bridge.done_event.clear()
+
+                    def _work():
+                        time.sleep(bridge.task_seconds)
+                        with bridge.lock:
+                            bridge.done += 1
+                            bridge.done_at = time.monotonic()
+                            bridge.done_event.set()
+                    threading.Thread(target=_work, daemon=True,
+                                     name="stub-task").start()
+                    payload = {"status": "ok",
+                               "result": "Tarefa iniciada em segundo plano."}
+                elif self.path in ("/health",):
+                    payload = {"status": "ok"}
+                else:
+                    payload = {"status": "error", "error": f"unknown {self.path}"}
+                raw = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True, name="stub-bridge")
+        self.thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def begin_cycle(self) -> None:
+        with self.lock:
+            self.done_event.clear()
+
+    def stop(self) -> None:
+        try:
+            self.server.shutdown()
+        except Exception:
+            pass
+
+
 class Sidecar:
-    def __init__(self, workdir: Path, model: str, log_path: Path):
+    def __init__(self, workdir: Path, model: str, log_path: Path,
+                 bridge_url: str = "http://127.0.0.1:9"):
         self.workdir = workdir
         self.model = model
         self.log_path = log_path
+        self.bridge_url = bridge_url
         self.proc: subprocess.Popen | None = None
         self.q: queue.Queue = queue.Queue()
         self.reader: threading.Thread | None = None
@@ -46,7 +121,7 @@ class Sidecar:
     def start(self, timeout: float = 90.0) -> bool:
         env = os.environ.copy()
         env.update({
-            "JARVIS_BRIDGE_URL": "http://127.0.0.1:9",
+            "JARVIS_BRIDGE_URL": self.bridge_url,
             "JARVIS_BRIDGE_TOKEN": "soak",
             "JARVIS_MODEL": self.model,
             "JARVIS_CWD": str(self.workdir),
@@ -126,7 +201,9 @@ class Soak:
         self.summary_path = run_dir / "summary.json"
         self.workdir = run_dir / "cwd"
         self.workdir.mkdir(parents=True, exist_ok=True)
-        self.sidecar = Sidecar(self.workdir, args.model, run_dir / "sidecar.log")
+        self.bridge = StubBridge(args.task_seconds)
+        self.sidecar = Sidecar(self.workdir, args.model,
+                               run_dir / "sidecar.log", self.bridge.url)
         self.summary = {
             "run_id": run_dir.name,
             "model": args.model,
@@ -203,39 +280,43 @@ class Soak:
         sink: list = []
         cycle_ok = True
 
-        # 1) delegate a slow task
+        # 1) delegate a slow execution to the independent worker
+        self.bridge.begin_cycle()
+        started_before = self.bridge.started
         task_text = (
-            f"Delegue a um Agent em segundo plano a tarefa de rodar o comando "
-            f"'sleep {self.args.task_seconds}; echo ciclo-{index}-ok'. Diga em "
-            f"uma frase que ela está rodando e NÃO espere o resultado.")
+            f"Chame qoder_task com mode='answer' e task='investigar o ciclo "
+            f"{index}'. Diga em uma frase que ela está rodando em segundo plano "
+            f"e NÃO espere o resultado.")
         task_id = self.sidecar.ask(task_text)
         parent_ok = self.wait_for(
             sink, lambda m: m.get("type") == "done" and self.msg_id(m) == task_id,
             timeout=self.args.turn_timeout)
-        parent_at = time.monotonic() - t0
+        parent_entry = next(((at, m) for at, m in sink
+                             if m.get("type") == "done"
+                             and self.msg_id(m) == task_id), None)
+        parent_at = (parent_entry[0] - t0) if parent_entry else time.monotonic() - t0
         if parent_ok:
             self.summary["max_parent_s"] = max(self.summary["max_parent_s"], parent_at)
         else:
             cycle_ok = False
             self.log("parent_timeout", cycle=index, id=task_id)
-        started = [m for _, m in sink
-                   if m.get("type") == "task" and m.get("phase") == "started"]
+        started = any(m.get("type") == "tool" and "qoder_task" in str(m.get("name"))
+                      for _, m in sink)
         if not started:
-            # The model may have answered without delegating; give it a moment.
-            self.wait_for(sink, lambda m: m.get("type") == "task"
-                          and m.get("phase") == "started", timeout=2.0)
-            started = [m for _, m in sink
-                       if m.get("type") == "task" and m.get("phase") == "started"]
+            # The tool call can land just after the spoken acknowledgement.
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and self.bridge.started == started_before:
+                try:
+                    msg = self.sidecar.q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                sink.append((time.monotonic(), msg))
+            started = self.bridge.started > started_before
         if not started:
             cycle_ok = False
             self.log("task_not_started", cycle=index, id=task_id)
-        started_ids = {str(m.get("id")) for m in started}
 
-        def _is_task_done(m: dict) -> bool:
-            return (m.get("type") == "task" and m.get("phase") == "done"
-                    and (not started_ids or str(m.get("id")) in started_ids))
-
-        # 2) conversation while the task is still running
+        # 2) conversation while the worker is still running
         conv_id = self.sidecar.ask(
             f"Responda em uma frase curta: qual é o número do ciclo {index}?",
             priority=None if parent_ok else "now")
@@ -250,9 +331,10 @@ class Soak:
             self.log("conversation_timeout", cycle=index, id=conv_id,
                      after_s=round(conv_at, 1))
 
-        # 3) wait for the background result
-        task_done = self.wait_for(sink, _is_task_done,
-                                  timeout=max(30.0, self.args.task_seconds + 25.0))
+        # 3) wait for the independent worker result
+        task_done = started and self.bridge.done_event.wait(
+            timeout=max(30.0, self.args.task_seconds + 25.0))
+        task_done_clock = self.bridge.done_at if task_done else 0.0
         if task_done:
             self.summary["task_completed"] += 1
         else:
@@ -260,15 +342,9 @@ class Soak:
             cycle_ok = False
             self.log("task_done_missing", cycle=index)
 
-        # 4) did the conversation finish while the task was still running?
-        parent_msg = next((m for _, m in sink
-                           if m.get("type") == "done" and self.msg_id(m) == task_id), None)
-        task_done_msg = next((m for _, m in sink if _is_task_done(m)), None)
-        if parent_msg and task_done_msg:
-            # Order in the stream is the ground truth: the parent done must
-            # appear before the task done for the conversation to be free.
-            order = [m for _, m in sink if m in (parent_msg, task_done_msg)]
-            if order and order[0] is parent_msg:
+        # 4) did the conversation finish while the worker was still running?
+        if parent_entry and task_done:
+            if parent_entry[0] < task_done_clock:
                 self.summary["parent_before_task"] += 1
             else:
                 self.summary["blocked"] += 1
@@ -310,7 +386,7 @@ def main() -> int:
     ap.add_argument("--hours", type=float, default=24.0)
     ap.add_argument("--interval-min", type=float, default=15.0)
     ap.add_argument("--turn-timeout", type=float, default=45.0)
-    ap.add_argument("--task-seconds", type=int, default=5)
+    ap.add_argument("--task-seconds", type=int, default=8)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--out", default=str(ROOT / "logs" / "soak"))
     args = ap.parse_args()
@@ -362,6 +438,7 @@ def main() -> int:
         soak.summary["finished"] = datetime.now(timezone.utc).isoformat()
         soak.save()
         soak.sidecar.stop()
+        soak.bridge.stop()
         soak.log("finish", **{k: soak.summary[k] for k in
                               ("cycles", "completed", "failed", "restarts",
                                "parent_before_task", "blocked",

@@ -925,6 +925,15 @@ _VOICE_TRAIN_PROMPTS = (
     "Agora um pouco mais alto: Gino, pode me ouvir?",
     "Sou eu de novo, falando do jeito normal.",
 )
+# An explicit send request is the owner's authorization: he should not have to
+# answer a second "pode enviar?" for something he just asked for.
+_ACTION_REQUEST_RE = re.compile(
+    r"\b(?:manda|mande|mandar|envia|envie|enviar|posta|poste|postar|"
+    r"publica|publique|compartilha|compartilhe)\b[^.!?]{0,60}"
+    r"\b(?:mensagem|whatsapp|zap|telegram|sms|e-?mail|recado|áudio|audio)\b"
+    r"|\b(?:whatsapp|zap|telegram)\b[^.!?]{0,40}"
+    r"\b(?:manda|mande|envia|envie|posta|poste)\b",
+    re.IGNORECASE)
 
 # Restart by voice: the request is deterministic (a gate), and the second
 # utterance must be the exact confirmation phrase from the owner's voice.
@@ -1400,6 +1409,14 @@ class JarvisLive:
         self._ptt                  = None    # core.hotkey.PushToTalk
         self._out_level            = 0.0     # level of the audio being played right now
         self._echo                 = EchoGuard()
+        try:
+            # The duck watchdog must not trust a playback stream that stays
+            # open while silent: this probe is the real "someone is speaking".
+            _duck.register_speech_probe(
+                lambda: bool(self._is_speaking)
+                or bool(getattr(self._groq, "speaking", False)))
+        except Exception:
+            pass
         self._cancel               = None    # core.playback_cancel, opened with the mic
         # `stream.write()` returns when the buffer accepts the audio, not when the
         # speaker has finished with it, so sound is still in the room after the
@@ -2834,6 +2851,7 @@ class JarvisLive:
                         voice=self._speaker,
                         restart=self._restart,
                         local_ask=self._local_ask,
+                        start_task=self._start_qoder_task,
                     )
                     actual = self._bridge.start()
                     break
@@ -2991,6 +3009,23 @@ class JarvisLive:
         except Exception as e:
             print(f"[Local] completion failed: {e}")
             return ""
+
+    def _start_qoder_task(self, task: str, mode: str = "answer",
+                          approval: bool | None = None) -> str:
+        """Start an execution in the independent Qoder job worker.
+
+        This is the only path a live-chat execution may take: the job runs in
+        its own process/thread, so preempting or restarting the chat sidecar
+        can never stop it.
+        """
+        mode = str(mode or "answer").strip().lower()
+        if mode not in ("answer", "plan", "write"):
+            mode = "answer"
+        if mode == "write" and approval is None:
+            # The live model only calls write when the owner asked explicitly.
+            approval = False
+        return _qoder_jobs.start(
+            str(task or ""), mode=mode, player=self.ui, approval=approval)
 
     def _local_ask(self, prompt: str) -> str:
         """Local model used only when the Qoder session delegates a small task."""
@@ -4803,6 +4838,14 @@ class JarvisLive:
                 _duck.up()
                 return
         self._memory_record_user(text)
+        if _ACTION_REQUEST_RE.search(text):
+            # The owner's own request is the authorization; no second prompt.
+            secs = _actiongate.open_window()
+            try:
+                self.ui.write_log(f"SYS: pedido explícito — ação autorizada "
+                                  f"pela sua voz ({secs:.0f}s).")
+            except Exception:
+                pass
         # Architecture A: the persistent Qoder session is the one
         # conversational brain. Gates above still win for instant local
         # actions (music, apps, screen, memory, persona, code); the local 7B

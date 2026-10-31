@@ -35,7 +35,7 @@ WINDOW_SECONDS = 120.0
 # How long a refused request stays on the table, waiting for the user's answer.
 # Shorter than the window itself: the question "posso enviar?" should be
 # answered now or the intent is stale.
-PENDING_SECONDS = 90.0
+PENDING_SECONDS = 300.0
 
 _lock = threading.Lock()
 _until = 0.0

@@ -207,6 +207,12 @@ class LocalAskRequest(BaseModel):
     prompt: str
 
 
+class TaskStartRequest(BaseModel):
+    task: str
+    mode: str = "answer"
+    approval: bool | None = None
+
+
 def _jsonable(value: Any) -> Any:
     try:
         return jsonable_encoder(value)
@@ -241,7 +247,8 @@ class ToolBridge:
     def __init__(self, registry, dispatch, token: str, host: str = "127.0.0.1",
                  port: int = 8011, confirm=None, logger: Callable[[str], None] = print,
                  audit_path=None, memory=None, voice=None, restart=None,
-                 local_ask=None, timeout: float = _DEFAULT_TIMEOUT):
+                 local_ask=None, start_task=None,
+                 timeout: float = _DEFAULT_TIMEOUT):
         if not isinstance(token, str) or not token:
             raise ValueError("ToolBridge requires a non-empty bearer token")
         self._registry = registry
@@ -257,6 +264,7 @@ class ToolBridge:
         self._voice = voice
         self._restart = restart
         self._local_ask = local_ask
+        self._start_task = start_task
         self._timeout = float(timeout)
 
         self._audit_lock = threading.Lock()
@@ -417,6 +425,18 @@ class ToolBridge:
                 return self._not_configured("local_ask", "Local model bridge is not configured.")
             return await self._delegate(fn, prompt=payload.prompt)
 
+        @app.post("/task/start", dependencies=auth)
+        async def task_start(payload: TaskStartRequest):
+            if self._start_task is None:
+                return self._not_configured("task", "Background task bridge is not configured.")
+            fn = self._start_task
+            if not callable(fn):
+                fn = self._find_method(fn, ("start", "start_task", "task"))
+            if not callable(fn):
+                return self._not_configured("task", "Background task bridge is not configured.")
+            return await self._delegate(fn, task=payload.task, mode=payload.mode,
+                                        approval=payload.approval)
+
         return app
 
     def _tool_catalog(self) -> list[dict]:
@@ -465,7 +485,9 @@ class ToolBridge:
                                    status=confirm_status)
                 return approved
             if not approved:
-                message = f"Action '{name}' was not confirmed."
+                message = (f"Action '{name}' was not authorized by the owner's "
+                           f"voice yet. Ask the owner to say 'pode' or 'pode "
+                           f"enviar' out loud; there is no popup to click.")
                 self._audit_action(name, args, tier, approved=False,
                                    result=message, status="denied")
                 return JSONResponse(

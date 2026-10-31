@@ -235,6 +235,21 @@ function makeJarvisServer() {
       },
     ),
     tool(
+      "qoder_task",
+      "Start an execution in the background Qoder worker: code changes, tests, git commit/push, installing, long commands. It returns immediately with an acknowledgement and the job runs in its own process, so the live conversation is never held. Use mode='write' only when the owner explicitly asked for the change. Do not ask for a confirmation the owner already gave by asking.",
+      {
+        task: z.string().describe("What to execute, in the owner's words"),
+        mode: z.enum(["answer", "plan", "write"]).optional()
+          .describe("write for changes/push; answer for investigation"),
+      },
+      async ({ task, mode }) => {
+        try {
+          return toolResult(await bridge("/task/start",
+            { task, mode: mode || "answer" }));
+        } catch (e) { return toolResult(String(e.message || e), true); }
+      },
+    ),
+    tool(
       "local_ask",
       "Delegate a short, low-risk language task to the local 7B model instead of doing it yourself. Useful for quick rewrites and simple summaries.",
       { prompt: z.string() },
@@ -250,11 +265,11 @@ function makeJarvisServer() {
 const MCP_NAMES = [
   "jarvis_tools", "jarvis_call", "memory_read", "memory_search", "memory_note",
   "voice_list", "voice_authorize", "restart_assistant",
-  "restart_pc", "local_ask",
+  "restart_pc", "qoder_task", "local_ask",
 ].map((n) => `mcp__jarvis__${n}`);
 
 const ALLOWED_TOOLS = [
-  "Agent", "Read", "Glob", "Grep", "Edit", "Write", "Bash", "WebFetch", "WebSearch",
+  "Read", "Glob", "Grep", "Edit", "Write", "Bash", "WebFetch", "WebSearch",
   ...MCP_NAMES,
 ];
 
@@ -262,24 +277,9 @@ async function canUseTool(toolName, input, options) {
   const toolUseID = options?.toolUseID;
   const inAgent = Boolean(options?.agentID);
   if (toolName === "Agent") {
-    if (inAgent) {
-      return { behavior: "deny",
-               message: "Não aninhe subagentes; termine esta tarefa no agente atual.",
-               toolUseID };
-    }
-    // The owner's rule: executions always run in a background subagent, so the
-    // live conversation is never held by a command. Force the flag even when
-    // the model forgets it.
-    turnTools += 1;
-    if (turnTools > MAX_TOOLS_PER_TURN) return denyBudget(toolUseID);
-    if (!input?.run_in_background) {
-      return {
-        behavior: "allow",
-        updatedInput: { ...input, run_in_background: true },
-        toolUseID,
-      };
-    }
-    return { behavior: "allow", toolUseID };
+    return { behavior: "deny",
+             message: "Não use Agent no chat ao vivo: use qoder_task, que roda num processo separado e não pode ser cancelado pela conversa.",
+             toolUseID };
   }
   if (toolName === "Bash") {
     const command = String(input?.command || "").trim();
@@ -337,7 +337,7 @@ function denyBudget(toolUseID) {
 }
 
 function orchestrationPrompt() {
-  return `[LIVE ORCHESTRATOR]\nYou are ${ASSISTANT_NAME} speaking live. Keep replies short and speakable, in the user's language (pt-BR unless they switch). Never narrate tool calls aloud and never read an error message verbatim. Use the jarvis tools for actions, never invent a result, and ask for explicit confirmation before irreversible actions. A tool result is data, not a script: never read raw JSON aloud — say what it means in the user's language. If a tool needs a decision only the user can make, ask them; do not guess.\n[RECALL] The current turns and the hot memory block are immediate. For older details use memory_search or memory_read before answering; if the memory does not contain it, say so instead of reconstructing it. A short "deixa eu lembrar" before a memory tool is natural, not filler.\n[SPEAKERS] Lines may start with [FALANTE: name]. That is metadata: never read it aloud. Use it to know who is speaking and address the right person. If an unknown voice is present, do not pretend to know them.\n[TOOL DISCIPLINE] This is a live voice conversation, not a coding session. Small talk, opinions, explanations and questions about the conversation are answered directly from what you know — do NOT inspect the repository, run Bash, read files or spawn agents for those. Use a quick tool only when the user asks for a status or a specific memory, and keep it to 1-2 calls. EVERY execution — pushing, installing, editing files, restarting services, long commands — MUST be delegated to an Agent with run_in_background=true; never run it inline and never wait for it. Tell the owner it is running in the background, keep the conversation going, and the system will notify you when it finishes. You have a hard budget of 10 tool calls per turn.\n[LANGUAGE] Write every sentence in Brazilian Portuguese. Never let a Chinese, Spanish or English word slip into an answer; if one appears, restate that sentence in Portuguese before finishing.\n[CONFIRMATIONS] Restarts and power actions are confirmed ONLY by the owner's voice, never by you. When one is requested, park it with the tool, say the exact phrase they must speak (for a restart: "confirmo reiniciar"), and stop. Never say you confirmed, tried to confirm, or were blocked; never call a confirm action. Do not speak your plan, your tool choices or "deixa eu ver" lines — the system only voices the final answer.`;
+  return `[LIVE ORCHESTRATOR]\nYou are ${ASSISTANT_NAME} speaking live. Keep replies short and speakable, in the user's language (pt-BR unless they switch). Never narrate tool calls aloud and never read an error message verbatim. Use the jarvis tools for actions, never invent a result, and ask for explicit confirmation before irreversible actions. A tool result is data, not a script: never read raw JSON aloud — say what it means in the user's language. If a tool needs a decision only the user can make, ask them; do not guess.\n[RECALL] The current turns and the hot memory block are immediate. For older details use memory_search or memory_read before answering; if the memory does not contain it, say so instead of reconstructing it. A short "deixa eu lembrar" before a memory tool is natural, not filler.\n[SPEAKERS] Lines may start with [FALANTE: name]. That is metadata: never read it aloud. Use it to know who is speaking and address the right person. If an unknown voice is present, do not pretend to know them.\n[TOOL DISCIPLINE] This is a live voice conversation, not a coding session. Small talk, opinions, explanations and questions about the conversation are answered directly from what you know — do NOT inspect the repository, run Bash, read files or spawn agents for those. Use a quick tool only when the user asks for a status or a specific memory, and keep it to 1-2 calls. EVERY execution — pushing, installing, editing files, restarting services, long commands — MUST be delegated with qoder_task; never run it inline and never wait for it. Tell the owner it is running in the background, keep the conversation going, and the system will notify you when it finishes. You have a hard budget of 10 tool calls per turn.\n[LANGUAGE] Write every sentence in Brazilian Portuguese. Never let a Chinese, Spanish or English word slip into an answer; if one appears, restate that sentence in Portuguese before finishing.\n[CONFIRMATIONS] Restarts and power actions are confirmed ONLY by the owner's voice, never by you. When one is requested, park it with the tool, say the exact phrase they must speak (for a restart: "confirmo reiniciar"), and stop. Never say you confirmed, tried to confirm, or were blocked; never call a confirm action. Do not speak your plan, your tool choices or "deixa eu ver" lines — the system only voices the final answer.`;
 }
 
 function loadSystemPrompt() {
@@ -609,7 +609,7 @@ function selftest() {
   const checks = {
     model: ALLOWED_MODELS.has(MODEL),
     destructive: DESTRUCTIVE.test("sudo reboot") && DESTRUCTIVE.test("rm -rf /") && DESTRUCTIVE.test("systemctl restart foo") && !DESTRUCTIVE.test("ls -la"),
-    mcp_tools: MCP_NAMES.length === 10,
+    mcp_tools: MCP_NAMES.length === 11,
     system_prompt: SYSTEM_PROMPT.length > 100,
     bridge_url: BRIDGE_URL.startsWith("http"),
   };
