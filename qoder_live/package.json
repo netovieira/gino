@@ -1,0 +1,20 @@
+{
+  "name": "jarvis-qoder-live",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Sidecar JSONL do Qoder Live: sessão persistente com streaming e ferramentas do JARVIS via MCP.",
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.mjs",
+    "check": "node --check index.mjs",
+    "selftest": "node index.mjs --selftest"
+  },
+  "dependencies": {
+    "@qoder-ai/qoder-agent-sdk": "1.0.58",
+    "zod": "4.6.7"
+  }
+}

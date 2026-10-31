@@ -1,0 +1,404 @@
+"""Tests for core/qoder_live.py — spawn, JSONL protocol, callbacks, teardown.
+
+The real Qoder model is never called here. Every test drives a tiny temporary
+Python "sidecar" (``node_cmd=sys.executable``) that speaks the same JSONL
+protocol as ``qoder_live/index.mjs``: it emits ``ready``, echoes asks, honours
+``interrupt``/``close``, and can be told to fail, hang or emit garbage through
+``FAKE_MODE``.
+"""
+from __future__ import annotations
+
+import json
+import os
+import signal
+import sys
+import threading
+import time
+import uuid
+
+import pytest
+
+from core.qoder_live import QoderLive
+
+FAKE_SOURCE = r'''"""Fake Qoder Live sidecar used by tests/test_qoder_live.py."""
+import json
+import os
+import sys
+import time
+
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    mode = os.environ.get("FAKE_MODE", "normal")
+    record = os.environ.get("FAKE_RECORD", "")
+    if mode == "garbage":
+        sys.stdout.write("this is not json\n")
+        sys.stdout.flush()
+    if mode == "fail":
+        out({"type": "error", "error": "boom: warmup failed"})
+        return 1
+    if mode == "hang":
+        time.sleep(60)
+        return 0
+    out({"type": "ready", "model": "Fake-Model", "warmup_ms": 7})
+    current = None
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        if record:
+            with open(record, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        msg = json.loads(line)
+        kind = msg.get("type")
+        if kind == "ask":
+            current = msg.get("id")
+            speaker = msg.get("speaker")
+            text = str(msg.get("text", ""))
+            if mode == "slow":
+                out({"type": "text", "id": current, "text": "start", "delta": True})
+                continue
+            out({"type": "text", "id": current, "text": "eco:", "delta": True})
+            out({"type": "text", "id": current, "text": " " + text, "delta": True})
+            out({
+                "type": "tool",
+                "id": current,
+                "name": "jarvis_call",
+                "input": {"name": "music_control"},
+            })
+            out({"type": "done", "id": current, "text": speaker + ":" + text if speaker else "-:" + text})
+            current = None
+        elif kind == "interrupt":
+            if current is not None:
+                out({"type": "interrupted", "id": current})
+                out({"type": "done", "id": current, "text": "late completion"})
+                current = None
+        elif kind == "close":
+            out({"type": "closed"})
+            return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+class Recorder:
+    """Thread-safe-ish callback sink (list.append is atomic under the GIL)."""
+
+    def __init__(self):
+        self.texts = []
+        self.tools = []
+        self.dones = []
+        self.errors = []
+        self.readies = []
+        self.closed = 0
+
+    def handlers(self):
+        return {
+            "on_text": lambda msg_id, text, delta: self.texts.append((msg_id, text, delta)),
+            "on_tool": lambda msg_id, name, tool_input: self.tools.append(
+                (msg_id, name, tool_input)
+            ),
+            "on_done": lambda msg_id, text: self.dones.append((msg_id, text)),
+            "on_error": lambda msg_id, error: self.errors.append((msg_id, error)),
+            "on_ready": lambda model, warmup_ms: self.readies.append((model, warmup_ms)),
+            "on_closed": lambda: setattr(self, "closed", self.closed + 1),
+        }
+
+
+def wait_until(predicate, timeout=5.0, interval=0.02):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+def sidecar_threads():
+    return [t for t in threading.enumerate() if t.name.startswith("qoder-live")]
+
+
+def assert_no_sidecar_threads(timeout=5.0):
+    assert wait_until(lambda: not sidecar_threads(), timeout), (
+        f"leaked threads: {[t.name for t in sidecar_threads()]}"
+    )
+
+
+@pytest.fixture(scope="session")
+def fake_script(tmp_path_factory):
+    path = tmp_path_factory.mktemp("qoder-live") / "fake_sidecar.py"
+    path.write_text(FAKE_SOURCE, encoding="utf-8")
+    return str(path)
+
+
+@pytest.fixture
+def make_live(fake_script):
+    instances = []
+
+    def factory(**overrides):
+        env = {"FAKE_MODE": "normal"}
+        env.update(overrides.pop("env", {}) or {})
+        overrides.setdefault("node_cmd", sys.executable)
+        overrides.setdefault("logger", lambda *_args, **_kwargs: None)
+        live = QoderLive(script=fake_script, env=env, **overrides)
+        instances.append(live)
+        return live
+
+    yield factory
+
+    for live in instances:
+        try:
+            live.stop(timeout=5.0)
+        except Exception:  # cleanup must never mask the real failure
+            pass
+
+
+# ── start / ready ────────────────────────────────────────────────────────────
+
+
+def test_start_waits_for_ready(make_live):
+    rec = Recorder()
+    live = make_live(**rec.handlers())
+    assert live.ready is False
+    assert live.is_ready() is False
+
+    assert live.start(timeout=15.0) is True
+
+    assert live.is_ready() is True
+    assert live.ready is True
+    assert live.last_error is None
+    assert isinstance(live.pid, int)
+    assert wait_until(lambda: rec.readies)
+    assert rec.readies == [("Fake-Model", 7)]
+
+
+def test_start_is_idempotent(make_live):
+    rec = Recorder()
+    live = make_live(**rec.handlers())
+    assert live.start(timeout=15.0) is True
+    first_pid = live.pid
+
+    assert live.start(timeout=5.0) is True
+    assert live.pid == first_pid
+    assert wait_until(lambda: len(rec.readies) == 1)
+    assert len(rec.readies) == 1
+
+
+def test_ask_generates_uuid_when_id_missing(make_live):
+    rec = Recorder()
+    live = make_live(**rec.handlers())
+    assert live.start(timeout=15.0) is True
+
+    returned = live.ask("oi")
+    assert str(uuid.UUID(returned)) == returned
+    assert wait_until(lambda: rec.dones)
+    assert rec.dones == [(returned, "-:oi")]
+
+
+def test_start_timeout_on_silent_sidecar(make_live):
+    live = make_live(env={"FAKE_MODE": "hang"})
+    started = time.monotonic()
+    assert live.start(timeout=0.4) is False
+    elapsed = time.monotonic() - started
+    assert elapsed < 5.0, f"start() blocked for {elapsed:.1f}s"
+    assert live.is_ready() is False
+    assert "timed out" in (live.last_error or "")
+
+    live.stop(timeout=3.0)
+    assert live.is_ready() is False
+    assert_no_sidecar_threads()
+
+
+def test_start_error_before_ready(make_live):
+    rec = Recorder()
+    live = make_live(env={"FAKE_MODE": "fail"}, **rec.handlers())
+
+    assert live.start(timeout=10.0) is False
+    assert live.is_ready() is False
+    assert "boom" in (live.last_error or "")
+    assert wait_until(lambda: rec.errors)
+    assert rec.errors[0][0] is None
+    assert "boom" in rec.errors[0][1]
+    # A failed boot never announced "closed" on its own.
+    assert rec.closed == 0
+
+    live.stop(timeout=3.0)
+    assert_no_sidecar_threads()
+
+
+def test_non_json_noise_is_ignored(make_live):
+    rec = Recorder()
+    live = make_live(env={"FAKE_MODE": "garbage"}, **rec.handlers())
+    assert live.start(timeout=15.0) is True
+    assert wait_until(lambda: rec.readies)
+
+    live.ask("oi")
+    assert wait_until(lambda: rec.dones)
+    assert rec.dones[0][1] == "-:oi"
+
+
+def test_restart_after_stop(make_live):
+    rec = Recorder()
+    live = make_live(**rec.handlers())
+    assert live.start(timeout=15.0) is True
+    live.stop(timeout=5.0)
+    assert live.is_ready() is False
+
+    assert live.start(timeout=15.0) is True
+    live.ask("de novo")
+    assert wait_until(lambda: len(rec.dones) == 1)
+    assert rec.dones[0][1] == "-:de novo"
+
+
+# ── ask / callbacks ──────────────────────────────────────────────────────────
+
+
+def test_ask_streams_text_tool_and_done(make_live):
+    rec = Recorder()
+    live = make_live(**rec.handlers())
+    assert live.start(timeout=15.0) is True
+
+    returned = live.ask("toca música", speaker="Anthero", id="fixed-1")
+
+    assert returned == "fixed-1"
+    assert wait_until(lambda: rec.dones)
+    assert [(item[0], item[1], item[2]) for item in rec.texts] == [
+        ("fixed-1", "eco:", True),
+        ("fixed-1", " toca música", True),
+    ]
+    assert rec.tools == [("fixed-1", "jarvis_call", {"name": "music_control"})]
+    assert rec.dones == [("fixed-1", "Anthero:toca música")]
+
+
+def test_callback_exception_is_logged_and_does_not_kill_reader(make_live):
+    logs = []
+    rec = Recorder()
+
+    def exploding_text(*_args):
+        raise ValueError("callback exploded")
+
+    live = make_live(
+        logger=logs.append,
+        on_text=exploding_text,
+        on_done=rec.handlers()["on_done"],
+        on_ready=rec.handlers()["on_ready"],
+    )
+    assert live.start(timeout=15.0) is True
+
+    live.ask("sobrevive", id="cb-1")
+    assert wait_until(lambda: rec.dones)
+    assert rec.dones == [("cb-1", "-:sobrevive")]
+    assert any("on_text callback failed" in line and "callback exploded" in line for line in logs)
+
+
+def test_interrupt_does_not_clear_inflight_delivery(make_live):
+    rec = Recorder()
+    live = make_live(env={"FAKE_MODE": "slow"}, **rec.handlers())
+    assert live.start(timeout=15.0) is True
+
+    msg_id = live.ask("demorado")
+    assert wait_until(lambda: rec.texts)
+    assert rec.dones == []
+
+    live.interrupt()
+
+    # The completion raced the interrupt; it is still delivered under its id.
+    assert wait_until(lambda: rec.dones)
+    assert rec.dones == [(msg_id, "late completion")]
+    assert live.is_ready() is True
+
+
+def test_protocol_lines_written_to_stdin(make_live, tmp_path):
+    record_path = tmp_path / "stdin.jsonl"
+    live = make_live(env={"FAKE_RECORD": str(record_path)})
+    assert live.start(timeout=15.0) is True
+
+    live.ask("olá", speaker="Heloisa", id="abc-123")
+    wait_until(lambda: record_path.exists() and "abc-123" in record_path.read_text())
+    live.interrupt()
+    live.stop(timeout=5.0)
+
+    lines = [
+        json.loads(line)
+        for line in record_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {"type": "ask", "id": "abc-123", "text": "olá", "speaker": "Heloisa"} in lines
+    assert {"type": "interrupt"} in lines
+    assert {"type": "close"} in lines
+
+
+def test_ask_requires_ready_sidecar(make_live):
+    live = make_live()
+    with pytest.raises(RuntimeError):
+        live.ask("cedo demais")
+
+
+def test_ask_after_stop_raises(make_live):
+    live = make_live()
+    assert live.start(timeout=15.0) is True
+    live.stop(timeout=5.0)
+    assert live.is_ready() is False
+    with pytest.raises(RuntimeError):
+        live.ask("depois de parar")
+
+
+def test_empty_text_is_rejected(make_live):
+    live = make_live()
+    assert live.start(timeout=15.0) is True
+    with pytest.raises(ValueError):
+        live.ask("   ")
+
+
+# ── teardown / crashes ───────────────────────────────────────────────────────
+
+
+def test_stop_is_idempotent_and_notifies_closed_once(make_live):
+    rec = Recorder()
+    live = make_live(**rec.handlers())
+    assert live.start(timeout=15.0) is True
+    assert live.pid is not None
+
+    assert live.stop(timeout=5.0) is None
+    assert live.stop(timeout=5.0) is None
+
+    assert live.is_ready() is False
+    assert live.ready is False
+    assert wait_until(lambda: rec.closed == 1)
+    assert rec.closed == 1
+    assert_no_sidecar_threads()
+
+
+def test_unexpected_exit_marks_not_ready_and_stop_survives(make_live):
+    rec = Recorder()
+    live = make_live(**rec.handlers())
+    assert live.start(timeout=15.0) is True
+    pid = live.pid
+    assert pid is not None
+
+    os.kill(pid, signal.SIGKILL)
+
+    assert wait_until(lambda: not live.is_ready())
+    assert wait_until(lambda: rec.closed == 1)
+    assert live.last_error is not None
+    assert "exited" in live.last_error
+
+    # BrokenPipe / reaped process must not raise from stop().
+    live.stop(timeout=3.0)
+    assert_no_sidecar_threads()
+
+
+def test_stop_before_start_is_safe(make_live):
+    live = make_live()
+    live.stop(timeout=1.0)
+    assert live.is_ready() is False
+    assert live.pid is None
+    with pytest.raises(RuntimeError):
+        live.ask("nada")
