@@ -375,7 +375,10 @@ function handleResult(msg) {
 }
 
 async function chatLoop() {
-  chatQuery = query({ prompt: channel, options: optionsFor(12) });
+  // No maxTurns on the live session: the process is meant to keep ONE
+  // conversation alive for the whole app run. Runaway tool chains are bounded
+  // by [TOOL DISCIPLINE], the Agent denial and the Python-side watchdog.
+  chatQuery = query({ prompt: channel, options: optionsFor(undefined) });
   try {
     for await (const msg of chatQuery) {
       if (closing) break;
