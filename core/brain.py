@@ -22,10 +22,13 @@ stored under plugin_config.brain in config/api_keys.json.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import re
+import socket
 import time
 from typing import Callable
+from urllib.parse import urlsplit
 
 import requests
 
@@ -69,7 +72,9 @@ PRESETS = {
     # can answer and reason but cannot act on the PC. brain.chat_stream therefore
     # skips it on any turn that carries tools, which is exactly the "smart for
     # conversation, local for tools" split. base_url is unused for this rung.
-    "qodercli":   {"base_url": "", "model": "DeepSeek-Flash",
+    # The conversation uses the FAST free model (thinking off, small window);
+    # delegated work uses DeepSeek-Flash with the full settings.
+    "qodercli":   {"base_url": "", "model": "Qwen3.8-Flash",
                    "key_url": "qoder login (CLI)"},
 }
 PROVIDERS = tuple(PRESETS)
@@ -548,6 +553,60 @@ def _last_user_text(messages: list) -> str:
     return ""
 
 
+# Small talk is where the local 7B is fine and the CLI's cold start is pure
+# delay. A SHORT QUESTION is not small talk: "Você conhece Alex?" and "Você
+# consegue auditar?" used to be answered by the 7B (and the second one even
+# escalated as a refusal) because they had five words.
+_SMALL_TALK = (
+    "bom dia", "boa tarde", "boa noite", "tudo bem", "tudo certo", "tudo bom",
+    "tudo tranquilo", "como vai", "como você está", "como esta", "como tá",
+    "como ta", "e aí", "e ai", "beleza", "tranquilo",
+    "você está bem", "voce esta bem", "está bem", "esta bem",
+    "tudo certo com você", "tudo bem com você",
+    "você está me ouvindo", "voce esta me ouvindo", "tá aí", "ta ai",
+    "está aí", "esta ai", "obrigado", "obrigada", "valeu", "good morning",
+    "hello", "hi ", "você está aí", "voce esta ai",
+)
+_QUESTION_START = re.compile(
+    r"^\s*(?:quem\b|o\s+que\b|qual\b|quais\b|quando\b|onde\b|por\s+que\b|"
+    r"porque\b|como\b|voc[eê]\s+(?:sabe|conhece|pode|consegue)\b|"
+    r"do\s+you\b|can\s+you\b|what\b|who\b|when\b|where\b|why\b|how\b|"
+    r"is\b|are\b|did\b|does\b)",
+    re.IGNORECASE)
+
+
+def _looks_like_question(text: str) -> bool:
+    t = str(text or "").strip()
+    return bool(t) and ("?" in t or bool(_QUESTION_START.match(t)))
+
+
+def _is_small_talk(text: str) -> bool:
+    t = " ".join(str(text or "").lower().split())
+    return any(p in t for p in _SMALL_TALK)
+
+
+def _cli_error_reply(reply: str) -> bool:
+    """True when the 'answer' is actually a CLI error/result JSON object.
+
+    Belt and suspenders: Qoder's transport already raises on these events, but
+    a future CLI format must never reach the voice as a spoken JSON blob.
+    """
+    first = str(reply or "").lstrip().splitlines()[:1]
+    if not first or not first[0].startswith("{"):
+        return False
+    try:
+        data = json.loads(first[0])
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    return bool(data.get("is_error")
+                or data.get("type") in ("result", "error")
+                or str(data.get("subtype") or "").startswith("error")
+                or data.get("error_code")
+                or data.get("errors"))
+
+
 def chat_stream(messages: list, tools: list | None, st: dict,
                 on_sentence: Callable[[str], None],
                 should_stop: Callable[[], bool] = lambda: False) -> tuple[str, list[dict]]:
@@ -570,13 +629,25 @@ def chat_stream(messages: list, tools: list | None, st: dict,
     """
     chain = st.get("chain") or [st]
     order = _order_rungs(chain)
+    if not tools:
+        # Conversation is local-first. The Qoder CLI is smarter, but every turn
+        # pays a fresh process cold start: the log showed 9.8 s to the first
+        # sentence against 3.6 s from the local 7B. A conversation that thinks
+        # for ten seconds is not a conversation. The CLI stays in the chain as
+        # the fallback when the local rung is down or answers nothing; explicit
+        # delegation still goes through qoder_agent with full tools.
+        live = [r for r in order if not _is_down(r)]
+        order = ([r for r in live if r.get("provider") != "qodercli"]
+                 + [r for r in live if r.get("provider") == "qodercli"]
+                 + [r for r in order if _is_down(r)])
     upward: list[int] = [0]
 
     def _say(sentence: str) -> None:
         upward[0] += 1
         on_sentence(sentence)
 
-    last: Exception | None = None
+    last = None
+    last_user = _last_user_text(messages)
     for i, rung in enumerate(order):
         # The `qoder` CLI has no access to this assistant's tools (it only has
         # its own bash/edit/grep). Sending it a tool turn would get a reply that
@@ -588,12 +659,12 @@ def chat_stream(messages: list, tools: list | None, st: dict,
             print(f"[Brain] {label(rung)} não tem as ferramentas do assistente — "
                   f"pulando neste turno com ferramentas.")
             continue
-        # A short greeting does not deserve a thirty-second agent. "Gino, você
-        # está me ouvindo?" is four words of small talk; the CLI thinks before
-        # it speaks, and the local model answers the same thing in one second.
-        # Anything with substance still goes to the smarter rung.
+        # A short greeting does not deserve a thirty-second agent. A short
+        # QUESTION does: "o que é X?", "você conhece Y?", "consegue auditar?"
+        # are exactly what the local 7B gets wrong.
         if (not tools and rung.get("provider") == "qodercli"
-                and len(_last_user_text(messages).split()) <= 6):
+                and len(last_user.split()) <= 6
+                and (not _looks_like_question(last_user) or _is_small_talk(last_user))):
             print(f"[Brain] {label(rung)} pulado — turno curto, respondo local.")
             continue
         # A rung that already returned an empty completion to a request carrying
@@ -818,8 +889,16 @@ def _qodercli_turn(messages: list, rung: dict,
         elif role == "tool":
             lines.append(f"[resultado] {text}")
     prompt = "\n".join(lines) or "(sem mensagem)"
-    qst = _q.settings()
+    # Conversation profile: free fast model, thinking off, low effort, small
+    # window. The CLI answers whole, and a 1M-token reasoning pass is exactly
+    # what makes a chat turn feel dead. Delegation (qoder_agent) is where the
+    # heavy profile belongs.
+    qst = _q.settings(profile="fast")
     qst["transport"] = "cli"
+    # A conversation turn that takes half a minute is already a failure, even if
+    # it eventually answers. Past this the local rung takes over — the user
+    # hears a reply instead of watching the cursor think.
+    qst["timeout"] = min(int(qst.get("timeout") or 120), 22)
     if rung.get("model"):
         qst["model"] = rung["model"]
     # Full tool access belongs to DELEGATION (qoder_agent), not to holding a
@@ -827,9 +906,12 @@ def _qodercli_turn(messages: list, rung: dict,
     # a greeting needs a shell command — "Gino, você está me ouvindo?" took 30 s.
     # Here its only job is to answer in words.
     qst["tools"] = ""
-    qst["permission_mode"] = "default"
     reply = (_q.ask(prompt, st=qst, system="\n\n".join(system_parts) or None,
                     max_tokens=MAX_TOKENS) or "").strip()[:MAX_REPLY_CHARS]
+    if not reply:
+        raise RuntimeError("qoder CLI terminou sem resposta")
+    if _cli_error_reply(reply):
+        raise RuntimeError("qoder CLI devolveu um erro em vez de resposta")
     # The CLI's model writes tool calls as DSML text when it has no tools; that
     # markup must never reach the voice.
     reply = strip_tool_markup(reply)
@@ -852,6 +934,10 @@ def _chat_once(messages: list, tools: list | None, st: dict,
     `raw_log` prints finish_reason and the raw message when the reply comes back
     empty: the UI promises "detalhes no terminal", and without this the terminal
     has nothing to show exactly when it matters."""
+    try:
+        st["base_url"] = _safe_base_url(st.get("base_url"))
+    except ValueError as e:
+        raise RuntimeError(f"base_url recusada: {e}") from e
     r = requests.post(f"{st['base_url']}/chat/completions",
                       json=_payload(messages, tools, st, stream=False),
                       headers=headers, timeout=TIMEOUT)
@@ -879,6 +965,10 @@ def _chat_stream_one(messages: list, tools: list | None, st: dict,
     if st.get("provider") == "qodercli":
         return _qodercli_turn(messages, st, on_sentence, should_stop)
 
+    try:
+        st["base_url"] = _safe_base_url(st.get("base_url"))
+    except ValueError as e:
+        raise RuntimeError(f"base_url recusada: {e}") from e
     payload = _payload(messages, tools, st, stream=True)
     headers = {"Content-Type": "application/json"}
     if st["api_key"]:
@@ -1383,11 +1473,64 @@ def test_connection(values: dict):
     return (not missing) and first_ok, "  |  ".join(lines)
 
 
+_SAFE_BASE_CACHE: dict[str, str] = {}
+
+
+def _safe_base_url(url) -> str:
+    """Reject non-HTTP, credential-bearing and internal/metadata base URLs.
+
+    The configured base URL is user-owned, but a bad or injected value must not
+    turn a model probe or chat request into an SSRF primitive. Public providers
+    are allowed; loopback is allowed for the local Ollama/Qoder proxy; private,
+    link-local, reserved, multicast and unspecified addresses are refused.
+    """
+    raw = str(url or "").strip().rstrip("/")
+    if not raw:
+        raise ValueError("base_url vazia")
+    if raw in _SAFE_BASE_CACHE:
+        return _SAFE_BASE_CACHE[raw]
+    parts = urlsplit(raw)
+    if parts.scheme not in ("http", "https"):
+        raise ValueError("esquema não permitido (use http/https)")
+    if parts.username or parts.password:
+        raise ValueError("credenciais embutidas na URL não são permitidas")
+    host = (parts.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        raise ValueError("host ausente")
+    # Loopback is the local Ollama/Qoder proxy; it is trusted on purpose.
+    if host == "localhost" or host == "::1" or host.startswith("127."):
+        _SAFE_BASE_CACHE[raw] = raw
+        return raw
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError as e:
+        raise ValueError(f"porta inválida: {e}") from e
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except Exception as e:
+        raise ValueError(f"host não resolvido: {host}") from e
+    for info in infos or []:
+        address = str(info[4][0]).split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise ValueError(f"endereço interno/metadata bloqueado: {host}")
+    _SAFE_BASE_CACHE[raw] = raw
+    return raw
+
+
 def _probe(rung: dict) -> tuple[bool, str]:
     """Can this provider list models and answer a tiny tool call? (ok, note)."""
+    try:
+        base_url = _safe_base_url(rung.get("base_url"))
+    except ValueError as e:
+        return False, f"base_url recusada: {e}"
     headers = {"Authorization": f"Bearer {rung['api_key']}"} if rung.get("api_key") else {}
     try:
-        r = requests.get(f"{rung['base_url']}/models", headers=headers, timeout=15)
+        r = requests.get(f"{base_url}/models", headers=headers, timeout=15)
         if r.status_code == 401:
             return False, "the provider rejected the key (401)"
         r.raise_for_status()
