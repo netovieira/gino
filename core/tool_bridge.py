@@ -83,6 +83,9 @@ ACTION_TIERS: dict[str, str] = {
     "file_processor": TIER_LOW,
     "desktop_control": TIER_LOW,
     "organizer": TIER_LOW,
+    "memory_index": TIER_LOW,
+    "open_in": TIER_LOW,
+    "media_control": TIER_LOW,
     "focus_mode": TIER_LOW,
     "humor_mode": TIER_LOW,
     "reminder": TIER_LOW,
@@ -111,6 +114,7 @@ ACTION_TIERS: dict[str, str] = {
     "qoder_agent": TIER_HIGH,
     "qoder_job": TIER_HIGH,
     "personas": TIER_HIGH,
+    "terminal_run": TIER_HIGH,
     "phrase_blocklist": TIER_HIGH,
     # Parking a restart is not the restart: the owner's spoken phrase is the
     # only thing that executes it. The confirmation action is refused by the
