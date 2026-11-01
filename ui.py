@@ -57,6 +57,7 @@ from PyQt6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QMenu, QSystemTrayIcon,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QPlainTextEdit, QMessageBox,
 )
 
 try:
@@ -3009,6 +3010,308 @@ class AgendaOverlay(QWidget):
         self.reload()
 
 
+class PersonaOverlay(QWidget):
+    """Cadastro de personas: voz, modelo, skills, stacks e WhatsApp próprio."""
+
+    _OW = 560
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            PersonaOverlay {{
+                background: rgba(0, 6, 10, 248);
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+        self._combo_style = (
+            f"QComboBox {{ background: #000d12; color: {C.TEXT}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px 8px; }}"
+            f"QComboBox QAbstractItemView {{ background: #000d12; color: {C.TEXT}; "
+            f"selection-background-color: {C.PRI_GHO}; }}")
+        self._line_style = (
+            f"QLineEdit {{ background: #000d12; color: {C.TEXT}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px; }}"
+            f"QLineEdit:focus {{ border: 1px solid {C.PRI}; }}")
+        self._btn_style = (
+            f"QPushButton {{ background: #00091a; color: {C.PRI}; "
+            f"border: 1px solid {C.PRI_DIM}; border-radius: 3px; padding: 4px 10px; }}"
+            f"QPushButton:hover {{ background: {C.PRI_GHO}; border-color: {C.PRI}; }}")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 14, 20, 14)
+        root.setSpacing(7)
+        root.addWidget(self._label("🧬  PERSONAS", 12, True))
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER};")
+        root.addWidget(sep)
+
+        top = QHBoxLayout()
+        top.addWidget(self._label("PERSONA", 8, color=C.TEXT_DIM))
+        self._select = QComboBox()
+        self._select.setStyleSheet(self._combo_style)
+        self._select.setFixedHeight(30)
+        self._select.currentIndexChanged.connect(self._load_selected)
+        top.addWidget(self._select, 1)
+        new_btn = QPushButton("NOVA")
+        new_btn.setStyleSheet(self._btn_style)
+        new_btn.clicked.connect(self._new)
+        top.addWidget(new_btn)
+        root.addLayout(top)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        inner = QWidget(); inner.setStyleSheet("background: transparent;")
+        form = QVBoxLayout(inner)
+        form.setContentsMargins(0, 0, 6, 0)
+        form.setSpacing(5)
+
+        self._name = self._line()
+        self._gender = self._combo([("f", "Feminino"), ("m", "Masculino"),
+                                    ("n", "Neutro")])
+        self._voice = self._line()
+        self._personality = QPlainTextEdit()
+        self._personality.setFixedHeight(74)
+        self._personality.setStyleSheet(self._line_style)
+        self._skills = self._line()
+        self._skills.setPlaceholderText("frontend-design, ui-styling")
+        self._stacks = self._line()
+        self._stacks.setPlaceholderText("react, nextjs, typescript")
+        self._model = QComboBox(); self._model.setStyleSheet(self._combo_style)
+        self._model.setFixedHeight(30)
+        self._reasoning = self._combo([(x, x) for x in
+                                       ("low", "medium", "high", "max")])
+        self._context = self._line()
+        self._context.setPlaceholderText("200000")
+        self._whatsapp = QComboBox(); self._whatsapp.setStyleSheet(self._combo_style)
+        self._whatsapp.setFixedHeight(30)
+        self._refresh_choices()
+
+        for label, widget in (
+            ("NOME", self._name),
+            ("GÊNERO", self._gender),
+            ("FISH VOICE ID", self._voice),
+            ("PERSONALIDADE", self._personality),
+            ("SKILLS (separadas por vírgula)", self._skills),
+            ("STACKS (separadas por vírgula)", self._stacks),
+            ("MODELO / MULTIPLICADOR", self._model),
+            ("RACIOCÍNIO", self._reasoning),
+            ("CONTEXTO (tokens)", self._context),
+            ("WHATSAPP DESTA PERSONA", self._whatsapp),
+        ):
+            form.addWidget(self._label(label, 8, color=C.TEXT_DIM))
+            form.addWidget(widget)
+        form.addStretch(1)
+        scroll.setWidget(inner)
+        root.addWidget(scroll, 1)
+
+        self._status = self._label("", 8, color=C.TEXT_DIM)
+        root.addWidget(self._status)
+        row = QHBoxLayout()
+        save = QPushButton("SALVAR")
+        save.setStyleSheet(self._btn_style)
+        save.clicked.connect(self._save)
+        row.addWidget(save)
+        retire = QPushButton("APOSENTAR")
+        retire.setStyleSheet(self._btn_style)
+        retire.clicked.connect(self._retire)
+        row.addWidget(retire)
+        close = QPushButton("FECHAR")
+        close.setStyleSheet(self._btn_style)
+        close.clicked.connect(self.hide)
+        row.addWidget(close)
+        root.addLayout(row)
+        self._reload()
+
+    @staticmethod
+    def _label(text, size=8, bold=False, color=None):
+        lbl = QLabel(text)
+        lbl.setFont(QFont("Courier New", size,
+                          QFont.Weight.Bold if bold else QFont.Weight.Normal))
+        lbl.setStyleSheet(f"color: {color or C.PRI}; background: transparent;")
+        return lbl
+
+    def _line(self):
+        w = QLineEdit(); w.setStyleSheet(self._line_style); w.setFixedHeight(28)
+        return w
+
+    def _combo(self, items):
+        w = QComboBox(); w.setStyleSheet(self._combo_style); w.setFixedHeight(28)
+        for value, text in items:
+            w.addItem(text, value)
+        return w
+
+    def _persona_store(self):
+        from core import personas
+        return personas
+
+    def _refresh_choices(self):
+        store = self._persona_store()
+        current_model = self._model.currentData()
+        self._model.blockSignals(True)
+        self._model.clear()
+        try:
+            catalog = store.model_catalog()
+        except Exception:
+            catalog = []
+        for model in catalog:
+            factor = store.format_multiplier(model.get("priceFactor") or 0.0)
+            self._model.addItem(f"{model.get('displayName')}  ·  {factor}",
+                                model.get("displayName"))
+        if current_model:
+            idx = self._model.findData(current_model)
+            if idx >= 0:
+                self._model.setCurrentIndex(idx)
+        self._model.blockSignals(False)
+
+        current_wa = self._whatsapp.currentData()
+        self._whatsapp.clear()
+        self._whatsapp.addItem("Conta principal (padrão)", "")
+        try:
+            from core import whatsapp
+            for name in whatsapp.account_names():
+                self._whatsapp.addItem(str(name), str(name))
+        except Exception:
+            pass
+        if current_wa:
+            idx = self._whatsapp.findData(current_wa)
+            if idx >= 0:
+                self._whatsapp.setCurrentIndex(idx)
+
+    def _reload(self):
+        store = self._persona_store()
+        self._refresh_choices()
+        self._select.blockSignals(True)
+        self._select.clear()
+        self._select.addItem("— nova persona —", "")
+        try:
+            for persona in store.list_personas():
+                wa = persona.get("whatsapp_account") or "principal"
+                self._select.addItem(
+                    f"{persona.get('name')}  ·  {wa}", persona.get("id"))
+        except Exception as exc:
+            self._status.setText(f"Falha ao ler personas: {exc}")
+        self._select.blockSignals(False)
+        self._new()
+
+    def _new(self):
+        self._select.blockSignals(True)
+        self._select.setCurrentIndex(0)
+        self._select.blockSignals(False)
+        self._name.clear(); self._voice.clear(); self._personality.clear()
+        self._skills.clear(); self._stacks.clear(); self._context.setText("200000")
+        self._gender.setCurrentIndex(0)
+        self._reasoning.setCurrentIndex(1)
+        if self._model.count():
+            self._model.setCurrentIndex(0)
+        self._whatsapp.setCurrentIndex(0)
+        self._status.setText("Nova persona.")
+
+    def _load_selected(self):
+        pid = self._select.currentData()
+        if not pid:
+            return
+        try:
+            persona = self._persona_store().get(pid)
+        except Exception:
+            persona = None
+        if not persona:
+            return
+        self._name.setText(str(persona.get("name") or ""))
+        idx = self._gender.findData(persona.get("gender") or "n")
+        self._gender.setCurrentIndex(max(0, idx))
+        self._voice.setText(str(persona.get("voice_id") or ""))
+        self._personality.setPlainText(str(persona.get("personality") or ""))
+        self._skills.setText(", ".join(persona.get("skills") or []))
+        self._stacks.setText(", ".join(persona.get("stacks") or []))
+        idx = self._model.findData(str(persona.get("model") or ""))
+        if idx >= 0:
+            self._model.setCurrentIndex(idx)
+        idx = self._reasoning.findData(str(persona.get("reasoning") or "medium"))
+        if idx >= 0:
+            self._reasoning.setCurrentIndex(idx)
+        self._context.setText(str(persona.get("context_size") or "200000"))
+        idx = self._whatsapp.findData(str(persona.get("whatsapp_account") or ""))
+        self._whatsapp.setCurrentIndex(max(0, idx))
+        self._status.setText(f"Editando {persona.get('name')}.")
+
+    def _fields(self):
+        def split(value):
+            return [p.strip() for p in str(value or "").split(",") if p.strip()]
+        fields = {
+            "name": self._name.text().strip(),
+            "gender": self._gender.currentData(),
+            "voice_id": self._voice.text().strip(),
+            "personality": self._personality.toPlainText().strip(),
+            "skills": split(self._skills.text()),
+            "stacks": split(self._stacks.text()),
+            "model": self._model.currentData(),
+            "reasoning": self._reasoning.currentData(),
+            "context_size": self._context.text().strip(),
+            "whatsapp_account": self._whatsapp.currentData() or "",
+        }
+        pid = self._select.currentData()
+        if pid:
+            fields["id"] = pid
+        return fields
+
+    def _save(self):
+        store = self._persona_store()
+        fields = self._fields()
+        if not fields["name"] or not fields["voice_id"]:
+            self._status.setText("Nome e Fish voice id são obrigatórios.")
+            return
+        try:
+            persona = store.upsert(fields)
+        except ValueError as exc:
+            text = str(exc)
+            if "pago" in text.lower() or "confirme" in text.lower():
+                answer = QMessageBox.question(
+                    self, "Modelo pago",
+                    text + "\n\nConfirmar este modelo pago para esta persona?")
+                if answer != QMessageBox.StandardButton.Yes:
+                    self._status.setText("Modelo pago não confirmado.")
+                    return
+                try:
+                    persona = store.upsert(fields, confirm_paid=True)
+                except Exception as exc2:
+                    self._status.setText(str(exc2))
+                    return
+            else:
+                self._status.setText(text)
+                return
+        except Exception as exc:
+            self._status.setText(f"Falha ao salvar: {exc}")
+            return
+        self._status.setText(f"Salvo: {persona.get('name')}.")
+        self._reload()
+        idx = self._select.findData(persona.get("id"))
+        if idx >= 0:
+            self._select.setCurrentIndex(idx)
+
+    def _retire(self):
+        pid = self._select.currentData()
+        if not pid:
+            self._status.setText("Selecione uma persona para aposentar.")
+            return
+        answer = QMessageBox.question(
+            self, "Aposentar persona",
+            "Aposentar esta persona? O nome entra no histórico e ela deixa de "
+            "atender, mas o registro é mantido.")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            ok = self._persona_store().delete(pid)
+        except Exception as exc:
+            self._status.setText(f"Falha ao aposentar: {exc}")
+            return
+        self._status.setText("Persona aposentada." if ok else "Persona não encontrada.")
+        self._reload()
+
+
 class PluginSettingsOverlay(QWidget):
     """Floating overlay — renders per-plugin settings forms.
 
@@ -3023,7 +3326,8 @@ class PluginSettingsOverlay(QWidget):
     _test_done = pyqtSignal(str, bool, str)   # namespace, ok, message
     _OW = 460
 
-    def __init__(self, sections: list[dict], parent=None):
+    def __init__(self, sections: list[dict], parent=None,
+                 title: str = "⚙  PLUGIN SETTINGS"):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
@@ -3047,7 +3351,7 @@ class PluginSettingsOverlay(QWidget):
         root.setContentsMargins(22, 16, 22, 16)
         root.setSpacing(8)
 
-        root.addWidget(self._lbl("⚙  PLUGIN SETTINGS", 12, True))
+        root.addWidget(self._lbl(title, 12, True))
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
         root.addWidget(sep)
@@ -5178,6 +5482,22 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self._open_plugin_settings)
         lay.addWidget(settings_btn)
 
+        personas_btn = QPushButton("🧬  PERSONAS")
+        personas_btn.setFixedHeight(26)
+        personas_btn.setFont(QFont("Courier New", 7))
+        personas_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        personas_btn.setStyleSheet(_BTN_STYLE_DIM)
+        personas_btn.clicked.connect(self._open_personas)
+        lay.addWidget(personas_btn)
+
+        whatsapp_btn = QPushButton("📱  WHATSAPP")
+        whatsapp_btn.setFixedHeight(26)
+        whatsapp_btn.setFont(QFont("Courier New", 7))
+        whatsapp_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        whatsapp_btn.setStyleSheet(_BTN_STYLE_DIM)
+        whatsapp_btn.clicked.connect(self._open_whatsapp_settings)
+        lay.addWidget(whatsapp_btn)
+
         w.adjustSize()
         return w
 
@@ -6755,6 +7075,38 @@ class MainWindow(QMainWindow):
         ov.show()
         ov.raise_()
         self._plugin_settings_overlay = ov   # keep a reference so it isn't GC'd
+
+    def _open_whatsapp_settings(self):
+        sections = self.get_plugin_settings() if self.get_plugin_settings else []
+        sections = [s for s in sections
+                    if (s.get("namespace") or "").lower() == "whatsapp"]
+        cw = self.centralWidget()
+        if not sections:
+            QMessageBox.warning(
+                cw, "WhatsApp",
+                "O plugin WHATSAPP não carregou. Confira os logs do app e "
+                "reinicia depois de corrigir o plugin.")
+            return
+        ov = PluginSettingsOverlay(
+            sections, parent=cw, title="📱  WHATSAPP")
+        ow = PluginSettingsOverlay._OW
+        oh = min(600, cw.height() - 16)
+        ov.setGeometry((cw.width() - ow) // 2,
+                       (cw.height() - oh) // 2, ow, oh)
+        ov.show()
+        ov.raise_()
+        self._whatsapp_overlay = ov
+
+    def _open_personas(self):
+        cw = self.centralWidget()
+        ov = PersonaOverlay(parent=cw)
+        ow = PersonaOverlay._OW
+        oh = min(700, cw.height() - 16)
+        ov.setGeometry((cw.width() - ow) // 2,
+                       (cw.height() - oh) // 2, ow, oh)
+        ov.show()
+        ov.raise_()
+        self._persona_overlay = ov
 
     # ── Clipboard intelligence ───────────────────────────────────────────────────
 
