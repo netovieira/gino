@@ -81,6 +81,8 @@ from core import speaker_id as _speaker_id
 from core import chat_memory as _chat_memory
 from core import personas as _personas
 from core import memory_index as _memory_index
+from core import sleep as _sleep
+from core import task_queue as _task_queue
 from core import health as _health
 from core import memory_librarian as _memory_librarian
 from core import metrics as _metrics
@@ -3230,6 +3232,18 @@ class JarvisLive:
         except Exception as e:
             print(f"[Obsidian] vault start failed: {e}")
 
+        try:
+            self._sleep_boot()
+        except Exception as e:
+            print(f"[Sleep] boot failed: {e}")
+        try:
+            threading.Thread(target=self._sleep_watch, daemon=True,
+                             name="sleep-watch").start()
+            threading.Thread(target=self._task_watch, daemon=True,
+                             name="task-watch").start()
+        except Exception as e:
+            print(f"[Scheduler] start failed: {e}")
+
         if (self._chat_memory is not None
                 and bool(cfg.get("memory_librarian_enabled", True))):
             try:
@@ -3427,6 +3441,127 @@ class JarvisLive:
         except Exception as e:
             print(f"[Obsidian] cofre indisponível: {e}")
 
+    def _sleep_summarize(self, prompt: str) -> str:
+        """Qoder-only summary for the nightly sleep file (no local model)."""
+        try:
+            from core import qoder as _qoder
+            st = _qoder.settings(get_plugin_config)
+            model = ""
+            try:
+                cfg = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
+                model = str(cfg.get("sleep_model") or "Qwen3.8-Flash")
+            except Exception:
+                model = "Qwen3.8-Flash"
+            return _qoder.ask(
+                prompt, st=st, model=model,
+                system=("Você compacta um dia de conversa para o próprio "
+                        "assistente lembrar amanhã. Seja fiel, curto e em "
+                        "português do Brasil; preserve decisões, pendências e "
+                        "quem cuidou do quê. Nunca invente."),
+                max_tokens=1200, timeout=120)
+        except Exception as e:
+            print(f"[Sleep] resumo Qoder falhou: {e}")
+            return ""
+
+    def _sleep_index(self, path) -> None:
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+            self._index_event("sleep", text[:2000], subject="sono", source="sleep")
+        except Exception as e:
+            print(f"[Sleep] index: {e}")
+
+    def _sleep_boot(self) -> None:
+        """Silent catch-up before the first prompt; refine with Qoder after."""
+        try:
+            _sleep.catch_up(ask=lambda _prompt: "", on_done=self._sleep_index)
+        except Exception as e:
+            print(f"[Sleep] catch-up: {e}")
+        try:
+            threading.Thread(target=self._sleep_refine_recent, daemon=True,
+                             name="sleep-refine").start()
+        except Exception as e:
+            print(f"[Sleep] refine start: {e}")
+
+    def _sleep_refine_recent(self) -> None:
+        try:
+            files = sorted(_sleep.SLEEP_DIR.glob("*.md"))[-2:]
+            for path in files:
+                day = path.stem
+                base = _sleep.build_day(day)
+                summary = _sleep.summarize(base, day, ask=self._sleep_summarize)
+                _sleep.write_day(day, summary, base)
+                self._sleep_index(path)
+        except Exception as e:
+            print(f"[Sleep] refine: {e}")
+
+    def _sleep_announce(self, text: str) -> None:
+        try:
+            if getattr(self.ui, "muted", False):
+                return
+            self._say_now(text, log=True)
+            self.ui.write_log(f"SYS: {text}")
+        except Exception:
+            pass
+
+    def _sleep_watch(self) -> None:
+        while not getattr(self, "_qoder_shutting_down", False):
+            time.sleep(60)
+            if getattr(self, "_qoder_shutting_down", False):
+                break
+            try:
+                path = _sleep.bedtime_tick(
+                    ask=self._sleep_summarize, announce=self._sleep_announce)
+                if path is not None:
+                    self._sleep_index(path)
+            except Exception as e:
+                print(f"[Sleep] tick: {e}")
+
+    def _task_watch(self) -> None:
+        while not getattr(self, "_qoder_shutting_down", False):
+            time.sleep(15)
+            if getattr(self, "_qoder_shutting_down", False):
+                break
+            try:
+                if _task_queue.status().get("current"):
+                    continue
+                if not self._qoder_live_ready():
+                    continue
+                with self._qoder_lock:
+                    if self._qoder_current_id is not None:
+                        continue
+                if bool(getattr(self, "_is_speaking", False)):
+                    continue
+                for task in _task_queue.tick():
+                    if _task_queue.status().get("current"):
+                        break
+                    started = _task_queue.start(task["id"])
+                    if not started:
+                        break
+                    kind = str(task.get("kind") or "task")
+                    title = str(task.get("title") or "tarefa")
+                    if kind in ("reminder", "event"):
+                        text = f"Lembrete: {title}"
+                        self._say_now(text, log=True)
+                        try:
+                            threading.Thread(
+                                target=self._whatsapp_notify_owner,
+                                args=(text,), daemon=True,
+                                name="task-whatsapp").start()
+                        except Exception:
+                            pass
+                        _task_queue.finish(task["id"], True, "anunciado")
+                        continue
+                    instruction = (
+                        f"[TAREFA DA FILA] Tarefa pedida pelo dono: \"{title}\". "
+                        "Execute o necessário agora; se for execução pesada, "
+                        "delegue ao Agent em background e diga em uma frase que "
+                        "está rodando. Responda curto.")
+                    self._qoder_turn(instruction, source="task", speak=True,
+                                     task_id=task["id"])
+                    break
+            except Exception as e:
+                print(f"[Tasks] tick: {e}")
+
     def _write_qoder_system_prompt(self) -> None:
         """Freeze the current memory snapshot for the next session start."""
         system_file = BASE_DIR / "memory" / "chat" / "qoder_live_system.txt"
@@ -3448,6 +3583,13 @@ class JarvisLive:
             block = ""
         if block:
             text += "\n\n" + block
+        try:
+            sleep_block = _sleep.latest_context()
+        except Exception as e:
+            print(f"[Sleep] context: {e}")
+            sleep_block = ""
+        if sleep_block:
+            text += "\n\n" + sleep_block
         return text
 
     def _memory_record_user(self, text: str) -> None:
@@ -4101,6 +4243,12 @@ class JarvisLive:
             except Exception as e:
                 print(f"[QoderLive] memory assistant turn: {e}")
             self._index_event("assistant", full, source="voice")
+        task_id = str(meta.get("task_id") or "")
+        if task_id:
+            try:
+                _task_queue.finish(task_id, True, full[:800])
+            except Exception as e:
+                print(f"[Tasks] finish: {e}")
         self._qoder_finish(turn_id)
         _metrics.inc("qoder.done")
         if self._memory_librarian is not None:
@@ -4137,6 +4285,12 @@ class JarvisLive:
                 "Não consegui responder agora. Tente de novo em instantes.",
                 "text")
             return
+        task_id = str(meta.get("task_id") or "")
+        if task_id:
+            try:
+                _task_queue.finish(task_id, False, error=err or "erro")
+            except Exception as e:
+                print(f"[Tasks] error finish: {e}")
         if spoken and self._memory_librarian is not None:
             try:
                 self._memory_librarian.tick()
@@ -4161,6 +4315,14 @@ class JarvisLive:
         print(f"[QoderLive] novo turno — interrompendo {old_id} para responder")
         _metrics.inc("qoder.preempt")
         if old_id:
+            with self._qoder_lock:
+                meta_map = getattr(self, "_qoder_meta", {}) or {}
+                task_id = str((meta_map.get(old_id) or {}).get("task_id") or "")
+            if task_id:
+                try:
+                    _task_queue.finish(task_id, False, error="interrompida")
+                except Exception as e:
+                    print(f"[Tasks] preempt: {e}")
             self._qoder_finish(old_id, flush=False)
 
     def _qoder_turn(self, text: str, pcm: bytes | None = None,
@@ -4168,7 +4330,8 @@ class JarvisLive:
                     source: str = "owner", reply_channel: str = "voice",
                     speak: bool = True, media_type: str = "text",
                     wa_account: str | None = None,
-                    wa_chat: str | None = None) -> None:
+                    wa_chat: str | None = None,
+                    task_id: str | None = None) -> None:
         """One user turn through the persistent Qoder session."""
         self._last_user_speech = time.monotonic()
         if not retry:
@@ -4292,6 +4455,7 @@ class JarvisLive:
                 "wa_account": str(wa_account or ""),
                 "wa_chat": str(wa_chat or ""),
                 "wa_sent": False,
+                "task_id": str(task_id or ""),
             }
         try:
             self._qoder_live.ask(
@@ -5741,6 +5905,11 @@ class JarvisLive:
             with self._qoder_lock:
                 self._persona_text_buf.clear()
                 self._persona_seen.clear()
+                current = self._qoder_current_id
+                meta_map = getattr(self, "_qoder_meta", {}) or {}
+                task_id = str((meta_map.get(current) or {}).get("task_id") or "")
+            if task_id:
+                _task_queue.finish(task_id, False, error="interrompida")
         except Exception:
             pass
         q = self.audio_in_queue

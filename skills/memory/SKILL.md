@@ -10,6 +10,7 @@ description: Hierarquia de memória em níveis. Use para decidir quando responde
 - **Nível 2 — fio atual**: tópico atual, threads abertas e notas. Use para saber o que ficou pendente.
 - **Nível 3 — horas, dias e tópicos**: use `memory_search` e depois `memory_read` no arquivo certo. Um "deixa eu lembrar" antes é natural.
 - **Nível 4 — longo prazo**: memória permanente (`recall_memory`/arquivo de longo prazo), só quando os níveis anteriores não bastarem.
+- **Nível sono**: o bloco `[SONO — memória compactada]` é o dia anterior resumido pelo Qoder; use para lembrar ontem, mas se precisar do detalhe exato abra o arquivo daquele dia.
 - **Nível 5 — não existe**: se não estiver registrado, diga que não lembra. Nunca reconstrua um detalhe por dedução.
 
 Regras:

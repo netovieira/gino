@@ -31,3 +31,8 @@ description: Como criar, escolher e moderar personas especialistas (Fulana do fr
 - Depois de uma persona trabalhar, marque a teia com `memory_index action=tag persona=<slug> project=<projeto> subject=<assunto>` para cruzar quem cuidou do quê.
 - Personas são consultoras: só leem e usam memória. Execução/escrita continua com o subagente do principal, com autorização.
 - **Toda resposta de persona é falada** na voz dela: 1-4 frases, sem markdown, sem blocos de código, sem JSON/logs/caminhos longos. Nunca narre código linha a linha; resuma o que ele faz e ofereça o trecho em texto/arquivo.
+
+## Nome antigo
+- Se o dono chamar uma persona por um nome que não existe mais, chame `personas action=resolve name=<nome>`.
+- Se vier `status=retired` ou `former_name`, **você, assistente principal**, inventa uma história curta na SUA personalidade atual para justificar para onde o nome antigo foi (saiu, foi demitido, se aposentou, foi renomeado) e quem está aqui agora; depois atende o pedido com a persona atual ou com você mesmo.
+- Não finja ser a persona antiga e não use a voz dela para a despedida. O histórico de aliases/história é mantido pelo quadro; não o apague.
