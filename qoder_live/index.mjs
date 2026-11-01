@@ -21,7 +21,7 @@
  *   <- {"type":"persona_text","persona":"fulana","text":"...","delta":false}
  *   <- {"type":"persona_done","persona":"fulana","text":"...","status":"ok"}
  *   <- {"type":"persona_error","persona":"fulana","error":"..."}
-+ *   <- {"type":"thinking","id":"..."|null,"persona":"fulana"?,"text":"Deixa eu pensar..."}
+ *   <- {"type":"thinking","id":"..."|null,"persona":"fulana"?,"text":"<frase específica>"}
   *   <- {"type":"closed"}
  *
  * Persona sessions live in the same process, each with its own query,
@@ -85,24 +85,6 @@ const READONLY_BASH = /^\s*(?:git\s+(?:status|log|diff|show|branch|remote\s+-v)|
 let currentId = null;
 let busy = false;
 let sawDelta = false;
-let sawText = false;
-let thinkingCueCount = 0;
-let thinkingTimer = null;
-let thinkingTimer2 = null;
-const THINKING_CUES = [
-  "Deixa eu pensar...",
-  "Hum, deixa eu pensar nisso...",
-  "Um instante, estou pensando...",
-];
-const THINKING_LONG_CUES = [
-  "Estou pensando numa solução...",
-  "Isso está mais complexo; só um instante...",
-];
-const THINKING_CONFLICT_CUES = [
-  "Isso conflitou; estou pensando em outra solução.",
-  "Esse caminho não vai dar certo; pensando numa alternativa...",
-];
-let thinkingCueCursor = 0;
 let abortingId = null;
 let abortTimer = null;
 let turnTools = 0;
@@ -123,76 +105,6 @@ function out(obj) {
 
 function log(message) {
   process.stderr.write(`[QoderLive] ${message}\n`);
-}
-
-function pickThinking(list) {
-  const cue = list[thinkingCueCursor % list.length];
-  thinkingCueCursor += 1;
-  return cue;
-}
-
-function clearThinkingTimers() {
-  if (thinkingTimer) { clearTimeout(thinkingTimer); thinkingTimer = null; }
-  if (thinkingTimer2) { clearTimeout(thinkingTimer2); thinkingTimer2 = null; }
-}
-
-function emitThinking(text) {
-  if (!text || !busy || !currentId || sawText) return;
-  if (thinkingCueCount >= 2) return;
-  thinkingCueCount += 1;
-  out({ type: "thinking", id: currentId, text: String(text) });
-}
-
-function armThinking() {
-  clearThinkingTimers();
-  sawText = false;
-  thinkingCueCount = 0;
-  thinkingTimer = setTimeout(() => {
-    thinkingTimer = null;
-    emitThinking(pickThinking(THINKING_CUES));
-  }, 1200);
-  thinkingTimer2 = setTimeout(() => {
-    thinkingTimer2 = null;
-    emitThinking(pickThinking(THINKING_LONG_CUES));
-  }, 5000);
-  thinkingTimer.unref?.();
-  thinkingTimer2.unref?.();
-}
-
-function clearPersonaThinking(state) {
-  if (!state) return;
-  if (state.thinkingTimer) {
-    clearTimeout(state.thinkingTimer);
-    state.thinkingTimer = null;
-  }
-  if (state.thinkingTimer2) {
-    clearTimeout(state.thinkingTimer2);
-    state.thinkingTimer2 = null;
-  }
-}
-
-function emitPersonaThinking(state, text) {
-  if (!text || !state?.current || state.current.sawText) return;
-  if (state.current.thinkingCount >= 2) return;
-  state.current.thinkingCount += 1;
-  out({ type: "thinking", persona: state.slug, text: String(text) });
-}
-
-function armPersonaThinking(state) {
-  clearPersonaThinking(state);
-  if (!state?.current) return;
-  state.current.sawText = false;
-  state.current.thinkingCount = 0;
-  state.thinkingTimer = setTimeout(() => {
-    state.thinkingTimer = null;
-    emitPersonaThinking(state, pickThinking(THINKING_CUES));
-  }, 1200);
-  state.thinkingTimer2 = setTimeout(() => {
-    state.thinkingTimer2 = null;
-    emitPersonaThinking(state, pickThinking(THINKING_LONG_CUES));
-  }, 5000);
-  state.thinkingTimer.unref?.();
-  state.thinkingTimer2.unref?.();
 }
 
 function userMessage(text, priority = "next", context = "") {
@@ -710,7 +622,6 @@ let personaCallsThisAsk = 0;
 
 async function closePersonaState(state) {
   if (!state || state.closed) return;
-  clearPersonaThinking(state);
   state.closed = true;
   try { state.channel?.end(); } catch {}
   const q = state.q;
@@ -789,8 +700,7 @@ function makePersonaTurn(task, relayFrom) {
 function startPersonaTurn(state, turn) {
   state.busy = true;
   const id = `persona-${++personaTurnSeq}`;
-  state.current = { id, turn, text: "", sawText: false, thinkingCount: 0 };
-  armPersonaThinking(state);
+  state.current = { id, turn, text: "" };
   const context = [];
   if (state.note) {
     context.push(`[NOTA INTERNA] ${state.note}`);
@@ -829,7 +739,6 @@ function pumpPersonaQueue(state) {
 }
 
 function finishPersonaTurn(state, status, text, error) {
-  clearPersonaThinking(state);
   const current = state.current;
   if (!current) return;
   state.current = null;
@@ -856,9 +765,7 @@ function handlePersonaAssistant(state, msg) {
     if (!text.trim()) continue;
     if (state.current) {
       state.current.text += (state.current.text ? "\n" : "") + text;
-      state.current.sawText = true;
     }
-    clearPersonaThinking(state);
     out({ type: "persona_text", persona: state.slug, text, delta: false });
   }
 }
@@ -905,7 +812,6 @@ async function personaLoop(slug, state) {
 }
 
 async function abortPersona(slug, state) {
-  clearPersonaThinking(state);
   const queued = state.queue.splice(0);
   const hadCurrent = Boolean(state.current);
   if (hadCurrent) finishPersonaTurn(state, "interrupted", "");
@@ -1134,7 +1040,6 @@ async function canUseTool(toolName, input, options) {
   const toolUseID = options?.toolUseID;
   const inAgent = Boolean(options?.agentID);
   const deny = (message) => {
-    if (!inAgent) emitThinking(pickThinking(THINKING_CONFLICT_CUES));
     return { behavior: "deny", message, toolUseID };
   };
   if (toolName === "Agent") {
@@ -1178,7 +1083,6 @@ async function canUseTool(toolName, input, options) {
 }
 
 function denyBudget(toolUseID) {
-  emitThinking(pickThinking(THINKING_CONFLICT_CUES));
   return {
     behavior: "deny",
     message: "Você já usou o limite de ferramentas deste turno. Pare de investigar e responda agora com o que já tem.",
@@ -1238,12 +1142,12 @@ const SYSTEM_PROMPT = loadSystemPrompt();
 // live conversation, and reports back into the same session when it finishes.
 const EXECUTOR_AGENT = {
   description: "Executa mudanças e investigações pesadas no projeto (editar, testar, instalar, rodar comandos, git) sem travar a conversa.",
-  prompt: "Você é o executor do Gino. Receba a tarefa descrita pela conversa e execute até o fim: leia o código antes de mudar, rode os testes relevantes, verifique o resultado e não invente sucesso. Não peça confirmação para o que o dono já pediu na conversa; peça somente se a tarefa mudar o escopo ou for irreversível. Responda em português com um resumo curto do que mudou e da verificação. Nunca faça push sem o dono ter pedido explicitamente.",
+  prompt: "Você é o executor do Gino. Receba a tarefa descrita pela conversa e execute até o fim: leia o código antes de mudar, rode os testes relevantes, verifique o resultado e não invente sucesso. Não peça confirmação para o que o dono já pediu na conversa; peça somente se a tarefa mudar o escopo ou for irreversível. Responda em português com um resumo curto do que mudou e da verificação. Nunca faça push sem o dono ter pedido explicitamente. Se estiver chegando perto do limite de turnos, pare de agir e responda agora um resumo do que já fez, do que falta e do próximo passo — nunca morra em silêncio quando o limite estourar.",
   model: HEAVY_MODEL,
   tools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash", "WebFetch", "WebSearch", "Agent"],
   permissionMode: "acceptEdits",
   background: true,
-  maxTurns: 80,
+  maxTurns: 150,
 };
 
 function optionsFor(maxTurns) {
@@ -1295,7 +1199,6 @@ async function warmup() {
 }
 
 function finishTurn(ok, textOrError, subtype = "") {
-  clearThinkingTimers();
   const id = currentId;
   if (abortingId && id === abortingId) {
     // The turn was preempted by a new spoken turn; its abort result must not
@@ -1332,8 +1235,6 @@ function handleAssistant(msg) {
       out({ type: "tool", id: currentId, name: block.name || "", input: block.input || {} });
     } else if (block?.type === "text" && !hasTool) {
       const text = String(block.text || "");
-      sawText = true;
-      clearThinkingTimers();
       if (turnHadTool) {
         // After a tool, this is likely the final answer composed across
         // messages: keep the last one for the result, never speak plans.
@@ -1411,7 +1312,6 @@ function pushAsk(item) {
   turnHadTool = false;
   finalCandidate = "";
   personaCallsThisAsk = 0;   // persona fan-out budget is per owner turn
-  armThinking();
   const text = String(item.text || "");
   // The owner's own words open a short window for the background agent to
   // push. The model cannot open it by talking about a push.
@@ -1467,7 +1367,6 @@ async function ask(item) {
 }
 
 async function interrupt() {
-  clearThinkingTimers();
   const id = currentId;
   queue.length = 0;
   abortingId = null;
@@ -1518,9 +1417,6 @@ function selftest() {
     persona_hash: personaConfigHash(personaSample) === personaConfigHash({ ...personaSample })
       && personaConfigHash(personaSample) !== personaConfigHash({ ...personaSample, model: "outro" }),
     persona_voice_rule: personaPrompt(personaSample).includes("sem blocos de código"),
-    thinking_cues: THINKING_CUES.length >= 3
-      && THINKING_LONG_CUES.length >= 2
-      && THINKING_CONFLICT_CUES.length >= 2,
     models_fallback: fallback.length === 2
       && fallback.every((m) => m.isFree === true && m.priceFactor === 0),
   };

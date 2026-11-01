@@ -41,10 +41,16 @@ def bind(manager: Optional[RestartManager]) -> None:
 
 def _status_text(manager: RestartManager) -> str:
     p = manager.pending()
-    if p is None:
-        return "No restart is awaiting confirmation."
-    return (f"The {p['kind']} restart is awaiting the spoken phrase "
-            f"'{p['phrase']}' ({p['expires_in']}s left). Nothing has restarted.")
+    if p is not None:
+        return (f"The {p['kind']} restart is awaiting the spoken phrase "
+                f"'{p['phrase']}' ({p['expires_in']}s left). Nothing has restarted.")
+    expired_fn = getattr(manager, "last_expired", None)
+    expired = expired_fn() if callable(expired_fn) else None
+    if expired:
+        return (f"The {expired['kind']} restart request expired "
+                f"{expired['expired_seconds_ago']}s ago before it was confirmed. "
+                f"Nothing has restarted; ask for it again if still wanted.")
+    return "No restart is awaiting confirmation."
 
 
 def restart_assistant(parameters: dict, player=None, speak=None,

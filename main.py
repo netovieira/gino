@@ -76,6 +76,7 @@ from memory.memory_manager import (
 from core import continuity as _continuity
 from core import brain as _brain
 from core import qoder_live as _qoder_live
+from core import narration as _narration
 from core import tool_bridge as _tool_bridge
 from core import speaker_id as _speaker_id
 from core import chat_memory as _chat_memory
@@ -227,6 +228,22 @@ _DUCK_DRAIN_RELEASE_S = 1.0
 # from parking the say-worker — and every line behind it — forever.
 _USER_SPEECH_HOLD_S = 30.0
 _USER_SPEECH_POLL_S = 0.2
+
+# The SDK reports "Operation aborted" when a turn is cancelled. If the owner
+# just took the floor by voice, that abort is the preemption — not a failure to
+# announce. Only matched together with _qoder_voice_preempts, so a real abort
+# (sidecar killed, provider error) still reaches the honest failure path.
+_QODER_ABORT_RE = re.compile(
+    r"operation\s+(?:was\s+)?aborted"
+    r"|\bcancell?ederror\b"
+    r"|\b(?:turn|turno|request|requisi[cç][aã]o)\s+(?:was\s+)?(?:aborted|cancell?ed)\b"
+    r"|\binterrompid[oa]\s+por\s+voz\b",
+    re.IGNORECASE,
+)
+
+# Wall clock of this process. The model reads it in [ESTADO NO BOOT] so a stale
+# "reinício pendente" from the previous session cannot be repeated as current.
+_PROCESS_STARTED_WALL = time.time()
 # Sem o segmenter local (Gemini Live), a única prova de fala é o transcript de
 # entrada; esta cauda cobre o silêncio entre os blocos da mesma frase.
 _USER_SPEECH_TAIL_S = 2.0
@@ -1388,6 +1405,11 @@ class JarvisLive:
         self._qoder_restart_attempts = 0
         self._qoder_restart_thread = None
         self._qoder_turn_timer     = None
+        # Pre-action narration: one policy, one timer per turn (core/narration).
+        self._narration_policy     = _narration.NarrationPolicy()
+        self._narration_timer      = None
+        self._narration_turn       = None
+        self._narration_spoken     = False
         self._qoder_turn_started   = 0.0
         # A watchdog only fires when the turn *stalls*: every text/tool event
         # pushes the deadline forward, and a hard cap stops runaway tool chains.
@@ -1402,6 +1424,11 @@ class JarvisLive:
         self._qoder_spoken: dict[str, list[str]] = {}
         self._qoder_turns: dict[str, str] = {}
         self._qoder_meta: dict[str, dict] = {}
+        # turn_id -> monotonic time. A barge-in marks the in-flight turn
+        # before asking the sidecar to abort; if the SDK then reports
+        # "Operation aborted", that is the owner taking the floor, not a
+        # failure worth asking him to repeat.
+        self._qoder_voice_preempts: dict[str, float] = {}
         self._persona_text_buf: dict[str, str] = {}
         self._persona_seen: set[str] = set()
         self._qoder_current_id     = None
@@ -1616,6 +1643,7 @@ class JarvisLive:
         # vale mesmo com auto_start desligado — um pareamento feito depois
         # (action=pair) também precisa ser observado.
         try:
+            from core import whatsapp as _whatsapp
             from core import whatsapp_watch as _wa_watch
             from memory.config_manager import get_assistant_name as _get_asst
             from memory.config_manager import get_plugin_setting as _get_plugin
@@ -3083,6 +3111,7 @@ class JarvisLive:
         if not text:
             return False
         try:
+            from core import whatsapp as _whatsapp
             from memory.config_manager import get_plugin_setting
             if not bool(get_plugin_setting("whatsapp", "owner_notify", True)):
                 return False
@@ -3590,6 +3619,28 @@ class JarvisLive:
             sleep_block = ""
         if sleep_block:
             text += "\n\n" + sleep_block
+        # The single source of truth for restart state, written into every
+        # fresh session. Without it the resumed history and the warm-up turns
+        # ("é só falar confirmo reiniciar") kept the old request alive forever.
+        try:
+            started = datetime.fromtimestamp(_PROCESS_STARTED_WALL)
+            pending = (self._restart.pending()
+                       if getattr(self, "_restart", None) is not None else None)
+            state = ("Há UM pedido de reinício aguardando a frase de confirmação "
+                     "do dono neste processo." if pending else
+                     "NÃO há pedido de reinício pendente. Qualquer pedido de "
+                     "reinício que apareça no histórico está CONCLUÍDO.")
+            text += (
+                "\n\n[ESTADO NO BOOT]\n"
+                f"Este processo começou em {started.strftime('%d/%m/%Y %H:%M')} e "
+                f"já está rodando o código do disco. {state} "
+                "Nunca diga que há reinício pendente por causa do histórico, da "
+                "memória ou de uma fala sua anterior: antes de falar do tema, "
+                "confira com restart_assistant action='status'. Não peça ao dono "
+                "para confirmar um reinício que já aconteceu e não repita pedidos "
+                "antigos como se fossem atuais.")
+        except Exception as e:
+            print(f"[QoderLive] boot state: {e}")
         return text
 
     def _memory_record_user(self, text: str) -> None:
@@ -3945,20 +3996,96 @@ class JarvisLive:
             thread.start()
             _metrics.event(f"qoder restart scheduled in {delay:.0f}s")
 
+    def _cancel_narration(self, turn_id: str | None = None) -> None:
+        """Cancel a pending status line when the answer (or turn) arrives."""
+        if turn_id is not None and turn_id != getattr(self, "_narration_turn", None):
+            return
+        timer = getattr(self, "_narration_timer", None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        self._narration_timer = None
+        self._narration_turn = None
+
+    def _schedule_narration(self, turn_id, name: str, tool_input: dict) -> None:
+        """Plan a status line; slow actions sound only if still running at 5 s.
+
+        The policy owns the decision (local/social => no line, external-effect
+        => immediate, slow => a sentence naming the action).  This method only
+        owns the timer and the cancellation rules, so fast answers never hear
+        a filler.
+        """
+        if getattr(self, "_narration_spoken", False) or self._qoder_ignore:
+            return
+        with self._qoder_lock:
+            meta = dict(self._qoder_meta.get(turn_id) or {})
+            user_text = str(self._qoder_turns.get(turn_id) or "")
+        if meta.get("source") == "whatsapp" or not meta.get("speak", True):
+            return
+        persona_name = ""
+        try:
+            if str(name or "").endswith("persona_ask"):
+                key = str((tool_input or {}).get("persona") or "")
+                persona = _personas.get(key)
+                if persona:
+                    persona_name = str(persona.get("name") or key)
+        except Exception as e:
+            print(f"[Persona] handoff: {e}")
+        plan = self._narration_policy.plan(
+            name, tool_input or {}, user_text=user_text,
+            persona_name=persona_name)
+        if plan is None:
+            return
+        self._cancel_narration()
+        self._narration_turn = turn_id
+        elapsed = time.monotonic() - getattr(
+            self, "_qoder_turn_started", time.monotonic())
+        remaining = max(0.0, plan.delay_s - elapsed)
+
+        def _fire() -> None:
+            if getattr(self, "_qoder_ignore", False):
+                return
+            if getattr(self, "_narration_turn", None) != turn_id:
+                return
+            with self._qoder_lock:
+                if self._qoder_current_id != turn_id:
+                    return
+                if (self._qoder_spoken.get(turn_id)
+                        or self._qoder_text_buf.get(turn_id)):
+                    return
+            waited = time.monotonic() - getattr(
+                self, "_qoder_turn_started", time.monotonic())
+            decision = self._narration_policy.decide(
+                plan, waited, spoken=getattr(self, "_narration_spoken", False),
+                turn=turn_id)
+            if not decision.narrate:
+                return
+            if getattr(self.ui, "muted", False):
+                return
+            self._narration_spoken = True
+            try:
+                self._say_now(decision.text, log=False)
+            except Exception as e:
+                print(f"[Narração] falhou: {e}")
+                return
+            self._narration_policy.note_spoken(decision.text, turn_id)
+            try:
+                self.ui.write_log(f"SYS: {self._asst_name} — {decision.text}")
+            except Exception:
+                pass
+
+        timer = threading.Timer(remaining, _fire)
+        timer.daemon = True
+        self._narration_timer = timer
+        timer.start()
+
     def _qoder_on_tool(self, turn_id, name: str, tool_input: dict) -> None:
         self._qoder_touch()
         self._qoder_tool_count += 1
         _metrics.inc("qoder.tools")
-        if str(name or "").endswith("persona_ask"):
-            try:
-                key = str((tool_input or {}).get("persona") or "")
-                persona = _personas.get(key)
-                if persona:
-                    line = (f"Vou pedir "
-                            f"{_personas.address(persona, contraction=True)} ver.")
-                    self._say_now(line, log=True, label=self._asst_name)
-            except Exception as e:
-                print(f"[Persona] handoff: {e}")
+        self._schedule_narration(turn_id, name, tool_input)
         with self._qoder_lock:
             meta = self._qoder_meta.get(turn_id)
             if meta and meta.get("source") == "whatsapp":
@@ -4014,6 +4141,7 @@ class JarvisLive:
         if not text or self._qoder_ignore:
             return
         self._qoder_touch()
+        self._cancel_narration(turn_id)
         with self._qoder_lock:
             if self._qoder_current_id is not None and turn_id != self._qoder_current_id:
                 return
@@ -4032,6 +4160,7 @@ class JarvisLive:
             self._qoder_say(turn_id, sentence)
 
     def _qoder_finish(self, turn_id, flush: bool = True) -> None:
+        self._cancel_narration(turn_id)
         try:
             timer = self._qoder_turn_timer
             self._qoder_turn_timer = None
@@ -4159,9 +4288,11 @@ class JarvisLive:
             pass
 
     def _qoder_on_thinking(self, persona: str | None, text: str) -> None:
-        """Short spoken cue while thinking; never the model's inner reasoning."""
+        """One contextual cue from an older sidecar; never generic filler."""
         text = str(text or "").strip()
         if not text or self._qoder_ignore:
+            return
+        if _narration.is_generic(text):
             return
         if getattr(self.ui, "muted", False):
             return
@@ -4258,6 +4389,31 @@ class JarvisLive:
                 print(f"[Librarian] tick: {e}")
         self._voice_training_hint()
 
+    def _mark_qoder_voice_preempt(self) -> str | None:
+        """Remember the in-flight turn the owner's voice is about to replace.
+
+        Called *before* asking the sidecar to stop, so an abort result that
+        arrives in the race is attributed to the preemption instead of being
+        announced as "O Qoder falhou neste turno".
+        """
+        lock = getattr(self, "_qoder_lock", None)
+        if lock is not None:
+            with lock:
+                turn_id = getattr(self, "_qoder_current_id", None)
+        else:
+            turn_id = getattr(self, "_qoder_current_id", None)
+        if not turn_id:
+            return None
+        now = time.monotonic()
+        table = getattr(self, "_qoder_voice_preempts", None)
+        if table is None:
+            table = {}
+            self._qoder_voice_preempts = table
+        table[str(turn_id)] = now
+        for stale in [key for key, when in table.items() if now - when > 300.0]:
+            table.pop(stale, None)
+        return str(turn_id)
+
     def _qoder_on_error(self, turn_id, error: str) -> None:
         err = str(error or "")
         # A saved session id can be rejected by a newer CLI/model. Retry once
@@ -4270,12 +4426,28 @@ class JarvisLive:
             _metrics.event("qoder resume rejected; starting fresh")
             self._schedule_qoder_restart()
         with self._qoder_lock:
+            voice_preempted = bool(
+                getattr(self, "_qoder_voice_preempts", {}).pop(turn_id, None))
             if turn_id not in self._qoder_turns:
                 return
             spoken = list(self._qoder_spoken.get(turn_id, []))
             original = self._qoder_turns.get(turn_id, "")
             meta = dict(self._qoder_meta.get(turn_id) or {})
         print(f"[QoderLive] turn error: {error}")
+        if voice_preempted and _QODER_ABORT_RE.search(err):
+            # The owner spoke over the answer; the abort is the consequence of
+            # him taking the floor. Never call it a failure and never ask him
+            # to repeat: the new utterance is already the next turn.
+            print("[QoderLive] abort por barge-in — turno substituído, silenciado")
+            _metrics.event("qoder turn replaced by owner voice; abort silenced")
+            task_id = str(meta.get("task_id") or "")
+            if task_id:
+                try:
+                    _task_queue.cancel(task_id)
+                except Exception as e:
+                    print(f"[Tasks] cancel preempted: {e}")
+            self._qoder_finish(turn_id, flush=False)
+            return
         _metrics.inc("qoder.error")
         _metrics.event(f"qoder turn error: {str(error)[:120]}")
         self._qoder_finish(turn_id, flush=False)
@@ -4298,12 +4470,30 @@ class JarvisLive:
                 print(f"[Librarian] tick: {e}")
         if not spoken and original:
             # The local model is not a conversational fallback in this
-            # architecture: keep the turn for Qoder or say it failed.
+            # architecture. A failed turn is relayed ONCE with the same words —
+            # the owner's rule is that he is never asked to repeat a request.
             if not self._qoder_live_ready():
                 self._qoder_hold(original, None, "erro no turno")
+            elif not self._qoder_retry_used:
+                self._qoder_retry_used = True
+                print("[QoderLive] turno falhou — relançando a mesma fala")
+                _metrics.inc("qoder.retry")
+                self._say_now("Deu um tropeço aqui; já estou refazendo.",
+                              log=False)
+                self._qoder_turn(
+                    original, None, retry=True,
+                    source=str(meta.get("source") or "owner"),
+                    reply_channel=str(meta.get("reply_channel") or "voice"),
+                    speak=bool(meta.get("speak", True)),
+                    media_type=str(meta.get("media_type") or "text"),
+                    wa_account=meta.get("wa_account"),
+                    wa_chat=meta.get("wa_chat"))
             else:
-                self._say_now("O Qoder falhou neste turno. Pode repetir?")
-                self._qoder_flush_pending()
+                self._say_now("Não consegui responder este turno. Não vou pedir "
+                              "que você repita; a fala está guardada e eu tento "
+                              "de novo na próxima.", log=False)
+                self._qoder_hold(original, None, "erro no turno",
+                                 announce=False)
 
     def _qoder_preempt(self, old_id) -> None:
         """Drop the active turn's hold on the conversation, keep its agents.
@@ -4425,6 +4615,11 @@ class JarvisLive:
         payload = labeled_text if "[FALANTE:" in labeled_text else (
             f"[FALANTE: {speaker}] {text}" if speaker else text)
         self._qoder_ignore = False
+        # A fresh turn was not cut: an old `interrupt()` must not drop the
+        # first line this turn speaks (Qoder never resets it elsewhere).
+        self._interrupted = False
+        self._cancel_narration()
+        self._narration_spoken = False
         self._qoder_first_sentence = False
         self._turn_t0 = time.monotonic()
         self._qoder_turn_started = self._turn_t0
@@ -4897,6 +5092,13 @@ class JarvisLive:
 
     def _restart_shutdown(self) -> None:
         """Clean-ish shutdown for the detached restart helper."""
+        # A requested restart must not resume the session that asked for it:
+        # that history is where "reinício pendente" lived forever. The durable
+        # memory (memory/chat) warms the fresh session at boot instead.
+        try:
+            self._clear_qoder_session()
+        except Exception as e:
+            print(f"[QoderLive] session clear on restart: {e}")
         try:
             if self._loop is not None and self.session is not None:
                 asyncio.run_coroutine_threadsafe(self._save_session_summary(), self._loop)
@@ -5891,6 +6093,10 @@ class JarvisLive:
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
+        # The UI INTERRUPT button and a voice barge-in both mean the owner
+        # ended the turn: the sidecar's "Operation aborted" that follows is
+        # that interruption, never a failure to ask them to repeat.
+        self._mark_qoder_voice_preempt()
         # Anything already queued for TTS belongs to the answer being cut.
         # The worker compares this epoch and drops the item instead of speaking
         # it after the owner has taken the floor.
@@ -6007,8 +6213,12 @@ class JarvisLive:
             return
         print(f"[Barge-in] owner interrupt: {clean[:80]!r}")
         self._log_heard(clean)
+        # The owner always has the floor. Holding his words in a backlog until
+        # a long agent job finishes is exactly the "you don't listen to me"
+        # report: the turn ends here and his sentence starts the next one.
         self.ui.write_log(f"SYS: interrompido por voz — «{clean[:60]}»")
         self._qoder_ignore = True
+        self._mark_qoder_voice_preempt()
         try:
             if self._qoder_live is not None:
                 self._qoder_live.interrupt()
@@ -6181,6 +6391,7 @@ class JarvisLive:
         except Exception:
             pass
         self._qoder_ignore = True
+        self._mark_qoder_voice_preempt()
         try:
             if self._qoder_live is not None:
                 self._qoder_live.interrupt()
@@ -7287,8 +7498,14 @@ class JarvisLive:
                 if g is not None and g.local:
                     g.feed(indata)
                 return
-            with self._speaking_lock:
-                jarvis_speaking = self._is_speaking
+            # ── The flag follows the SPEAKERS, not the turn ──────────────────
+            # A Qoder turn (an agent working) keeps `_reply_active` True long
+            # after the last sentence, and one narration line heard mid-job was
+            # enough to leave this flag stuck for the whole turn: the gate below
+            # then discarded every block and the owner was deaf until INTERRUPT.
+            # With the queue empty past the grace window nothing of ours is
+            # sounding, so there is nothing to protect from — the block is his.
+            jarvis_speaking = self._mic_gate_speaking()
 
             # ── The owner has the floor ──────────────────────────────────────
             # The VAD on the microphone is the proof that a human voice is in
@@ -7643,6 +7860,48 @@ class JarvisLive:
             return True
         return bool(getattr(self._groq, "speaking", False))
 
+    def _mic_gate_speaking(self) -> bool:
+        """The speaking flag as the microphone gate must see it.
+
+        Read on the mic callback thread. `_reply_active` is deliberately not
+        consulted: it stays True for the whole Qoder turn (an agent working),
+        and gating on it is what made the assistant deaf until INTERRUPT.
+        """
+        with self._speaking_lock:
+            speaking = self._is_speaking
+        if speaking and self._playback_silent():
+            return False
+        return speaking
+
+    def _playback_silent(self) -> bool:
+        """Nothing of ours is sounding: empty queue, no batch in the grace window.
+
+        The speaking flag follows the SPEAKERS, not the turn. A Qoder turn
+        (agent working) keeps `_reply_active` True long after the last
+        sentence, so a flag gated on it stays stuck and the microphone goes
+        deaf until INTERRUPT. Used by the drain (release) and by the mic gate
+        in `_listen_audio` (a block heard now is the owner, not our echo).
+        """
+        q = self.audio_in_queue
+        if q is not None and not q.empty():
+            return False
+        return (time.monotonic() - getattr(self, "_last_play_batch", 0.0)
+                >= _DUCK_DRAIN_RELEASE_S)
+
+    def _release_speaking_on_drain(self) -> None:
+        """Reopen the microphone once the speakers have gone quiet.
+
+        Between two sentences of a reply the queue refills inside the grace
+        window, so a real reply never flickers. Past it, nothing of ours is
+        sounding — even if the turn is still open (a Qoder agent working) — and
+        the owner must be heard without pressing INTERRUPT.
+        """
+        if not self._is_speaking:
+            return
+        if not self._playback_silent():
+            return
+        self.set_speaking(False)
+
     def _duck_check_drain(self) -> None:
         """Playback tick with an empty queue: when the silence outlives the
         gap between two sentences of one reply, the exchange has audibly ended
@@ -7708,13 +7967,15 @@ class JarvisLive:
                         timeout=0.1
                     )
                 except asyncio.TimeoutError:
-                    if (
-                        self._turn_done_event
-                        and self._turn_done_event.is_set()
-                        and self.audio_in_queue.empty()
-                        and not getattr(self, "_reply_active", False)
-                    ):
-                        self.set_speaking(False)
+                    # The speaking flag follows the SPEAKERS, not the turn. A
+                    # long Qoder turn (agent working) keeps `_reply_active`
+                    # True long after the last sentence; gating the release on
+                    # it left `_is_speaking` stuck, the microphone half-closed
+                    # and the assistant deaf until INTERRUPT was pressed.
+                    self._release_speaking_on_drain()
+                    if (not self._is_speaking
+                            and self._turn_done_event
+                            and self._turn_done_event.is_set()):
                         self._turn_done_event.clear()
                     # Turn still open (background job speaking was done): the
                     # volumes come back with the SPEECH, not with the turn.

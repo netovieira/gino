@@ -9,8 +9,10 @@ no helper process and no reboot can ever happen during the suite.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
+import time
 import types
 from pathlib import Path
 from unittest import mock
@@ -239,11 +241,13 @@ def test_pc_confirm_requires_the_phrase(manager, no_popen):
 
 # ── live path (Popen mocked) ─────────────────────────────────────────────────
 
-def test_live_assistant_restart_spawns_detached_helper_then_shuts_down(monkeypatch):
+def test_live_assistant_restart_spawns_detached_helper_then_shuts_down(monkeypatch,
+                                                                       tmp_path):
     popen = mock.Mock(return_value=mock.Mock())
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
     shutdown = mock.Mock()
-    manager = RestartManager(dry_run=False, logger=mock.Mock())
+    manager = RestartManager(dry_run=False, logger=mock.Mock(),
+                             state_path=tmp_path / "restart_pending.json")
     manager.bind(shutdown_cb=shutdown)
 
     manager.request_assistant(reason="melhoria testada")
@@ -262,10 +266,12 @@ def test_live_assistant_restart_spawns_detached_helper_then_shuts_down(monkeypat
     assert manager.pending() is None
 
 
-def test_live_assistant_restart_without_shutdown_hook_refuses(monkeypatch):
+def test_live_assistant_restart_without_shutdown_hook_refuses(monkeypatch,
+                                                              tmp_path):
     popen = mock.Mock(side_effect=AssertionError("must not spawn"))
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
-    manager = RestartManager(dry_run=False, logger=mock.Mock())
+    manager = RestartManager(dry_run=False, logger=mock.Mock(),
+                             state_path=tmp_path / "restart_pending.json")
     manager.bind(pc_restart=mock.Mock())
 
     manager.request_assistant()
@@ -276,11 +282,12 @@ def test_live_assistant_restart_without_shutdown_hook_refuses(monkeypatch):
     assert manager.pending() is None
 
 
-def test_live_pc_restart_calls_the_callback(monkeypatch):
+def test_live_pc_restart_calls_the_callback(monkeypatch, tmp_path):
     popen = mock.Mock(side_effect=AssertionError("must not spawn"))
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
     pc = mock.Mock()
-    manager = RestartManager(dry_run=False, logger=mock.Mock())
+    manager = RestartManager(dry_run=False, logger=mock.Mock(),
+                             state_path=tmp_path / "restart_pending.json")
     manager.bind(pc_restart=pc)
 
     manager.request_pc()
@@ -291,7 +298,7 @@ def test_live_pc_restart_calls_the_callback(monkeypatch):
     assert manager.pending() is None
 
 
-def test_live_pc_restart_defaults_to_computer_settings(monkeypatch):
+def test_live_pc_restart_defaults_to_computer_settings(monkeypatch, tmp_path):
     fake = types.ModuleType("actions.computer_settings")
     pc = mock.Mock()
     fake.restart_computer = pc
@@ -299,7 +306,8 @@ def test_live_pc_restart_defaults_to_computer_settings(monkeypatch):
     monkeypatch.setattr(restart.subprocess, "Popen",
                         mock.Mock(side_effect=AssertionError("must not spawn")))
 
-    manager = RestartManager(dry_run=False, logger=mock.Mock())
+    manager = RestartManager(dry_run=False, logger=mock.Mock(),
+                             state_path=tmp_path / "restart_pending.json")
     manager.request_pc()
     # Asking is not doing.
     pc.assert_not_called()
@@ -309,11 +317,12 @@ def test_live_pc_restart_defaults_to_computer_settings(monkeypatch):
     pc.assert_called_once_with()
 
 
-def test_live_pc_restart_failure_does_not_claim_success(monkeypatch):
+def test_live_pc_restart_failure_does_not_claim_success(monkeypatch, tmp_path):
     monkeypatch.setattr(restart.subprocess, "Popen",
                         mock.Mock(side_effect=AssertionError("must not spawn")))
     pc = mock.Mock(side_effect=RuntimeError("polkit denied"))
-    manager = RestartManager(dry_run=False, logger=mock.Mock())
+    manager = RestartManager(dry_run=False, logger=mock.Mock(),
+                             state_path=tmp_path / "restart_pending.json")
     manager.bind(pc_restart=pc)
 
     manager.request_pc()
@@ -393,3 +402,70 @@ def test_action_pc_cancel_and_no_false_claim(manager, no_popen):
     assert "no restart awaiting confirmation" in manager.confirm(
         "confirmo reiniciar").lower()
     no_popen.assert_not_called()
+
+
+# ── persistence across turns / instances ─────────────────────────────────────
+
+def test_pending_request_survives_a_new_manager_instance(tmp_path):
+    state = tmp_path / "restart_pending.json"
+    first = RestartManager(dry_run=True, logger=mock.Mock(), state_path=state)
+    first.request_assistant(reason="correções de hoje")
+
+    second = RestartManager(dry_run=True, logger=mock.Mock(), state_path=state)
+    p = second.pending()
+    assert p is not None
+    assert p["kind"] == "assistant"
+    assert p["reason"] == "correções de hoje"
+    assert "correções de hoje" in state.read_text(encoding="utf-8")
+
+    result = second.confirm("confirmo reiniciar o assistente")
+    assert result.startswith("[DRY RUN]")
+    assert not state.exists()
+
+
+def test_pending_request_from_a_previous_process_is_discarded(tmp_path):
+    """Um pedido salvo antes deste processo nascer já foi cumprido pelo boot.
+
+    Era assim que o reinício voltava em loop: o processo novo lia o arquivo da
+    sessão anterior e anunciava "reinício continua estacionado" outra vez.
+    """
+    state = tmp_path / "restart_pending.json"
+    state.write_text(json.dumps({
+        "kind": "assistant",
+        "reason": "pedido da sessão anterior",
+        "phrase": "confirmo reiniciar o assistente",
+        "created_at": time.time() - 3600.0,
+    }), encoding="utf-8")
+
+    manager = RestartManager(dry_run=True, logger=mock.Mock(), state_path=state)
+
+    assert manager.pending() is None
+    assert not state.exists(), "o pedido antigo continuou em disco"
+    assert "no restart awaiting" in manager.confirm(
+        "confirmo reiniciar o assistente").lower()
+
+
+def test_cancel_removes_the_persisted_request(tmp_path):
+    state = tmp_path / "restart_pending.json"
+    manager = RestartManager(dry_run=True, logger=mock.Mock(), state_path=state)
+    manager.request_pc(reason="kernel")
+    assert state.exists()
+
+    manager.cancel()
+    assert not state.exists()
+    assert manager.pending() is None
+
+
+def test_status_reports_expired_instead_of_nothing_pending(tmp_path, monkeypatch):
+    state = tmp_path / "restart_pending.json"
+    manager = RestartManager(dry_run=True, logger=mock.Mock(), state_path=state)
+    action.bind(manager)
+    manager.request_assistant(reason="teste de expiração")
+
+    monkeypatch.setattr(restart, "CONFIRM_TIMEOUT_SECONDS", -1.0)
+    status = action.restart_assistant({"action": "status"})
+
+    assert "expired" in status.lower()
+    assert "No restart is awaiting" not in status
+    assert not state.exists()
+    assert manager.last_expired()["kind"] == "assistant"

@@ -361,12 +361,13 @@ def test_thinking_events_are_forwarded():
     seen = []
     live = QoderLive(on_thinking=lambda persona, text: seen.append((persona, text)),
                      logger=lambda *_a: None)
-    live._dispatch({"type": "thinking", "id": "t1", "text": "Deixa eu pensar..."})
+    live._dispatch({"type": "thinking", "id": "t1",
+                    "text": "Enviando a mensagem para Maria no WhatsApp."})
     live._dispatch({"type": "thinking", "persona": "fulana",
-                    "text": "Estou pensando numa solução..."})
+                    "text": "A Fulana ainda está trabalhando nisso."})
     assert seen == [
-        (None, "Deixa eu pensar..."),
-        ("fulana", "Estou pensando numa solução..."),
+        (None, "Enviando a mensagem para Maria no WhatsApp."),
+        ("fulana", "A Fulana ainda está trabalhando nisso."),
     ]
 
 

@@ -25,7 +25,7 @@ PROTOCOL (see ``qoder_live/index.mjs`` for the source of truth)
         {"type": "persona_text", "persona": "<slug>", "text": "...", "delta": false}
         {"type": "persona_done", "persona": "<slug>", "text": "...", "status": "ok"|"error"|"interrupted"}
         {"type": "persona_error", "persona": "<slug>", "error": "..."}
-        {"type": "thinking", "id": "..."|null, "persona": "<slug>"?, "text": "Deixa eu pensar..."}
+        {"type": "thinking", "id": "..."|null, "persona": "<slug>"?, "text": "<frase específica>"}
         {"type": "done", "id": "...", "text": "..."}
         {"type": "error", "id": "..."|null, "error": "..."}
         {"type": "closed"}

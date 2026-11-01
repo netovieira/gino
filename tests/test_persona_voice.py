@@ -91,18 +91,29 @@ class PersonaHandoffTest(unittest.TestCase):
         obj._qoder_meta = {}
         obj._qoder_tool_count = 0
         obj._qoder_touch = lambda: None
+        obj._qoder_ignore = False
         obj._asst_name = "Gino"
         obj.ui = _UI()
         obj.said = []
+        obj.scheduled = []
         obj._say_now = lambda text, **kwargs: obj.said.append((text, kwargs))
+        obj._schedule_narration = (
+            lambda turn_id, name, tool_input: obj.scheduled.append(
+                (turn_id, name, tool_input)))
         return obj
 
-    def test_persona_ask_speaks_handoff_with_gender_article(self):
+    def test_persona_ask_is_planned_without_an_immediate_announcement(self):
         obj = self._obj()
         with mock.patch("core.personas.get", return_value=PERSONA):
             main.JarvisLive._qoder_on_tool(
                 obj, "t1", "mcp__jarvis__persona_ask", {"persona": "fulana"})
-        self.assertEqual(obj.said[0][0], "Vou pedir pra Fulana ver.")
+        self.assertEqual(obj.said, [])
+        self.assertEqual(obj.scheduled[0][1], "mcp__jarvis__persona_ask")
+        plan = main._narration.NarrationPolicy().plan(
+            "mcp__jarvis__persona_ask", {"persona": "fulana"},
+            user_text="pede pra ela revisar o texto", persona_name="Fulana")
+        self.assertIn("Fulana", plan.text)
+        self.assertFalse(main._narration.is_technical(plan.text))
 
 
 class PersonaSpeechTest(unittest.TestCase):
@@ -164,18 +175,19 @@ class ThinkingCueTest(unittest.TestCase):
         obj._say_now = lambda text, **kwargs: obj.said.append((text, kwargs))
         return obj
 
-    def test_main_cue_uses_main_voice_and_is_not_logged_as_answer(self):
+    def test_generic_legacy_cue_is_never_spoken(self):
         obj = self._obj()
         main.JarvisLive._qoder_on_thinking(obj, None, "Deixa eu pensar...")
-        self.assertEqual(obj.said[0][0], "Deixa eu pensar...")
-        self.assertFalse(obj.said[0][1]["log"])
-        self.assertTrue(any("pensando" in line for line in obj.ui.logs))
+        main.JarvisLive._qoder_on_thinking(obj, None, "Estou pensando numa solução...")
+        self.assertEqual(obj.said, [])
 
-    def test_persona_cue_uses_persona_voice(self):
+    def test_specific_cue_uses_persona_voice(self):
         obj = self._obj()
         with mock.patch("core.personas.get", return_value=PERSONA):
             main.JarvisLive._qoder_on_thinking(
-                obj, "fulana", "Estou pensando numa solução...")
+                obj, "fulana", "Enviando a mensagem para Maria no WhatsApp.")
+        self.assertEqual(obj.said[0][0],
+                         "Enviando a mensagem para Maria no WhatsApp.")
         self.assertEqual(obj.said[0][1]["voice_id"], "voice-fulana")
         self.assertEqual(obj.said[0][1]["label"], "Fulana")
 
