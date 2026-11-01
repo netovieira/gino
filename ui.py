@@ -101,6 +101,27 @@ BASE_DIR   = _base_dir()
 CONFIG_DIR = BASE_DIR / "config"
 API_FILE   = CONFIG_DIR / "api_keys.json"
 
+# On-disk mirror of the Activity Log. Every line the UI shows is appended here
+# with a timestamp and fsynced immediately, so a freeze or a hard crash can no
+# longer erase what was on screen. Lines arrive from several threads (brain,
+# plugins, actions), so writes are serialised and a bad write is never fatal.
+LOG_DIR  = BASE_DIR / "logs"
+LOG_FILE = LOG_DIR / "activity.log"
+_log_lock = threading.Lock()
+
+
+def _persist_activity_line(text: str) -> None:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with _log_lock:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(f"[{stamp}] {text}\n")
+                f.flush()
+                os.fsync(f.fileno())
+    except Exception as e:          # noqa: BLE001 — logging must never kill the UI
+        print(f"[ActivityLog] could not write {LOG_FILE}: {e}")
+
 
 def _read_full_config() -> dict:
     """Read api_keys.json config dict. Returns {} on any error."""
@@ -1149,6 +1170,7 @@ class LogWidget(QTextEdit):
         self._sig.connect(self._enqueue)
 
     def append_log(self, text: str):
+        _persist_activity_line(text)
         self._sig.emit(text)
 
     def _enqueue(self, text: str):
@@ -3799,7 +3821,10 @@ class MainWindow(QMainWindow):
         self._api_tmr.timeout.connect(self._update_api_usage)
         self._api_tmr.start(500)
 
-        self._log_sig.connect(self._log.append_log)
+        # Direct: append_log only mirrors to disk and re-emits, so it is safe
+        # off the GUI thread — and writing on the emitting thread means lines
+        # still reach activity.log while the main loop is stuck.
+        self._log_sig.connect(self._log.append_log, type=Qt.ConnectionType.DirectConnection)
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
@@ -6848,7 +6873,7 @@ class MainWindow(QMainWindow):
         txt = self._input.text().strip()
         if not txt: return
         self._input.clear()
-        self._log.append_log(f"You: {txt}")
+        self._log.append_log(f"YOU: {txt}")
         if self.on_text_command:
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
 
