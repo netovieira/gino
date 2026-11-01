@@ -45,6 +45,21 @@ def main():
         time.sleep(60)
         return 0
     out({"type": "ready", "model": "Fake-Model", "warmup_ms": 7})
+    out({
+        "type": "models",
+        "source": "fallback",
+        "models": [{
+            "value": "Fake-Model",
+            "displayName": "Fake-Model",
+            "isFree": True,
+            "priceFactor": 0.0,
+            "originalPriceFactor": 0.0,
+            "availableContextWindows": [200000],
+            "maxInputTokens": 200000,
+            "efforts": ["low", "medium", "high", "max"],
+            "defaultEffort": "medium",
+        }],
+    })
     current = None
     for line in sys.stdin:
         line = line.strip()
@@ -72,8 +87,30 @@ def main():
             })
             out({"type": "done", "id": current, "text": speaker + ":" + text if speaker else "-:" + text})
             current = None
+        elif kind == "persona_ask":
+            persona = str(msg.get("persona") or "")
+            task = str(msg.get("task") or "")
+            out({"type": "session", "id": "persona-session-" + persona, "persona": persona})
+            if msg.get("fail"):
+                out({"type": "persona_error", "persona": persona, "error": "persona falhou"})
+                out({"type": "persona_done", "persona": persona, "text": "",
+                     "status": "error"})
+            else:
+                out({"type": "persona_text", "persona": persona,
+                     "text": "resposta de " + persona, "delta": False})
+                out({"type": "persona_text", "persona": persona,
+                     "text": " sobre " + task, "delta": False})
+                out({"type": "persona_done", "persona": persona,
+                     "text": "resposta de " + persona + " sobre " + task,
+                     "status": "ok"})
         elif kind == "interrupt":
-            if current is not None:
+            persona = msg.get("persona")
+            if persona is not None:
+                targets = [persona] if persona != "all" else ["fulana", "beltrano"]
+                for slug in targets:
+                    out({"type": "persona_done", "persona": slug, "text": "",
+                         "status": "interrupted"})
+            elif current is not None:
                 out({"type": "interrupted", "id": current})
                 out({"type": "done", "id": current, "text": "late completion"})
                 current = None
@@ -98,6 +135,12 @@ class Recorder:
         self.errors = []
         self.readies = []
         self.closed = 0
+        self.persona_texts = []
+        self.persona_dones = []
+        self.persona_errors = []
+        self.persona_sessions = []
+        self.models = []
+        self.thinking = []
 
     def handlers(self):
         return {
@@ -109,6 +152,22 @@ class Recorder:
             "on_error": lambda msg_id, error: self.errors.append((msg_id, error)),
             "on_ready": lambda model, warmup_ms: self.readies.append((model, warmup_ms)),
             "on_closed": lambda: setattr(self, "closed", self.closed + 1),
+            "on_persona_text": lambda persona, text: self.persona_texts.append(
+                (persona, text)
+            ),
+            "on_persona_done": lambda persona, text, status: self.persona_dones.append(
+                (persona, text, status)
+            ),
+            "on_persona_error": lambda persona, error: self.persona_errors.append(
+                (persona, error)
+            ),
+            "on_persona_session": lambda persona, session_id: self.persona_sessions.append(
+                (persona, session_id)
+            ),
+            "on_models": lambda models: self.models.append(models),
+            "on_thinking": lambda persona, text: self.thinking.append(
+                (persona, text)
+            ),
         }
 
 
@@ -296,6 +355,19 @@ def test_callback_exception_is_logged_and_does_not_kill_reader(make_live):
     assert wait_until(lambda: rec.dones)
     assert rec.dones == [("cb-1", "-:sobrevive")]
     assert any("on_text callback failed" in line and "callback exploded" in line for line in logs)
+
+
+def test_thinking_events_are_forwarded():
+    seen = []
+    live = QoderLive(on_thinking=lambda persona, text: seen.append((persona, text)),
+                     logger=lambda *_a: None)
+    live._dispatch({"type": "thinking", "id": "t1", "text": "Deixa eu pensar..."})
+    live._dispatch({"type": "thinking", "persona": "fulana",
+                    "text": "Estou pensando numa solução..."})
+    assert seen == [
+        (None, "Deixa eu pensar..."),
+        ("fulana", "Estou pensando numa solução..."),
+    ]
 
 
 def test_task_events_are_forwarded_to_the_owner():

@@ -12,13 +12,20 @@ PROTOCOL (see ``qoder_live/index.mjs`` for the source of truth)
     Python -> sidecar:
         {"type": "ask", "id": "...", "text": "...", "speaker": "Anthero"}
         {"type": "interrupt"}
+        {"type": "interrupt", "persona": "<slug>"|"all"}
         {"type": "close"}
 
     Sidecar -> Python:
         {"type": "ready", "model": "Qwen3.8-Flash", "warmup_ms": 1234}
+        {"type": "models", "models": [...], "source": "remote"|"fallback"}
         {"type": "session", "id": "..."}            (resumable session id)
+        {"type": "session", "id": "...", "persona": "<slug>"}
         {"type": "text", "id": "...", "text": "...", "delta": true|false}
         {"type": "tool", "id": "...", "name": "...", "input": {...}}
+        {"type": "persona_text", "persona": "<slug>", "text": "...", "delta": false}
+        {"type": "persona_done", "persona": "<slug>", "text": "...", "status": "ok"|"error"|"interrupted"}
+        {"type": "persona_error", "persona": "<slug>", "error": "..."}
+        {"type": "thinking", "id": "..."|null, "persona": "<slug>"?, "text": "Deixa eu pensar..."}
         {"type": "done", "id": "...", "text": "..."}
         {"type": "error", "id": "..."|null, "error": "..."}
         {"type": "closed"}
@@ -91,6 +98,12 @@ class QoderLive:
         on_session: Optional[Callable[[str], None]] = None,
         on_closed: Optional[Callable[[], None]] = None,
         on_task: Optional[Callable[[dict[str, Any]], None]] = None,
+        on_persona_text: Optional[Callable[[str, str], None]] = None,
+        on_persona_done: Optional[Callable[[str, str, str], None]] = None,
+        on_persona_error: Optional[Callable[[str, str], None]] = None,
+        on_persona_session: Optional[Callable[[str, str], None]] = None,
+        on_models: Optional[Callable[[list[dict[str, Any]]], None]] = None,
+        on_thinking: Optional[Callable[[Optional[str], str], None]] = None,
         logger: Optional[Callable[[str], None]] = print,
     ) -> None:
         self.script = str(script) if script is not None else str(DEFAULT_SCRIPT)
@@ -108,6 +121,12 @@ class QoderLive:
         self.on_session = on_session
         self.on_closed = on_closed
         self.on_task = on_task
+        self.on_persona_text = on_persona_text
+        self.on_persona_done = on_persona_done
+        self.on_persona_error = on_persona_error
+        self.on_persona_session = on_persona_session
+        self.on_models = on_models
+        self.on_thinking = on_thinking
         self.logger = logger or NOOP_LOGGER
 
         self._lock = threading.Lock()          # readiness + process state
@@ -276,6 +295,26 @@ class QoderLive:
             self._log("interrupt ignored: sidecar is not ready")
             return
         self._send({"type": "interrupt"})
+
+    def interrupt_persona(self, persona: Optional[str] = None) -> None:
+        """Abort one persona session (or all of them) inside the sidecar.
+
+        ``persona`` is the persona slug; ``None`` means every persona. The
+        owner's own turn is untouched: ``{"type": "interrupt"}`` without a
+        persona keeps meaning "stop the main turn". The sidecar answers with
+        ``persona_done``/``status="interrupted"`` for each persona that had a
+        turn in flight. Best effort, like :meth:`interrupt`.
+        """
+        with self._lock:
+            proc = self._proc
+            usable = self._ready and proc is not None
+        if not usable or proc is None or proc.poll() is not None:
+            self._log("interrupt_persona ignored: sidecar is not ready")
+            return
+        target = str(persona).strip() if persona else "all"
+        if not target:
+            target = "all"
+        self._send({"type": "interrupt", "persona": target})
 
     # ── process plumbing ─────────────────────────────────────────────────────
 
@@ -490,10 +529,43 @@ class QoderLive:
             )
         elif kind == "task":
             self._emit("on_task", message)
+        elif kind == "models":
+            models = message.get("models")
+            self._emit("on_models", models if isinstance(models, list) else [])
         elif kind == "session":
             session_id = str(message.get("id") or "")
             if session_id:
-                self._emit("on_session", session_id)
+                persona = message.get("persona")
+                if persona:
+                    self._emit("on_persona_session", str(persona), session_id)
+                else:
+                    self._emit("on_session", session_id)
+        elif kind == "persona_text":
+            self._emit(
+                "on_persona_text",
+                str(message.get("persona") or ""),
+                str(message.get("text") or ""),
+            )
+        elif kind == "persona_done":
+            self._emit(
+                "on_persona_done",
+                str(message.get("persona") or ""),
+                str(message.get("text") or ""),
+                str(message.get("status") or ""),
+            )
+        elif kind == "persona_error":
+            self._emit(
+                "on_persona_error",
+                str(message.get("persona") or ""),
+                str(message.get("error") or "unknown persona error"),
+            )
+        elif kind == "thinking":
+            persona = message.get("persona")
+            self._emit(
+                "on_thinking",
+                str(persona) if persona else None,
+                str(message.get("text") or ""),
+            )
         elif kind == "done":
             self._emit("on_done", message.get("id"), str(message.get("text") or ""))
         elif kind == "error":
