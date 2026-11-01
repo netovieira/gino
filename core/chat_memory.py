@@ -494,6 +494,14 @@ class ChatMemory:
             return []
 
     # ── hot index ───────────────────────────────────────────────────────────
+    def current_topic(self) -> str:
+        """The topic slug currently open in state.md ('' when none)."""
+        try:
+            with _LOCK:
+                return str(self._read_state().get("current_topic") or "")
+        except Exception:
+            return ""
+
     def _topic_links(self) -> list[str]:
         links: list[str] = []
         slugs: list[str] = []
