@@ -292,12 +292,23 @@ def add_account(name: str) -> _Account:
 
 def remove_account(name_or_uuid: str) -> bool:
     """Para a conta e apaga sessão/inbox/mídia dela do disco."""
+    _ensure_accounts()
     key = str(name_or_uuid or "").strip().lower()
     for uuid, a in list(_accounts.items()):
         if a.uuid.lower() != key and a.name.lower() != key:
             continue
+        # Removing the outbound account is allowed after an explicit UI
+        # confirmation: promote another account first so sends never lose a
+        # destination.
         if a.default and len(_accounts) > 1:
-            return False    # não remove a default sem escolher outra antes
+            replacement = next(other for other in _accounts.values()
+                               if other is not a)
+            replacement.default = True
+            try:
+                from memory.config_manager import save_plugin_config
+                save_plugin_config(NS, {"default_account": replacement.name})
+            except Exception:
+                pass
         _stop_account(a)
         del _accounts[uuid]
         try:
@@ -307,11 +318,60 @@ def remove_account(name_or_uuid: str) -> bool:
         except Exception:
             pass
         _save_accounts()
+        if not _accounts:
+            try:
+                from memory.config_manager import save_plugin_config
+                save_plugin_config(NS, {"default_account": ""})
+            except Exception:
+                pass
         return True
     return False
 
 
+def update_account(name_or_uuid: str, new_name: str | None = None,
+                   auto_start: bool | None = None,
+                   notify: bool | None = None,
+                   default: bool | None = None) -> bool:
+    """Edit one paired account (name/flags/outbound). False when not found or
+    when the new name collides with another account."""
+    _ensure_accounts()
+    key = str(name_or_uuid or "").strip().lower()
+    target = next((a for a in _accounts.values()
+                   if a.uuid.lower() == key or a.name.lower() == key), None)
+    if target is None:
+        return False
+    if new_name is not None:
+        name = str(new_name).strip()
+        if not name:
+            return False
+        if any(other is not target and other.name.casefold() == name.casefold()
+               for other in _accounts.values()):
+            return False
+        target.name = name
+    if auto_start is not None:
+        target.auto_start = bool(auto_start)
+    if notify is not None:
+        target.notify = bool(notify)
+    if default is True:
+        for other in _accounts.values():
+            other.default = other is target
+    elif default is False and target.default and len(_accounts) > 1:
+        target.default = False
+        replacement = next(other for other in _accounts.values()
+                           if other is not target)
+        replacement.default = True
+    _save_accounts()
+    if any(a.default and a is target for a in _accounts.values()):
+        try:
+            from memory.config_manager import save_plugin_config
+            save_plugin_config(NS, {"default_account": target.name})
+        except Exception:
+            pass
+    return True
+
+
 def set_default_account(name_or_uuid: str) -> bool:
+    _ensure_accounts()
     key = str(name_or_uuid or "").strip().lower()
     found = None
     for a in _accounts.values():
