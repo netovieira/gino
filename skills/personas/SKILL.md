@@ -6,7 +6,7 @@ description: Como criar, escolher e moderar personas especialistas (Fulana do fr
 # Personas
 
 ## Criar/editar
-- Campos obrigatórios: `name`, `gender` (`f`/`m`/`n`), `voice_id` do Fish Audio, `personality`, `skills`, `stacks`, `model`, `reasoning` (`low|medium|high|max`), `context_size`.
+- Campos obrigatórios: `name`, `gender` (`f`/`m`/`n`), `voice_id` do Fish Audio, `personality`, `skills`, `stacks`, `model`, `reasoning` (`low|medium|high|max`), `context_size`, e `whatsapp_account` (a conta pareada que essa persona usa como dela; vazio = principal).
 - Consulte `personas action=models` antes de escolher o modelo. Mostre o multiplicador: `0.0x`, `0.1x`, `0.5x`, `1.0x`...
 - Modelo pago só é salvo depois de o dono confirmar o multiplicador. Mostre o custo, espere o “pode” e chame `personas action=create/update` de novo com `confirm_paid=true`.
 - Leia o resumo dos campos de volta antes de salvar. Nunca invente voice id, modelo, skills ou contexto.

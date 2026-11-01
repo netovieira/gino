@@ -675,7 +675,7 @@ def delete(id_or_name, retired_status: str = "left") -> bool:
 # ── upsert ──────────────────────────────────────────────────────────────────
 
 _FIELDS = ("name", "gender", "voice_id", "personality", "skills", "stacks",
-           "model", "reasoning", "context_size")
+           "model", "reasoning", "context_size", "whatsapp_account")
 
 
 def _merge_fields(base: dict, fields: dict) -> dict:
@@ -747,6 +747,22 @@ def upsert(fields: dict, confirm_paid: bool = False,
         reasoning = _reasoning(model, merged.get("reasoning"))
         context_size = _validate_context(merged.get("context_size"), model)
 
+        wa_account = _text(merged.get("whatsapp_account"))
+        if wa_account:
+            try:
+                from core import whatsapp as _wa
+                names = [str(n) for n in _wa.account_names()]
+                match = next((n for n in names
+                              if n.casefold() == wa_account.casefold()), None)
+            except Exception:
+                names, match = [], None
+            if match is None:
+                available = ", ".join(names) or "nenhuma conta pareada"
+                raise ValueError(
+                    f"WhatsApp {wa_account!r} não está pareado "
+                    f"(disponíveis: {available})")
+            wa_account = match
+
         now = _now()
         old_name = _text((existing or {}).get("name"))
         aliases = _clean_aliases((existing or {}).get("aliases"))
@@ -777,6 +793,7 @@ def upsert(fields: dict, confirm_paid: bool = False,
             "model_price_factor": factor,
             "reasoning": reasoning,
             "context_size": context_size,
+            "whatsapp_account": wa_account,
             "aliases": aliases,
             "history": entries,
             "created_at": _text((existing or {}).get("created_at")) or now,

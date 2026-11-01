@@ -138,6 +138,17 @@ def test_create_uses_slugified_name_and_defaults_when_model_omitted(env):
     assert persona["context_size"] == 200000
 
 
+def test_whatsapp_account_is_validated_and_stored(env, monkeypatch):
+    from core import whatsapp
+    monkeypatch.setattr(whatsapp, "account_names",
+                        lambda: ["principal", "trabalho"])
+    persona = personas.upsert(fields(whatsapp_account="trabalho"))
+    assert persona["whatsapp_account"] == "trabalho"
+    assert personas.get("fulana")["whatsapp_account"] == "trabalho"
+    with pytest.raises(ValueError):
+        personas.upsert(fields(name="Outra", whatsapp_account="inexistente"))
+
+
 def test_get_update_list_delete(env):
     created = personas.upsert(fields())
 

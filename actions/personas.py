@@ -25,7 +25,8 @@ _SECRET_RE = re.compile(
 )
 
 _FIELD_KEYS = ("id", "name", "gender", "voice_id", "personality", "skills",
-               "stacks", "model", "reasoning", "context_size")
+               "stacks", "model", "reasoning", "context_size",
+               "whatsapp_account")
 
 _ACTION_ALIASES = {
     "criar": "create", "crie": "create", "nova": "create",
@@ -97,6 +98,7 @@ def _summary(persona: dict) -> dict:
         "multiplier": _multiplier(persona),
         "reasoning": persona.get("reasoning"),
         "context_size": persona.get("context_size"),
+        "whatsapp_account": persona.get("whatsapp_account") or "",
         "skills": list(persona.get("skills") or []),
         "stacks": list(persona.get("stacks") or []),
         "aliases": list(persona.get("aliases") or []),
@@ -495,6 +497,12 @@ TOOL = {
             "context_size": {
                 "type": "INTEGER",
                 "description": "Janela de contexto em tokens (ex.: 200000).",
+            },
+            "whatsapp_account": {
+                "type": "STRING",
+                "description": "Nome da conta WhatsApp pareada que esta persona "
+                               "usa como dela (ex.: 'trabalho'); vazio = conta "
+                               "principal.",
             },
             "path": {
                 "type": "STRING",
