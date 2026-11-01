@@ -147,6 +147,42 @@ class ChatMemoryTest(unittest.TestCase):
         # index is the only allowed source of old detail.
         self.assertNotIn("foguete azul", self.read("hot.md"))
 
+    def test_subject_epoch_after_silence_is_new_subject_not_session_reset(self):
+        start = self.now
+        self.mem.append_turn("user", "assunto antigo do foguete", at=start)
+        self.mem.mark_user_speech(at=start)
+
+        self.now = start + timedelta(hours=5, minutes=59)
+        self.assertFalse(self.mem.subject_epoch()["new_subject"])
+
+        self.now = start + timedelta(hours=6, minutes=1)
+        epoch = self.mem.subject_epoch()
+        self.assertTrue(epoch["new_subject"])
+        self.assertIn("NOVO ASSUNTO", epoch["prompt"])
+        self.assertIn("PAUSA", epoch["prompt"])
+
+        # An assistant/system turn during the silence must not erase the gap.
+        self.mem.append_turn("assistant", "status automático", at=self.now)
+        self.now = start + timedelta(hours=7)
+        self.assertTrue(self.mem.subject_epoch()["new_subject"])
+        self.assertTrue(self.mem.check_gap()["long"])
+
+        # The first owner turn after the pause closes the epoch.
+        self.mem.mark_user_speech()
+        self.assertFalse(self.mem.subject_epoch()["new_subject"])
+        self.assertFalse(self.mem.check_gap()["long"])
+
+    def test_begin_new_subject_closes_the_old_topic(self):
+        self.mem.write_topic("foguete", "detalhes do foguete")
+        self.assertTrue(self.mem._read_state()["current_topic"])
+        self.mem.mark_user_speech(at=self.now - timedelta(hours=8))
+        epoch = self.mem.subject_epoch()
+        self.assertTrue(epoch["new_subject"])
+        self.mem.begin_new_subject(epoch["gap_hours"])
+        state = self.mem._read_state()
+        self.assertEqual(state["current_topic"], "")
+        self.assertTrue(any(n.get("kind") == "pausa" for n in state["notes"]))
+
     # ── bounds ──────────────────────────────────────────────────────────────
     def test_prompt_block_and_hot_are_bounded(self):
         for i in range(80):

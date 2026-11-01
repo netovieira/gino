@@ -71,6 +71,7 @@ _ROLE_LABELS = {
 }
 
 _RE_LAST_SEEN = re.compile(r"last_seen:[ \t]*([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2})")
+_RE_LAST_USER = re.compile(r"last_user_at:[ \t]*([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2})")
 _RE_CURRENT_TOPIC = re.compile(r"current_topic:[ \t]*(.*)$", re.M)
 _RE_OPEN_THREADS = re.compile(r"open_threads:[ \t]*(.*)$", re.M)
 _RE_STATE_NOTE = re.compile(
@@ -232,6 +233,7 @@ class ChatMemory:
         self.topics_dir = self.base_dir / "topics"
         self.state_path = self.base_dir / "state.md"
         self.hot_path = self.base_dir / "hot.md"
+        self.index_path = self.base_dir / "index.md"
         with _LOCK:
             self._ensure_layout()
 
@@ -261,6 +263,7 @@ class ChatMemory:
             "# Estado da conversa",
             "",
             f"- last_seen: {state.get('last_seen') or ''}",
+            f"- last_user_at: {state.get('last_user_at') or ''}",
             f"- current_topic: {state.get('current_topic') or ''}",
             "- open_threads: " + " | ".join(state.get("open_threads") or []),
             "",
@@ -275,7 +278,7 @@ class ChatMemory:
         return "\n".join(lines)
 
     def _read_state(self) -> dict:
-        state = {"last_seen": "", "current_topic": "",
+        state = {"last_seen": "", "last_user_at": "", "current_topic": "",
                  "open_threads": [], "notes": []}
         raw = _safe_read(self.state_path)
         if not raw:
@@ -284,6 +287,9 @@ class ChatMemory:
             m = _RE_LAST_SEEN.search(raw)
             if m:
                 state["last_seen"] = m.group(1).strip()
+            m = _RE_LAST_USER.search(raw)
+            if m:
+                state["last_user_at"] = m.group(1).strip()
             m = _RE_CURRENT_TOPIC.search(raw)
             if m:
                 value = m.group(1).strip()
@@ -326,7 +332,9 @@ class ChatMemory:
             current = _as_dt(now) or _now()
             with _LOCK:
                 state = self._read_state()
-            raw = state.get("last_seen") or ""
+            # The gap that matters for the conversation is since the OWNER last
+            # spoke. Assistant/system turns after a silence must not erase it.
+            raw = (state.get("last_user_at") or state.get("last_seen") or "")
             result["last_seen"] = raw
             last = _as_dt(raw)
             if last is None:
@@ -336,14 +344,93 @@ class ChatMemory:
             result["long"] = gap > HOT_HOURS
             if result["long"]:
                 result["prompt"] = (
-                    f"[PAUSA LONGA: {_human_gap(gap)}] A última conversa foi em "
-                    f"{last:%d/%m/%Y %H:%M}. Reconheça a pausa: não finja "
-                    "continuidade; pergunte se retoma o assunto anterior ou "
-                    "começa outro."
+                    f"[PAUSA LONGA: {_human_gap(gap)}] A última vez que o dono "
+                    f"falou foi em {last:%d/%m/%Y %H:%M}. A próxima fala abre "
+                    "outro assunto: não finja continuidade nem misture com o fio "
+                    "anterior; reconheça a pausa em uma frase curta e comece "
+                    "pelo novo assunto."
                 )
         except Exception as e:
             print(f"[ChatMemory] check_gap failed: {e}")
         return result
+
+    def mark_user_speech(self, at=None) -> str:
+        """Record that the OWNER actually spoke (not a reminder/status turn)."""
+        try:
+            dt = _as_dt(at) or _now()
+            with _LOCK:
+                self._ensure_layout()
+                state = self._read_state()
+                stamp = f"{dt:%Y-%m-%d %H:%M}"
+                previous = _as_dt(state.get("last_user_at"))
+                if previous is None or dt >= previous:
+                    state["last_user_at"] = stamp
+                last_seen = _as_dt(state.get("last_seen"))
+                if last_seen is None or dt >= last_seen:
+                    state["last_seen"] = stamp
+                self._write_state(state)
+            return stamp
+        except Exception as e:
+            print(f"[ChatMemory] mark_user_speech failed: {e}")
+            return ""
+
+    def subject_epoch(self, now=None, gap_hours=HOT_HOURS) -> dict:
+        """Is this a new subject after a long silence?
+
+        The Qoder session is NEVER reset here. This only tells the turn to carry
+        a context marker and the last day index, so a speech after a pause is
+        not mistaken for a continuation.
+        """
+        result = {"new_subject": False, "gap_hours": 0.0, "last_user_at": "",
+                  "prompt": "", "last_day_index": ""}
+        try:
+            current = _as_dt(now) or _now()
+            threshold = max(0.0, float(gap_hours or HOT_HOURS))
+            with _LOCK:
+                state = self._read_state()
+            raw = state.get("last_user_at") or state.get("last_seen") or ""
+            result["last_user_at"] = raw
+            last = _as_dt(raw)
+            if last is None:
+                return result
+            gap = max(0.0, (current - last).total_seconds() / 3600.0)
+            result["gap_hours"] = round(gap, 3)
+            if gap < threshold:
+                return result
+            index = self._last_day_index(raw)
+            result["new_subject"] = True
+            result["last_day_index"] = index
+            result["prompt"] = (
+                f"[NOVO ASSUNTO APÓS PAUSA DE {_human_gap(gap)}] O dono não "
+                f"falava desde {last:%d/%m/%Y %H:%M}. Trate a fala abaixo como "
+                "o começo de outro assunto, não como continuação do fio "
+                "anterior. Reconheça a pausa em uma frase curta, se fizer "
+                "sentido, e não misture os assuntos. Se precisar de algo do "
+                "passado, use o índice do último dia abaixo ou memory_search."
+            )
+            if index:
+                result["prompt"] += ("\nÍndice do último dia:\n"
+                                     + _truncate(index, 1100))
+            return result
+        except Exception as e:
+            print(f"[ChatMemory] subject_epoch failed: {e}")
+            return result
+
+    def begin_new_subject(self, gap_hours=0.0) -> None:
+        """Close the old thread in state and record the pause as a note."""
+        try:
+            with _LOCK:
+                state = self._read_state()
+                state["current_topic"] = ""
+                note = (f"pausa de {_human_gap(float(gap_hours or 0))}; "
+                        "novo assunto após a pausa")
+                state.setdefault("notes", []).append({
+                    "at": f"{_now():%Y-%m-%d %H:%M}", "kind": "pausa",
+                    "text": note,
+                })
+                self._write_state(state)
+        except Exception as e:
+            print(f"[ChatMemory] begin_new_subject failed: {e}")
 
     # ── turns ───────────────────────────────────────────────────────────────
     def append_turn(self, role, text, at=None) -> str:
@@ -749,4 +836,127 @@ class ChatMemory:
                 return text if len(text) <= max_chars else text[:max_chars]
         except Exception as e:
             print(f"[ChatMemory] prompt_block failed: {e}")
+            return ""
+
+    def index_block(self, max_chars=2600, now=None, resumed=False) -> str:
+        """The leveled index written to ``index.md`` and read at every start.
+
+        Level 0 is the live Qoder session itself. Levels 1-2 are injected in
+        full; level 3 lists the day/topic files that memory_search can open;
+        level 4 is the long-term store; level 5 is honesty — what is not
+        recorded is not remembered.
+        """
+        try:
+            max_chars = max(200, int(max_chars))
+        except (TypeError, ValueError):
+            max_chars = 2600
+        try:
+            current = _as_dt(now) or _now()
+            with _LOCK:
+                self._ensure_layout()
+                self._ensure_hot(current)
+                gap = self.check_gap(now=current)
+                state = self._read_state()
+                recent = self._turns_between(
+                    current - timedelta(hours=HOT_HOURS), current)
+                lines = ["# Índice da conversa (níveis)",
+                         f"Agora: {current:%d/%m/%Y %H:%M}."]
+
+                lines.append("## Nível 0 — sessão viva")
+                if resumed:
+                    lines.append("- Sessão Qoder retomada; o histórico acima já "
+                                 "está no contexto. Use-o antes de buscar arquivos.")
+                else:
+                    lines.append("- Sessão nova: use o índice e os últimos turnos "
+                                 "abaixo para esquentar a conversa.")
+                lines.append(f"- {len(recent)} falas nas últimas {HOT_HOURS} h.")
+
+                lines.append("## Nível 1 — últimas horas (hot.md)")
+                if gap["long"]:
+                    lines.append(f"- {gap['prompt']}")
+                elif recent:
+                    hot = _tail_lines(self._render_hot(current), 1200)
+                    lines.append(hot)
+                else:
+                    lines.append("- (sem falas recentes)")
+
+                lines.append("## Nível 2 — fio atual (state.md)")
+                if state.get("current_topic"):
+                    lines.append(f"- Assunto atual: [[topics/{state['current_topic']}]]")
+                if state.get("open_threads"):
+                    lines.append("- Threads abertas: "
+                                 + "; ".join(state["open_threads"][:8]) + ".")
+                notes = state.get("notes") or []
+                for note in notes[-4:]:
+                    at = str(note.get("at") or "")
+                    lines.append(f"- Nota {at[11:16] if len(at) >= 16 else at} "
+                                 f"[{note.get('kind', 'note')}] "
+                                 f"{str(note.get('text') or '')[:160]}")
+                if not (state.get("current_topic") or state.get("open_threads") or notes):
+                    lines.append("- (sem assunto aberto registrado)")
+
+                lines.append("## Nível 3 — horas, dias e tópicos (memory_search/read)")
+                days = sorted(self.days_dir.glob("*/index.md"),
+                              key=lambda p: p.parent.name, reverse=True)[:5]
+                for path in days:
+                    lines.append(f"- [[days/{path.parent.name}/index]]")
+                topics = self._topic_links()
+                if topics:
+                    lines.extend(topics)
+                else:
+                    lines.append("- (nenhum tópico gravado ainda)")
+
+                lines.append("## Nível 4 — longo prazo")
+                lines.append("- `memory/long_term.json` via recall_memory, só "
+                             "quando os níveis acima não bastarem.")
+                lines.append("## Nível 5 — não existe")
+                lines.append("- Se não estiver registrado, diga que não lembra; "
+                             "nunca reconstrua um detalhe por dedução.")
+
+                text = "\n".join(lines)
+                if len(text) > max_chars:
+                    text = text[:max_chars]
+                _atomic_write(self.index_path, text + "\n")
+                return text
+        except Exception as e:
+            print(f"[ChatMemory] index_block failed: {e}")
+            return ""
+
+    def warmup_block(self, max_chars=7000, recent_turns=14, now=None,
+                     resumed=False) -> str:
+        """What a fresh Qoder session reads at boot to warm the same chat.
+
+        The index gives the shape of the memory; the last turns give the exact
+        words. Both are bounded so the prompt stays cheap.
+        """
+        try:
+            max_chars = max(500, int(max_chars))
+            recent_turns = max(0, int(recent_turns))
+        except (TypeError, ValueError):
+            max_chars, recent_turns = 7000, 14
+        try:
+            index = self.index_block(max_chars=2600, now=now, resumed=resumed)
+            turns = self.recent_turns(hours=HOT_HOURS, now=now)
+            if recent_turns:
+                turns = turns[-recent_turns:]
+            lines = ["[WARM-UP DA CONVERSA — leia antes de responder]",
+                     "Esta é a continuação da MESMA conversa. O índice abaixo "
+                     "diz o que existe e em que nível; os últimos turnos são as "
+                     "palavras exatas do fio recente. Não comece como se fosse "
+                     "a primeira mensagem e não pergunte o que já está aqui."]
+            if index:
+                lines.append(index)
+            if turns:
+                lines.append("## Últimos turnos (palavras exatas, nível 0/1)")
+                for turn in turns:
+                    at = str(turn.get("at") or "")
+                    stamp = at[11:16] if len(at) >= 16 else at
+                    lines.append(f"- {stamp} {turn.get('role', '?')}: "
+                                 f"{str(turn.get('text') or '')[:500]}")
+            lines.append("Se precisar de um detalhe que não está aqui, use "
+                         "memory_search/memory_read antes de dizer que não lembra.")
+            text = "\n".join(lines)
+            return text if len(text) <= max_chars else text[:max_chars]
+        except Exception as e:
+            print(f"[ChatMemory] warmup_block failed: {e}")
             return ""
