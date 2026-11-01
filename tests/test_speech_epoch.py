@@ -85,7 +85,7 @@ class SpeechEpochTest(unittest.TestCase):
         obj._speech_epoch = 1
         obj._say_q = queue.Queue()
         calls = []
-        obj._say_blocking = lambda text, log=True, epoch=None: calls.append(
+        obj._say_blocking = lambda text, log=True, epoch=None, voice_id=None, label=None: calls.append(
             (text, epoch))
         obj._ensure_say_worker()
         obj._say_q.put_nowait(("antiga", True, 0))

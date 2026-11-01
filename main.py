@@ -79,6 +79,7 @@ from core import qoder_live as _qoder_live
 from core import tool_bridge as _tool_bridge
 from core import speaker_id as _speaker_id
 from core import chat_memory as _chat_memory
+from core import personas as _personas
 from core import health as _health
 from core import memory_librarian as _memory_librarian
 from core import metrics as _metrics
@@ -1398,6 +1399,8 @@ class JarvisLive:
         self._qoder_spoken: dict[str, list[str]] = {}
         self._qoder_turns: dict[str, str] = {}
         self._qoder_meta: dict[str, dict] = {}
+        self._persona_text_buf: dict[str, str] = {}
+        self._persona_seen: set[str] = set()
         self._qoder_current_id     = None
         self._qoder_ignore         = False
         # Turns spoken while the sidecar is warming or restarting wait here and
@@ -3299,6 +3302,12 @@ class JarvisLive:
             on_session=self._qoder_on_session,
             on_closed=self._qoder_on_closed,
             on_task=self._qoder_on_task,
+            on_persona_text=self._qoder_on_persona_text,
+            on_persona_done=self._qoder_on_persona_done,
+            on_persona_error=self._qoder_on_persona_error,
+            on_persona_session=self._qoder_on_persona_session,
+            on_models=self._qoder_on_models,
+            on_thinking=self._qoder_on_thinking,
             logger=print,
         )
         threading.Thread(target=self._qoder_start_worker, daemon=True,
@@ -3759,6 +3768,16 @@ class JarvisLive:
         self._qoder_touch()
         self._qoder_tool_count += 1
         _metrics.inc("qoder.tools")
+        if str(name or "").endswith("persona_ask"):
+            try:
+                key = str((tool_input or {}).get("persona") or "")
+                persona = _personas.get(key)
+                if persona:
+                    line = (f"Vou pedir "
+                            f"{_personas.address(persona, contraction=True)} ver.")
+                    self._say_now(line, log=True, label=self._asst_name)
+            except Exception as e:
+                print(f"[Persona] handoff: {e}")
         with self._qoder_lock:
             meta = self._qoder_meta.get(turn_id)
             if meta and meta.get("source") == "whatsapp":
@@ -3867,6 +3886,115 @@ class JarvisLive:
         _duck.up()
         if flush:
             self._qoder_flush_pending()
+
+    def _persona_say(self, slug: str, text: str) -> None:
+        if self._qoder_ignore:
+            return
+        persona = _personas.get(slug) or {}
+        name = str(persona.get("name") or slug or "persona")
+        voice_id = str(persona.get("voice_id") or "") or None
+        self._say_now(text, log=True, voice_id=voice_id, label=name)
+
+    def _qoder_on_persona_text(self, slug: str, text: str) -> None:
+        self._qoder_touch()
+        text = str(text or "")
+        if not text or self._qoder_ignore:
+            return
+        slug = str(slug or "")
+        with self._qoder_lock:
+            self._persona_seen.add(slug)
+            buf = self._persona_text_buf.get(slug, "") + text
+            sentences, rest = self._qoder_split(buf)
+            self._persona_text_buf[slug] = rest
+        for sentence in sentences:
+            self._persona_say(slug, sentence)
+
+    def _qoder_on_persona_done(self, slug: str, text: str, status: str) -> None:
+        self._qoder_touch()
+        slug = str(slug or "")
+        with self._qoder_lock:
+            rest = self._persona_text_buf.pop(slug, "")
+            seen = slug in self._persona_seen
+            self._persona_seen.discard(slug)
+        if rest.strip():
+            self._persona_say(slug, rest.strip())
+        persona = _personas.get(slug) or {}
+        name = str(persona.get("name") or slug or "persona")
+        full = str(text or "").strip()
+        if status == "ok":
+            if not seen and full:
+                self._persona_say(slug, full)
+            if full:
+                try:
+                    if self._chat_memory is not None:
+                        self._chat_memory.append_turn(
+                            "assistant", f"[{name}] {full[:800]}")
+                except Exception as e:
+                    print(f"[Persona] memory note: {e}")
+            try:
+                self.ui.write_log(f"SYS: {name} concluiu.")
+            except Exception:
+                pass
+        elif status == "interrupted":
+            try:
+                self.ui.write_log(f"SYS: {name} interrompida.")
+            except Exception:
+                pass
+        elif status == "error":
+            try:
+                self.ui.write_log(f"SYS: {name} falhou.")
+            except Exception:
+                pass
+
+    def _qoder_on_persona_error(self, slug: str, error: str) -> None:
+        slug = str(slug or "")
+        persona = _personas.get(slug) or {}
+        name = str(persona.get("name") or slug or "persona")
+        print(f"[Persona] {name} falhou: {error}")
+        try:
+            self.ui.write_log(f"SYS: {name} falhou: {str(error)[:140]}")
+        except Exception:
+            pass
+        if not self._qoder_ignore:
+            self._say_now(f"{name} não conseguiu responder agora.",
+                          log=True, label=self._asst_name)
+
+    def _qoder_on_persona_session(self, slug: str, session_id: str) -> None:
+        print(f"[Persona] {slug} session {session_id}")
+        try:
+            self.ui.write_log(f"SYS: persona {slug} pronta na sessão "
+                              f"{str(session_id)[:8]}.")
+        except Exception:
+            pass
+
+    def _qoder_on_models(self, models: list) -> None:
+        try:
+            self._model_catalog = list(models or [])
+            self.ui.write_log(f"SYS: catálogo de modelos Qoder: "
+                              f"{len(self._model_catalog)} com multiplicador.")
+        except Exception:
+            pass
+
+    def _qoder_on_thinking(self, persona: str | None, text: str) -> None:
+        """Short spoken cue while thinking; never the model's inner reasoning."""
+        text = str(text or "").strip()
+        if not text or self._qoder_ignore:
+            return
+        if getattr(self.ui, "muted", False):
+            return
+        if persona:
+            info = _personas.get(persona) or {}
+            name = str(info.get("name") or persona)
+            voice_id = str(info.get("voice_id") or "") or None
+            self._say_now(text, log=False, voice_id=voice_id, label=name)
+            log_name = name
+        else:
+            self._say_now(text, log=False, label=self._asst_name)
+            log_name = self._asst_name
+        try:
+            self.ui.write_log(f"SYS: {log_name} pensando — {text}")
+        except Exception:
+            pass
 
     def _qoder_on_done(self, turn_id, text: str) -> None:
         if self._qoder_ignore:
@@ -5559,6 +5687,17 @@ class JarvisLive:
         # it after the owner has taken the floor.
         self._speech_epoch += 1
         self._reply_active = False
+        try:
+            if self._qoder_live is not None:
+                self._qoder_live.interrupt_persona("all")
+        except Exception as e:
+            print(f"[Persona] interrupt: {e!r}")
+        try:
+            with self._qoder_lock:
+                self._persona_text_buf.clear()
+                self._persona_seen.clear()
+        except Exception:
+            pass
         q = self.audio_in_queue
         if q:
             drained = 0
@@ -5682,7 +5821,9 @@ class JarvisLive:
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
-    def _say_now(self, text: str, log: bool = True) -> None:
+    def _say_now(self, text: str, log: bool = True,
+                 voice_id: str | None = None,
+                 label: str | None = None) -> None:
         """Queue one sentence to be spoken outside any turn (economy mode).
 
         Called by the local gates (sudo, memory, music, YouTube) — which run on
@@ -5701,7 +5842,8 @@ class JarvisLive:
         try:
             self._ensure_say_worker()
             self._say_q.put_nowait(
-                (text, bool(log), getattr(self, "_speech_epoch", 0)))
+                (text, bool(log), getattr(self, "_speech_epoch", 0),
+                 str(voice_id or ""), str(label or "")))
         except Exception as e:
             print(f"[Say] não consegui enfileirar: {e}")
 
@@ -5716,17 +5858,23 @@ class JarvisLive:
                 item = self._say_q.get()
                 try:
                     if isinstance(item, tuple):
-                        if len(item) >= 3:
+                        if len(item) >= 5:
                             text, log, epoch = item[0], item[1], item[2]
+                            voice_id, label = item[3], item[4]
+                        elif len(item) >= 3:
+                            text, log, epoch = item[0], item[1], item[2]
+                            voice_id, label = "", ""
                         else:
                             text, log = item[0], item[1]
-                            epoch = None
+                            epoch, voice_id, label = None, "", ""
                     else:
-                        text, log, epoch = item, True, None
+                        text, log, epoch, voice_id, label = item, True, None, "", ""
                     if (epoch is not None
                             and epoch != getattr(self, "_speech_epoch", epoch)):
                         continue      # the owner interrupted before this line
-                    self._say_blocking(text, log=log, epoch=epoch)
+                    self._say_blocking(text, log=log, epoch=epoch,
+                                       voice_id=voice_id or None,
+                                       label=label or None)
                 except Exception as e:
                     print(f"[Say] falhou: {e}")
 
@@ -5848,7 +5996,9 @@ class JarvisLive:
         return True
 
     def _say_blocking(self, text: str, log: bool = True,
-                      epoch: int | None = None) -> None:
+                      epoch: int | None = None,
+                      voice_id: str | None = None,
+                      label: str | None = None) -> None:
         """Synthesise and queue one sentence onto the playback queue."""
         text = str(text or "").strip()
         if not text:
@@ -5863,7 +6013,10 @@ class JarvisLive:
                 voice_text = _sp(text, style="hybrid" if st.get("tts_engine") == "fish" else "words")
             except Exception:
                 voice_text = text
-            pcm = _b.synth_pcm24k(voice_text, st)
+            if voice_id:
+                pcm = _b.synth_pcm24k(voice_text, st, voice_id=voice_id)
+            else:
+                pcm = _b.synth_pcm24k(voice_text, st)
         except Exception as e:
             print(f"[Say] TTS failed: {e}")
             return
@@ -5891,9 +6044,10 @@ class JarvisLive:
             self._loop.call_soon_threadsafe(
                 self.audio_in_queue.put_nowait, pcm[i:i + 2400])
         if log:
+            speaker = str(label or self._asst_name)
             try:
-                self.ui.write_log(f"{self._asst_name}: {text}")
-                self._session_log.append(f"{self._asst_name}: {text}")
+                self.ui.write_log(f"{speaker}: {text}")
+                self._session_log.append(f"{speaker}: {text}")
             except Exception:
                 pass
         # Out-of-turn speech (gates, announcements, Qoder status) has no brain

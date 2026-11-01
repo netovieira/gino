@@ -11,3 +11,4 @@ description: Política de identificação de voz e falantes. Use quando a linha 
 - Para listar vozes use `voice_list`; para autorizar uma voz já cadastrada use `voice_authorize` (somente com o dono pedindo).
 - Confirmações sensíveis (reinício, energia, envio) dependem da fala do dono, não do modelo. Uma voz não autorizada não abre essas janelas.
 - Não descreva o processo de diarização nem fale sobre embeddings; trate o resultado como "quem falou".
+- **Toda resposta é falada** por TTS ou enviada como áudio. Escreva para o ouvido: frases curtas, sem markdown, sem blocos de código, sem JSON, sem logs e sem caminhos longos. Nunca narre código linha a linha; diga o que ele faz e ofereça mostrar o trecho em texto ou arquivo.

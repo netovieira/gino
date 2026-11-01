@@ -11,5 +11,6 @@ description: Política de execução pesada. Use quando o dono pedir para verifi
 - Nunca edite, rode comando longo, instale ou investigue o repositório inline no chat ao vivo. O gancho de permissão bloqueia; tentar só atrasa.
 - Antes de delegar, escreva a tarefa com o contexto necessário: o que investigar, quais arquivos, qual comportamento esperado. O subagente não vê a conversa; a descrição é o contrato dele.
 - O executor deve rodar os testes relevantes e só afirmar sucesso com evidência. Se falhar, diga o erro real, sem inventar.
+- Ao relatar uma execução, fale para o ouvido: 1-3 frases, sem colar código, diff, log ou JSON. Se o dono pedir o detalhe técnico, ofereça mostrar em texto/arquivo em vez de narrar.
 - `git push`, release e publicação externa só depois de o dono pedir explicitamente para subir/publicar. Um subagente pode fazer o push apenas nessa janela.
 - Não criar planos em `.md` nem documentos intermediários sem o dono pedir.

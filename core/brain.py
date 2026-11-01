@@ -1364,7 +1364,8 @@ def _fish_pieces(text: str) -> list[str]:
     return pieces
 
 
-def refresh_fish_voice(st: dict) -> dict:
+def refresh_fish_voice(st: dict, voice_id: str | None = None,
+                       *, override: bool = False) -> dict:
     """Re-read the Fish voice from config, in place, before each synthesis.
 
     `st` is a snapshot taken when the economy session connects, and
@@ -1372,32 +1373,44 @@ def refresh_fish_voice(st: dict) -> dict:
     the customise form would only be heard after a restart — the one thing the
     field must not do. A key that is present but empty is meaningful: it means
     "use the model's default voice", so it is copied through as "".
+
+    When ``override`` is true, the explicit ``voice_id`` wins and is applied
+    AFTER the config read, so a persona's voice is never clobbered by the
+    global Fish setting.
     """
     try:
         from memory.config_manager import get_plugin_config
         cfg = get_plugin_config(NAMESPACE)
     except Exception:
-        return st
+        cfg = {}
     if "fish_voice_id" in cfg:
         st["fish_voice_id"] = fish_voice_id(cfg.get("fish_voice_id"))
     model = str(cfg.get("fish_model") or "").strip()
     if model in FISH_MODELS:
         st["fish_model"] = model
+    if override and voice_id is not None:
+        st["fish_voice_id"] = fish_voice_id(voice_id)
     return st
 
 
-def synth_pcm24k(text: str, st: dict) -> bytes:
-    """One sentence → 24 kHz PCM with whichever voice engine is configured."""
+def synth_pcm24k(text: str, st: dict, voice_id: str | None = None) -> bytes:
+    """One sentence → 24 kHz PCM with whichever voice engine is configured.
+
+    ``voice_id`` is a per-line Fish override (persona voice). It never mutates
+    the caller's settings dict or the global config.
+    """
     if st.get("tts_engine") == "fish":
-        refresh_fish_voice(st)
+        override = bool(voice_id)
+        state = dict(st) if override else st
+        refresh_fish_voice(state, voice_id=voice_id, override=override)
         pieces = _fish_pieces(text)
         if len(pieces) <= 1:
-            return tts_fish_pcm24k(text, st)
+            return tts_fish_pcm24k(text, state)
         out = bytearray()
         for i, piece in enumerate(pieces):
             if i:
                 out.extend(_FISH_GAP)
-            out.extend(tts_fish_pcm24k(piece, st))
+            out.extend(tts_fish_pcm24k(piece, state))
         return bytes(out)
     return tts_pcm24k(text, st["tts_voice"])
 
