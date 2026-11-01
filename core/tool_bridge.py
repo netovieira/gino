@@ -110,6 +110,7 @@ ACTION_TIERS: dict[str, str] = {
     "code_helper": TIER_HIGH,
     "qoder_agent": TIER_HIGH,
     "qoder_job": TIER_HIGH,
+    "personas": TIER_HIGH,
     "phrase_blocklist": TIER_HIGH,
     # Parking a restart is not the restart: the owner's spoken phrase is the
     # only thing that executes it. The confirmation action is refused by the
@@ -285,8 +286,16 @@ class ToolBridge:
 
     def risk_tier(self, name: str, args: Optional[dict] = None) -> str:
         """Resolve the tier for an action name, escalating on dangerous args."""
-        tier = ACTION_TIERS.get(str(name or ""), TIER_HIGH)
-        tokens = _ESCALATING_ARGS.get(str(name or ""))
+        action_name = str(name or "")
+        if action_name == "personas" and isinstance(args, dict):
+            # Reading personas/projects/models is safe; changing the board is
+            # high-risk and needs the owner's spoken confirmation.
+            action = str(args.get("action") or "").strip().lower()
+            if action in ("list", "show", "models", "for_project"):
+                return TIER_SAFE
+            return TIER_HIGH
+        tier = ACTION_TIERS.get(action_name, TIER_HIGH)
+        tokens = _ESCALATING_ARGS.get(action_name)
         if tokens and isinstance(args, dict):
             for key in _ARG_SCAN_KEYS:
                 value = args.get(key)
