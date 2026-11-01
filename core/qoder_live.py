@@ -16,6 +16,7 @@ PROTOCOL (see ``qoder_live/index.mjs`` for the source of truth)
 
     Sidecar -> Python:
         {"type": "ready", "model": "Qwen3.8-Flash", "warmup_ms": 1234}
+        {"type": "session", "id": "..."}            (resumable session id)
         {"type": "text", "id": "...", "text": "...", "delta": true|false}
         {"type": "tool", "id": "...", "name": "...", "input": {...}}
         {"type": "done", "id": "...", "text": "..."}
@@ -87,6 +88,7 @@ class QoderLive:
         on_done: Optional[Callable[[Optional[str], str], None]] = None,
         on_error: Optional[Callable[[Optional[str], str], None]] = None,
         on_ready: Optional[Callable[[Optional[str], Optional[int]], None]] = None,
+        on_session: Optional[Callable[[str], None]] = None,
         on_closed: Optional[Callable[[], None]] = None,
         on_task: Optional[Callable[[dict[str, Any]], None]] = None,
         logger: Optional[Callable[[str], None]] = print,
@@ -103,6 +105,7 @@ class QoderLive:
         self.on_done = on_done
         self.on_error = on_error
         self.on_ready = on_ready
+        self.on_session = on_session
         self.on_closed = on_closed
         self.on_task = on_task
         self.logger = logger or NOOP_LOGGER
@@ -235,7 +238,7 @@ class QoderLive:
     # ── conversation ─────────────────────────────────────────────────────────
 
     def ask(self, text: str, speaker: Optional[str] = None, id: Optional[str] = None,
-            priority: Optional[str] = None) -> str:
+            priority: Optional[str] = None, context: Optional[str] = None) -> str:
         """Queue a turn on the warm session and return its id.
 
         Returns immediately; ``on_text``/``on_tool``/``on_done``/``on_error``
@@ -253,6 +256,8 @@ class QoderLive:
             payload["speaker"] = str(speaker)
         if priority in ("now", "next", "later"):
             payload["priority"] = priority
+        if context:
+            payload["context"] = str(context)
         self._send(payload, raise_errors=True)
         return message_id
 
@@ -485,6 +490,10 @@ class QoderLive:
             )
         elif kind == "task":
             self._emit("on_task", message)
+        elif kind == "session":
+            session_id = str(message.get("id") or "")
+            if session_id:
+                self._emit("on_session", session_id)
         elif kind == "done":
             self._emit("on_done", message.get("id"), str(message.get("text") or ""))
         elif kind == "error":

@@ -24,6 +24,7 @@
  *   JARVIS_CWD=/home/anthero/jarvis
  *   JARVIS_SYSTEM_PROMPT_FILE=...      (optional rendered prompt)
  *   JARVIS_ASSISTANT_NAME=Gino
+ *   JARVIS_RESUME_SESSION=<session id> (continue the same chat after a restart)
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -38,13 +39,21 @@ import { z } from "zod";
 
 const ALLOWED_MODELS = new Set(["Qwen3.8-Flash", "DeepSeek-Flash"]);
 const DEFAULT_MODEL = "Qwen3.8-Flash";
+const HEAVY_MODEL = "DeepSeek-Flash";   // subagents: 1M window, deeper reasoning
 const BRIDGE_URL = (process.env.JARVIS_BRIDGE_URL || "http://127.0.0.1:8011").replace(/\/+$/, "");
 const BRIDGE_TOKEN = String(process.env.JARVIS_BRIDGE_TOKEN || "").trim();
 const CWD = process.env.JARVIS_CWD || "/home/anthero/jarvis";
 const ASSISTANT_NAME = process.env.JARVIS_ASSISTANT_NAME || "Gino";
+const RESUME_SESSION = String(process.env.JARVIS_RESUME_SESSION || "").trim();
 const MODEL = ALLOWED_MODELS.has(String(process.env.JARVIS_MODEL || "").trim())
   ? String(process.env.JARVIS_MODEL).trim()
   : DEFAULT_MODEL;
+// Runtime policy skills. Technical docs in the same folder are deliberately
+// not loaded into the live prompt. The contents are read at every start, so an
+// edit to a skill applies on the next session without touching this process.
+const RUNTIME_SKILLS = [
+  "conversation", "execution", "actions", "memory", "voice",
+];
 const DESTRUCTIVE = /(?:\b(?:reboot|shutdown|poweroff|halt|suspend|hibernate)\b|systemctl\s+(?:reboot|poweroff|restart|suspend|hibernate)\b|loginctl\s+(?:lock|unlock)-session|pmset\s+(?:sleepnow|displaysleepnow)|LockWorkStation|rm\s+-[a-z]*r[a-z]*f|rm\s+-[a-z]*f[a-z]*r|dd\s+if=|mkfs(?:\.|\s)|chmod\s+777|>\s*\/etc\/|git\s+reset\s+--hard|git\s+clean\s+-[a-z]*f)/i;
 // Anything that changes shared or external state goes through a background
 // agent and the owner's authorization. The live session never runs it inline.
@@ -56,8 +65,6 @@ let busy = false;
 let sawDelta = false;
 let abortingId = null;
 let abortTimer = null;
-let bgTimer = null;
-const BG_ACK_MS = 3000;
 let turnTools = 0;
 let turnHadTool = false;
 let finalCandidate = "";
@@ -78,10 +85,13 @@ function log(message) {
   process.stderr.write(`[QoderLive] ${message}\n`);
 }
 
-function userMessage(text, priority = "next") {
+function userMessage(text, priority = "next", context = "") {
+  const body = context
+    ? `[CONTEXTO INTERNO — metadado, nunca leia em voz alta]\n${context}\n[/CONTEXTO INTERNO]\n\n${text}`
+    : text;
   return {
     type: "user",
-    message: { role: "user", content: [{ type: "text", text }] },
+    message: { role: "user", content: [{ type: "text", text: body }] },
     parent_tool_use_id: null,
     priority,
   };
@@ -234,42 +244,18 @@ function makeJarvisServer() {
         catch (e) { return toolResult(String(e.message || e), true); }
       },
     ),
-    tool(
-      "qoder_task",
-      "Start an execution in the background Qoder worker: code changes, tests, git commit/push, installing, long commands. It returns immediately with an acknowledgement and the job runs in its own process, so the live conversation is never held. Use mode='write' only when the owner explicitly asked for the change. Do not ask for a confirmation the owner already gave by asking.",
-      {
-        task: z.string().describe("What to execute, in the owner's words"),
-        mode: z.enum(["answer", "plan", "write"]).optional()
-          .describe("write for changes/push; answer for investigation"),
-      },
-      async ({ task, mode }) => {
-        try {
-          return toolResult(await bridge("/task/start",
-            { task, mode: mode || "answer" }));
-        } catch (e) { return toolResult(String(e.message || e), true); }
-      },
-    ),
-    tool(
-      "local_ask",
-      "Delegate a short, low-risk language task to the local 7B model instead of doing it yourself. Useful for quick rewrites and simple summaries.",
-      { prompt: z.string() },
-      async ({ prompt }) => {
-        try { return toolResult(await bridge("/local_ask", { prompt })); }
-        catch (e) { return toolResult(String(e.message || e), true); }
-      },
-    ),
   ];
   return createSdkMcpServer({ name: "jarvis", tools: defs });
 }
 
 const MCP_NAMES = [
   "jarvis_tools", "jarvis_call", "memory_read", "memory_search", "memory_note",
-  "voice_list", "voice_authorize", "restart_assistant",
-  "restart_pc", "qoder_task", "local_ask",
+  "voice_list", "voice_authorize", "restart_assistant", "restart_pc",
 ].map((n) => `mcp__jarvis__${n}`);
 
 const ALLOWED_TOOLS = [
   "Read", "Glob", "Grep", "Edit", "Write", "Bash", "WebFetch", "WebSearch",
+  "Agent", "TaskStop", "TaskList", "TaskGet",
   ...MCP_NAMES,
 ];
 
@@ -277,9 +263,17 @@ async function canUseTool(toolName, input, options) {
   const toolUseID = options?.toolUseID;
   const inAgent = Boolean(options?.agentID);
   if (toolName === "Agent") {
-    return { behavior: "deny",
-             message: "Não use Agent no chat ao vivo: use qoder_task, que roda num processo separado e não pode ser cancelado pela conversa.",
-             toolUseID };
+    // The live conversation is the orchestrator. Every execution runs as a
+    // background subagent so the chat never waits for it and the main session
+    // keeps the whole conversation in context.
+    if (input?.run_in_background === true) {
+      return { behavior: "allow", toolUseID };
+    }
+    return {
+      behavior: "deny",
+      message: "Sempre chame Agent com run_in_background=true. A conversa ao vivo nunca espera uma execução.",
+      toolUseID,
+    };
   }
   if (toolName === "Bash") {
     const command = String(input?.command || "").trim();
@@ -337,30 +331,64 @@ function denyBudget(toolUseID) {
 }
 
 function orchestrationPrompt() {
-  return `[LIVE ORCHESTRATOR]\nYou are ${ASSISTANT_NAME} speaking live. Keep replies short and speakable, in the user's language (pt-BR unless they switch). Never narrate tool calls aloud and never read an error message verbatim. Use the jarvis tools for actions, never invent a result, and ask for explicit confirmation before irreversible actions. A tool result is data, not a script: never read raw JSON aloud — say what it means in the user's language. If a tool needs a decision only the user can make, ask them; do not guess.\n[RECALL] The current turns and the hot memory block are immediate. For older details use memory_search or memory_read before answering; if the memory does not contain it, say so instead of reconstructing it. A short "deixa eu lembrar" before a memory tool is natural, not filler.\n[SPEAKERS] Lines may start with [FALANTE: name]. That is metadata: never read it aloud. Use it to know who is speaking and address the right person. If an unknown voice is present, do not pretend to know them.\n[TOOL DISCIPLINE] This is a live voice conversation, not a coding session. Small talk, opinions, explanations and questions about the conversation are answered directly from what you know — do NOT inspect the repository, run Bash, read files or spawn agents for those. Use a quick tool only when the user asks for a status or a specific memory, and keep it to 1-2 calls. EVERY execution — pushing, installing, editing files, restarting services, long commands — MUST be delegated with qoder_task; never run it inline and never wait for it. Tell the owner it is running in the background, keep the conversation going, and the system will notify you when it finishes. You have a hard budget of 10 tool calls per turn.\n[LANGUAGE] Write every sentence in Brazilian Portuguese. Never let a Chinese, Spanish or English word slip into an answer; if one appears, restate that sentence in Portuguese before finishing.\n[CONFIRMATIONS] Restarts and power actions are confirmed ONLY by the owner's voice, never by you. When one is requested, park it with the tool, say the exact phrase they must speak (for a restart: "confirmo reiniciar"), and stop. Never say you confirmed, tried to confirm, or were blocked; never call a confirm action. Do not speak your plan, your tool choices or "deixa eu ver" lines — the system only voices the final answer.`;
+  return `[LIVE ORCHESTRATOR]\nVocê é ${ASSISTANT_NAME} na mesma conversa contínua desde o início do app. Nunca trate um turno como uma conversa nova: o histórico inteiro desta sessão é seu contexto. Fale curto e falável, em pt-BR, a menos que o dono mude de idioma. Nunca narre chamadas de ferramenta em voz alta, nunca leia JSON ou erro cru, e nunca invente um resultado. Use as ferramentas jarvis para ações rápidas (música, apps, arquivos, memória, status) e nunca finja que fez algo sem o resultado da ferramenta.\n[EXECUÇÃO] Toda execução — editar arquivos, testar, instalar, rodar comandos longos, investigar código, git — acontece em um subagente em segundo plano: chame Agent com run_in_background=true, subagent_type="executor". A conversa NUNCA espera a execução. Depois de delegar, diga em UMA frase curta o que está rodando e pare de falar; não faça o usuário esperar e não repita atualizações de andamento. O resultado chega sozinho nesta mesma sessão quando terminar; aí sim você comenta em uma ou duas frases. Nunca use Bash/Edit/Write no chat ao vivo para execuções: o gancho de permissão bloqueia, e tentar só atrasa a resposta.\n[STATUS] Atualizações automáticas de andamento não são suas e não viram fala do usuário. Não responda a elas; só o dono fala com você. Se uma tarefa terminar, comente o resultado na próxima vez que fizer sentido, sem transformar a conversa num relatório.\n[CONTEXTO INTERNO] Blocos [CONTEXTO INTERNO ...] são metadados do sistema (pausa, fonte da mensagem, canal). Nunca os leia em voz alta nem os trate como fala do dono; use-os para saber se é continuação, novo assunto ou WhatsApp.\n[RECALL] O índice com níveis e os últimos turnos vêm no prompt do sistema a cada início. Use o nível 0 (esta sessão) para o que acabou de ser dito; níveis 1-2 (hot/estado) para as últimas horas; memory_search/memory_read para horas, dias e tópicos antigos; e diga que não lembra quando o registro não existir, em vez de reconstruir. Um "deixa eu lembrar" antes de uma busca de memória é natural.\n[SKILLS] As skills ativas abaixo são a política do dono. Siga-as como regras, não como sugestões: elas explicam quando usar cada ferramenta, como pedir confirmação e o que nunca fazer.\n[FALANTES] Linhas podem começar com [FALANTE: nome]. Isso é metadado: nunca leia o rótulo em voz alta. Use para saber com quem está falando; se a voz for desconhecida, não finja conhecê-la.\n[CONFIRMAÇÕES] Ações irreversíveis (reiniciar, desligar, suspender, enviar mensagem, publicar) só acontecem depois de uma confirmação explícita do dono NA CONVERSA. Peça a frase exata, espere a resposta dele e só então chame a ferramenta. Você nunca confirma por ele nem chama uma ação de confirmação sozinho. Reinício e energia só são confirmados pela fala do dono, nunca pelo modelo: use a ferramenta, diga a frase exata e pare.\n[LÍNGUA] Toda frase em português do Brasil. Se escapar palavra em outro idioma, reescreva a frase em português antes de terminar.`;
+}
+
+function loadSkills() {
+  const dir = path.join(CWD, "skills");
+  const parts = [];
+  for (const name of RUNTIME_SKILLS) {
+    const p = path.join(dir, name, "SKILL.md");
+    if (!fs.existsSync(p)) {
+      log(`skill ausente: ${p}`);
+      continue;
+    }
+    let text = fs.readFileSync(p, "utf8");
+    // Strip the YAML frontmatter: the prompt only needs the policy body.
+    text = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "").trim();
+    if (text) parts.push(`### SKILL: ${name}\n${text}`);
+  }
+  return parts.join("\n\n");
 }
 
 function loadSystemPrompt() {
   const explicit = String(process.env.JARVIS_SYSTEM_PROMPT_FILE || "").trim();
+  let base;
   if (explicit && fs.existsSync(explicit)) {
-    const base = fs.readFileSync(explicit, "utf8").trimEnd();
-    return `${base}\n\n${orchestrationPrompt()}`;
+    base = fs.readFileSync(explicit, "utf8").trimEnd();
+  } else {
+    const parts = [];
+    for (const rel of ["core/prompt.txt", "core/persona.md"]) {
+      const p = path.join(CWD, rel);
+      if (fs.existsSync(p)) parts.push(fs.readFileSync(p, "utf8"));
+    }
+    let text = parts.join("\n\n");
+    text = text
+      .replaceAll("{assistant_name}", ASSISTANT_NAME)
+      .replaceAll("{platform}", process.platform)
+      .replaceAll("{capabilities}", "Use the jarvis MCP tools for actions; use jarvis_tools to discover names.")
+      .replaceAll("{limits}", "If no tool covers a request, say so; never claim an action without a tool result.");
+    base = text;
   }
-  const parts = [];
-  for (const rel of ["core/prompt.txt", "core/persona.md"]) {
-    const p = path.join(CWD, rel);
-    if (fs.existsSync(p)) parts.push(fs.readFileSync(p, "utf8"));
-  }
-  let text = parts.join("\n\n");
-  text = text
-    .replaceAll("{assistant_name}", ASSISTANT_NAME)
-    .replaceAll("{platform}", process.platform)
-    .replaceAll("{capabilities}", "Use the jarvis MCP tools for actions; use jarvis_tools to discover names.")
-    .replaceAll("{limits}", "If no tool covers a request, say so; never claim an action without a tool result.");
-  return `${text}\n\n${orchestrationPrompt()}`;
+  const skills = loadSkills();
+  return [base, orchestrationPrompt(), skills ? `# SKILLS ATIVAS (política do dono)\n${skills}` : ""]
+    .filter(Boolean).join("\n\n");
 }
 
 const SYSTEM_PROMPT = loadSystemPrompt();
+
+// The executor is a background subagent, not a separate CLI process. It is
+// spawned by the main session, inherits the task description written from the
+// live conversation, and reports back into the same session when it finishes.
+const EXECUTOR_AGENT = {
+  description: "Executa mudanças e investigações pesadas no projeto (editar, testar, instalar, rodar comandos, git) sem travar a conversa.",
+  prompt: "Você é o executor do Gino. Receba a tarefa descrita pela conversa e execute até o fim: leia o código antes de mudar, rode os testes relevantes, verifique o resultado e não invente sucesso. Não peça confirmação para o que o dono já pediu na conversa; peça somente se a tarefa mudar o escopo ou for irreversível. Responda em português com um resumo curto do que mudou e da verificação. Nunca faça push sem o dono ter pedido explicitamente.",
+  model: HEAVY_MODEL,
+  tools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash", "WebFetch", "WebSearch", "Agent"],
+  permissionMode: "acceptEdits",
+  background: true,
+  maxTurns: 80,
+};
 
 function optionsFor(maxTurns) {
   return {
@@ -372,8 +400,10 @@ function optionsFor(maxTurns) {
     canUseTool,
     mcpServers: { jarvis: makeJarvisServer() },
     allowedTools: ALLOWED_TOOLS,
+    agents: { executor: EXECUTOR_AGENT },
     includePartialMessages: true,
-    persistSession: false,
+    persistSession: true,
+    resume: RESUME_SESSION || undefined,
     maxTurns,
     systemPrompt: { type: "preset", preset: "qodercli", append: SYSTEM_PROMPT },
     stderr: (data) => process.stderr.write(data),
@@ -382,7 +412,12 @@ function optionsFor(maxTurns) {
 
 async function warmup() {
   const started = Date.now();
-  const q = query({ prompt: "Responda apenas: ok", options: optionsFor(1) });
+  const q = query({
+    prompt: "Responda apenas: ok",
+    // The warm-up is about loading the daemon/model. It must not create a
+    // resumable session that could later collide with the real chat.
+    options: { ...optionsFor(1), persistSession: false, resume: undefined },
+  });
   try {
     for await (const msg of q) {
       if (msg.type === "result" && msg.subtype !== "success") {
@@ -396,13 +431,8 @@ async function warmup() {
   return Date.now() - started;
 }
 
-function clearBgTimer() {
-  if (bgTimer) { clearTimeout(bgTimer); bgTimer = null; }
-}
-
 function finishTurn(ok, textOrError, subtype = "") {
   const id = currentId;
-  clearBgTimer();
   if (abortingId && id === abortingId) {
     // The turn was preempted by a new spoken turn; its abort result must not
     // be attributed to the new turn nor spoken as an error.
@@ -474,28 +504,14 @@ async function chatLoop() {
       if (closing) break;
       if (msg.type === "system" && msg.subtype === "init") {
         log(`session ${msg.session_id || "?"} ready`);
+        if (msg.session_id) out({ type: "session", id: msg.session_id });
       } else if (msg.type === "system" && msg.subtype === "task_started") {
         taskDescriptions.set(msg.task_id, msg.description || "");
         out({ type: "task", phase: "started", id: msg.task_id,
               description: msg.description || "" });
-        // The owner's rule: a background execution must never hold the
-        // conversation. If the model stays waiting for the task, cut the turn
-        // after a short acknowledgement window; the agent keeps running and
-        // reports through task_notification.
-        if (busy && currentId && !bgTimer) {
-          const id = currentId;
-          bgTimer = setTimeout(() => {
-            bgTimer = null;
-            if (!busy || currentId !== id) return;
-            currentId = null;
-            busy = false;
-            sawDelta = false;
-            out({ type: "done", id,
-                  text: "Deleguei isso em segundo plano; eu te aviso quando terminar." });
-            try { chatQuery?.interrupt?.(); } catch {}
-            pumpQueue();
-          }, BG_ACK_MS);
-        }
+        // A background subagent never holds the conversation. The main session
+        // keeps running; the task notification arrives in this same session
+        // when it finishes, so the context is never lost.
       } else if (msg.type === "system" && msg.subtype === "task_notification") {
         const description = taskDescriptions.get(msg.task_id) || "";
         taskDescriptions.delete(msg.task_id);
@@ -536,7 +552,8 @@ function pushAsk(item) {
     sharedActionUntil = Date.now() + SHARED_ACTION_WINDOW_MS;
     log("owner window: git push allowed from a background agent");
   }
-  channel.push(userMessage(item.text, item.priority || "next"));
+  channel.push(userMessage(item.text, item.priority || "next",
+                           item.context || ""));
   out({ type: "accepted", id: item.id });
 }
 
@@ -586,7 +603,6 @@ async function interrupt() {
   queue.length = 0;
   abortingId = null;
   if (abortTimer) { clearTimeout(abortTimer); abortTimer = null; }
-  clearBgTimer();
   try { await chatQuery?.interrupt?.(); } catch (e) { log(`interrupt: ${e?.message || e}`); }
   if (id) {
     currentId = null;
@@ -606,11 +622,15 @@ async function closeAll() {
 }
 
 function selftest() {
+  const skills = RUNTIME_SKILLS.map((name) => path.join(CWD, "skills", name, "SKILL.md"));
   const checks = {
     model: ALLOWED_MODELS.has(MODEL),
     destructive: DESTRUCTIVE.test("sudo reboot") && DESTRUCTIVE.test("rm -rf /") && DESTRUCTIVE.test("systemctl restart foo") && !DESTRUCTIVE.test("ls -la"),
-    mcp_tools: MCP_NAMES.length === 11,
+    mcp_tools: MCP_NAMES.length === 9,
     system_prompt: SYSTEM_PROMPT.length > 100,
+    skills: skills.every((p) => fs.existsSync(p)),
+    background_agent: EXECUTOR_AGENT.background === true && EXECUTOR_AGENT.model === HEAVY_MODEL,
+    internal_context: userMessage("x", "next", "ctx").message.content[0].text.includes("[CONTEXTO INTERNO"),
     bridge_url: BRIDGE_URL.startsWith("http"),
   };
   const ok = Object.values(checks).every(Boolean);

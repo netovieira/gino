@@ -346,6 +346,25 @@ def test_protocol_lines_written_to_stdin(make_live, tmp_path):
     assert {"type": "close"} in lines
 
 
+def test_ask_carries_the_subject_epoch_context(make_live, tmp_path):
+    record_path = tmp_path / "stdin-context.jsonl"
+    live = make_live(env={"FAKE_RECORD": str(record_path)})
+    assert live.start(timeout=15.0) is True
+
+    live.ask("oi", id="ctx-1", context="[NOVO ASSUNTO APÓS PAUSA]")
+    wait_until(lambda: record_path.exists() and "ctx-1" in record_path.read_text())
+    live.stop(timeout=5.0)
+
+    lines = [
+        json.loads(line)
+        for line in record_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(line.get("id") == "ctx-1"
+               and line.get("context") == "[NOVO ASSUNTO APÓS PAUSA]"
+               for line in lines)
+
+
 def test_ask_requires_ready_sidecar(make_live):
     live = make_live()
     with pytest.raises(RuntimeError):
