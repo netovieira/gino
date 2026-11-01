@@ -9,11 +9,19 @@ WHY THIS EXISTS
 STORAGE
     memory/personas.json (local, git-ignored), written atomically::
 
-        {"version": 1, "personas": {"fulana-front": {...}}}
+        {"version": 1,
+         "personas": {"fulana-front": {...}},
+         "retired": {"fulana-antiga": {...}}}
+
+    Active records carry ``aliases`` (old names, at most 20) and ``history``
+    (rename entries). Deleting or retiring never erases a persona: the record
+    moves to ``retired`` with ``retired_at``/``retired_status`` (left,
+    retired, fired or renamed) and an optional ``successor``, so the owner can
+    still call an old name and hear an in-character farewell.
 
     A malformed or missing store never raises: ``load()`` returns an empty
-    board, and the first ``save()`` repairs it. Nothing outside that file is
-    ever written.
+    board (or whatever slices are still valid), and the first ``save()``
+    repairs it. Nothing outside that file is ever written.
 
 PAID MODELS
     The live catalog (memory/models.json) carries Fish/Qoder price factors.
@@ -43,8 +51,10 @@ SKILLS_DIR = BASE_DIR / "skills"
 
 MAX_PERSONAS = 12
 MAX_PERSONALITY = 2000
+MAX_ALIASES = 20
 DEFAULT_MODEL = "Qwen3.8-Flash"
 REASONING_LEVELS = ("low", "medium", "high", "max")
+RETIRED_STATUSES = ("left", "retired", "fired", "renamed")
 CONTEXT_MIN = 16_000
 CONTEXT_MAX = 1_000_000
 DEFAULT_CONTEXT = 200_000
@@ -369,7 +379,58 @@ def _reasoning(model: dict, value=None) -> str:
 # ── store ───────────────────────────────────────────────────────────────────
 
 def _empty() -> dict:
-    return {"version": 1, "personas": {}}
+    return {"version": 1, "personas": {}, "retired": {}}
+
+
+def _clean_aliases(value) -> list[str]:
+    """Unique, non-empty names, case-insensitive, capped at MAX_ALIASES."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        text = _text(item)
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= MAX_ALIASES:
+            break
+    return out
+
+
+def _clean_history(value) -> list[dict]:
+    """Rename/retirement entries; malformed entries are dropped, not raised."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: list[dict] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        name = _text(item.get("name"))
+        if not name:
+            continue
+        entry = {
+            "name": name,
+            "at": _text(item.get("at")),
+            "status": _text(item.get("status")) or "renamed",
+        }
+        to = _text(item.get("to"))
+        if to:
+            entry["to"] = to
+        out.append(entry)
+    return out
 
 
 def _clean_persona(raw) -> dict | None:
@@ -380,6 +441,30 @@ def _clean_persona(raw) -> dict | None:
         return None
     persona = dict(raw)
     persona["id"] = pid
+    persona["aliases"] = _clean_aliases(raw.get("aliases"))
+    persona["history"] = _clean_history(raw.get("history"))
+    return persona
+
+
+def _normalize_retired_status(value) -> str:
+    status = _text(value).casefold() or "left"
+    if status not in RETIRED_STATUSES:
+        raise ValueError(
+            "status de aposentadoria inválido; use left, retired, fired ou "
+            "renamed")
+    return status
+
+
+def _clean_retired(raw) -> dict | None:
+    persona = _clean_persona(raw)
+    if persona is None:
+        return None
+    persona["retired_at"] = _text(persona.get("retired_at"))
+    status = _text(persona.get("retired_status")).casefold()
+    persona["retired_status"] = (
+        status if status in RETIRED_STATUSES else "left")
+    if persona.get("successor") is not None:
+        persona["successor"] = _text(persona.get("successor"))
     return persona
 
 
@@ -393,21 +478,30 @@ def _read_store() -> dict:
         return _empty()
     if not isinstance(data, dict):
         return _empty()
+    store = _empty()
     personas = data.get("personas")
-    if not isinstance(personas, dict):
-        return _empty()
-    clean = {}
-    for key, raw in personas.items():
-        persona = _clean_persona(raw)
-        if persona:
-            clean[str(persona["id"])] = persona
-    return {"version": 1, "personas": clean}
+    if isinstance(personas, dict):
+        for key, raw in personas.items():
+            persona = _clean_persona(raw)
+            if persona:
+                store["personas"][str(persona["id"])] = persona
+    retired = data.get("retired")
+    if isinstance(retired, dict):
+        for key, raw in retired.items():
+            persona = _clean_retired(raw)
+            if persona:
+                store["retired"][str(persona["id"])] = persona
+    return store
 
 
 def _write_store(data: dict) -> None:
     personas = data.get("personas") if isinstance(data, dict) else None
-    payload = {"version": 1,
-               "personas": personas if isinstance(personas, dict) else {}}
+    retired = data.get("retired") if isinstance(data, dict) else None
+    payload = {
+        "version": 1,
+        "personas": personas if isinstance(personas, dict) else {},
+        "retired": retired if isinstance(retired, dict) else {},
+    }
     path = Path(PERSONAS_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
@@ -431,7 +525,7 @@ def _write_store(data: dict) -> None:
 
 
 def load() -> dict:
-    """The persona store; a missing or malformed file yields an empty board."""
+    """The persona store; malformed slices are dropped, never raised."""
     with _LOCK:
         return _read_store()
 
@@ -443,7 +537,7 @@ def save(data: dict) -> None:
 
 
 def list_personas() -> list[dict]:
-    """All personas, ordered by name, with the id as the tiebreaker."""
+    """Active personas only, ordered by name, with the id as tiebreaker."""
     with _LOCK:
         items = [dict(p) for p in _read_store()["personas"].values()]
     items.sort(key=lambda p: (str(p.get("name") or "").casefold(),
@@ -451,48 +545,131 @@ def list_personas() -> list[dict]:
     return items
 
 
-def get(id_or_name):
-    """Persona by id (slug) or name, case-insensitive; None when absent."""
-    wanted = _text(id_or_name).casefold()
-    if not wanted:
-        return None
-    slug = _slugify(wanted)
-    with _LOCK:
-        personas = _read_store()["personas"]
-        if wanted in personas:
-            return dict(personas[wanted])
-        for persona in personas.values():
-            if str(persona.get("name") or "").casefold() == wanted:
-                return dict(persona)
-        if slug in personas:
-            return dict(personas[slug])
-    return None
-
-
-def delete(id_or_name) -> bool:
-    """Remove a persona by id or name; False when there was nothing to remove."""
+def _match(personas: dict, id_or_name) -> tuple[dict | None, str]:
+    """(persona copy, former alias) matching id, current name, then alias."""
     wanted = _text(id_or_name)
     if not wanted:
-        return False
+        return None, ""
+    key = wanted.casefold()
     slug = _slugify(wanted)
+    if key in personas:
+        return dict(personas[key]), ""
+    if slug in personas:
+        return dict(personas[slug]), ""
+    for persona in personas.values():
+        if _text(persona.get("name")).casefold() == key:
+            return dict(persona), ""
+    for persona in personas.values():
+        for alias in persona.get("aliases") or []:
+            if _text(alias).casefold() == key:
+                return dict(persona), _text(alias)
+    return None, ""
+
+
+def get(id_or_name):
+    """Active persona by id, name or alias (case-insensitive); None if absent."""
+    with _LOCK:
+        persona, _ = _match(_read_store()["personas"], id_or_name)
+    return persona
+
+
+def resolve_name(id_or_name) -> dict:
+    """Resolve a current, old or retired name without ever guessing.
+
+    Active personas win over retired ones. The ``former_name`` names the alias
+    that matched, so the main assistant can acknowledge "you mean Fulana,
+    who is now Fulana Front"; retired records carry their successor when the
+    owner appointed one.
+    """
+    wanted = _text(id_or_name)
+    if not wanted:
+        return {"status": "unknown", "name": wanted}
     with _LOCK:
         data = _read_store()
-        keys = list(data["personas"].keys())
-        target = None
-        if wanted.casefold() in keys:
-            target = wanted.casefold()
-        elif slug in keys:
-            target = slug
+        persona, former = _match(data["personas"], wanted)
+        if persona is not None:
+            if not former and (
+                    _text(persona.get("name")).casefold() != wanted.casefold()):
+                # The id/slug matched first, but the owner spelled an old
+                # name: report it so the assistant can acknowledge the rename.
+                for alias in persona.get("aliases") or []:
+                    if _text(alias).casefold() == wanted.casefold():
+                        former = _text(alias)
+                        break
+            return {
+                "status": "active",
+                "persona": persona,
+                "former_name": former,
+            }
+        persona, _ = _match(data["retired"], wanted)
+        if persona is not None:
+            successor, _ = _match(
+                data["personas"], persona.get("successor"))
+            return {
+                "status": "retired",
+                "persona": persona,
+                "successor": successor,
+            }
+    return {"status": "unknown", "name": wanted}
+
+
+def history(id_or_name) -> dict | None:
+    """Aliases, rename/retirement entries and successor for any known name."""
+    resolved = resolve_name(id_or_name)
+    if resolved["status"] == "unknown":
+        return None
+    persona = resolved["persona"]
+    retired = resolved["status"] == "retired"
+    return {
+        "persona": persona,
+        "aliases": list(persona.get("aliases") or []),
+        "history": [dict(entry) for entry in persona.get("history") or []],
+        "retired_at": persona.get("retired_at") if retired else None,
+        "retired_status": persona.get("retired_status") if retired else None,
+        "successor": resolved.get("successor") if retired else None,
+    }
+
+
+def retire(id_or_name, status: str = "left", successor=None) -> dict | None:
+    """Move an active persona to ``retired``; None when the name is unknown.
+
+    The record keeps aliases, history, personality, voice and gender. The
+    optional successor (id or name) is resolved to the active persona's id so
+    later lookups can hand the owner over to whoever took the role.
+    """
+    wanted = _text(id_or_name)
+    if not wanted:
+        return None
+    retired_status = _normalize_retired_status(status)
+    with _LOCK:
+        data = _read_store()
+        persona, _ = _match(data["personas"], wanted)
+        if persona is None:
+            return None
+        target = str(persona["id"])
+        successor_ref = ""
+        if successor is not None:
+            chosen, _ = _match(data["personas"], successor)
+            if chosen is not None:
+                successor_ref = str(chosen["id"])
+            else:
+                successor_ref = _text(successor)
+        record = dict(persona)
+        record["retired_at"] = _now()
+        record["retired_status"] = retired_status
+        if successor_ref:
+            record["successor"] = successor_ref
         else:
-            for key, persona in data["personas"].items():
-                if str(persona.get("name") or "").casefold() == wanted.casefold():
-                    target = key
-                    break
-        if target is None:
-            return False
+            record.pop("successor", None)
         data["personas"].pop(target, None)
+        data["retired"][target] = record
         _write_store(data)
-        return True
+        return dict(record)
+
+
+def delete(id_or_name, retired_status: str = "left") -> bool:
+    """Retire a persona (status ``left`` by default); False when absent."""
+    return retire(id_or_name, status=retired_status) is not None
 
 
 # ── upsert ──────────────────────────────────────────────────────────────────
@@ -571,6 +748,23 @@ def upsert(fields: dict, confirm_paid: bool = False,
         context_size = _validate_context(merged.get("context_size"), model)
 
         now = _now()
+        old_name = _text((existing or {}).get("name"))
+        aliases = _clean_aliases((existing or {}).get("aliases"))
+        entries = _clean_history((existing or {}).get("history"))
+        if existing is not None and old_name and (
+                old_name.casefold() != name.casefold()):
+            # The old name is never lost: it becomes an alias (used by
+            # resolve_name) and a history entry pointing at the new name.
+            if not any(_text(alias).casefold() == old_name.casefold()
+                       for alias in aliases):
+                aliases.append(old_name)
+                del aliases[:-MAX_ALIASES]
+            entries.append({
+                "name": old_name,
+                "at": now,
+                "status": "renamed",
+                "to": name,
+            })
         persona = {
             "id": target_id,
             "name": name,
@@ -583,6 +777,8 @@ def upsert(fields: dict, confirm_paid: bool = False,
             "model_price_factor": factor,
             "reasoning": reasoning,
             "context_size": context_size,
+            "aliases": aliases,
+            "history": entries,
             "created_at": _text((existing or {}).get("created_at")) or now,
             "updated_at": now,
         }

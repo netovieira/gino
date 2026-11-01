@@ -34,6 +34,9 @@ _ACTION_ALIASES = {
     "listar": "list", "mostrar": "show", "ver": "show",
     "modelos": "models", "projeto": "for_project", "para_projeto": "for_project",
     "vincular": "link_project", "vincular_projeto": "link_project",
+    "resolver": "resolve", "resolva": "resolve", "nome_antigo": "resolve",
+    "historico": "history", "histórico": "history", "memoria": "history",
+    "aposentar": "retire", "aposentada": "retire", "aposentado": "retire",
 }
 
 
@@ -96,7 +99,13 @@ def _summary(persona: dict) -> dict:
         "context_size": persona.get("context_size"),
         "skills": list(persona.get("skills") or []),
         "stacks": list(persona.get("stacks") or []),
+        "aliases": list(persona.get("aliases") or []),
     }
+
+
+def _wanted(parameters: dict) -> str:
+    return str(parameters.get("id") or parameters.get("name")
+               or parameters.get("persona") or "").strip()
 
 
 def _fields_from(parameters: dict) -> dict:
@@ -211,17 +220,86 @@ def _update(parameters: dict) -> dict:
 
 
 def _delete(parameters: dict) -> dict:
-    wanted = str(parameters.get("id") or parameters.get("name")
-                 or parameters.get("persona") or "").strip()
+    wanted = _wanted(parameters)
     existing = persona_store.get(wanted) if wanted else None
     if not existing:
         raise ValueError("persona não encontrada; informe id ou name")
-    persona_store.delete(existing["id"])
+    status = str(parameters.get("retired_status")
+                 or parameters.get("status") or "left").strip()
+    retired = persona_store.retire(existing["id"], status=status)
+    if retired is None:  # changed between the read and the retire
+        raise ValueError("persona não encontrada; informe id ou name")
     return {
         "status": "deleted",
         "id": existing["id"],
         "name": existing.get("name"),
-        "message": f"Persona {existing.get('name')} removida.",
+        "retired_at": retired.get("retired_at"),
+        "retired_status": retired.get("retired_status"),
+        "message": (f"Persona {existing.get('name')} removida do quadro "
+                    f"(aposentada: {retired.get('retired_status')})."),
+    }
+
+
+def _resolve(parameters: dict) -> dict:
+    wanted = _wanted(parameters)
+    if not wanted:
+        raise ValueError("informe id ou nome da persona")
+    result = persona_store.resolve_name(wanted)
+    persona = result.get("persona")
+    if result["status"] == "active":
+        result["address"] = persona_store.address(persona)
+        result["multiplier"] = _multiplier(persona)
+    elif result["status"] == "retired":
+        result["address"] = persona_store.address(persona)
+        result["retired_status"] = persona.get("retired_status")
+        successor = result.get("successor")
+        result["successor_address"] = (
+            persona_store.address(successor) if successor else "")
+    else:
+        result["message"] = (
+            "Nome desconhecido: não há persona ativa nem aposentada com esse "
+            "nome.")
+    return result
+
+
+def _history(parameters: dict) -> dict:
+    wanted = _wanted(parameters)
+    if not wanted:
+        raise ValueError("informe id ou nome da persona")
+    info = persona_store.history(wanted)
+    if info is None:
+        return {
+            "status": "not_found",
+            "message": "Persona não encontrada (nem ativa, nem aposentada).",
+        }
+    return {"status": "ok", **info}
+
+
+def _retire(parameters: dict) -> dict:
+    wanted = _wanted(parameters)
+    if not wanted:
+        raise ValueError("informe id ou nome da persona")
+    status = str(parameters.get("retired_status")
+                 or parameters.get("status") or "left").strip()
+    successor = parameters.get("successor")
+    successor = str(successor).strip() if successor is not None else ""
+    retired = persona_store.retire(
+        wanted, status=status, successor=successor or None)
+    if retired is None:
+        raise ValueError("persona não encontrada; informe id ou name")
+    successor_persona = (persona_store.get(retired.get("successor"))
+                         if retired.get("successor") else None)
+    return {
+        "status": "retired",
+        "id": retired["id"],
+        "name": retired.get("name"),
+        "retired_at": retired.get("retired_at"),
+        "retired_status": retired.get("retired_status"),
+        "successor": (_summary(successor_persona)
+                      if successor_persona else None),
+        "persona": retired,
+        "message": (f"Persona {retired.get('name')} aposentada "
+                    f"({retired.get('retired_status')})."),
     }
 
 
@@ -309,6 +387,9 @@ _DISPATCH = {
     "create": lambda p: _create(p),
     "update": lambda p: _update(p),
     "delete": lambda p: _delete(p),
+    "resolve": lambda p: _resolve(p),
+    "history": lambda p: _history(p),
+    "retire": lambda p: _retire(p),
     "list": lambda p: _list(),
     "show": lambda p: _show(p),
     "models": lambda p: _models(),
@@ -326,8 +407,9 @@ def personas(parameters: dict, player=None, speak=None,
     if handler is None:
         return _json({
             "status": "error",
-            "error": "action inválida; use create, update, delete, list, "
-                     "show, models, for_project ou link_project",
+            "error": "action inválida; use create, update, delete, resolve, "
+                     "history, retire, list, show, models, for_project ou "
+                     "link_project",
         })
     try:
         return _json(handler(p))
@@ -347,20 +429,27 @@ TOOL = {
         "frontend, Beltrano do backend...). Use action=list/show/models para "
         "consultar, for_project para descobrir qual persona cuida da stack de "
         "um projeto, link_project para fixar uma persona a um projeto, e "
-        "create/update/delete para alterar o quadro. Toda persona tem nome, "
-        "gênero (f/m/n), voice_id do Fish Audio, personalidade, skills, stacks, "
-        "modelo, reasoning e contexto. Modelo pago só é salvo com confirmação "
-        "explícita: mostre o multiplicador ao dono e chame de novo com "
-        "confirm_paid=true depois do 'pode'. Nunca grave segredos na "
-        "personalidade."
+        "create/update/delete para alterar o quadro. Nomes antigos continuam "
+        "valendo: action=resolve descobre se um nome é atual, antigo ou de uma "
+        "persona aposentada; action=history devolve aliases, histórico de "
+        "nomes e sucessor; action=retire aposenta com status left, retired, "
+        "fired ou renamed e sucessor opcional. Quando o dono chamar um nome "
+        "aposentado, o assistente principal (não a persona antiga) se despede "
+        "em personagem usando a personalidade e o status do registro, depois "
+        "responde o pedido. Toda persona tem nome, gênero (f/m/n), voice_id do "
+        "Fish Audio, personalidade, skills, stacks, modelo, reasoning e "
+        "contexto. Modelo pago só é salvo com confirmação explícita: mostre o "
+        "multiplicador ao dono e chame de novo com confirm_paid=true depois do "
+        "'pode'. Nunca grave segredos na personalidade."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "enum": ["create", "update", "delete", "list", "show",
-                         "models", "for_project", "link_project"],
+                "enum": ["create", "update", "delete", "resolve", "history",
+                         "retire", "list", "show", "models", "for_project",
+                         "link_project"],
                 "description": "Ação a executar.",
             },
             "id": {
@@ -413,7 +502,18 @@ TOOL = {
             },
             "persona": {
                 "type": "STRING",
-                "description": "Id ou nome da persona para link_project.",
+                "description": "Id ou nome da persona (atual, antigo ou "
+                               "aposentado).",
+            },
+            "retired_status": {
+                "type": "STRING",
+                "description": "'left', 'retired', 'fired' ou 'renamed' — "
+                               "motivo da aposentadoria em delete/retire.",
+            },
+            "successor": {
+                "type": "STRING",
+                "description": "Id ou nome de quem assume o papel depois de "
+                               "retire.",
             },
             "confirm_paid": {
                 "type": "BOOLEAN",

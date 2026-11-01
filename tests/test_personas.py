@@ -116,9 +116,12 @@ def test_create_defaults_normalizes_and_snapshots(env):
     assert persona["reasoning"] == "medium"
     assert persona["context_size"] == 200000
     assert persona["created_at"] and persona["updated_at"]
+    assert persona["aliases"] == []
+    assert persona["history"] == []
 
     stored = json.loads(Path(personas.PERSONAS_PATH).read_text(encoding="utf-8"))
     assert stored["version"] == 1
+    assert stored["retired"] == {}
     assert stored["personas"]["fulana"]["voice_id"] == "fish-ref-abc123"
     assert stored["personas"]["fulana"]["model_price_factor"] == 0.0
 
@@ -161,6 +164,222 @@ def test_upsert_can_change_name_without_changing_id(env):
     renamed = personas.upsert({"id": "fulana", "name": "Fulana Front"})
     assert renamed["id"] == "fulana"
     assert renamed["name"] == "Fulana Front"
+
+
+# ── names history, retirement and resolution ───────────────────────────────
+
+def test_rename_keeps_alias_and_history(env):
+    personas.upsert(fields())
+    renamed = personas.upsert({"id": "fulana", "name": "Fulana Front"})
+    assert renamed["name"] == "Fulana Front"
+    assert renamed["aliases"] == ["Fulana"]
+    assert len(renamed["history"]) == 1
+    entry = renamed["history"][0]
+    assert entry["name"] == "Fulana"
+    assert entry["status"] == "renamed"
+    assert entry["to"] == "Fulana Front"
+    assert entry["at"]
+
+    # Updating another field never duplicates aliases or history.
+    touched = personas.upsert({"id": "fulana", "personality": "mais direta"})
+    assert touched["aliases"] == ["Fulana"]
+    assert touched["history"] == renamed["history"]
+
+    # A second rename accumulates both old names, in order.
+    twice = personas.upsert({"id": "fulana", "name": "Fulana Front 2"})
+    assert twice["aliases"] == ["Fulana", "Fulana Front"]
+    assert [e["to"] for e in twice["history"]] == [
+        "Fulana Front", "Fulana Front 2"]
+
+    stored = json.loads(Path(personas.PERSONAS_PATH).read_text(encoding="utf-8"))
+    assert stored["personas"]["fulana"]["aliases"] == [
+        "Fulana", "Fulana Front"]
+    assert stored["personas"]["fulana"]["history"] == twice["history"]
+
+
+def test_aliases_are_unique_and_capped(env):
+    personas.upsert(fields())
+    for index in range(30):
+        personas.upsert({"id": "fulana", "name": f"Nome {index}"})
+    persona = personas.get("fulana")
+    assert len(persona["aliases"]) == personas.MAX_ALIASES == 20
+    keys = [alias.casefold() for alias in persona["aliases"]]
+    assert len(set(keys)) == len(keys)
+    # The most recent aliases survive; the oldest are dropped.
+    assert "Nome 10" in persona["aliases"]
+    assert "Fulana" not in persona["aliases"]
+
+
+def test_resolve_old_name_after_rename(env):
+    personas.upsert(fields())
+    personas.upsert({"id": "fulana", "name": "Fulana Front"})
+
+    old = personas.resolve_name("Fulana")
+    assert old["status"] == "active"
+    assert old["persona"]["id"] == "fulana"
+    assert old["former_name"] == "Fulana"
+
+    current = personas.resolve_name("fulana front")
+    assert current["status"] == "active"
+    assert current["former_name"] == ""
+
+    by_id = personas.resolve_name("fulana")
+    assert by_id["status"] == "active"
+    assert by_id["persona"]["name"] == "Fulana Front"
+    # get() still sees only active personas, but accepts their aliases.
+    assert personas.get("Fulana")["id"] == "fulana"
+
+
+def test_delete_retires_preserving_the_record(env):
+    created = personas.upsert(fields())
+    assert personas.delete("Fulana") is True
+    assert personas.list_personas() == []
+    assert personas.get("Fulana") is None
+
+    resolved = personas.resolve_name("Fulana")
+    assert resolved["status"] == "retired"
+    retired = resolved["persona"]
+    assert retired["id"] == created["id"]
+    assert retired["personality"] == created["personality"]
+    assert retired["voice_id"] == created["voice_id"]
+    assert retired["gender"] == "f"
+    assert retired["retired_status"] == "left"
+    assert retired["retired_at"]
+    assert resolved["successor"] is None
+
+    # Removing again finds no active persona.
+    assert personas.delete("Fulana") is False
+    stored = json.loads(Path(personas.PERSONAS_PATH).read_text(encoding="utf-8"))
+    assert "fulana" not in stored["personas"]
+    assert stored["retired"]["fulana"]["retired_status"] == "left"
+
+
+def test_history_and_successor_resolution(env):
+    personas.upsert(fields())
+    personas.upsert(fields(name="Beltrano", gender="m", voice_id="v2",
+                           personality="backend rabugento",
+                           stacks=["python"], skills=[]))
+    personas.upsert({"id": "fulana", "name": "Fulana Front"})
+
+    retired = personas.retire("Fulana Front", status="fired",
+                              successor="Beltrano")
+    assert retired["retired_status"] == "fired"
+    assert retired["successor"] == "beltrano"
+    assert retired["personality"] == "especialista em frontend, direta e cética"
+
+    resolved = personas.resolve_name("Fulana")  # old name from the rename
+    assert resolved["status"] == "retired"
+    assert resolved["persona"]["name"] == "Fulana Front"
+    assert resolved["successor"]["id"] == "beltrano"
+
+    info = personas.history("Fulana")
+    assert info["aliases"] == ["Fulana"]
+    assert info["history"][0]["to"] == "Fulana Front"
+    assert info["retired_status"] == "fired"
+    assert info["retired_at"]
+    assert info["successor"]["id"] == "beltrano"
+
+    active = personas.history("Beltrano")
+    assert active["retired_at"] is None
+    assert active["retired_status"] is None
+    assert active["successor"] is None
+
+
+def test_retire_statuses_validation_and_unknown(env):
+    personas.upsert(fields())
+    with pytest.raises(ValueError, match="status"):
+        personas.retire("Fulana", status="banished")
+    assert personas.get("fulana") is not None  # nothing moved
+
+    assert personas.retire("Ninguem") is None
+    assert personas.delete("Ninguem") is False
+
+    retired = personas.retire("Fulana", status="fired")
+    assert retired["retired_status"] == "fired"
+    assert personas.get("fulana") is None
+    assert personas.resolve_name("fulana")["status"] == "retired"
+
+
+def test_unknown_and_active_wins_over_retired(env):
+    assert personas.resolve_name("Ninguem") == {
+        "status": "unknown", "name": "Ninguem"}
+    assert personas.resolve_name("") == {"status": "unknown", "name": ""}
+    assert personas.history("Ninguem") is None
+
+    personas.upsert(fields())
+    personas.delete("Fulana")
+    assert personas.resolve_name("Fulana")["status"] == "retired"
+
+    replacement = personas.upsert(fields(name="Fulana", id="fulana-nova",
+                                         voice_id="v2"))
+    resolved = personas.resolve_name("Fulana")
+    assert resolved["status"] == "active"
+    assert resolved["persona"]["id"] == replacement["id"] == "fulana-nova"
+
+
+def test_malformed_store_preserves_retired_and_normalizes(env):
+    path = Path(personas.PERSONAS_PATH)
+    path.write_text(json.dumps({
+        "version": 1,
+        "personas": "broken",
+        "retired": {
+            "fulana": {
+                "id": "fulana",
+                "name": "Fulana",
+                "gender": "f",
+                "voice_id": "fish-ref-abc123",
+                "personality": "ranzinza",
+                "aliases": ["Fulana", "fulana", "Fulana Antiga"],
+                "history": [
+                    {"name": "Fulana Antiga",
+                     "at": "2026-01-01T00:00:00-03:00",
+                     "status": "renamed", "to": "Fulana"},
+                    "broken",
+                ],
+                "successor": "beltrano",
+            },
+            "quebrada": "nope",
+        },
+    }), encoding="utf-8")
+
+    data = personas.load()
+    assert data["personas"] == {}
+    retired = data["retired"]["fulana"]
+    assert retired["aliases"] == ["Fulana", "Fulana Antiga"]
+    assert retired["history"][0]["status"] == "renamed"
+    assert retired["retired_status"] == "left"  # missing status repaired
+    assert retired["retired_at"] == ""
+    assert "quebrada" not in data["retired"]
+
+    assert personas.list_personas() == []
+    assert personas.get("Fulana") is None
+    resolved = personas.resolve_name("Fulana")
+    assert resolved["status"] == "retired"
+    assert resolved["persona"]["personality"] == "ranzinza"
+    assert resolved["successor"] is None  # successor is not active
+
+    # A later upsert repairs the file without losing the retired record.
+    personas.upsert(fields(name="Beltrano", gender="m", voice_id="v2",
+                           stacks=["python"], skills=[]))
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["retired"]["fulana"]["retired_status"] == "left"
+    assert "beltrano" in stored["personas"]
+
+
+def test_existing_records_normalize_aliases_and_history(env):
+    path = Path(personas.PERSONAS_PATH)
+    path.write_text(json.dumps({"version": 1, "personas": {"fulana": {
+        "id": "fulana", "name": "Fulana", "gender": "f", "voice_id": "v",
+        "personality": "", "skills": [], "stacks": [],
+        "model": "Qwen3.8-Flash", "reasoning": "medium",
+        "context_size": 200000,
+    }}}), encoding="utf-8")
+
+    loaded = personas.get("Fulana")
+    assert loaded["aliases"] == []
+    assert loaded["history"] == []
+    assert personas.history("Fulana")["aliases"] == []
+
 
 
 # ── gender and addressing ───────────────────────────────────────────────────
@@ -320,16 +539,16 @@ def test_format_multiplier():
 def test_malformed_store_returns_empty_and_is_repaired_on_save(env):
     path = Path(personas.PERSONAS_PATH)
     path.write_text("not-a-json", encoding="utf-8")
-    assert personas.load() == {"version": 1, "personas": {}}
+    assert personas.load() == {"version": 1, "personas": {}, "retired": {}}
     assert personas.list_personas() == []
 
     path.write_text('{"version": 1, "personas": []}', encoding="utf-8")
-    assert personas.load() == {"version": 1, "personas": {}}
+    assert personas.load() == {"version": 1, "personas": {}, "retired": {}}
 
     personas.save({"personas": {"x": "quebrada"}})
     data = personas.load()
     # A non-dict entry is ignored, but the file is valid again.
-    assert data == {"version": 1, "personas": {}}
+    assert data == {"version": 1, "personas": {}, "retired": {}}
     json.loads(path.read_text(encoding="utf-8"))
 
     personas.upsert(fields())
@@ -427,6 +646,76 @@ def test_action_models_list_show_delete(env):
     assert deleted["status"] == "deleted"
     assert _call(action="show", name="Fulana")["status"] == "not_found"
     assert _call(action="nonsense")["status"] == "error"
+
+
+def test_action_resolve_history_and_retire(env):
+    assert _call(action="create", **fields())["status"] == "created"
+    renamed = _call(action="update", id="fulana", name="Fulana Front")
+    assert renamed["persona"]["aliases"] == ["Fulana"]
+
+    listed = _call(action="list")
+    assert listed["personas"][0]["aliases"] == ["Fulana"]
+
+    resolved = _call(action="resolve", name="Fulana")
+    assert resolved["status"] == "active"
+    assert resolved["former_name"] == "Fulana"
+    assert resolved["persona"]["id"] == "fulana"
+    assert resolved["address"] == "a Fulana Front"
+
+    info = _call(action="history", name="Fulana")
+    assert info["status"] == "ok"
+    assert info["aliases"] == ["Fulana"]
+    assert info["history"][0]["status"] == "renamed"
+
+    assert _call(action="create", **fields(
+        name="Beltrano", gender="m", voice_id="v2",
+        personality="backend rabugento", stacks=["python"], skills=[]))[
+            "status"] == "created"
+
+    retired = _call(action="retire", name="Fulana Front",
+                    retired_status="fired", successor="Beltrano")
+    assert retired["status"] == "retired"
+    assert retired["retired_status"] == "fired"
+    assert retired["successor"]["id"] == "beltrano"
+    assert retired["persona"]["personality"] == fields()["personality"]
+
+    old = _call(action="resolve", name="Fulana")
+    assert old["status"] == "retired"
+    assert old["persona"]["personality"] == fields()["personality"]
+    assert old["retired_status"] == "fired"
+    assert old["successor"]["id"] == "beltrano"
+
+    info = _call(action="history", name="Fulana")
+    assert info["status"] == "ok"
+    assert info["retired_status"] == "fired"
+    assert info["successor"]["id"] == "beltrano"
+
+    assert _call(action="resolve", name="Ninguem")["status"] == "unknown"
+    assert _call(action="history", name="Ninguem")["status"] == "not_found"
+    assert _call(action="retire", name="Ninguem")["status"] == "error"
+    assert _call(action="retire", name="Beltrano",
+                 retired_status="banished")["status"] == "error"
+    assert personas.get("beltrano") is not None
+
+
+def test_action_delete_retires_with_status(env):
+    assert _call(action="create", **fields())["status"] == "created"
+    deleted = _call(action="delete", name="Fulana")
+    assert deleted["status"] == "deleted"
+    assert deleted["retired_status"] == "left"
+
+    resolved = _call(action="resolve", name="Fulana")
+    assert resolved["status"] == "retired"
+    assert resolved["persona"]["personality"] == fields()["personality"]
+    assert _call(action="show", name="Fulana")["status"] == "not_found"
+    assert _call(action="list")["count"] == 0
+
+    assert _call(action="create", **fields(
+        name="Beltrano", gender="m", voice_id="v2", stacks=["python"],
+        skills=[]))["status"] == "created"
+    fired = _call(action="delete", name="Beltrano", retired_status="fired")
+    assert fired["retired_status"] == "fired"
+    assert _call(action="resolve", name="Beltrano")["status"] == "retired"
 
 
 def test_action_for_project_and_link_project(env, tmp_path, monkeypatch):
