@@ -15,6 +15,8 @@ reaches this path; an echo of Gino's own voice never reaches it either.
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import main
 from core import actiongate, rootgate
@@ -39,6 +41,21 @@ def _obj(speaking=False, own_echo=False):
     obj._log_heard = lambda text: obj.said.append(f"heard:{text}")
     obj._looks_like_own_voice = lambda text: own_echo
     return obj
+
+
+class _Clock:
+    """A monotonic clock the test moves by hand, so expiry is exact."""
+
+    def __init__(self, now: float = 1000.0):
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _patch_clock(clock):
+    return mock.patch.object(actiongate, "time",
+                             SimpleNamespace(monotonic=clock.monotonic))
 
 
 class SpokenConsentWindowTests(unittest.TestCase):
@@ -66,9 +83,10 @@ class SpokenConsentWindowTests(unittest.TestCase):
         self.assertTrue(actiongate.authorized())
         self.assertFalse(actiongate.has_pending())
         self.assertIn("Pode, autorizado.", obj.said)
-        # The retry now passes: confirm() finds the open window and consumes it.
+        # The retry now passes: confirm() finds the open window. Authorising a
+        # call does not spend the window — only the 120 s deadline closes it.
         self.assertTrue(actiongate.confirm("Confirm 'whatsapp_control'", "again"))
-        self.assertFalse(actiongate.authorized())  # single use
+        self.assertTrue(actiongate.authorized())
 
     def test_bare_pode_answers_a_pending_request(self):
         self._refuse_once()
@@ -76,14 +94,21 @@ class SpokenConsentWindowTests(unittest.TestCase):
         self.assertTrue(main.JarvisLive._try_action_consent(obj, "pode"))
         self.assertTrue(actiongate.authorized())
 
-    def test_window_is_single_use(self):
-        self._refuse_once()
-        obj = _obj()
-        self.assertTrue(main.JarvisLive._try_action_consent(obj, "pode enviar"))
-        self.assertTrue(actiongate.confirm("Confirm 'whatsapp_control'", "first"))
-        # A second risky action needs a NEW spoken consent.
-        self.assertFalse(actiongate.confirm("Confirm 'send_message'", "second"))
-        self.assertFalse(actiongate.authorized())
+    def test_window_lasts_the_deadline_not_a_single_use(self):
+        clock = _Clock()
+        with _patch_clock(clock):
+            self._refuse_once()
+            obj = _obj()
+            self.assertTrue(main.JarvisLive._try_action_consent(obj, "pode enviar"))
+            self.assertTrue(actiongate.confirm("Confirm 'whatsapp_control'", "first"))
+            # Still open near the end of the window: a first call does not
+            # spend the consent on the handler's behalf.
+            clock.now += actiongate.WINDOW_SECONDS - 1.0
+            self.assertTrue(actiongate.confirm("Confirm 'send_message'", "second"))
+            # Only the deadline closes it.
+            clock.now += 2.0
+            self.assertFalse(actiongate.confirm("Confirm 'send_message'", "third"))
+            self.assertFalse(actiongate.authorized())
 
     def test_stray_consent_without_pending_opens_nothing(self):
         # No refusal happened: nothing on the table, nothing authorisable.
@@ -146,7 +171,7 @@ class EconomyQoderTurnConsentTests(unittest.TestCase):
         self.assertFalse(actiongate.has_pending())
         # The following bridge call passes — this is what failed 22 times.
         self.assertTrue(actiongate.confirm("Confirm 'whatsapp_control'", "retry"))
-        self.assertFalse(actiongate.authorized())   # window is single-use
+        self.assertTrue(actiongate.authorized())    # still inside the 120 s window
         self.assertIn("Pode, autorizado.", obj.said)
 
     def test_retry_replay_does_not_run_the_gates(self):

@@ -244,7 +244,15 @@ class GroqListener:
 
     def set_assistant_speaking(self, value: bool) -> None:
         """Called by the playback path: a reply is (not) coming out now."""
-        self.assistant_speaking = bool(value)
+        value = bool(value)
+        if value == self.assistant_speaking:
+            # The playback loop calls this once per ~200 ms batch. Re-arming
+            # the pending drop on every call wiped whatever the owner had
+            # started to say during the reply: the segment could never grow
+            # into an utterance, so voice barge-in was effectively deaf.
+            # Only the START of a reply invalidates a half-open segment.
+            return
+        self.assistant_speaking = value
         if value:
             # Drop any stale segment on the next mic block instead of touching
             # the segment list from the playback thread. A reply only starts
