@@ -84,6 +84,7 @@ ACTION_TIERS: dict[str, str] = {
     "desktop_control": TIER_LOW,
     "organizer": TIER_LOW,
     "memory_index": TIER_LOW,
+    "tasks": TIER_LOW,
     "open_in": TIER_LOW,
     "media_control": TIER_LOW,
     "focus_mode": TIER_LOW,

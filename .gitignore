@@ -37,6 +37,7 @@ memory/email_otp_seen.json
 memory/personas.json
 memory/models.json
 memory/projects.json
+memory/tasks.json
 .mypy_cache/
 # Attachments received on WhatsApp (photos, voice notes, documents):
 memory/whatsapp_media/
