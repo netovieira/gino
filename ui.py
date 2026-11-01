@@ -57,7 +57,7 @@ from PyQt6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QMenu, QSystemTrayIcon,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QPlainTextEdit, QMessageBox,
+    QPlainTextEdit, QMessageBox, QCheckBox,
 )
 
 try:
@@ -3010,6 +3010,329 @@ class AgendaOverlay(QWidget):
         self.reload()
 
 
+class WhatsAppOverlay(QWidget):
+    """CRUD das contas pareadas + chat direto do dono."""
+
+    _OW = 780
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            WhatsAppOverlay {{
+                background: rgba(0, 6, 10, 248);
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+        self._line_style = (
+            f"QLineEdit {{ background: #000d12; color: {C.TEXT}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px; }}"
+            f"QLineEdit:focus {{ border: 1px solid {C.PRI}; }}")
+        self._btn_style = (
+            f"QPushButton {{ background: #00091a; color: {C.PRI}; "
+            f"border: 1px solid {C.PRI_DIM}; border-radius: 3px; padding: 4px 10px; }}"
+            f"QPushButton:hover {{ background: {C.PRI_GHO}; border-color: {C.PRI}; }}")
+        self._selected = ""
+        self._accounts = []
+        self._qr_timer = QTimer(self)
+        self._qr_timer.timeout.connect(self._poll_pairing)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 14, 20, 14)
+        root.setSpacing(8)
+        root.addWidget(self._label("📱  WHATSAPP", 12, True))
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER};")
+        root.addWidget(sep)
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_list_page())
+        self._stack.addWidget(self._build_form_page())
+        root.addWidget(self._stack, 1)
+        self._reload()
+
+    @staticmethod
+    def _label(text, size=8, bold=False, color=None):
+        lbl = QLabel(text)
+        lbl.setFont(QFont("Courier New", size,
+                          QFont.Weight.Bold if bold else QFont.Weight.Normal))
+        lbl.setStyleSheet(f"color: {color or C.PRI}; background: transparent;")
+        return lbl
+
+    def _line(self, placeholder=""):
+        w = QLineEdit(); w.setStyleSheet(self._line_style); w.setFixedHeight(28)
+        w.setPlaceholderText(placeholder)
+        return w
+
+    def _build_list_page(self):
+        page = QWidget(); page.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(page); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(6)
+        self._table = QTableWidget(0, 6)
+        self._table.setHorizontalHeaderLabels(
+            ["CONTA", "NÚMERO", "STATUS", "SAÍDA", "AUTO", "AVISAR"])
+        self._table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.setFixedHeight(190)
+        self._table.setStyleSheet(
+            f"QTableWidget {{ background: #000d12; color: {C.TEXT}; "
+            f"border: 1px solid {C.BORDER}; gridline-color: {C.BORDER}; }}"
+            f"QHeaderView::section {{ background: #00091a; color: {C.PRI}; "
+            f"border: 0; padding: 3px; }}")
+        self._table.cellClicked.connect(self._select_row)
+        self._table.cellDoubleClicked.connect(lambda *_: self._edit_selected())
+        lay.addWidget(self._table)
+
+        row = QHBoxLayout()
+        for text, fn in (("NOVA CONTA", self._new),
+                         ("EDITAR", self._edit_selected),
+                         ("EXCLUIR", self._delete_selected),
+                         ("PAREAR / CONECTAR", self._pair_selected),
+                         ("ATUALIZAR", self._reload),
+                         ("FECHAR", self.hide)):
+            b = QPushButton(text); b.setStyleSheet(self._btn_style)
+            b.clicked.connect(fn); row.addWidget(b)
+        lay.addLayout(row)
+
+        self._status = self._label("", 8, color=C.TEXT_DIM)
+        lay.addWidget(self._status)
+        self._qr = QLabel()
+        self._qr.setFixedSize(210, 210)
+        self._qr.setStyleSheet(f"background: #000d12; border: 1px solid {C.BORDER};")
+        self._qr.hide()
+        lay.addWidget(self._qr, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        lay.addWidget(self._label("CHAT DIRETO DO DONO", 9, True))
+        self._owner_chat = self._line("ex.: 5511999999999")
+        lay.addWidget(self._owner_chat)
+        flags = QHBoxLayout()
+        self._owner_notify = QCheckBox("Mandar lembretes pelo WhatsApp")
+        self._media_download = QCheckBox("Baixar mídia recebida")
+        for cb in (self._owner_notify, self._media_download):
+            cb.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+            flags.addWidget(cb)
+        flags.addStretch(1)
+        save_general = QPushButton("SALVAR GERAL")
+        save_general.setStyleSheet(self._btn_style)
+        save_general.clicked.connect(self._save_general)
+        flags.addWidget(save_general)
+        lay.addLayout(flags)
+        lay.addStretch(1)
+        return page
+
+    def _build_form_page(self):
+        page = QWidget(); page.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(page); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(5)
+        lay.addWidget(self._label("CONTA", 9, True))
+        self._form_name = self._line("nome da conta, ex.: trabalho")
+        lay.addWidget(self._form_name)
+        self._form_auto = QCheckBox("Iniciar junto com o Jarvis")
+        self._form_notify = QCheckBox("Avisar novas mensagens em voz")
+        self._form_default = QCheckBox("Usar como conta de saída")
+        for cb in (self._form_auto, self._form_notify, self._form_default):
+            cb.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+            lay.addWidget(cb)
+        note = self._label(
+            "A conta nova fica sem pareamento até você clicar em "
+            "PAREAR / CONECTAR na lista.", 8, color=C.TEXT_DIM)
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        row = QHBoxLayout()
+        save = QPushButton("SALVAR"); save.setStyleSheet(self._btn_style)
+        save.clicked.connect(self._save)
+        cancel = QPushButton("CANCELAR"); cancel.setStyleSheet(self._btn_style)
+        cancel.clicked.connect(lambda: self._stack.setCurrentIndex(0))
+        row.addWidget(save); row.addWidget(cancel); row.addStretch(1)
+        lay.addLayout(row)
+        lay.addStretch(1)
+        return page
+
+    def _wa(self):
+        from core import whatsapp
+        return whatsapp
+
+    def _clean_name(self, value):
+        return str(value or "").strip()
+
+    def _reload(self):
+        try:
+            wa = self._wa()
+            self._accounts = wa.list_accounts()
+        except Exception as exc:
+            self._accounts = []
+            self._status.setText(f"Falha ao ler contas: {exc}")
+        self._table.setRowCount(0)
+        for acc in self._accounts:
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+            status = ("conectado" if acc.get("connected") else
+                      "pareado" if acc.get("paired") else "não pareado")
+            if acc.get("error"):
+                status += f" · {str(acc['error'])[:30]}"
+            values = [str(acc.get("name") or ""), str(acc.get("number") or ""),
+                      status, "sim" if acc.get("default") else "não",
+                      "sim" if acc.get("auto_start") else "não",
+                      "sim" if acc.get("notify") else "não"]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, acc.get("name"))
+                self._table.setItem(row, col, item)
+        try:
+            from memory.config_manager import get_plugin_setting
+            self._owner_chat.setText(str(
+                get_plugin_setting("whatsapp", "owner_chat", "") or ""))
+            self._owner_notify.setChecked(bool(
+                get_plugin_setting("whatsapp", "owner_notify", True)))
+            self._media_download.setChecked(bool(
+                get_plugin_setting("whatsapp", "media_download", True)))
+        except Exception:
+            pass
+        self._stack.setCurrentIndex(0)
+
+    def _select_row(self, row, _col):
+        item = self._table.item(row, 0)
+        if item is not None:
+            self._selected = str(item.data(Qt.ItemDataRole.UserRole) or "")
+
+    def _edit_selected(self):
+        if not self._selected:
+            self._status.setText("Selecione uma conta na lista.")
+            return
+        acc = next((a for a in self._accounts
+                    if str(a.get("name")) == self._selected), None)
+        if acc is None:
+            self._status.setText("Conta não encontrada; atualize a lista.")
+            return
+        self._form_name.setText(str(acc.get("name") or ""))
+        self._form_auto.setChecked(bool(acc.get("auto_start")))
+        self._form_notify.setChecked(bool(acc.get("notify")))
+        self._form_default.setChecked(bool(acc.get("default")))
+        self._stack.setCurrentIndex(1)
+
+    def _new(self):
+        self._selected = ""
+        self._form_name.clear()
+        self._form_auto.setChecked(True)
+        self._form_notify.setChecked(False)
+        self._form_default.setChecked(False)
+        self._stack.setCurrentIndex(1)
+        self._form_name.setFocus()
+
+    def _save(self):
+        name = self._clean_name(self._form_name.text())
+        if not name:
+            self._status.setText("Dê um nome à conta.")
+            return
+        wa = self._wa()
+        try:
+            if self._selected:
+                ok = wa.update_account(
+                    self._selected, new_name=name,
+                    auto_start=self._form_auto.isChecked(),
+                    notify=self._form_notify.isChecked(),
+                    default=self._form_default.isChecked())
+                if not ok:
+                    self._status.setText(
+                        "Não salvei: nome duplicado ou conta não encontrada.")
+                    return
+                self._selected = name
+            else:
+                wa.add_account(name)
+                wa.update_account(
+                    name, auto_start=self._form_auto.isChecked(),
+                    notify=self._form_notify.isChecked(),
+                    default=self._form_default.isChecked())
+        except Exception as exc:
+            self._status.setText(f"Falha ao salvar: {exc}")
+            return
+        self._status.setText(f"Conta {name} salva.")
+        self._reload()
+
+    def _delete_selected(self):
+        if not self._selected:
+            self._status.setText("Selecione uma conta para excluir.")
+            return
+        answer = QMessageBox.question(
+            self, "Excluir conta do WhatsApp",
+            f"Excluir a conta {self._selected}? A sessão, o inbox e a mídia "
+            "dessa conta serão apagados do disco. Se for a conta de saída, "
+            "outra será promovida.")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            ok = self._wa().remove_account(self._selected)
+        except Exception as exc:
+            self._status.setText(f"Falha ao excluir: {exc}")
+            return
+        self._status.setText("Conta excluída." if ok else "Conta não encontrada.")
+        self._selected = ""
+        self._qr.hide()
+        self._reload()
+
+    def _pair_selected(self):
+        if not self._selected:
+            self._status.setText("Selecione uma conta para parear.")
+            return
+        wa = self._wa()
+        if not wa.available():
+            self._status.setText("neonize não está instalado; não dá para parear.")
+            return
+        try:
+            ok, msg = wa.start(on_message=None, account=self._selected)
+        except Exception as exc:
+            self._status.setText(f"Falha ao conectar: {exc}")
+            return
+        self._status.setText(str(msg))
+        self._qr_timer.start(2000)
+        self._poll_pairing()
+
+    def _poll_pairing(self):
+        if not self._selected:
+            self._qr_timer.stop()
+            return
+        try:
+            st = self._wa().status(self._selected)
+        except Exception:
+            self._qr_timer.stop()
+            return
+        if st.get("error"):
+            self._status.setText(str(st["error"])[:160])
+        if st.get("connected"):
+            self._status.setText(
+                f"{self._selected} conectado"
+                + (f" · {st.get('number')}" if st.get("number") else ""))
+            self._qr.hide()
+            self._qr_timer.stop()
+            self._reload()
+            return
+        path = st.get("qr_path") or ""
+        if path and os.path.exists(path):
+            pm = QPixmap(path)
+            if not pm.isNull():
+                self._qr.setPixmap(pm.scaled(
+                    204, 204, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation))
+                self._qr.show()
+                self._status.setText("Escaneie o QR com o WhatsApp do celular.")
+
+    def _save_general(self):
+        try:
+            from memory.config_manager import save_plugin_config
+            save_plugin_config("whatsapp", {
+                "owner_chat": self._owner_chat.text().strip(),
+                "owner_notify": self._owner_notify.isChecked(),
+                "media_download": self._media_download.isChecked(),
+            })
+            self._status.setText("Configuração geral do WhatsApp salva.")
+        except Exception as exc:
+            self._status.setText(f"Falha ao salvar: {exc}")
+
+
 class PersonaOverlay(QWidget):
     """Cadastro de personas: voz, modelo, skills, stacks e WhatsApp próprio."""
 
@@ -3047,18 +3370,39 @@ class PersonaOverlay(QWidget):
         sep.setStyleSheet(f"color: {C.BORDER};")
         root.addWidget(sep)
 
-        top = QHBoxLayout()
-        top.addWidget(self._label("PERSONA", 8, color=C.TEXT_DIM))
+        # A hidden data source keeps the existing load/save helpers simple; the
+        # visible list is the table below.
         self._select = QComboBox()
-        self._select.setStyleSheet(self._combo_style)
-        self._select.setFixedHeight(30)
+        self._select.hide()
         self._select.currentIndexChanged.connect(self._load_selected)
-        top.addWidget(self._select, 1)
-        new_btn = QPushButton("NOVA")
-        new_btn.setStyleSheet(self._btn_style)
-        new_btn.clicked.connect(self._new)
-        top.addWidget(new_btn)
-        root.addLayout(top)
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(
+            ["NOME", "MODELO", "WHATSAPP", "STACKS"])
+        self._table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.setFixedHeight(150)
+        self._table.setStyleSheet(
+            f"QTableWidget {{ background: #000d12; color: {C.TEXT}; "
+            f"border: 1px solid {C.BORDER}; gridline-color: {C.BORDER}; }}"
+            f"QHeaderView::section {{ background: #00091a; color: {C.PRI}; "
+            f"border: 0; padding: 3px; }}")
+        self._table.cellClicked.connect(self._table_clicked)
+        root.addWidget(self._table)
+        btns = QHBoxLayout()
+        for text, fn in (("NOVA", self._new),
+                         ("ATUALIZAR", self._reload),
+                         ("EXCLUIR", self._retire),
+                         ("FECHAR", self.hide)):
+            b = QPushButton(text)
+            b.setStyleSheet(self._btn_style)
+            b.clicked.connect(fn)
+            btns.addWidget(b)
+        root.addLayout(btns)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -3115,7 +3459,7 @@ class PersonaOverlay(QWidget):
         save.setStyleSheet(self._btn_style)
         save.clicked.connect(self._save)
         row.addWidget(save)
-        retire = QPushButton("APOSENTAR")
+        retire = QPushButton("EXCLUIR")
         retire.setStyleSheet(self._btn_style)
         retire.clicked.connect(self._retire)
         row.addWidget(retire)
@@ -3187,20 +3531,49 @@ class PersonaOverlay(QWidget):
         self._select.blockSignals(True)
         self._select.clear()
         self._select.addItem("— nova persona —", "")
+        rows = []
         try:
-            for persona in store.list_personas():
-                wa = persona.get("whatsapp_account") or "principal"
-                self._select.addItem(
-                    f"{persona.get('name')}  ·  {wa}", persona.get("id"))
+            rows = store.list_personas()
         except Exception as exc:
             self._status.setText(f"Falha ao ler personas: {exc}")
+        for persona in rows:
+            wa = persona.get("whatsapp_account") or "principal"
+            self._select.addItem(
+                f"{persona.get('name')}  ·  {wa}", persona.get("id"))
         self._select.blockSignals(False)
+        self._table.setRowCount(0)
+        for persona in rows:
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+            values = [
+                str(persona.get("name") or ""),
+                str(persona.get("model") or ""),
+                str(persona.get("whatsapp_account") or "principal"),
+                ", ".join(persona.get("stacks") or []),
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, persona.get("id"))
+                self._table.setItem(row, col, item)
         self._new()
+
+    def _table_clicked(self, row: int, _col: int) -> None:
+        item = self._table.item(row, 0)
+        if item is None:
+            return
+        pid = item.data(Qt.ItemDataRole.UserRole)
+        idx = self._select.findData(pid)
+        if idx >= 0:
+            self._select.setCurrentIndex(idx)
+            self._load_selected()
 
     def _new(self):
         self._select.blockSignals(True)
         self._select.setCurrentIndex(0)
         self._select.blockSignals(False)
+        if hasattr(self, "_table"):
+            self._table.clearSelection()
         self._name.clear(); self._voice.clear(); self._personality.clear()
         self._skills.clear(); self._stacks.clear(); self._context.setText("200000")
         self._gender.setCurrentIndex(0)
@@ -3298,17 +3671,19 @@ class PersonaOverlay(QWidget):
             self._status.setText("Selecione uma persona para aposentar.")
             return
         answer = QMessageBox.question(
-            self, "Aposentar persona",
-            "Aposentar esta persona? O nome entra no histórico e ela deixa de "
-            "atender, mas o registro é mantido.")
+            self, "Excluir persona",
+            "Excluir esta persona da lista? O histórico de nomes e o registro "
+            "de aposentadoria são preservados.")
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
             ok = self._persona_store().delete(pid)
         except Exception as exc:
-            self._status.setText(f"Falha ao aposentar: {exc}")
+            self._status.setText(f"Falha ao excluir: {exc}")
             return
-        self._status.setText("Persona aposentada." if ok else "Persona não encontrada.")
+        self._status.setText(
+            "Persona excluída da lista (histórico preservado)." if ok
+            else "Persona não encontrada.")
         self._reload()
 
 
@@ -7077,20 +7452,10 @@ class MainWindow(QMainWindow):
         self._plugin_settings_overlay = ov   # keep a reference so it isn't GC'd
 
     def _open_whatsapp_settings(self):
-        sections = self.get_plugin_settings() if self.get_plugin_settings else []
-        sections = [s for s in sections
-                    if (s.get("namespace") or "").lower() == "whatsapp"]
         cw = self.centralWidget()
-        if not sections:
-            QMessageBox.warning(
-                cw, "WhatsApp",
-                "O plugin WHATSAPP não carregou. Confira os logs do app e "
-                "reinicia depois de corrigir o plugin.")
-            return
-        ov = PluginSettingsOverlay(
-            sections, parent=cw, title="📱  WHATSAPP")
-        ow = PluginSettingsOverlay._OW
-        oh = min(600, cw.height() - 16)
+        ov = WhatsAppOverlay(parent=cw)
+        ow = WhatsAppOverlay._OW
+        oh = min(720, cw.height() - 16)
         ov.setGeometry((cw.width() - ow) // 2,
                        (cw.height() - oh) // 2, ow, oh)
         ov.show()
