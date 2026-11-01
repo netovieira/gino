@@ -126,6 +126,13 @@ class DirectChatTests(WatcherHarness):
         super().setUp()
         whatsapp_watch.set_direct_chat(ACCOUNT, CHAT)
         self.addCleanup(whatsapp_watch.set_direct_chat, "", "")
+        # The owner's real config may select another outbound account; the
+        # test pins the account it configured.
+        acct = mock.patch(
+            "core.whatsapp_watch.whatsapp.default_account_name",
+            return_value=ACCOUNT)
+        acct.start()
+        self.addCleanup(acct.stop)
 
     def test_direct_chat_does_not_need_the_name(self):
         self.assertTrue(whatsapp_watch.handle(
