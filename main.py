@@ -80,6 +80,7 @@ from core import tool_bridge as _tool_bridge
 from core import speaker_id as _speaker_id
 from core import chat_memory as _chat_memory
 from core import personas as _personas
+from core import memory_index as _memory_index
 from core import health as _health
 from core import memory_librarian as _memory_librarian
 from core import metrics as _metrics
@@ -2869,6 +2870,7 @@ class JarvisLive:
         if direct:
             epoch = self._begin_user_epoch()
             self._memory_record_user(text)
+            self._index_event("user", text, source="whatsapp")
             self._last_user_speech = time.monotonic()
             try:
                 self.ui.write_log(f"WHATSAPP YOU: {text[:300]}")
@@ -2893,6 +2895,7 @@ class JarvisLive:
                 if self._chat_memory is not None:
                     self._chat_memory.append_turn(
                         "system", f"[WhatsApp de {who}] {text[:500]}")
+                self._index_event("user", text, source="whatsapp")
             except Exception:
                 pass
             try:
@@ -3221,6 +3224,12 @@ class JarvisLive:
             _health.set_component("memory", False, str(e)[:160])
             print(f"[QoderLive] chat memory disabled: {e}")
 
+        try:
+            threading.Thread(target=self._prepare_obsidian_vault,
+                             daemon=True, name="obsidian-vault").start()
+        except Exception as e:
+            print(f"[Obsidian] vault start failed: {e}")
+
         if (self._chat_memory is not None
                 and bool(cfg.get("memory_librarian_enabled", True))):
             try:
@@ -3408,6 +3417,16 @@ class JarvisLive:
         self._save_qoder_session(session_id)
         print(f"[QoderLive] sessão contínua: {session_id}")
 
+    def _prepare_obsidian_vault(self) -> None:
+        """Create ~/Jarvis and mirror the Qoder plans for Obsidian."""
+        try:
+            from core import obsidian as _obsidian
+            _obsidian.ensure_vault()
+            plans = _obsidian.mirror_plans()
+            print(f"[Obsidian] cofre pronto; {len(plans)} plano(s) espelhado(s)")
+        except Exception as e:
+            print(f"[Obsidian] cofre indisponível: {e}")
+
     def _write_qoder_system_prompt(self) -> None:
         """Freeze the current memory snapshot for the next session start."""
         system_file = BASE_DIR / "memory" / "chat" / "qoder_live_system.txt"
@@ -3456,6 +3475,26 @@ class JarvisLive:
         except Exception as e:
             print(f"[Librarian] subject epoch: {e}")
             return {}
+
+    def _current_subject(self) -> str:
+        try:
+            return self._chat_memory.current_topic() if self._chat_memory else ""
+        except Exception:
+            return ""
+
+    def _index_event(self, kind: str, text: str, persona=None, project=None,
+                     source: str = "voice", subject=None) -> None:
+        """Feed the spider index without ever breaking the conversation."""
+        try:
+            active = _memory_index.active()
+            _memory_index.record_event(
+                kind, text, persona=persona,
+                project=project or active.get("project") or None,
+                subject=subject or active.get("subject") or self._current_subject() or None,
+                source=source,
+            )
+        except Exception as e:
+            print(f"[MemoryIndex] event: {e}")
 
     def _memory_idle(self) -> bool:
         return (not bool(getattr(self, "_is_speaking", False))
@@ -3931,6 +3970,8 @@ class JarvisLive:
                             "assistant", f"[{name}] {full[:800]}")
                 except Exception as e:
                     print(f"[Persona] memory note: {e}")
+                self._index_event("assistant", full, persona=slug,
+                                  source="persona")
             try:
                 self.ui.write_log(f"SYS: {name} concluiu.")
             except Exception:
@@ -4030,6 +4071,7 @@ class JarvisLive:
                         self._chat_memory.append_turn("assistant", full)
                 except Exception as e:
                     print(f"[QoderLive] memory whatsapp turn: {e}")
+                self._index_event("assistant", full, source="whatsapp")
             self._qoder_finish(turn_id)
             _metrics.inc("qoder.done")
             if self._memory_librarian is not None:
@@ -4058,6 +4100,7 @@ class JarvisLive:
                     self._chat_memory.append_turn("assistant", full)
             except Exception as e:
                 print(f"[QoderLive] memory assistant turn: {e}")
+            self._index_event("assistant", full, source="voice")
         self._qoder_finish(turn_id)
         _metrics.inc("qoder.done")
         if self._memory_librarian is not None:
@@ -5062,6 +5105,7 @@ class JarvisLive:
                 pass
             _epoch = self._begin_user_epoch()
             self._memory_record_user(text)
+            self._index_event("user", text, source="typed")
             self._last_user_speech = time.monotonic()
             if self._qoder_live_ready():
                 self._qoder_turn(text, epoch=_epoch)
@@ -5625,6 +5669,7 @@ class JarvisLive:
         # recording the turn; reminders and status turns never reach here.
         _epoch = self._begin_user_epoch()
         self._memory_record_user(text)
+        self._index_event("user", text, source="voice")
         if _ACTION_REQUEST_RE.search(text):
             # The owner's own request is the authorization; no second prompt.
             secs = _actiongate.open_window()

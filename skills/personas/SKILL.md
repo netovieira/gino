@@ -28,5 +28,6 @@ description: Como criar, escolher e moderar personas especialistas (Fulana do fr
 
 ## Contexto
 - Cada persona tem histórico separado; a memória de projeto/decisões é compartilhada. Grave no máximo um resumo curto do resultado (`[Fulana] ...`), nunca o transcript inteiro.
+- Depois de uma persona trabalhar, marque a teia com `memory_index action=tag persona=<slug> project=<projeto> subject=<assunto>` para cruzar quem cuidou do quê.
 - Personas são consultoras: só leem e usam memória. Execução/escrita continua com o subagente do principal, com autorização.
 - **Toda resposta de persona é falada** na voz dela: 1-4 frases, sem markdown, sem blocos de código, sem JSON/logs/caminhos longos. Nunca narre código linha a linha; resuma o que ele faz e ofereça o trecho em texto/arquivo.

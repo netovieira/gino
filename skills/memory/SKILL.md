@@ -17,3 +17,5 @@ Regras:
 - Grave decisões, preferências e threads abertas com `memory_note`, sem narrar a gravação.
 - Quando o dono disser "encerra esse assunto" ou "muda de assunto", trate como fechamento do tópico atual.
 - Um resumo não substitui o registro exato: detalhes vivem em `hours/`, `days/` e `topics/`.
+- **Teia de índices**: use `memory_index action=query` para cruzar assunto, hora, persona e projeto ("o que a Fulana fez no projeto X?", "o que aconteceu no assunto Y?"). Use `action=tag` ao começar um projeto/assunto para os próximos turnos herdarem o foco, e `action=open` para abrir a teia no Obsidian. `action=link` liga dois nós quando a relação não for óbvia.
+- Ao responder "quem cuidou disso" ou "quando foi", consulte a teia antes de inventar; se não houver registro, diga que não lembra.
