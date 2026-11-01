@@ -3395,6 +3395,7 @@ class PersonaOverlay(QWidget):
         root.addWidget(self._table)
         btns = QHBoxLayout()
         for text, fn in (("NOVA", self._new),
+                         ("EDITAR", self._load_selected),
                          ("ATUALIZAR", self._reload),
                          ("EXCLUIR", self._retire),
                          ("FECHAR", self.hide)):
