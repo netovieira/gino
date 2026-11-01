@@ -140,6 +140,27 @@ class _Account:
 
 _accounts: dict[str, _Account] = {}
 
+# Observadores de TODAS as contas. Diferente do sink (`on_message`), que é por
+# conta e substituído a cada start(), estes vivem no processo inteiro — é o que
+# o monitoramento autônomo usa para seguir vendo mensagens mesmo quando uma
+# conta é reconectada ou pareada depois do boot.
+_watchers: list = []
+
+
+def add_watcher(callback) -> None:
+    """Chama `callback(account_name, item)` a cada mensagem de qualquer conta."""
+    with _lock:
+        if callback not in _watchers:
+            _watchers.append(callback)
+
+
+def remove_watcher(callback) -> None:
+    with _lock:
+        try:
+            _watchers.remove(callback)
+        except ValueError:
+            pass
+
 
 # ── contas: carregar, listar, adicionar, remover ─────────────────────────────
 
@@ -178,8 +199,45 @@ def _ensure_accounts() -> None:
     for entry in _load_accounts_from_config():
         a = _entry_to_account(entry)
         _accounts[a.uuid] = a
+    # The settings check is authoritative: it may have changed after the
+    # accounts list was last written by pair/remove.
+    try:
+        from memory.config_manager import get_plugin_setting
+        chosen = str(get_plugin_setting(NS, "default_account", "") or "").strip()
+    except Exception:
+        chosen = ""
+    if chosen:
+        key = chosen.lower()
+        for a in _accounts.values():
+            if a.uuid.lower() == key or a.name.lower() == key:
+                for other in _accounts.values():
+                    other.default = other is a
+                break
     if _accounts and not any(a.default for a in _accounts.values()):
         next(iter(_accounts.values())).default = True
+
+
+def default_account_name() -> str:
+    """The account the assistant uses when the user did not name one.
+
+    The settings check (plugin_config.whatsapp.default_account) wins; the
+    per-account ``default`` flag is the fallback for older configs.
+    """
+    _ensure_accounts()
+    try:
+        from memory.config_manager import get_plugin_setting
+        chosen = str(get_plugin_setting(NS, "default_account", "") or "").strip()
+    except Exception:
+        chosen = ""
+    if chosen:
+        key = chosen.lower()
+        for a in _accounts.values():
+            if a.uuid.lower() == key or a.name.lower() == key:
+                return a.name
+    for a in _accounts.values():
+        if a.default:
+            return a.name
+    return ""
 
 
 def _save_accounts() -> None:
@@ -255,14 +313,20 @@ def remove_account(name_or_uuid: str) -> bool:
 
 def set_default_account(name_or_uuid: str) -> bool:
     key = str(name_or_uuid or "").strip().lower()
-    found = False
+    found = None
     for a in _accounts.values():
         hit = a.uuid.lower() == key or a.name.lower() == key
         a.default = hit
-        found = found or hit
-    if found:
+        if hit:
+            found = a
+    if found is not None:
         _save_accounts()
-    return found
+        try:
+            from memory.config_manager import save_plugin_config
+            save_plugin_config(NS, {"default_account": found.name})
+        except Exception as e:
+            _log(f"não consegui salvar a conta de saída: {e}")
+    return found is not None
 
 
 def _A(account: str | None = None) -> _Account:
@@ -278,6 +342,11 @@ def _A(account: str | None = None) -> _Account:
         _accounts[a.uuid] = a
         return a
     if account is None or str(account).strip() == "":
+        chosen = default_account_name()
+        if chosen:
+            for a in _accounts.values():
+                if a.name == chosen:
+                    return a
         for a in _accounts.values():
             if a.default:
                 return a
@@ -1096,6 +1165,12 @@ def _on_message(client, ev, acct: _Account) -> None:
                 cb(item)
             except Exception as e:
                 _log(f"o aviso de mensagem nova falhou: {e}")
+
+        for watcher in list(_watchers):
+            try:
+                watcher(acct.name, item)
+            except Exception as e:
+                _log(f"[{acct.name}] observador de mensagens falhou: {e}")
     except Exception as e:
         _log(f"[{acct.name}] mensagem ilegível: {e}")
 

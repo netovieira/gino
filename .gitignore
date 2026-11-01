@@ -31,6 +31,8 @@ memory/voices/
 memory/*.db
 # WhatsApp messages it kept (the session itself lives in config/whatsapp_web/):
 memory/whatsapp_inbox.jsonl
+memory/whatsapp_inbox_*.jsonl
+memory/email_otp_seen.json
 # Attachments received on WhatsApp (photos, voice notes, documents):
 memory/whatsapp_media/
 # Screenshots captured from the Mac and voice samples of the owner:

@@ -531,8 +531,8 @@ class LifecycleTests(unittest.TestCase):
 
 class VoiceConfirmTests(unittest.TestCase):
     """The bridge confirm channel is the voice window in core/actiongate.py:
-    only a spoken consent opens it, it authorises exactly one action, and the
-    root (sudo) window never bleeds into it."""
+    only a spoken consent opens it, the 120 s deadline (not a use count) closes
+    it, and the root (sudo) window never bleeds into it."""
 
     def setUp(self):
         actiongate.close()
@@ -568,14 +568,50 @@ class VoiceConfirmTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.dispatch.calls[0][0], "send_message")
 
-    def test_window_is_consumed_by_the_first_action(self):
+    def test_window_stays_open_for_the_whole_deadline(self):
         actiongate.open_window()
         response = self._send()
         self.assertEqual(response.status_code, 200, response.text)
-        # A second risky action needs a new spoken consent.
+        # Closing the window is the deadline's job, not the first action's.
         response = self._send()
-        self.assertEqual(response.status_code, 403, response.text)
-        self.assertEqual(len(self.dispatch.calls), 1)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.dispatch.calls), 2)
+
+    def test_handler_asking_for_a_missing_argument_does_not_spend_the_window(self):
+        # The live failure of 31/10: the window was consumed by a call the
+        # handler aborted asking "para quem?", so the retry with the contact
+        # was refused with 403.
+        calls = []
+
+        def dispatch(name, args):
+            calls.append((name, dict(args)))
+            if not args.get("to"):
+                return "para quem? diga o nome do contato ou o número"
+            return f"enviado para {args['to']}"
+
+        bridge = make_bridge(registry=self.registry, dispatch=dispatch,
+                             confirm=actiongate.confirm)
+        client = TestClient(bridge.app)
+        self.addCleanup(client.close)
+
+        actiongate.open_window()
+        first = client.post(
+            "/call", headers=AUTH,
+            json={"name": "whatsapp_control",
+                  "args": {"action": "send", "text": "oi"}},
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertIn("para quem?", first.json()["result"])
+        self.assertTrue(actiongate.authorized())   # the abort did not spend it
+
+        second = client.post(
+            "/call", headers=AUTH,
+            json={"name": "whatsapp_control",
+                  "args": {"action": "send", "to": "Vida", "text": "oi"}},
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json()["result"], "enviado para Vida")
+        self.assertEqual(calls[-1][1]["to"], "Vida")
 
     def test_consent_without_pending_matches_nothing_and_window_stays_closed(self):
         self.assertFalse(actiongate.has_pending())

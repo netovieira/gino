@@ -45,6 +45,13 @@ def _ambiguous(account: str) -> str | None:
     names = [a["name"] for a in accts]
     if account and account.lower() in [n.lower() for n in names]:
         return None
+    # A conta de saída escolhida no check é aplicada sem perguntar. Perguntar
+    # só quando o usuário tem várias e nenhuma foi definida.
+    try:
+        if whatsapp.default_account_name():
+            return None
+    except Exception:
+        pass
     return ("você tem mais de um WhatsApp pareado: " + ", ".join(names)
             + ". Qual eu uso?")
 
@@ -444,8 +451,16 @@ PLUGIN_SETTINGS = {
     "namespace": NS,
     "title": "WHATSAPP (seu número, via QR)",
     "fields": [
-        {"key": "default_account", "label": "Conta default (a que ele usa sem você nomear)",
+        {"key": "default_account",
+         "label": "Conta de saída (respostas ao dono, lembretes e envios sem conta)",
          "type": "choice", "options": _account_choices(), "default": "principal"},
+        {"key": "owner_chat",
+         "label": "Seu número/JID no WhatsApp do Gino (chat direto)",
+         "type": "text", "default": "",
+         "placeholder": "ex.: 5511999999999"},
+        {"key": "owner_notify",
+         "label": "Mandar lembretes também pelo WhatsApp",
+         "type": "toggle", "default": True},
         {"key": "media_download", "label": "Baixar a mídia que chegar",
          "type": "toggle", "default": True},
     ],

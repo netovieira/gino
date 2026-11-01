@@ -237,6 +237,12 @@ class ToolBridge:
     confirm:
         ``confirm(title, message) -> bool``. When None, medium/high calls are
         refused with HTTP 409 ``confirmation_required``.
+    preauthorize:
+        Optional ``preauthorize(name, args) -> bool``. Checked before the
+        confirmation gate for medium/high calls; True means a separate, narrow
+        grant already authorises this exact call (the autonomous WhatsApp
+        reply in core/actiongate.py). Exceptions count as False, so a broken
+        hook never approves anything.
     memory / voice / restart / local_ask:
         Optional delegated components. Each may be an object exposing methods
         or a dict of callables. When absent the endpoint answers HTTP 501.
@@ -248,7 +254,7 @@ class ToolBridge:
                  port: int = 8011, confirm=None, logger: Callable[[str], None] = print,
                  audit_path=None, memory=None, voice=None, restart=None,
                  local_ask=None, start_task=None,
-                 timeout: float = _DEFAULT_TIMEOUT):
+                 timeout: float = _DEFAULT_TIMEOUT, preauthorize=None):
         if not isinstance(token, str) or not token:
             raise ValueError("ToolBridge requires a non-empty bearer token")
         self._registry = registry
@@ -258,6 +264,7 @@ class ToolBridge:
         self._requested_port = int(port)
         self._port = int(port)
         self._confirm = confirm
+        self._preauthorize = preauthorize
         self._log_fn = logger or (lambda _msg: None)
         self._audit_path = Path(audit_path) if audit_path else None
         self._memory = memory
@@ -457,44 +464,45 @@ class ToolBridge:
 
         approved = True
         if tier in (TIER_MEDIUM, TIER_HIGH):
-            if self._confirm is None:
-                message = (
-                    f"Action '{name}' needs confirmation (risk: {tier}), but no "
-                    f"confirmation channel is bound to the bridge."
-                )
-                self._audit_action(name, args, tier, approved=False,
-                                   result=message, status="confirmation_required")
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "status": "confirmation_required",
-                        "action": name,
-                        "tier": tier,
-                        "message": message,
-                    },
-                )
+            if not self._preauthorized(name, args):
+                if self._confirm is None:
+                    message = (
+                        f"Action '{name}' needs confirmation (risk: {tier}), but no "
+                        f"confirmation channel is bound to the bridge."
+                    )
+                    self._audit_action(name, args, tier, approved=False,
+                                       result=message, status="confirmation_required")
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "status": "confirmation_required",
+                            "action": name,
+                            "tier": tier,
+                            "message": message,
+                        },
+                    )
 
-            title = f"Confirm '{name}'"
-            message = f"Risk: {tier}. Arguments: {summarize(redact_args(args), 300)}"
-            approved = await self._run_confirm(title, message)
-            if isinstance(approved, JSONResponse):
-                confirm_status = ("timeout" if approved.status_code == 504 else "error")
-                self._audit_action(name, args, tier, approved=False,
-                                   result=approved.body.decode("utf-8", "replace")
-                                   if isinstance(approved.body, bytes) else str(approved.body),
-                                   status=confirm_status)
-                return approved
-            if not approved:
-                message = (f"Action '{name}' was not authorized by the owner's "
-                           f"voice yet. Ask the owner to say 'pode' or 'pode "
-                           f"enviar' out loud; there is no popup to click.")
-                self._audit_action(name, args, tier, approved=False,
-                                   result=message, status="denied")
-                return JSONResponse(
-                    status_code=403,
-                    content={"status": "denied", "action": name,
-                             "tier": tier, "message": message},
-                )
+                title = f"Confirm '{name}'"
+                message = f"Risk: {tier}. Arguments: {summarize(redact_args(args), 300)}"
+                approved = await self._run_confirm(title, message)
+                if isinstance(approved, JSONResponse):
+                    confirm_status = ("timeout" if approved.status_code == 504 else "error")
+                    self._audit_action(name, args, tier, approved=False,
+                                       result=approved.body.decode("utf-8", "replace")
+                                       if isinstance(approved.body, bytes) else str(approved.body),
+                                       status=confirm_status)
+                    return approved
+                if not approved:
+                    message = (f"Action '{name}' was not authorized by the owner's "
+                               f"voice yet. Ask the owner to say 'pode' or 'pode "
+                               f"enviar' out loud; there is no popup to click.")
+                    self._audit_action(name, args, tier, approved=False,
+                                       result=message, status="denied")
+                    return JSONResponse(
+                        status_code=403,
+                        content={"status": "denied", "action": name,
+                                 "tier": tier, "message": message},
+                    )
 
         executor = self._executor()
         if executor is None:
@@ -532,6 +540,19 @@ class ToolBridge:
         self._audit_action(name, args, tier, approved=approved, result=text, status="ok")
         return {"status": "ok", "action": name, "tier": tier,
                 "approved": True, "result": text}
+
+    def _preauthorized(self, name: str, args: dict) -> bool:
+        """True when a separate, narrow grant already authorises this exact call."""
+        if self._preauthorize is None:
+            return False
+        try:
+            granted = bool(self._preauthorize(name, args))
+        except Exception as exc:
+            self._log(f"[ToolBridge] preauthorization for '{name}' failed: {exc}")
+            return False
+        if granted:
+            self._log(f"[ToolBridge] '{name}' authorized by a narrow grant")
+        return granted
 
     def _executor(self) -> Optional[Callable[..., Any]]:
         if self._dispatch is not None:
