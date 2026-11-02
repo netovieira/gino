@@ -90,7 +90,10 @@ screenshots/
 # ── Dados de uso criados em tempo de execução (fork João Gabriel) ─────────────
 memory/organizer.json
 memory/usage.json
+memory/series_mode.json
 memory/briefing_state.json
+memory/comm_review_state.json
+memory/restart_last.json
 memory/music_cache/
 *.lnk
 models/

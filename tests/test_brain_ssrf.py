@@ -57,7 +57,7 @@ class SafeBaseUrlTest(unittest.TestCase):
     def test_chat_once_rejects_internal_base(self):
         with self.assertRaises(RuntimeError):
             brain._chat_once([], None,
-                             {"provider": "custom",
+                             {"provider": "deepseek",
                               "base_url": "http://169.254.169.254/v1"},
                              {})
 

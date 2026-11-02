@@ -15,8 +15,9 @@ Ações expostas ao cérebro:
     status     — está plugado? pareado? iOS/modelo/número de série
     info       — dump completo do DeviceInfo em chave=valor
     pair       — dispara o pareamento; o iPhone mostra o diálogo "Confiar?"
-    screenshot — captura a tela; se houver visão local (qwen2.5vl) ligada,
-                 descreve o que vê. Aceita `query` para perguntar algo específico
+    screenshot — captura a tela; se a visão estiver ligada, descreve o que vê
+                 (Qoder com a imagem anexada por padrão). Aceita `query` para
+                 perguntar algo específico
     logs       — últimas N linhas do syslog em tempo real (aceita `query`
                  como filtro por substring, case-insensitive)
     crashes    — baixa os crash reports para memory/iphone/crashes/ e lista
@@ -205,23 +206,23 @@ def _do_screenshot(query: str) -> tuple[str, str]:
     if not query:
         return (f"tirei a screenshot da tela do iPhone e salvei em {path.name}",
                 body)
-    # Vision local igual ao computer_control.screen_find — a imagem NUNCA sai
-    # da máquina, e se o VL não estiver disponível o usuário ainda recebe o
-    # caminho do arquivo.
+    # Mesmo caminho do computer_control.screen_find: a visão configurada
+    # descreve o PNG (Qoder com a imagem anexada, por padrão); se ela estiver
+    # desligada ou falhar, o usuário ainda recebe o caminho do arquivo.
     try:
         from core import brain as _b
         from memory.config_manager import get_plugin_config
         st = _b.settings(get_plugin_config)
-        if not st.get("vision_local", st.get("provider") == "custom"):
-            return (f"screenshot salva em {path.name} (visão local disponível "
-                    "só quando o cérebro é o Ollama)", body)
+        if not st.get("vision_enabled", True):
+            return (f"screenshot salva em {path.name} (visão desligada — "
+                    "ligue em ECONOMY BRAIN → Vision provider)", body)
         data = path.read_bytes()
         q = (f"{query}\n\nResponda em português, em uma frase curta, com o que "
              "você REALMENTE vê nesta imagem; se não tiver certeza, diz que não "
              "conseguiu ler.")
         desc = _b.vision_describe(data, "image/png", q, st) or ""
     except Exception as e:
-        return (f"screenshot salva em {path.name} mas a visão local falhou: {e}",
+        return (f"screenshot salva em {path.name} mas a visão falhou: {e}",
                 f"{body}\nvision error: {e}")
     if not desc:
         return (f"screenshot salva em {path.name}, o modelo de visão não respondeu",

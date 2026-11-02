@@ -3,9 +3,13 @@
 O QUE É UM GATILHO
     Uma mensagem NOVA (no máximo MAX_AGE_S de idade — o HistorySync reenvia
     meses de conversa e nada disso é "nova"), em chat INDIVIDUAL (grupo nunca),
-    que não é do próprio dono nem uma resposta do assistente (`from_me`), e
-    cujo texto contém a palavra "Gino", sem diferenciar maiúsculas. Basta o
-    primeiro "oi Gino" para o assistente responder sem pedir confirmação.
+    cujo texto contém o nome atual do assistente, sem diferenciar maiúsculas.
+    Duas exceções, ambas no chat DIRETO do dono (o número dele ou o número
+    pareado da própria conta): qualquer mensagem vale, sem exigir o nome — e
+    inclusive com `from_me=True`, porque o dono escrevendo do celular chega
+    como evento do próprio aparelho. Fora do chat direto, `from_me` continua
+    sendo resposta própria e é ignorado; o eco de um envio DESTE processo é
+    reconhecido pelo ID e descartado (anti-laço).
 
 DEDUPE E LIMITE
     Cada id de mensagem aceito é lembrado uma única vez: o mesmo evento pode
@@ -18,10 +22,14 @@ DEDUPE E LIMITE
 COMO A RESPOSTA ACONTECE
     `start(handler)` registra o observador em core/whatsapp.py, que entrega
     mensagens de TODAS as contas pareadas (`callback(account_name, item)`).
-    Antes de chamar o handler, este módulo estaciona em core/actiongate.py uma
-    autorização presa àquela conta+contato: só o whatsapp_control action=send
-    para a mesma conversa passa pelo gate de voz. Qualquer outra ação — e
-    qualquer outro contato — continua esperando o "pode" do dono.
+    A resposta é enviada pelo próprio WhatsApp (texto→texto, áudio→áudio no
+    chat direto do dono) e nunca pelo alto-falante da sala: o aviso falado de
+    "mensagem nova" é suprimido nesse chat para o mesmo pedido não ganhar duas
+    respostas. Antes de chamar o handler, este módulo estaciona em
+    core/actiongate.py uma autorização presa àquela conta+contato: só o
+    whatsapp_control action=send para a mesma conversa passa pelo gate de voz.
+    Qualquer outra ação — e qualquer outro contato — continua esperando o
+    "pode" do dono.
 
 CÓDIGOS DE VERIFICAÇÃO
     Em chat individual, uma mensagem que é claramente um OTP (ver
@@ -105,6 +113,12 @@ def trigger_name() -> str:
     return _trigger_name
 
 
+def armed() -> bool:
+    """Há um handler autônomo ligado? (o turno do chat direto vai existir)"""
+    with _lock:
+        return _handler is not None
+
+
 def matches(text: object) -> bool:
     """O texto chama o assistente pelo nome atual? Palavra/frase inteira."""
     trigger = _trigger_norm
@@ -112,6 +126,28 @@ def matches(text: object) -> bool:
         return False
     body = _norm_words(text)
     return f" {trigger} " in f" {body} "
+
+
+def _same_chat(a: object, b: object) -> bool:
+    """Mesmo chat escrito de dois jeitos ("+55 17 9..." vs "5517...").
+
+    A comparação normalizada cobre nome/rótulo; a de dígitos cobre o JID do
+    WhatsApp, que chega sem "+" e sem pontuação.
+    """
+    if not str(a or "").strip() or not str(b or "").strip():
+        return False
+    if _norm_words(a) == _norm_words(b):
+        return True
+    da, db = _digits(a), _digits(b)
+    return bool(da and db and da == db)
+
+
+def _account_number(account: str) -> str:
+    """O número pareado da conta que recebeu o evento ('' se desconhecido)."""
+    try:
+        return _digits(whatsapp.account_number(account))
+    except Exception:
+        return ""
 
 
 def _is_direct(account: str, item: dict) -> bool:
@@ -128,14 +164,21 @@ def _is_direct(account: str, item: dict) -> bool:
                          or _direct_chat)
     except Exception:
         selected, owner_chat = _direct_account, _direct_chat
-    if not selected or not owner_chat:
-        return False
-    if account.lower() != selected.lower():
-        return False
-    if _norm_words(chat) == _norm_words(owner_chat):
+
+    # (1) Chat do próprio número pareado. É aqui que o dono escreve do celular
+    # ("mensagem para você mesmo"/chat direto da conta): o outro lado do chat é
+    # o número DESTA conta, e isso vale mesmo com owner_chat vazio.
+    own = _account_number(account)
+    if own and _same_chat(chat, own):
         return True
-    a, b = _digits(chat), _digits(owner_chat)
-    return bool(a and b and a == b)
+
+    # (2) O dono escrevendo para o número de saída do assistente (a conta
+    # configurada como default). O `owner_chat` é o número do dono.
+    if not owner_chat:
+        return False
+    if selected and account.lower() != selected.lower():
+        return False
+    return _same_chat(chat, owner_chat)
 
 
 def _is_own_account(chat: object) -> bool:
@@ -222,17 +265,35 @@ def _fresh(item: dict) -> bool:
 
 
 def is_candidate(item: dict, account: str = "") -> bool:
-    """Nova, individual, de outra pessoa; nome atual ou chat direto do dono."""
+    """Nova, individual, do dono no chat direto ou nomeando o assistente.
+
+    Mensagem do dono vinda do celular chega com ``from_me=True`` (é um aparelho
+    pareado da MESMA conta). No chat direto ela é conversa com o assistente e
+    precisa contar como turno; fora dele ``from_me`` continua sendo resposta
+    própria e nunca vira gatilho.
+    """
     if not isinstance(item, dict):
         return False
-    if item.get("from_me") or item.get("group"):
+    if item.get("group"):
         return False
     chat = str(item.get("chat") or "")
     if not chat or chat.endswith("g.us"):
         return False
     if not _fresh(item):
         return False
-    if _is_direct(account, item):
+    direct = _is_direct(account, item)
+    if item.get("from_me"):
+        if not direct:
+            return False
+        # Anti-laço: o eco de um envio DESTE processo tem o mesmo ID que
+        # core.whatsapp guardou em _deliveries. A mensagem do dono, não.
+        try:
+            if whatsapp.sent_by_me(item.get("id")):
+                return False
+        except Exception:
+            return False
+        return True
+    if direct:
         return True
     # Never let one of JARVIS's own paired numbers trigger the name scheme on
     # another account (anti-loop between the two WhatsApp connections).

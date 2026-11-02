@@ -46,6 +46,11 @@ class VoiceCommandsTest(unittest.TestCase):
         obj._last_known_at = 0.0
         obj.said = []
         obj._say_now = lambda text, log=True: obj.said.append(text)
+        # The legacy self-enroll path now requires a voiceprint confirmed as
+        # the owner (same decision table as the guided gate). The confirmation
+        # itself is covered in test_voice_training.py.
+        obj._owner_speaker_confirmed = lambda _text, _pcm: (
+            True, 0.9, "voz=Anthero")
         return obj
 
     def test_lists_known_voices(self):
@@ -100,7 +105,8 @@ class VoiceCommandsTest(unittest.TestCase):
         sp = FakeSpeaker()
         obj = self._obj(sp, unknown_emb=[0.1, 0.2])
         hit = main.JarvisLive._voice_enroll_gate(
-            obj, "A registro dessa voz também como minha")
+            obj, "A registro dessa voz também como minha",
+            b"\x01\x00" * 8000)
         self.assertTrue(hit)
         self.assertEqual(sp.enrolled[0][0], "Anthero")
         self.assertTrue(sp.enrolled[0][2])
@@ -109,7 +115,8 @@ class VoiceCommandsTest(unittest.TestCase):
         sp = FakeSpeaker()
         obj = self._obj(sp, unknown_emb=[0.1, 0.2])
         obj._last_unknown_at = 0.0
-        hit = main.JarvisLive._voice_enroll_gate(obj, "Registra minha voz")
+        hit = main.JarvisLive._voice_enroll_gate(
+            obj, "Registra minha voz", b"\x01\x00" * 8000)
         self.assertTrue(hit)
         self.assertEqual(sp.enrolled, [])
         self.assertIn("Não tenho", obj.said[0])

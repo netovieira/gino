@@ -89,6 +89,22 @@ class ChatMemoryTest(unittest.TestCase):
         # date objects are accepted too
         self.assertIn("2026-10-31", self.mem.build_day_index(date(2026, 10, 31)))
 
+    def test_first_turn_after_midnight_opens_new_day_index(self):
+        # Turno às 23:56 de 31/10 continua no dia anterior...
+        self.mem.append_turn("user", "antes da meia-noite",
+                             at=datetime(2026, 10, 31, 23, 56))
+        # ...e o primeiro evento de 01/11 abre a pasta de horas do novo dia.
+        after = datetime(2026, 11, 1, 0, 5)
+        self.mem.append_turn("user", "bom dia de novembro", at=after)
+        self.assertIn("bom dia de novembro",
+                      self.read("hours", "2026-11-01", "00.md"))
+        self.mem.compact_hour(now=datetime(2026, 11, 1, 0, 6))
+        today = self.read("days", "2026-11-01", "index.md")
+        self.assertIn("Índice do dia 2026-11-01", today)
+        self.assertIn("bom dia de novembro", today)
+        self.assertIn("Índice do dia 2026-10-31",
+                      self.read("days", "2026-10-31", "index.md"))
+
     # ── topics ──────────────────────────────────────────────────────────────
     def test_topic_write_read_and_hot_link(self):
         slug = self.mem.write_topic("Música Favorita",

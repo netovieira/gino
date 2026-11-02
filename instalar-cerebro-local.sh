@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# ⚠ LEGADO (fase 1 do corte de IA local): o modelo de TEXTO local foi
+# desligado do Gino. A conversa é 100% Qoder/nuvem. Este script continua
+# servindo apenas para instalar/manter o servidor Ollama que a VISÃO local
+# (qwen2.5vl) ainda usa; o 7B abaixo NÃO é mais um fallback de conversa.
+# Não configure "provider": "custom" no brain — essa opção foi removida.
+#
 # Cérebro local do JARVIS no Ollama — instalação no SEU usuário, sem sudo.
 #
 # Por que este modelo: a 3070 tem 8 GB. Um 7B em Q4_K_M ocupa ~4,7 GB e deixa
@@ -13,7 +19,7 @@
 #          MODEL=qwen2.5:3b ./instalar-cerebro-local.sh     (mais rápido, mais burro)
 set -euo pipefail
 
-MODEL="${MODEL:-qwen2.5:7b-instruct}"
+MODEL="${MODEL:-}"
 DEST="$HOME/.local/ollama"
 MODELS="$HOME/.local/share/ollama-models"
 # Chaves e logs em casa própria: o ~/.ollama desta máquina pertence a nobody
@@ -103,12 +109,17 @@ respondendo || {
     exit 1; }
 
 # ── 3. o modelo ─────────────────────────────────────────────────────────────
-log "Baixando $MODEL (uma vez, ~4,7 GB)"
-HOME="$OLLAMA_HOME_DIR" "$OLLAMA_BIN" pull "$MODEL"
+# O texto local foi aposentado. Sem MODEL explícito, este script não baixa
+# mais um 7B: só garante a visão local que esta fase ainda usa.
+VISION_MODEL="${VISION_MODEL:-qwen2.5vl:3b}"
+if [ -n "$MODEL" ]; then
+    warn "MODEL=$MODEL pedido explicitamente — baixando o modelo de texto (legado)."
+    log "Baixando $MODEL (legado, não é mais usado para conversar)"
+    HOME="$OLLAMA_HOME_DIR" "$OLLAMA_BIN" pull "$MODEL"
 
-# ── 4. o teste que importa: ele responde E chama ferramenta? ────────────────
-log "Teste com ferramentas (é isso que o JARVIS faz)"
-python3 - "$MODEL" "$PORT" <<'PY'
+    # ── 4. o teste do texto legado: ele responde E chama ferramenta? ────────
+    log "Teste com ferramentas (modelo de texto legado)"
+    python3 - "$MODEL" "$PORT" <<'PY'
 import json, sys, time, urllib.request
 model, port = sys.argv[1], sys.argv[2]
 tools = [
@@ -143,21 +154,22 @@ el2, msg2 = call([{"role": "system", "content": "Responda em uma frase curta, em
                   {"role": "user", "content": "Tudo bem com você?"}])
 print(f"   conversa:   {el2:5.1f}s  -> {(msg2.get('content') or '').strip()[:70]!r}")
 PY
+else
+    log "Baixando o modelo de visão $VISION_MODEL (o único uso local restante)"
+    HOME="$OLLAMA_HOME_DIR" "$OLLAMA_BIN" pull "$VISION_MODEL"
+fi
 
 log "Onde o modelo está rodando"
 HOME="$OLLAMA_HOME_DIR" "$OLLAMA_BIN" ps 2>/dev/null || true
 
 cat <<EOF
 
-Pronto. Para o JARVIS usar este cérebro:
-  ⚙ → PLUGIN SETTINGS → ECONOMY BRAIN
-     PROVIDER ......... custom   (Ollama/OpenAI-compatible)
-     BASE URL ......... http://127.0.0.1:$PORT/v1
-     MODEL ............ $MODEL
-     API KEY .......... ollama   (o Ollama ignora, mas o campo não pode ficar vazio)
+Pronto — servidor Ollama em http://127.0.0.1:$PORT.
+A conversa NÃO usa este modelo: o cérebro é Qoder/nuvem.
+A visão local usa qwen2.5vl:3b. Para puxá-la:
 
-Ou, pelo arquivo: config/api_keys.json → plugin_config.brain
-     "provider": "custom", "base_url": "http://127.0.0.1:$PORT/v1",
-     "model": "$MODEL", "api_key": "ollama",
-     "fallback_provider": "groq"     ← fica de reserva para quando o PC estiver ocupado
+    HOME="$OLLAMA_HOME_DIR" "$OLLAMA_BIN" pull qwen2.5vl:3b
+
+Não configure "provider": "custom" nem "fallback_provider": "custom"
+em config/api_keys.json — o provedor local de texto foi removido do código.
 EOF

@@ -19,6 +19,14 @@ que o neonize precisa para medir e converter não vem do apt (instalar exigiria
 root): ele mora em tools/ffmpeg/, extraído dos .deb do Ubuntu, e este módulo o
 põe no PATH antes de qualquer coisa tocar no neonize.
 
+EVENTOS DO DONO: o whatsmeow entrega o horário em MILISSEGUNDOS e, depois da
+migração para LID, o chat como ``<id>@lid`` (um identificador interno, não o
+telefone). Este módulo normaliza os dois — ver ``_stamp_seconds`` e
+``_chat_identity`` — para a mensagem do dono ser reconhecida como conversa com
+ele, uma única vez por id, e avisa o app por ``add_owner_wake_hook`` (quem
+decide acordar). Com o assistente dormindo, o aviso fica na gaveta
+(``pending_owner``/``drain_owner_pending``) e o texto já está no inbox em disco.
+
 O QUE ISTO NÃO FAZ, de propósito:
   - grupos para envio (o nome do grupo não está no catálogo de contatos);
   - transcrição de áudio (o assistente ouve o microfone, não arquivos).
@@ -92,9 +100,35 @@ FRESH_TS_S     = 24 * 3600    # só guarda o que chegou nas últimas 24h
 MEDIA_MAX_MB   = 20           # acima disso a mídia fica no servidor
 MEDIA_KEEP_DAYS = 7           # quanto tempo os arquivos baixados ficam aqui
 
+# Envio só está "confirmado" quando chega recibo. O servidor devolve o ID na
+# hora e manda o ReceiptEv depois; esperar demais atrapalha a conversa, então
+# o padrão é curto e `wait_delivery` aceita outro valor por chamada.
+DELIVERY_WAIT_S  = 8.0        # espera padrão por recibo de entrega/leitura
+_DELIVERY_KEEP_S = 300.0      # por quanto tempo o estado de entrega fica na memória
+
+# Mensagem do dono entregue como turno: o id fica lembrado este tempo para o
+# mesmo evento (reconexão, duas rotinas lendo o mesmo store) não virar dois
+# turnos. Curto de propósito: id não é único para sempre, e o que interessa é
+# cobrir o reenvio.
+OWNER_ID_KEEP_S = 900.0
+
+# Quantos avisos do dono ficam na gaveta esperando o próximo despertar.
+OWNER_PENDING_KEEP = 50
+
+# Idade máxima de uma mensagem para valer como aviso na hora (tela/alto-falante
+# e o gancho de despertar). Mais velha que isto é histórico de reconexão: fica
+# no inbox, mas não acorda ninguém.
+NOTICE_AGE_S = 300.0
+
 _lock       = threading.RLock()
 _inbox_lock = threading.RLock()
 _logger     = None
+
+# ID da mensagem enviada → estado de entrega. Vive só na memória: o recibo
+# chega na mesma execução do app e não há o que recuperar depois de reiniciar.
+_delivery_lock = threading.Lock()
+_deliveries: dict[str, dict] = {}
+
 # O neonize carrega um runtime Go (whatsmeow) que segura threads do processo.
 # Depois disso o Python nunca mais sai sozinho ao fim do mainloop, então quem
 # encerra o app precisa chamar hard_exit() — ver a explicação lá embaixo. O
@@ -160,6 +194,103 @@ def remove_watcher(callback) -> None:
             _watchers.remove(callback)
         except ValueError:
             pass
+
+
+# ── aviso ao dono: acordar, e a gaveta de quem está dormindo ────────────────
+#
+# Mensagem do DONO no chat direto não é "recado de terceiro": é conversa com
+# ele, e enquanto o assistente dorme ela não pode virar nada. Dois caminhos:
+#   1. `add_owner_wake_hook(cb)` — quem quiser ser chamado na hora (main.py
+#      usa para acordar e falar o aviso, a regra que o dono pediu);
+#   2. sem gancho, ou com o gancho dizendo False, o aviso fica na gaveta
+#      (`pending_owner`/`drain_owner_pending`) para ser entregue no despertar.
+# O conteúdo em si nunca se perde: ele já está no inbox em disco, que é o que
+# sobrevive a um reinício; a gaveta é só a lista do que ainda não foi avisado.
+_alert_lock = threading.Lock()
+_alert_hooks: list = []
+_owner_pending: list[dict] = []
+
+# Ids de mensagens do dono já transformadas em turno por esta conta.
+_owner_id_lock = threading.Lock()
+_owner_ids: dict[tuple[str, str], float] = {}
+
+
+def add_owner_wake_hook(callback) -> None:
+    """Chama `callback(account, item)` a cada mensagem do DONO (inclusive dormindo).
+
+    O callback roda na thread do neonize: quem acorda a interface precisa
+    agendar no loop (`call_soon_threadsafe`), não mexer na UI daqui. Devolver
+    True marca o aviso como entregue; False/None o deixa na gaveta.
+    """
+    with _alert_lock:
+        if callback not in _alert_hooks:
+            _alert_hooks.append(callback)
+
+
+def remove_owner_wake_hook(callback) -> None:
+    with _alert_lock:
+        try:
+            _alert_hooks.remove(callback)
+        except ValueError:
+            pass
+
+
+def pending_owner() -> list[dict]:
+    """Os avisos do dono que ainda não foram entregues (do mais antigo)."""
+    with _alert_lock:
+        return [dict(item) for item in _owner_pending]
+
+
+def drain_owner_pending() -> list[dict]:
+    """Entrega a gaveta: devolve os avisos pendentes e esvazia a lista."""
+    with _alert_lock:
+        items = [dict(item) for item in _owner_pending]
+        _owner_pending.clear()
+        return items
+
+
+def _stash_owner_item(account: str, item: dict) -> None:
+    """Guarda o aviso na gaveta, sem repetir o mesmo id."""
+    alert = dict(item)
+    alert["account"] = account
+    mid = str(alert.get("id") or "").strip()
+    with _alert_lock:
+        if mid and any(str(old.get("id") or "") == mid and
+                       str(old.get("account") or "") == account
+                       for old in _owner_pending):
+            return
+        _owner_pending.append(alert)
+        del _owner_pending[:-OWNER_PENDING_KEEP]
+
+
+def _owner_arrived(account: str, item: dict) -> None:
+    """Mensagem do dono: avisa agora quem estiver ligado, senão põe na gaveta."""
+    with _alert_lock:
+        hooks = list(_alert_hooks)
+    for hook in hooks:
+        try:
+            if hook(account, dict(item)):
+                return
+        except Exception as e:
+            _log(f"o aviso de mensagem do dono falhou: {e}")
+    _stash_owner_item(account, item)
+
+
+def _first_owner_sighting(account: str, message_id: object) -> bool:
+    """Primeira vez que ESTA conta vê esta mensagem do dono? (dedupe por id)"""
+    mid = str(message_id or "").strip()
+    if not mid:
+        return True
+    now = time.monotonic()
+    key = (str(account or ""), mid)
+    with _owner_id_lock:
+        for stale in [k for k, at in _owner_ids.items()
+                      if now - at > OWNER_ID_KEEP_S]:
+            _owner_ids.pop(stale, None)
+        if key in _owner_ids:
+            return False
+        _owner_ids[key] = now
+    return True
 
 
 # ── contas: carregar, listar, adicionar, remover ─────────────────────────────
@@ -446,6 +577,108 @@ def _digits(s: str) -> str:
     return re.sub(r"\D", "", str(s or ""))
 
 
+def _stamp_seconds(value: object) -> int:
+    """Timestamp de mensagem em SEGUNDOS.
+
+    O proto do neonize chama o campo de ``Timestamp`` e o whatsmeow o preenche
+    em MILISSEGUNDOS (é o mesmo número que o pedido de HistorySync manda em
+    ``oldestMsgTimestampMS``). Lido como segundos, todo evento parecia de 1970:
+    nada entrava no inbox, mídia nenhuma era baixada, o aviso de sala nunca
+    saía e o watcher via toda mensagem como velha — a "entrada morta" de
+    01/11. Segundos continuam aceitos (eventos antigos e os testes).
+    """
+    try:
+        value = int(value or 0)
+    except Exception:
+        value = 0
+    if value <= 0:
+        return int(time.time())
+    while value > 10_000_000_000:      # em segundos, só depois de 2286
+        value //= 1000
+    return value
+
+
+def _jid_user(jid) -> str:
+    try:
+        return str(getattr(jid, "User", "") or "")
+    except Exception:
+        return ""
+
+
+def _jid_server(jid) -> str:
+    try:
+        return str(getattr(jid, "Server", "") or "")
+    except Exception:
+        return ""
+
+
+def _chat_identity(src, from_me: bool) -> tuple[str, str]:
+    """O outro lado do chat: (chat, lid).
+
+    Depois da migração para LID o WhatsApp manda o chat como
+    ``<número>@lid`` — um identificador interno que NÃO é telefone. O telefone
+    (PN) vem no JID alternativo do evento: ``SenderAlt`` para quem escreveu e
+    ``RecipientAlt`` para o destinatário de uma mensagem do próprio aparelho.
+    Sem resolver isso, o chat do dono nunca batia com ``owner_chat`` nem com o
+    número pareado: a mensagem dele era tratada como de terceiro e o assistente
+    respondia que o circuito estava vivo sem ter visto nada.
+
+    Devolve o telefone quando ele existe (é para lá que a resposta vai) e o
+    LID à parte, só para o log.
+    """
+    chat_jid = getattr(src, "Chat", None)
+    chat_user = _jid_user(chat_jid)
+    chat_server = _jid_server(chat_jid)
+    if chat_server not in ("", "s.whatsapp.net", "lid"):
+        # Grupo (@g.us), status, lista de transmissão: o chat é ele mesmo.
+        return f"{chat_user}@{chat_server}", ""
+    alt = getattr(src, "RecipientAlt" if from_me else "SenderAlt", None)
+    alt_user = _jid_user(alt)
+    phone = ""
+    if alt_user and _jid_server(alt) != "lid" and _digits(alt_user):
+        phone = _digits(alt_user)
+    if not phone and chat_server != "lid":
+        phone = _digits(chat_user)
+    return (phone or chat_user), (chat_user if chat_server == "lid" else "")
+
+
+def account_number(account: str | None = None) -> str:
+    """O número pareado desta conta, só dígitos ('' enquanto não conectou).
+
+    É o "número do próprio assistente" naquela conta. O dono pode escrever no
+    chat direto dele (o WhatsApp chama isso de "mensagem para você mesmo"):
+    aí o outro lado do chat é este número, não o ``owner_chat`` do config.
+    """
+    try:
+        a = _A(account)
+    except KeyError:
+        return ""
+    with _lock:
+        number = _digits(a.me.get("number") or "")
+    if number:
+        return number
+    for entry in list_accounts():
+        if entry.get("name") == a.name:
+            return _digits(entry.get("number") or "")
+    return ""
+
+
+def sent_by_me(message_id: object) -> bool:
+    """Este id é de uma mensagem que ESTE processo enviou?
+
+    O evento de uma mensagem enviada pelo celular chega com ``from_me=True`` e
+    é exatamente o que o dono quer que o assistente responda; já o eco de um
+    envio do próprio assistente não pode reabrir a conversa (laço). O ID é a
+    única coisa que separa os dois: ``send()``/``send_media()`` registram o ID
+    devolvido pelo servidor em ``_deliveries`` antes de qualquer resposta.
+    """
+    mid = str(message_id or "").strip()
+    if not mid:
+        return False
+    with _delivery_lock:
+        return mid in _deliveries
+
+
 def available() -> bool:
     """neonize instalado? (o import é caro e só interessa quando alguém conecta)"""
     import importlib.util
@@ -728,6 +961,123 @@ def _client_state(acct: _Account) -> tuple[object, bool, str]:
         return acct.client, acct.connected, acct.error
 
 
+# ── confirmação de entrega ───────────────────────────────────────────────────
+#
+# Sucesso de envio NÃO é "não deu exceção": o servidor devolve um ID e depois
+# manda um recibo (entregue/lido). Guardamos o ID de cada envio aqui e o
+# ReceiptEv atualiza o estado — é o que permite dizer "entregue" com prova.
+
+# Valores de Receipt.Type no proto do neonize (sem importar neonize aqui).
+_RECEIPT_DELIVERED = 1
+_RECEIPT_READ      = 4
+_RECEIPT_PLAYED    = 6
+
+
+def _prune_deliveries(now: float | None = None) -> None:
+    """Descarta estados antigos. Só é chamada com `_delivery_lock` na mão."""
+    now = time.time() if now is None else now
+    for mid in [m for m, rec in _deliveries.items()
+                if now - rec["at"] > _DELIVERY_KEEP_S]:
+        _deliveries.pop(mid, None)
+
+
+def _remember_send(resp, acct: "_Account | None" = None) -> str:
+    """Guarda o ID devolvido no SendResponse e devolve o ID (ou "")."""
+    msg_id = getattr(resp, "ID", "")
+    if not isinstance(msg_id, str) or not msg_id.strip():
+        return ""
+    msg_id = msg_id.strip()
+    with _delivery_lock:
+        _prune_deliveries()
+        _deliveries[msg_id] = {
+            "at": time.time(),
+            "account": getattr(acct, "name", "") or "",
+            "delivered": False,
+            "read": False,
+            "event": threading.Event(),
+        }
+    return msg_id
+
+
+def _receipt_state(evt) -> str:
+    try:
+        kind = int(getattr(evt, "Type", 0) or 0)
+    except Exception:
+        return ""
+    if kind in (_RECEIPT_READ, _RECEIPT_PLAYED):
+        return "read"
+    if kind == _RECEIPT_DELIVERED:
+        return "delivered"
+    return ""
+
+
+def _on_receipt(evt, acct: "_Account | None" = None) -> None:
+    """ReceiptEv: o destinatário recebeu/leu alguma coisa que mandamos."""
+    state = _receipt_state(evt)
+    if not state:
+        return
+    try:
+        ids = [str(mid) for mid in (getattr(evt, "MessageIDs", None) or [])]
+    except Exception:
+        return
+    with _delivery_lock:
+        for mid in ids:
+            rec = _deliveries.get(mid)
+            if rec is None:
+                continue
+            if state == "read":
+                rec["read"] = True
+                rec["delivered"] = True
+            else:
+                rec["delivered"] = True
+            rec["event"].set()
+
+
+def wait_delivery(msg_id: str, timeout: float | None = None) -> dict:
+    """Espera o recibo de entrega/leitura de uma mensagem já enviada.
+
+    Devolve {"id", "state", "delivered", "read", "waited"}. `state` é
+    "delivered"/"read" quando o recibo chegou, "pending" no timeout e
+    "unknown" para um ID que este processo não enviou (ou já esqueceu).
+    Espera no máximo `timeout` segundos (padrão DELIVERY_WAIT_S).
+    """
+    mid = str(msg_id or "").strip()
+    try:
+        timeout = (DELIVERY_WAIT_S if timeout is None else max(0.0, float(timeout)))
+    except Exception:
+        timeout = DELIVERY_WAIT_S
+    with _delivery_lock:
+        rec = _deliveries.get(mid)
+    if rec is None:
+        return {"id": mid, "state": "unknown", "delivered": False,
+                "read": False, "waited": 0.0}
+    t0 = time.monotonic()
+    rec["event"].wait(timeout)
+    waited = round(time.monotonic() - t0, 3)
+    read, delivered = bool(rec["read"]), bool(rec["delivered"])
+    return {
+        "id": mid,
+        "state": "read" if read else ("delivered" if delivered else "pending"),
+        "delivered": delivered,
+        "read": read,
+        "waited": waited,
+    }
+
+
+def _delivery_outcome(msg_id: str, sent_phrase: str, label: str,
+                      timeout: float | None = None) -> tuple[bool, str]:
+    """Frase falada com o estado REAL do envio — nunca "mandei" sem ID."""
+    if not msg_id:
+        return True, (f"o envio para {label} não foi confirmado pelo WhatsApp: "
+                      f"nenhum identificador de mensagem voltou")
+    result = wait_delivery(msg_id, timeout)
+    if result["state"] in ("delivered", "read"):
+        return True, (f"{sent_phrase} e o WhatsApp confirmou a entrega "
+                      f"para {label}")
+    return True, (f"{sent_phrase} para {label}, aguardando confirmação "
+                  f"de entrega")
+
+
 def send(recipient: str, text: str, account: str | None = None) -> tuple[bool, str]:
     """Envia texto. Devolve (ok, frase) — a frase é o que o assistente fala."""
     text = str(text or "").strip()
@@ -759,13 +1109,14 @@ def send(recipient: str, text: str, account: str | None = None) -> tuple[bool, s
     # que o usuário disse, que é o melhor nome disponível.
     label = _display(target, a) or recipient
     try:
-        client.send_message(target, text)
+        resp = client.send_message(target, text)
     except Exception as e:
         return False, f"o WhatsApp recusou o envio para {label}: {e}"
+    msg_id = _remember_send(resp, a)
     _append_inbox({"ts": int(time.time()), "chat": _user_of(target),
                    "name": str(label), "from_me": True, "group": False,
-                   "text": text[:600], "id": ""}, a)
-    return True, f"enviado para {label}"
+                   "text": text[:600], "id": msg_id}, a)
+    return _delivery_outcome(msg_id, "enviei a mensagem", label)
 
 
 def _user_of(jid) -> str:
@@ -963,24 +1314,25 @@ def _resolve_file(path: str, acct: _Account) -> Path | None:
     return _find_local(raw, acct)
 
 
-def _send_any(client, target, file: Path, caption) -> str:
-    """Manda o arquivo pelo tipo certo. Devolve o tipo, falado."""
+def _send_any(client, target, file: Path, caption) -> tuple[str, object]:
+    """Manda o arquivo pelo tipo certo. Devolve (tipo falado, SendResponse)."""
     ext = file.suffix.lower()
     if ext in _IMAGE_EXT:
-        client.send_image(target, str(file), caption=caption)
-        return "foto"
+        resp = client.send_image(target, str(file), caption=caption)
+        return "foto", resp
     if ext in _VIDEO_EXT:
-        client.send_video(target, str(file), caption=caption)
-        return "vídeo"
+        resp = client.send_video(target, str(file), caption=caption)
+        return "vídeo", resp
     if ext in _AUDIO_EXT:
         # PTT é o "segurar e falar": só faz sentido em ogg/opus.
-        client.send_audio(target, str(file), ptt=ext in (".ogg", ".opus"))
-        return "áudio"
+        resp = client.send_audio(target, str(file), ptt=ext in (".ogg", ".opus"))
+        return "áudio", resp
     if ext == ".webp":
-        client.send_sticker(target, str(file))
-        return "figurinha"
-    client.send_document(target, str(file), caption=caption, filename=file.name)
-    return "documento"
+        resp = client.send_sticker(target, str(file))
+        return "figurinha", resp
+    resp = client.send_document(target, str(file), caption=caption,
+                                filename=file.name)
+    return "documento", resp
 
 
 def _convert_for_whatsapp(src: Path, video: bool) -> Path | None:
@@ -1042,7 +1394,7 @@ def send_media(recipient: str, path: str, caption: str = "",
     ext = file.suffix.lower()
     caption = str(caption or "").strip() or None
     try:
-        kind = _send_any(client, target, file, caption)
+        kind, resp = _send_any(client, target, file, caption)
     except Exception as e:
         # Container que o WhatsApp não engole (mkv, avi, flac…) tem conserto
         # local: o ffmpeg converte e a gente tenta de novo, uma vez.
@@ -1052,19 +1404,20 @@ def send_media(recipient: str, path: str, caption: str = "",
         if converted is None:
             return False, f"o WhatsApp recusou o envio para {label}: {e}"
         try:
-            kind = _send_any(client, target, converted, caption)
+            kind, resp = _send_any(client, target, converted, caption)
             file = converted
             ext = converted.suffix.lower()
         except Exception as e2:
             return False, f"o WhatsApp recusou o envio para {label}: {e2}"
 
+    msg_id = _remember_send(resp, a)
     item = {"ts": int(time.time()), "chat": _user_of(target), "name": str(label),
             "from_me": True, "group": False,
             "text": f"[{kind}{(': ' + caption) if caption else ''}]",
-            "id": "", "media": {"kind": kind, "name": file.name, "ext": ext}}
+            "id": msg_id, "media": {"kind": kind, "name": file.name, "ext": ext}}
     _append_inbox(item, a)
     artigo = "a" if kind in ("foto", "figurinha") else "o"
-    return True, f"mandei {artigo} {kind} para {label}"
+    return _delivery_outcome(msg_id, f"mandei {artigo} {kind}", label)
 
 
 def open_media(recipient: str = "", hint: str = "",
@@ -1163,27 +1516,90 @@ def _on_logged_out(_client, _evt, acct: _Account) -> None:
     _log(f"[{acct.name}] {acct.error}")
 
 
+def _on_stream_replaced(client, _evt, acct: _Account) -> None:
+    """Outro processo/aparelho tomou o stream desta sessão.
+
+    O whatsmeow não derruba o `connect()` nesse caso: o app continua dizendo
+    "conectado" mas não recebe mais nada (foi o que aconteceu no diagnóstico
+    de "replaced stream error"). Aqui marcamos a queda e pedimos a desconexão
+    de verdade, uma vez por client, para o laço de `_run` reconectar.
+    """
+    with _lock:
+        acct.connected = False
+        acct.error = ("a sessão foi substituída por outro processo/aparelho — "
+                      "reconectando")
+    _log(f"[{acct.name}] {acct.error}")
+    if getattr(client, "_jarvis_stream_replaced", False):
+        return
+    try:
+        client._jarvis_stream_replaced = True
+    except Exception:
+        pass
+
+    def _force_disconnect():
+        # Deixa o handler do Go voltar antes de chamar o Go de novo; o
+        # `Disconnect` é o que faz o `connect()` bloqueado retornar.
+        time.sleep(0.5)
+        for step in ("disconnect", "stop"):
+            try:
+                getattr(client, step)()
+            except Exception:
+                pass
+
+    threading.Thread(target=_force_disconnect,
+                     name=f"jarvis-whatsapp-reconnect-{acct.name}",
+                     daemon=True).start()
+
+
 def _chat_name(chat_user: str, pushname: str, is_group: bool,
                acct: _Account) -> str:
     if is_group:
-        return f"grupo {chat_user}"
+        return f"grupo {str(chat_user).split('@')[0]}"
     for c in _contact_index(acct):
         if c["user"] == chat_user:
             return c["name"]
     return pushname or chat_user
 
 
+def _is_direct_chat(acct: _Account, item: dict) -> bool:
+    """A conversa é o chat direto do dono nesta conta?
+
+    A regra de "chat direto" mora em core/whatsapp_watch.py (número pareado da
+    própria conta ou o ``owner_chat`` da conta de saída). Import tardio porque
+    o watcher é quem importa este módulo; consultar aqui evita duas definições
+    de "chat do dono" que possam divergir.
+    """
+    try:
+        from core import whatsapp_watch
+        return bool(whatsapp_watch.is_direct(acct.name, item))
+    except Exception:
+        return False
+
+
+def _is_owner_turn(acct: _Account, item: dict) -> bool:
+    """A mensagem é do chat direto do dono (= turno, não aviso de terceiro)?"""
+    try:
+        from core import whatsapp_watch
+        return bool(whatsapp_watch.armed() and _is_direct_chat(acct, item))
+    except Exception:
+        return False
+
+
 def _on_message(client, ev, acct: _Account) -> None:
     try:
         from neonize.utils import extract_text
-    except Exception:
+    except Exception as e:
+        # Antes isto era um `return` mudo: uma versão de neonize sem
+        # extract_text fazia TODA mensagem sumir sem uma linha no log.
+        _log(f"[{acct.name}] não consegui importar extract_text do neonize: {e}")
         return
     try:
         src   = ev.Info.MessageSource
-        chat  = getattr(getattr(src, "Chat", None), "User", "") or ""
-        group = bool(getattr(src, "IsGroup", False)) or chat.endswith("g.us")
+        group = bool(getattr(src, "IsGroup", False))
         from_me = bool(getattr(src, "IsFromMe", False))
-        stamp = int(ev.Info.Timestamp or time.time())
+        chat, lid = _chat_identity(src, from_me)
+        group = group or chat.endswith("g.us")
+        stamp = _stamp_seconds(ev.Info.Timestamp)
         try:
             text = (extract_text(ev.Message) or "").strip()
         except Exception:
@@ -1200,6 +1616,7 @@ def _on_message(client, ev, acct: _Account) -> None:
         item = {
             "ts": stamp,
             "chat": chat,
+            "chat_lid": lid,
             "name": _chat_name(chat, ev.Info.Pushname or "", group, acct),
             "from_me": from_me,
             "group": group,
@@ -1207,24 +1624,74 @@ def _on_message(client, ev, acct: _Account) -> None:
             "id": ev.Info.ID or "",
             "media": media,
         }
+        # Rastro mínimo de que o evento chegou ao Python. Sem esta linha um
+        # MessageEv perdido era indistinguível de uma conexão muda; só chat
+        # individual (grupo é volume alto e nunca vira gatilho). O LID vai
+        # junto porque é ele que aparece no celular do dono.
+        if not group:
+            _log(f"[{acct.name}] evento {item['id'] or '(sem id)'} de {chat}"
+                 + (f"/{lid}" if lid else "")
+                 + f" ({'do dono/outro aparelho' if from_me else 'recebida'})")
+
+        # Chat direto do dono: a mensagem dele é UM turno, uma vez só. O mesmo
+        # evento pode voltar numa reconexão (ou ser lido por duas rotinas), e
+        # responder duas vezes é o erro que ele percebe na hora.
+        owner_direct = _is_direct_chat(acct, item)
+        if owner_direct and not _first_owner_sighting(acct.name, item["id"]):
+            _log(f"[{acct.name}] mensagem {item['id']} do dono repetida — "
+                 f"já virou turno, ignorando esta cópia")
+            return
+
         # O HistorySync do WhatsApp reenvia meses de conversa de uma vez. Guardo
         # só o que é recente de verdade, senão o inbox local vira um arquivo de
-        # histórico alheio ao que o usuário veio perguntar.
+        # histórico alheio ao que o usuário veio perguntar. (Com o timestamp
+        # certo isto volta a valer para TODA mensagem — ver `_stamp_seconds`.)
         if abs(time.time() - stamp) < FRESH_TS_S:
             _append_inbox(item, acct)
 
         # O link da mídia morre: quem quer o arquivo tem que pedir agora.
-        if media and not from_me and abs(time.time() - stamp) < FRESH_TS_S:
-            threading.Thread(target=_download_media,
-                             args=(client, ev.Message, item, acct),
-                             name="jarvis-whatsapp-media", daemon=True).start()
+        # O dono mandando do celular também conta — no chat direto dele
+        # (próprio número pareado ou owner_chat) o áudio precisa ser baixado
+        # para ser transcrito e respondido em áudio.
+        if media and abs(time.time() - stamp) < FRESH_TS_S:
+            want_media = not from_me
+            if not want_media:
+                chat_digits = _digits(chat)
+                with _lock:
+                    own_digits = _digits(acct.me.get("number") or "")
+                want_media = bool(chat_digits and chat_digits == own_digits)
+                if not want_media:
+                    try:
+                        from memory.config_manager import get_plugin_setting
+                        owner = _digits(get_plugin_setting(NS, "owner_chat", "") or "")
+                    except Exception:
+                        owner = ""
+                    want_media = bool(chat_digits and owner and chat_digits == owner)
+            if want_media:
+                threading.Thread(target=_download_media,
+                                 args=(client, ev.Message, item, acct),
+                                 name="jarvis-whatsapp-media", daemon=True).start()
 
+        # A regra do dono: notificação de fundo enquanto ele dorme o ACORDA.
+        # Aqui a conversa é com ele, então o aviso é sempre dele — o gancho
+        # (main.py) decide se acorda na hora; sem gancho a mensagem fica na
+        # gaveta e é entregue no próximo despertar. O eco de um envio DESTE
+        # processo não é mensagem nova e não acorda ninguém.
+        if owner_direct and abs(time.time() - stamp) < NOTICE_AGE_S \
+                and not sent_by_me(item["id"]):
+            _owner_arrived(acct.name, item)
+
+        # O aviso falado na sala é para TERCEIROS. No chat direto do dono a
+        # mensagem é um turno da conversa: o watcher responde no WhatsApp, e o
+        # aviso de ambiente produziria uma segunda resposta em voz alta para o
+        # mesmo pedido — exatamente a duplicação que o dono não quer.
         cb = acct.sink
-        if cb and not from_me and abs(time.time() - stamp) < 300:
-            try:
-                cb(item)
-            except Exception as e:
-                _log(f"o aviso de mensagem nova falhou: {e}")
+        if cb and not from_me and abs(time.time() - stamp) < NOTICE_AGE_S:
+            if not (owner_direct and _is_owner_turn(acct, item)):
+                try:
+                    cb(item)
+                except Exception as e:
+                    _log(f"o aviso de mensagem nova falhou: {e}")
 
         for watcher in list(_watchers):
             try:
@@ -1263,6 +1730,16 @@ def _run(acct: _Account) -> None:
                 lambda _c, _e, a=acct: _on_logged_out(client, _e, a))
             client.event(ev.MessageEv)(
                 lambda _c, _e, a=acct: _on_message(client, _e, a))
+            # Recibo de entrega/leitura: sem isto "enviado" era só ausência
+            # de exceção. O handler é opcional em versões antigas do neonize.
+            receipt_ev = getattr(ev, "ReceiptEv", None)
+            if receipt_ev is not None:
+                client.event(receipt_ev)(
+                    lambda _c, _e, a=acct: _on_receipt(_e, a))
+            replaced_ev = getattr(ev, "StreamReplacedEv", None)
+            if replaced_ev is not None:
+                client.event(replaced_ev)(
+                    lambda _c, _e, a=acct: _on_stream_replaced(_c, _e, a))
             with _lock:
                 acct.client = client
                 acct.error = ""

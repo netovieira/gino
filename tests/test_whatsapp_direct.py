@@ -77,6 +77,7 @@ class DirectChatTest(unittest.TestCase):
         obj._transcribe_whatsapp_audio.assert_called_once_with("/tmp/x.ogg")
         _, kwargs = obj._qoder_turn.call_args
         self.assertEqual(kwargs["media_type"], "audio")
+        self.assertFalse(kwargs["speak"])
         self.assertIn("transcrição do áudio", obj._qoder_turn.call_args[0][0])
 
     def test_third_party_is_external_not_owner(self):
@@ -127,6 +128,35 @@ class SendAnswerTest(unittest.TestCase):
                 "trabalho", "5511999999999", "resposta", "audio"))
         send.assert_called_once()
 
+    def test_tts_that_raises_still_sends_plain_text(self):
+        obj = self._obj()
+        obj._synthesize_whatsapp_audio = mock.Mock(
+            side_effect=RuntimeError("motor de voz fora"))
+        with mock.patch("core.whatsapp.send_media") as send_media, \
+                mock.patch("core.whatsapp.send", return_value=(True, "ok")) as send:
+            self.assertTrue(obj._send_whatsapp_answer(
+                "trabalho", "5511999999999", "resposta", "audio"))
+        send_media.assert_not_called()
+        send.assert_called_once_with("5511999999999", "resposta",
+                                     account="trabalho")
+        self.assertFalse(obj._wa_audio_sent)
+
+    def test_audio_that_fails_to_send_falls_back_to_text_once(self):
+        obj = self._obj()
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as handle:
+            path = handle.name
+        obj._synthesize_whatsapp_audio = mock.Mock(return_value=path)
+        with mock.patch("core.whatsapp.send_media",
+                        return_value=(False, "formato recusado")) as send_media, \
+                mock.patch("core.whatsapp.send", return_value=(True, "ok")) as send:
+            self.assertTrue(obj._send_whatsapp_answer(
+                "trabalho", "5511999999999", "resposta", "audio"))
+        send_media.assert_called_once()
+        send.assert_called_once_with("5511999999999", "resposta",
+                                     account="trabalho")
+        self.assertFalse(obj._wa_audio_sent)
+        self.assertFalse(Path(path).exists())
+
 
 class NoRoomSpeechTest(unittest.TestCase):
     def _obj(self):
@@ -163,6 +193,15 @@ class NoRoomSpeechTest(unittest.TestCase):
         self.assertTrue(any(line.startswith("WHATSAPP Gino:")
                             for line in obj.ui.logs))
 
+    def test_whatsapp_audio_turn_is_delivered_as_audio(self):
+        obj = self._obj()
+        obj._qoder_meta["t1"]["media_type"] = "audio"
+        obj._qoder_text_buf["t1"] = "resposta falada"
+        main.JarvisLive._qoder_on_done(obj, "t1", "resposta falada")
+        obj._qoder_say.assert_not_called()
+        args, _kwargs = obj._send_whatsapp_answer.call_args
+        self.assertEqual(args[3], "audio")
+
 
 class OutboundAccountTest(unittest.TestCase):
     def test_selected_outbound_account_removes_the_question(self):
@@ -180,6 +219,57 @@ class OutboundAccountTest(unittest.TestCase):
                 mock.patch("plugins.whatsapp_control.whatsapp.default_account_name",
                            return_value=""):
             self.assertTrue(wc._ambiguous(""))
+
+
+class OwnerLabelTest(unittest.TestCase):
+    """'manda pra mim'/'pra conta principal' resolve pelo owner_chat."""
+
+    def _send(self, to, owner, accounts=None, text="oi"):
+        from plugins import whatsapp_control as wc
+        accounts = accounts or [{"name": "principal", "uuid": "jarvis",
+                                 "number": owner},
+                                {"name": "trabalho", "uuid": "jarvis-trabalho",
+                                 "number": "5517992101133"}]
+        with mock.patch.object(wc, "get_plugin_setting", return_value=owner), \
+                mock.patch.object(wc, "_accounts", return_value=accounts), \
+                mock.patch.object(wc, "_ambiguous", return_value=None), \
+                mock.patch.object(wc.whatsapp, "send",
+                                  return_value=(True, "ok")) as send:
+            spoken, body = wc._do_send(to, text)
+        return send, spoken, body
+
+    def test_owner_labels_resolve_to_owner_chat(self):
+        for label in ("mim", "para mim", "eu", "principal",
+                      "conta principal", "minha conta principal",
+                      "meu número", "conta do dono"):
+            with self.subTest(label=label):
+                send, spoken, body = self._send(label, "5517981792464")
+                send.assert_called_once_with(
+                    "5517981792464", "oi", account=None)
+                self.assertEqual(spoken, "ok")
+                self.assertEqual(body, "ok")
+
+    def test_account_label_resolves_to_that_account_number(self):
+        send, _spoken, _body = self._send("conta trabalho", "5517981792464")
+        send.assert_called_once_with("5517992101133", "oi", account=None)
+
+    def test_unknown_contact_is_not_guessed(self):
+        send, _spoken, _body = self._send("João", "5517981792464")
+        send.assert_called_once_with("João", "oi", account=None)
+
+    def test_missing_owner_chat_is_an_explicit_error(self):
+        send, spoken, _body = self._send("mim", "")
+        send.assert_not_called()
+        self.assertIn("owner_chat", spoken)
+        self.assertIn("registrad", spoken)
+        self.assertNotIn("para quem?", spoken)
+
+    def test_empty_destination_mentions_the_unregistered_number(self):
+        from plugins import whatsapp_control as wc
+        with mock.patch.object(wc, "get_plugin_setting", return_value=""):
+            spoken, _body = wc._do_send("", "oi")
+        self.assertIn("owner_chat", spoken)
+        self.assertIn("registrad", spoken)
 
 
 if __name__ == "__main__":

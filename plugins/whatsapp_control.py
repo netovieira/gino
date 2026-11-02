@@ -17,7 +17,9 @@ pela conta errada.
 """
 from __future__ import annotations
 
+import re
 import time
+import unicodedata
 
 from core import whatsapp
 from memory.config_manager import get_plugin_setting, save_plugin_config
@@ -30,6 +32,122 @@ def _accounts() -> list[dict]:
         return whatsapp.list_accounts()
     except Exception:
         return []
+
+
+# ── destino por rótulo ───────────────────────────────────────────────────────
+#
+# O usuário fala "manda pra mim", "manda pra conta principal" e espera que o
+# próprio número dele seja o destino. Esse número mora em `owner_chat`; os
+# nomes das contas (accounts[].name) também valem como destino (o número da
+# própria conta). Nunca aproximamos nomes: só rótulo exato, senão um contato
+# parecido receberia mensagem que não era para ele.
+
+_OWNER_LABELS = frozenset({
+    "mim", "pra mim", "para mim", "eu", "me", "eu mesmo", "mim mesmo",
+    "minha conta", "conta principal", "minha conta principal",
+    "principal", "meu numero", "numero principal", "meu numero principal",
+    "meu whatsapp", "whatsapp principal", "meu zap", "zap principal",
+    "meu celular", "meu telefone", "conta do dono", "numero do dono", "dono",
+})
+
+
+def _fold(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = re.sub(r"[^a-z0-9\s]", " ", text.lower())
+    return " ".join(text.split())
+
+
+def _digits(value: object) -> str:
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _owner_chat() -> str:
+    try:
+        return str(get_plugin_setting(NS, "owner_chat", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _owner_missing() -> str:
+    return ("o seu número ainda não está registrado no WhatsApp do Gino: "
+            "preencha 'Seu número/JID' (owner_chat) em "
+            "⚙ → PLUGIN SETTINGS → WHATSAPP, com DDD e 55. "
+            "Sem isso eu não sei para quem mandar.")
+
+
+def _account_variants(acct: dict) -> set[str]:
+    name = _fold(acct.get("name"))
+    values = {name, _fold(acct.get("uuid"))}
+    values.update(_fold(f"{prefix} {name}")
+                  for prefix in ("conta", "minha conta", "whatsapp", "zap",
+                                 "numero"))
+    values.discard("")
+    return values
+
+
+def _account_is_owner(acct: dict) -> bool:
+    owner = _digits(_owner_chat())
+    return bool(owner) and _digits(acct.get("number")) == owner
+
+
+def is_owner_label(value: object) -> bool:
+    """O rótulo aponta para o dono (mim/eu/principal/conta do dono)?"""
+    key = _fold(value)
+    if not key:
+        return False
+    if key in _OWNER_LABELS:
+        return True
+    for acct in _accounts():
+        if _account_is_owner(acct) and key in _account_variants(acct):
+            return True
+        # A conta histórica "principal" é o número do dono, mesmo offline.
+        if _fold(acct.get("name")) == "principal" \
+                and key in ("principal", "conta principal"):
+            return True
+    return False
+
+
+def _account_label(value: object) -> dict | None:
+    key = _fold(value)
+    if not key:
+        return None
+    for acct in _accounts():
+        if key in _account_variants(acct):
+            return acct
+    return None
+
+
+def _resolve_recipient(to: object) -> tuple[str, str]:
+    """Rótulo → número. Devolve (destinatário, erro); erro vazio = pode enviar.
+
+    Contato comum volta como veio, para o core/whatsapp.py resolver na agenda.
+    """
+    raw = str(to or "").strip()
+    if not raw:
+        return "", "falta o destinatário"
+    if is_owner_label(raw):
+        owner = _owner_chat()
+        if not owner:
+            return "", _owner_missing()
+        return owner, ""
+    acct = _account_label(raw)
+    if acct is not None:
+        number = str(acct.get("number") or "").strip()
+        if not number:
+            return "", (f"a conta '{acct.get('name')}' não está conectada "
+                        "agora, então eu não sei o número dela")
+        return number, ""
+    return raw, ""
+
+
+def _missing_destination() -> str:
+    if _owner_chat():
+        return ("para quem? diga o nome do contato, o número, ou 'mim' "
+                "para o seu próprio número")
+    return ("para quem? diga o nome do contato ou o número — e o seu próprio "
+            "número ainda não está registrado: preencha 'owner_chat' em "
+            "⚙ → PLUGIN SETTINGS → WHATSAPP.")
 
 
 def _ambiguous(account: str) -> str | None:
@@ -102,7 +220,12 @@ PLUGIN = {
             "to": {
                 "type": "STRING",
                 "description": "send/send_file: the contact name as the user "
-                               "said it, or the phone number with country code",
+                               "said it, or the phone number with country code. "
+                               "When the user says 'manda pra mim', 'pra mim "
+                               "mesmo' or 'pra conta principal', pass 'mim' — "
+                               "the tool resolves it to the owner's own number "
+                               "from owner_chat. An account label (e.g. "
+                               "'trabalho') resolves to that account's number.",
             },
             "text": {
                 "type": "STRING",
@@ -220,25 +343,35 @@ def _do_pair(account: str = "") -> tuple[str, str]:
 
 def _do_send(to: str, text: str, account: str = "") -> tuple[str, str]:
     if not to:
-        return ("para quem? diga o nome do contato ou o número", "falta o destinatário")
+        return _missing_destination(), "falta o destinatário"
     if not text:
         return ("o que eu mando? a mensagem está vazia", "falta a mensagem")
+    target, why = _resolve_recipient(to)
+    if why:
+        return why, why
     amb = _ambiguous(account)
     if amb:
         return amb, "conta ambígua"
-    ok, msg = whatsapp.send(to, text, account=account or None)
+    ok, msg = whatsapp.send(target, text, account=account or None)
+    if not ok:
+        return f"falhou: {msg}", msg
     return msg, msg
 
 
 def _do_send_file(to: str, path: str, caption: str, account: str = "") -> tuple[str, str]:
     if not to:
-        return ("para quem? diga o nome do contato ou o número", "falta o destinatário")
+        return _missing_destination(), "falta o destinatário"
     if not path:
         return ("qual arquivo? diga o caminho ou o nome dele", "falta o arquivo")
+    target, why = _resolve_recipient(to)
+    if why:
+        return why, why
     amb = _ambiguous(account)
     if amb:
         return amb, "conta ambígua"
-    ok, msg = whatsapp.send_media(to, path, caption, account=account or None)
+    ok, msg = whatsapp.send_media(target, path, caption, account=account or None)
+    if not ok:
+        return f"falhou: {msg}", msg
     return msg, msg
 
 

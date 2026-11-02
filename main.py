@@ -50,9 +50,11 @@ for _stream in ("stdout", "stderr"):
 
 import asyncio
 import atexit
+import hashlib
 import os
 import re
 import secrets
+import tempfile
 import threading
 import time
 import json
@@ -77,13 +79,18 @@ from core import continuity as _continuity
 from core import brain as _brain
 from core import qoder_live as _qoder_live
 from core import narration as _narration
+from core import activity as _activity
+from core import speech_guard as _speech_guard
 from core import tool_bridge as _tool_bridge
 from core import speaker_id as _speaker_id
+from core import series_gate as _series_gate_mod
 from core import chat_memory as _chat_memory
 from core import personas as _personas
 from core import memory_index as _memory_index
 from core import sleep as _sleep
 from core import task_queue as _task_queue
+from core import task_mirror as _task_mirror
+from core import wake_announce as _wake_announce
 from core import health as _health
 from core import memory_librarian as _memory_librarian
 from core import metrics as _metrics
@@ -137,6 +144,20 @@ from core.wake_word            import (
 # How long the assistant stays awake with no user speech before it auto-sleeps
 # again (wake-word mode only).
 WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
+
+# While asleep, an unaddressed transcribed line is dropped (with a SYS line) or
+# wakes her: the owner repeating himself inside this window is a conversation
+# she is missing, and a bare address cue ("para de me ignorar") has no name in
+# it. Both exist because 19 transcribed owner sentences were discarded in
+# silence by the old "asleep — not addressed to me" print.
+ASLEEP_SPEAK_WINDOW_S = 60.0
+ASLEEP_SPEAK_WAKE_COUNT = 3
+_OWNER_ADDRESS_CUE_RE = re.compile(
+    r"\b(?:para\s+de\s+me\s+ignorar|me\s+ignor\w+|"
+    r"t[aá]\s+(?:me\s+)?(?:ouvindo|escutando)|me\s+ouve|me\s+escuta|"
+    r"estou\s+falando\s+com\s+voc[eê]|fala\s+comigo|"
+    r"(?:voc[eê]|tu)\s+(?:n[aã]o\s+)?(?:me\s+)?(?:ouve|escuta|ignora))\b",
+    re.IGNORECASE)
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -255,6 +276,13 @@ _USER_SPEECH_TAIL_S = 2.0
 # palavras da mesma frase, para o playback não entrar na pausa.
 _BARGE_CONFIRM_BLOCKS = 3      # ~190 ms de voz sustentada
 _OWNER_VOICE_TAIL_S = 1.0      # pausa entre palavras ainda é "ele falando"
+# A fresh burst of our own TTS hits the microphone as an attack transient, and
+# that is the one moment the EchoGuard has no learned floor for it yet (a line
+# queued after a silence is exactly when a "return to sender" false barge-in
+# used to happen). A voiced block inside this window still raises the owner's
+# floor and is still fed to the segmenter — it just does not count toward the
+# barge-in confirmation, so our own attack can never cut the reply.
+_BARGE_SETTLE_S = 0.25
 
 # Erring early is the safe direction. A viewer tolerates a mouth that moves
 # slightly before the sound far better than one that moves after it — the
@@ -853,7 +881,7 @@ _APPS_RE = re.compile(
     re.IGNORECASE)
 
 # "Olha a minha tela" / "o que tem na tela" — capture and describe it here,
-# with the local vision model, instead of hoping the model picks screen_process.
+# with the configured vision backend, instead of hoping the model picks screen_process.
 _SCREEN_RE = re.compile(
     r"\b(?:minha|nossa|dessa|desta|nessa|nesta|nessa|na|da)\s+tela\b"
     r"|\bo\s+que\s+(?:tem|est[aá]|ta|aparece)\s+(?:na|nessa|nesta|aqui)\b"
@@ -946,14 +974,107 @@ _VOICE_SELF_ENROLL_RE = re.compile(
     re.IGNORECASE)
 # Guided enrollment ("Ok Google" style): the assistant asks for a handful of
 # short phrases, keeps only the embeddings and never the raw audio.
+#
+# The trigger is deliberately narrow. It was `cadastr\w*|registr\w*|trein\w*
+# |aprend\w*` anywhere near "minha voz", so at 19:43:57 a FEATURE REQUEST —
+# "implemente uma ferramenta para registrar minha voz" — hijacked the
+# conversation into the five-phrase flow and enrolled arbitrary audio. Now only
+# an explicit FIRST-PERSON request counts ("quero cadastrar minha voz",
+# "cadastrar minha voz de novo", "cadastra minha voz", "ok google").
 _VOICE_TRAIN_RE = re.compile(
-    r"\b(?:cadastr\w*|registr\w*|trein\w*|aprend\w*)\b[^.!?]{0,50}"
-    r"\b(?:minha\s+voz|voz\s+do\s+dono|reconhecimento\s+de\s+voz)\b"
-    r"|\b(?:reconhe[çc]\w*|identific\w*)\b[^.!?]{0,40}\b(?:pela\s+)?voz\b"
+    r"\b(?:quero|queria|gostaria|preciso|pode|poderia|vamos|bora|vou)\b"
+    r"[^.!?]{0,40}\b(?:cadastr\w*|registr\w*|trein\w*|grav\w*|ensin\w*)\b"
+    r"[^.!?]{0,30}\b(?:minha\s+voz|reconhecimento\s+de\s+voz|voz\s+do\s+dono)\b"
+    r"|\b(?:cadastra|cadastre|cadastrar|cadastro|registra|registre|"
+    r"grava|grave|treina|treine|ensina|ensine)\b"
+    r"[^.!?]{0,30}\bminha\s+voz\b"
     r"|\b(?:ok\s+google|voice\s+match)\b",
+    re.IGNORECASE)
+# A feature/implementation request that merely MENTIONS voice enrollment is a
+# conversational turn for the brain, never the guided flow.
+_VOICE_TRAIN_FEATURE_RE = re.compile(
+    r"\b(?:implemente|implementar|implementa[cç][aã]o|implementa|"
+    r"crie|criar|cria|desenvolva|desenvolver|ferramenta|ferramentas|"
+    r"feature|funcionalidade|recurso|plugin|skill|script|"
+    r"registro\s+autom[aá]tico|adiciona\s+essa\s+tamb[eé]m)\b",
     re.IGNORECASE)
 _VOICE_TRAIN_CANCEL_RE = re.compile(
     r"^\s*(?:cancela|cancelar|para|pare|depois|chega|deixa)\b", re.IGNORECASE)
+# Refusals cancel immediately, even mid-phrase ("eu não pedi isso").
+_VOICE_TRAIN_REFUSE_RE = re.compile(
+    r"\b(?:eu\s+)?n[ãa]o\s+(?:pedi|quero|autorizei|autorizo|falei|mandei|"
+    r"foi\s+isso)\b"
+    r"|\bdeixa\s+(?:pra|para)\s+depois\b|\bagora\s+n[ãa]o\b",
+    re.IGNORECASE)
+# Fuzzy acceptance of the prompted phrase: the owner repeats it, Whisper may
+# drop a word. Token recall OR normalized Levenshtein similarity must reach
+# this floor; anything below re-prompts the SAME phrase (no progress).
+_VOICE_TRAIN_MATCH_MIN = 0.60
+_VOICE_TRAIN_MAX_FAILURES = 3
+# How long the progressive gate's last verdict still counts as the "current
+# voice" for the STT segment-cap hook (core/groq_stt.current_speaker_is_owner).
+# Older than this is not evidence; the hook fails open (owner cap).
+_STT_OWNER_EVIDENCE_TTL_S = 120.0
+# "Modo série": liga/desliga por voz, sem popup. Bare "modo série" liga; any
+# off verb (or "off") desliga. A question about the mode is left to the brain.
+_SERIES_MODE_RE = re.compile(r"\bmodo\s+s[eé]rie\b", re.IGNORECASE)
+_SERIES_OFF_RE = re.compile(
+    r"\b(?:sai|sair|desliga|desligar|desativa|desativar|encerra|encerrar|"
+    r"para|parar|off|desligad[oa]|desativad[oa])\b", re.IGNORECASE)
+_SERIES_QUESTION_RE = re.compile(
+    r"^\s*(?:gino[,\s]+)?(?:o\s+que|que\s+[eé]|como|quando|por\s+que|"
+    r"qual|explica|me\s+explica)\b", re.IGNORECASE)
+
+# ── Indulgência cirúrgica do único dono + "modo cinema" ─────────────────────
+# With exactly one enrolled voice (the owner), a low score is more likely the
+# microphone than an intruder — but only for a short/bare-address call or for
+# a score already inside the gray band. A full TV sentence far below the
+# owner's cluster must never be answered as the owner (the 20:01:58 anomaly).
+DEFAULT_VOICE_INDULGENCE_GRAY_FLOOR = 0.38
+# Cinema mode: N suspicious non-owner utterances inside the window ask the
+# owner ONCE whether a show is playing. Activation only on an explicit owner
+# yes; while active, unknown speech dies before the brain and without a reply.
+DEFAULT_CINEMA_TRIGGER_COUNT = 3
+DEFAULT_CINEMA_TRIGGER_WINDOW_S = 60.0
+DEFAULT_CINEMA_IDLE_EXIT_S = 600.0
+DEFAULT_CINEMA_PROMPT_TTL_S = 60.0
+DEFAULT_CINEMA_PROMPT_COOLDOWN_S = 600.0
+CINEMA_STATE_PATH = BASE_DIR / "memory" / "cinema_mode.json"
+_CINEMA_MODE_RE = re.compile(r"\bmodo\s+cinema\b", re.IGNORECASE)
+_CINEMA_EXIT_RE = re.compile(
+    r"\b(?:sai|sair|desliga|desligar|desativa|desativar|encerra|encerrar|"
+    r"para|parar|off|desligad[oa]|desativad[oa])\b[^.!?]{0,24}"
+    r"\bmodo\s+cinema\b"
+    r"|\bmodo\s+cinema\b[^.!?]{0,24}\b(?:sai|sair|desliga|desligar|"
+    r"desativa|desativar|encerra|encerrar|para|parar|off)\b",
+    re.IGNORECASE)
+_CINEMA_ACTIVATE_RE = re.compile(
+    r"\b(?:liga|ligar|ativa|ativar|entra|entrar|inicia|iniciar|come[cç]a|"
+    r"come[cç]ar)\b[^.!?]{0,24}\bmodo\s+cinema\b"
+    r"|\bmodo\s+cinema\b[^.!?]{0,24}\b(?:liga|ligar|ativa|ativar|entra|"
+    r"entrar|inicia|iniciar)\b",
+    re.IGNORECASE)
+# Full-utterance answers only: "pode enviar" is consent for another gate, not
+# a yes to the cinema question. The owner answers "sim", "pode", "claro".
+_CINEMA_YES_RE = re.compile(
+    r"^\s*(?:gino[,\s]+)?(?:sim|pode|claro|quero|isso|exato|afirmativo|"
+    r"ativa|ative|liga|ligue|manda|bora|com\s+certeza)"
+    r"(?:\s*,?\s*(?:sim|pode|claro|por\s+favor))?\s*[.!]?\s*$",
+    re.IGNORECASE)
+_CINEMA_NO_RE = re.compile(
+    r"^\s*(?:gino[,\s]+)?(?:n[ãa]o|nao|deixa|deixe|melhor\s+n[ãa]o|"
+    r"agora\s+n[ãa]o|nem|negativo)"
+    r"(?:\s*,?\s*(?:obrigado|agora|por\s+favor|deixa))?\s*[.!]?\s*$",
+    re.IGNORECASE)
+# "me mostra trabalhando": pedido explícito para ver a execução, atendido
+# antes do modelo para a janela abrir na hora (ver _mirror_show_gate).
+_MIRROR_SHOW_RE = re.compile(
+    r"\b(?:me\s+mostra|mostra(?:\s+(?:pra|para)\s+mim)?|quero\s+ver|"
+    r"deixa\s+eu\s+ver)\b[^.!?]{0,50}?"
+    r"\b(?:trabalhando|o\s+trabalho|a\s+execu[cç][aã]o|o\s+executor|"
+    r"o\s+espelho|rodando|em\s+segundo\s+plano)\b"
+    r"|\babre\s+(?:o\s+)?(?:espelho|terminal\s+do\s+trabalho)\b",
+    re.IGNORECASE)
 _VOICE_TRAIN_PROMPTS = (
     "Gino, sou eu, o Anthero.",
     "Quero que você reconheça a minha voz.",
@@ -961,6 +1082,55 @@ _VOICE_TRAIN_PROMPTS = (
     "Agora um pouco mais alto: Gino, pode me ouvir?",
     "Sou eu de novo, falando do jeito normal.",
 )
+
+
+def _voice_phrase_tokens(text: str) -> list[str]:
+    """Lowercase, accent-free word tokens (punctuation dropped)."""
+    import unicodedata
+    folded = unicodedata.normalize("NFKD", str(text or "").lower())
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    return re.findall(r"[a-z0-9]+", folded)
+
+
+def _levenshtein_similarity(a: str, b: str) -> float:
+    """Normalized Levenshtein similarity in [0, 1] (1 = identical)."""
+    a, b = str(a or ""), str(b or "")
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    if len(a) < len(b):
+        a, b = b, a
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        current = [i]
+        for j, cb in enumerate(b, 1):
+            current.append(min(
+                previous[j] + 1,             # deletion
+                current[j - 1] + 1,          # insertion
+                previous[j - 1] + (ca != cb)  # substitution
+            ))
+        previous = current
+    distance = previous[-1]
+    return max(0.0, 1.0 - distance / float(max(len(a), len(b))))
+
+
+def _voice_phrase_score(spoken: str, prompt: str) -> float:
+    """How closely the transcript matches the phrase that was prompted.
+
+    Two cheap measures, best of both: recall of the prompt's tokens (a
+    repeated phrase with one dropped word still passes) and the normalized
+    Levenshtein similarity of the joined normalized strings. Junk spoken
+    during enrollment ("Vai tomar no cú.") scores near zero on both.
+    """
+    want = _voice_phrase_tokens(prompt)
+    got = _voice_phrase_tokens(spoken)
+    if not want or not got:
+        return 0.0
+    wanted = set(want)
+    overlap = len(wanted & set(got)) / float(len(wanted))
+    lev = _levenshtein_similarity(" ".join(got), " ".join(want))
+    return max(overlap, lev)
 # An explicit send request is the owner's authorization: he should not have to
 # answer a second "pode enviar?" for something he just asked for.
 _ACTION_REQUEST_RE = re.compile(
@@ -1096,7 +1266,8 @@ TOOL_DECLARATIONS = [
         "name": "clipboard_view",
         "description": (
             "Read what is on the user's clipboard RIGHT NOW: a copied screenshot "
-            "or image (described by the local vision model) or copied text "
+            "or image (described by the configured vision backend, Qoder by "
+            "default) or copied text "
             "(returned verbatim). Use it when the user mentions a print, "
             "screenshot, copy or the clipboard — instead of asking them to "
             "paste or describe it."),
@@ -1392,6 +1563,30 @@ class JarvisLive:
         self._chat_memory          = None
         self._memory_librarian     = None
         self._speaker              = None
+        # "Modo série": progressive voice gate before transcription. Built
+        # with the SpeakerId in _maybe_start_qoder_live; None means no gate.
+        self._series_gate          = None
+        # Owner-only forgiveness floor (see _voice_indulgence_ok) and the
+        # cinema-mode detector/state. The state file is the only durable bit;
+        # timers and counters live in RAM and restart with the process.
+        self._voice_indulgence_gray_floor = DEFAULT_VOICE_INDULGENCE_GRAY_FLOOR
+        self._cinema_mode_enabled = True
+        self._cinema_trigger_count = DEFAULT_CINEMA_TRIGGER_COUNT
+        self._cinema_trigger_window_s = DEFAULT_CINEMA_TRIGGER_WINDOW_S
+        self._cinema_idle_exit_s = DEFAULT_CINEMA_IDLE_EXIT_S
+        self._cinema_prompt_ttl_s = DEFAULT_CINEMA_PROMPT_TTL_S
+        self._cinema_prompt_cooldown_s = DEFAULT_CINEMA_PROMPT_COOLDOWN_S
+        self._cinema_state_file = CINEMA_STATE_PATH
+        self._cinema_active = False
+        self._cinema_loaded = False
+        self._cinema_since = 0.0
+        self._cinema_last_audio = 0.0
+        self._cinema_events: list[float] = []
+        self._cinema_counted: dict[int, float] = {}
+        self._cinema_prompted_at = 0.0
+        self._cinema_pending = False
+        self._cinema_timer: threading.Timer | None = None
+        self._cinema_lock = threading.RLock()
         self._wa_stt_lock          = threading.Lock()
         self._restart              = None
         self._power                = None
@@ -1410,6 +1605,15 @@ class JarvisLive:
         self._narration_timer      = None
         self._narration_turn       = None
         self._narration_spoken     = False
+        # Audit trail for the Activity Log: one integer per conversation turn
+        # (the owner greps `"turn":N` to reconstruct a context) and the record
+        # of what actually reached the TTS for that turn, so the line logged at
+        # the end can carry audio_requested/audio_generated/tts honestly.
+        self._turn_seq             = 0
+        self._turn_ref             = 0
+        self._turn_input_chan      = "voz"
+        self._speech_audit: dict[int, list[dict]] = {}
+        self._speech_audit_lock    = threading.RLock()
         self._qoder_turn_started   = 0.0
         # A watchdog only fires when the turn *stalls*: every text/tool event
         # pushes the deadline forward, and a hard cap stops runaway tool chains.
@@ -1422,6 +1626,7 @@ class JarvisLive:
         self._qoder_lock           = threading.RLock()
         self._qoder_text_buf: dict[str, str] = {}
         self._qoder_spoken: dict[str, list[str]] = {}
+        self._qoder_say_events: dict[str, threading.Event] = {}
         self._qoder_turns: dict[str, str] = {}
         self._qoder_meta: dict[str, dict] = {}
         # turn_id -> monotonic time. A barge-in marks the in-flight turn
@@ -1470,6 +1675,17 @@ class JarvisLive:
         self._barge_vad            = None
         self._barge_run            = 0       # blocos de voz consecutivos
         self._owner_voice_until    = 0.0     # monotonic: piso do dono até quando
+        self._owner_voice_since    = 0.0     # início da fala dele (para o log)
+        # O onset é confirmado por blocos (~190 ms); o áudio em curso também
+        # precisa parar. `_out_stream` é o stream de saída aberto em
+        # _play_audio, para o barge-in abortá-lo; `_play_abort` avisa o loop
+        # para reiniciar o stream antes do próximo lote — o que já estava no
+        # buffer do dispositivo morre junto, em vez de tocar até o fim.
+        self._out_stream           = None
+        self._play_abort           = threading.Event()
+        self._play_abort_at        = 0.0     # monotonic of the last barge-in abort
+        self._play_burst_until     = 0.0     # fim da janela de assentamento
+        self._interrupt_note       = ""      # linha SYS do motivo do interrupt
         try:
             from core import silero_vad as _sv
             if _sv.available():
@@ -1569,6 +1785,10 @@ class JarvisLive:
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
+        # Times (monotonic) of owner-confirmed lines heard while asleep. Three
+        # inside ASLEEP_SPEAK_WINDOW_S wake her: the audit found streaks of
+        # transcribed-and-discarded owner sentences ("para de me ignorar").
+        self._asleep_owner_speech: list[float] = []
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
@@ -1653,6 +1873,11 @@ class JarvisLive:
                 direct_account=_whatsapp.default_account_name(),
                 direct_chat=str(_get_plugin("whatsapp", "owner_chat", "") or ""),
             )
+            # Mensagem do DONO no chat direto: o core chama este gancho na
+            # thread do neonize antes de qualquer resposta. Acordado, vira uma
+            # fala curta; dormindo/mudo/sem sessão, o aviso fica na gaveta e
+            # `wake()` o drena no próximo despertar (ver _whatsapp_owner_wake).
+            _whatsapp.add_owner_wake_hook(self._whatsapp_owner_wake)
         except Exception as e:
             print(f"[WhatsApp] monitoramento autônomo indisponível: {e}")
         # ── Códigos de verificação (OTP) no e-mail ──────────────────────────
@@ -1664,6 +1889,18 @@ class JarvisLive:
             _email_otp.start(self._announce_otp)
         except Exception as e:
             print(f"[OTP] monitor de códigos no e-mail indisponível: {e}")
+        # ── Revisão de comunicação a cada 6 horas ───────────────────────────
+        # Lê só o trecho novo do Activity Log, grava logs/comm-review.md e
+        # deixa um evento na fila de tarefas; o _task_watch fala a pendência em
+        # voz alta na próxima janela. É leitura pura: não pede confirmação.
+        try:
+            from core import comm_review as _comm_review
+            _comm_review.start(
+                logger=lambda msg: self.ui.write_log(f"SYS: {msg}"),
+                ready=lambda: (bool(getattr(self, "_awake", True))
+                               and not bool(getattr(self.ui, "muted", False))))
+        except Exception as e:
+            print(f"[CommReview] rotina de revisão indisponível: {e}")
         try:
             from memory.config_manager import get_plugin_setting
             _wa_auto = bool(get_plugin_setting("whatsapp", "auto_start", True))
@@ -1737,6 +1974,9 @@ class JarvisLive:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
         self.ui.write_log(f"SYS: Acordei — {reason}.")
+        # O dono pode ter escrito no WhatsApp enquanto ela dormia: a gaveta do
+        # core é entregue agora, numa única frase, pelo mesmo canal de fala.
+        self._drain_whatsapp_owner_wake()
 
     def sleep(self, reason: str = "timeout") -> None:
         if not self._awake:
@@ -1748,6 +1988,56 @@ class JarvisLive:
         self.ui.set_state("SLEEPING")
         self.ui.write_log(f"SYS: Dormindo — {reason}. Diga 'Hey {self._asst_name}' "
                           f"para me acordar.")
+
+    # ── O relógio de sono e a regra "nunca ignorar" ─────────────────────────
+    def _note_owner_speech(self, reason: str = "") -> None:
+        """A consumed spoken line restarts the auto-sleep clock.
+
+        The sleep watcher only knows `_last_user_speech`, and a local gate that
+        answers and returns never reaches `_qoder_turn` (which refreshes it).
+        The 01/11 audit caught the consequence: at 19:44:42 Gino answered a
+        gate turn and 11 s later logged "Dormindo — nenhuma fala por 2
+        minutos", then dropped every following sentence. Every early return
+        that consumed a genuine owner utterance must call this.
+        """
+        self._last_user_speech = time.monotonic()
+        if reason:
+            print(f"[Wake] fala consumida por «{reason}» — relógio de sono renovado")
+
+    def _asleep_utterance_wakes(self, text: str, pcm: bytes | None) -> bool:
+        """While asleep, should this unaddressed line wake her and be answered?
+
+        Two rules, both from the real audit (19 transcribed owner sentences
+        discarded with nothing but a print):
+          * an address cue with no name in it ("para de me ignorar") is a call;
+          * the owner speaking 3+ times inside a minute is a conversation she
+            is missing, even without the wake word.
+        Anything else is dropped — but never silently: the discard writes a
+        SYS line to the activity log with the transcript and the voice score.
+        """
+        confirmed, score, detail = self._owner_speaker_confirmed(text, pcm)
+        cue = bool(_OWNER_ADDRESS_CUE_RE.search(text or ""))
+        now = time.monotonic()
+        speaks = [t for t in getattr(self, "_asleep_owner_speech", []) or []
+                  if now - t <= ASLEEP_SPEAK_WINDOW_S]
+        if confirmed:
+            speaks.append(now)
+        self._asleep_owner_speech = speaks
+        if cue:
+            print(f"[Wake] dormindo, mas endereçada a mim: {text[:60]!r}")
+            return True
+        if confirmed and len(speaks) >= ASLEEP_SPEAK_WAKE_COUNT:
+            print(f"[Wake] dormindo, mas o dono falou {len(speaks)}x em "
+                  f"{ASLEEP_SPEAK_WINDOW_S:.0f}s: {text[:60]!r}")
+            return True
+        line = (f"SYS: dormindo — fala não endereçada descartada: "
+                f"«{str(text or '')[:80]}» (você? score={score:.2f}, {detail})")
+        try:
+            self.ui.write_log(line)
+        except Exception:
+            pass
+        print(line)
+        return False
 
     async def _run_reminder_watch(self) -> None:
         """Speak reminders as they come due.
@@ -1852,11 +2142,10 @@ class JarvisLive:
 
         st = _brain.settings(get_plugin_config)
         missing = _brain.missing_packages(st)
-        # Providers that need no API key: the local Ollama (custom) and the
-        # qoder CLI (qodercli — it reads its own login from disk). Testing only
-        # for "custom" here left a qodercli brain waiting forever for a key it
-        # never needs, and nothing ever started.
-        _keyless = st["provider"] in ("custom", "qodercli")
+        # Providers that need no API key: the qoder CLI (qodercli — it reads its
+        # own login from disk). The old local Ollama rung is gone; testing for
+        # any keyless local provider here no longer applies.
+        _keyless = st["provider"] == "qodercli"
         if missing:
             self.ui.write_log("ERR: Economy brain needs packages for the voice — run: "
                               "py -m pip install " + " ".join(missing))
@@ -1919,18 +2208,28 @@ class JarvisLive:
         # The same system prompt and tool list the Live session would get.
         self._build_config()
         self._brain_st = st
-        # Vision in economy mode is the local VL model on the same Ollama: the
-        # screenshot never leaves the machine. Only offered when the brain is
-        # local — a text-only provider would receive a tool it cannot use.
-        self._local_vision = st["provider"] == "custom"
+        # Vision is its own flag (vision_provider). Phase 2 moved the default
+        # to Qoder: the screenshot is attached to a `qoder -p` turn and read by
+        # the free Qwen3.8-Flash; "local" keeps Ollama/qwen2.5vl, "off" removes
+        # the vision tools from the model's list entirely.
+        self._vision_enabled = bool(st.get("vision_enabled", True))
+        self._vision_provider = str(st.get("vision_provider") or "qoder")
         tools = _brain.to_openai_tools(self._all_tool_decls,
-                                       include_vision=self._local_vision)
-        _vision_sentence = (
-            "You CAN see: screen_process captures the screen (angle=camera for the "
-            "webcam) and a LOCAL vision model describes it — the image never leaves "
-            "this machine." if self._local_vision else
-            "You have NO vision in this mode — screen_process and close_camera are "
-            "not available, so never offer to look at the screen or camera.")
+                                       include_vision=self._vision_enabled)
+        if not self._vision_enabled:
+            _vision_sentence = (
+                "You have NO vision in this mode — screen_process and close_camera "
+                "are not available, so never offer to look at the screen or camera.")
+        elif self._vision_provider == "local":
+            _vision_sentence = (
+                "You CAN see: screen_process captures the screen (angle=camera for "
+                "the webcam) and a LOCAL vision model describes it — the image "
+                "never leaves this machine.")
+        else:
+            _vision_sentence = (
+                "You CAN see: screen_process captures the screen (angle=camera for "
+                "the webcam) and the image is sent to Qoder, which describes it. "
+                "Never claim to have looked without calling the tool.")
         self._system_prompt_text += (
             f"\n\n[MODE]\nYou are running in economy mode: your words are written by a "
             f"text model and read aloud by a separate voice. {_vision_sentence} "
@@ -2001,6 +2300,10 @@ class JarvisLive:
             loop = asyncio.get_event_loop()
             while True:
                 text = await self._brain_q.get()
+                # This turn's index, captured before any await: the LOG line
+                # written at the end must point at the turn it answered, not at
+                # whatever turn happened to be open by then.
+                _turn = int(getattr(self, "_turn_ref", 0) or 0)
                 self._interrupted = False
                 self._reply_active = True
                 if self._turn_done_event is not None:
@@ -2156,14 +2459,25 @@ class JarvisLive:
                     if any(m in low for m in _scratch_markers):
                         print(f"[Economy] não falei o rascunho do modelo: {sentence[:80]!r}")
                         return
+                    # A camada de fala vale também aqui: o texto exibido fica,
+                    # o TTS recebe a versão sem nome de ferramenta/caminho/
+                    # JSON/inglês, e o log da vez ganha `sanitized=`.
+                    try:
+                        guarded = _speech_guard.sanitize(
+                            sentence, lang=(_activity.lang_of(sentence) or "pt"))
+                        spoken_sentence = guarded.text or sentence
+                        sanitized_flag = "+".join(guarded.kinds)
+                    except Exception:
+                        spoken_sentence = sentence
+                        sanitized_flag = ""
                     # Screen keeps the digits; the voice gets the words
                     # ("R$ 380.789,00" → "trezentos e oitenta mil, …").
                     try:
                         from core.numwords import speakable as _speakable
                         voice_text = _speakable(
-                            sentence, style="hybrid" if st.get("tts_engine") == "fish" else "words")
+                            spoken_sentence, style="hybrid" if st.get("tts_engine") == "fish" else "words")
                     except Exception:
-                        voice_text = sentence
+                        voice_text = spoken_sentence
                     try:
                         pcm = _brain.synth_pcm24k(voice_text, st)
                     except _brain.FishCreditsExhausted as e:
@@ -2178,22 +2492,55 @@ class JarvisLive:
                         except Exception as e2:
                             self.ui.write_log(f"SYS: A voz falhou — {str(e2)[:120]}")
                             print(f"[Economy] fallback TTS failed: {e2}")
+                            self._note_speech(sentence, spoken_sentence,
+                                              generated=False, turn=_turn,
+                                              origin="economia",
+                                              sanitized=sanitized_flag,
+                                              cut=True)
+                            self._queue_speech_cut_note(sentence, _turn, "tts")
                             return
                     except Exception as e:
                         self.ui.write_log(f"SYS: A voz falhou — {str(e)[:120]}")
                         print(f"[Economy] TTS failed: {e}")
+                        self._note_speech(sentence, spoken_sentence,
+                                          generated=False, turn=_turn,
+                                          origin="economia",
+                                          sanitized=sanitized_flag,
+                                          cut=True)
+                        self._queue_speech_cut_note(sentence, _turn, "tts")
                         return
                     if not pcm or self._interrupted:
+                        cut = bool(self._interrupted)
+                        self._note_speech(sentence, voice_text,
+                                          generated=False, turn=_turn,
+                                          origin="economia",
+                                          sanitized=sanitized_flag, cut=cut)
+                        self._queue_speech_cut_note(
+                            sentence, _turn, "turno" if cut else "vazio")
                         return
                     if not lat[1]:
                         lat[1] = True
+                        self._note_first_audio(_turn)
                         print(f"[Latência] texto → voz pronta: "
                               f"{time.monotonic() - getattr(self, '_turn_t0', 0.0):.1f}s")
                     _usage.note("brain", tts_s=len(pcm) / 48000.0)
                     queued_s[0] += len(pcm) / 48000.0
                     spoken.append(sentence)
+                    # The TTS saw `voice_text`, not necessarily `sentence`
+                    # ("R$ 380" → "trezentos e oitenta reais"). Record both;
+                    # the answer line adds `tts=` only when they differ.
+                    self._note_speech(sentence, voice_text, generated=True,
+                                      turn=_turn, origin="economia",
+                                      sanitized=sanitized_flag)
                     self.ui.holo_transcript(sentence)
                     for i in range(0, len(pcm), 2400):
+                        if self._interrupted:
+                            self._note_speech(sentence, voice_text,
+                                              generated=False, turn=_turn,
+                                              origin="economia",
+                                              sanitized=sanitized_flag, cut=True)
+                            self._queue_speech_cut_note(sentence, _turn, "meio")
+                            return
                         loop.call_soon_threadsafe(self.audio_in_queue.put_nowait, pcm[i:i + 2400])
 
                 # Decide this turn's tool access with a cheap, smart router
@@ -2378,8 +2725,17 @@ class JarvisLive:
                     full = " ".join(spoken).strip()
                     if full:
                         self._last_out_logged = full
-                        self.ui.write_log(f"{self._asst_name}: {full}")
+                        meta_flags = self._speech_meta(
+                            chan=str(getattr(self, "_turn_input_chan", "") or "voz"),
+                            requested=True, shown=full, turn=_turn,
+                            only_origin="economia")
+                        self.ui.write_log(self._log_line(
+                            f"{self._asst_name}: {full}", meta_flags))
                         self._session_log.append(f"{self._asst_name}: {full}")
+                        try:
+                            self._flush_speech_cut_note()
+                        except Exception:
+                            pass
                         try:
                             if self._chat_memory is not None:
                                 self._chat_memory.append_turn("assistant", full)
@@ -2396,13 +2752,22 @@ class JarvisLive:
                         # see that the turn happened at all. Being cut off by
                         # the user is not a failure, though, and calling it one
                         # sends them looking for a bug that does not exist.
+                        # The flags say which case it was: audio was requested
+                        # and not generated is exactly "não falou quando devia".
+                        meta_flags = _activity.make_meta(
+                            turn=_turn,
+                            chan=str(getattr(self, "_turn_input_chan", "") or "voz"),
+                            requested=not self._interrupted,
+                            generated=False, origin="economia")
                         if self._interrupted:
-                            self.ui.write_log("SYS: Turno interrompido — você "
-                                              "pediu para parar.")
+                            self.ui.write_log(self._log_line(
+                                "SYS: Turno interrompido — você "
+                                "pediu para parar.", meta_flags))
                         else:
-                            self.ui.write_log("SYS: Nada foi falado neste turno — o "
-                                              "cérebro ou a voz recusou (detalhes no "
-                                              "terminal).")
+                            self.ui.write_log(self._log_line(
+                                "SYS: Nada foi falado neste turno — o "
+                                "cérebro ou a voz recusou (detalhes no "
+                                "terminal).", meta_flags))
                         _duck.up()      # no reply will speak: end the exchange
                     self._reply_active = False
                     self._turn_done_event.set()     # _play_audio drops the speaking flag when drained
@@ -2857,6 +3222,106 @@ class JarvisLive:
         db = re.sub(r"\D", "", b)
         return bool(da and db and da == db)
 
+    # ── Aviso do dono no chat direto do WhatsApp ─────────────────────────────
+    # core/whatsapp chama `_whatsapp_owner_wake` na thread do neonize a cada
+    # mensagem do dono. Isto NÃO é o pipeline de resposta (esse continua em
+    # `_whatsapp_autoreply`, que responde pelo próprio WhatsApp): é só o aviso
+    # falado de que ele escreveu. Dormindo ou sem sessão, devolver False deixa
+    # a mensagem na gaveta do core e `wake()` a drena numa única frase.
+    @staticmethod
+    def _whatsapp_owner_quote(item: dict) -> str:
+        text = " ".join(str(item.get("text") or "").split())
+        if not text:
+            media = item.get("media") or {}
+            kind = str(media.get("kind") or "").strip()
+            text = (f"uma mensagem de {kind}" if kind
+                    else "uma mensagem sem texto")
+        return text[:180]
+
+    def _announce_whatsapp_owner(self, entries, while_asleep: bool = False) -> bool:
+        """UMA frase com os avisos do dono, injetada na conversa (nunca voice_sink)."""
+        pairs = []
+        for entry in entries or []:
+            try:
+                account, item = entry
+            except (TypeError, ValueError):
+                continue
+            if isinstance(item, dict):
+                pairs.append((str(account or item.get("account") or ""),
+                              dict(item)))
+        if not pairs:
+            return False
+        quotes = "; ".join(f"«{self._whatsapp_owner_quote(item)}»"
+                           for _account, item in pairs)
+        what = ("uma mensagem" if len(pairs) == 1
+                else f"{len(pairs)} mensagens")
+        when = " enquanto eu estava dormindo" if while_asleep else ""
+        line = (f"[WHATSAPP — AVISO AO DONO] Diga ao dono, em UMA frase curta, "
+                f"que ele mandou {what} no chat direto do WhatsApp{when}: "
+                f"{quotes}, e a resposta pelo WhatsApp segue o fluxo normal.")
+        delivered = self._inject_user_turn(line)
+        try:
+            self.ui.write_log(
+                f"SYS: aviso do dono no WhatsApp "
+                f"({'gaveta entregue' if while_asleep else 'na hora'}): "
+                f"{len(pairs)} mensagem(ns).")
+        except Exception:
+            pass
+        return bool(delivered)
+
+    def _whatsapp_owner_wake(self, account: str, item: dict) -> bool:
+        """Gancho do core/whatsapp, executado na thread do neonize.
+
+        Só entrega quando a fala pode sair agora: acordado, microfone aberto e
+        sessão viva. Dormindo/mudo/sem sessão devolve False e o item fica na
+        gaveta de core/whatsapp para `wake()` drenar no próximo despertar.
+        """
+        if not getattr(self, "_awake", True):
+            return False
+        if getattr(getattr(self, "ui", None), "muted", False):
+            return False
+        if getattr(self, "session", None) is None:
+            return False
+        loop = getattr(self, "_loop", None)
+        if loop is None:
+            return False
+        try:
+            if loop.is_closed():
+                return False
+        except Exception:
+            pass
+        payload = dict(item) if isinstance(item, dict) else {}
+        if not payload:
+            return False
+        try:
+            loop.call_soon_threadsafe(
+                self._announce_whatsapp_owner,
+                [(str(account or payload.get("account") or ""), payload)])
+        except Exception as e:
+            print(f"[WhatsApp] aviso do dono não agendado: {e}")
+            return False
+        return True
+
+    def _drain_whatsapp_owner_wake(self) -> bool:
+        """Entrega a gaveta de mensagens do dono no despertar (uma frase)."""
+        if getattr(getattr(self, "ui", None), "muted", False):
+            return False
+        if getattr(self, "session", None) is None:
+            return False
+        if getattr(self, "_loop", None) is None:
+            return False
+        try:
+            from core import whatsapp as _whatsapp
+            pending = _whatsapp.drain_owner_pending()
+        except Exception as e:
+            print(f"[WhatsApp] gaveta do dono indisponível: {e}")
+            return False
+        entries = [(str(item.get("account") or ""), dict(item))
+                   for item in pending if isinstance(item, dict)]
+        if not entries:
+            return False
+        return self._announce_whatsapp_owner(entries, while_asleep=True)
+
     def _whatsapp_autoreply(self, account: str, item: dict) -> bool:
         """Turn a new WhatsApp message into one turn of the SAME conversation.
 
@@ -2871,6 +3336,10 @@ class JarvisLive:
         text = str(item.get("text") or "").strip()
         if not chat:
             return False
+        # Third-party channel: gets its own index in the Activity Log so the
+        # answer line says `chan=whatsapp` and can never be mistaken for speech
+        # in the room (the audio flags on that line are the proof).
+        self._next_turn_ref("whatsapp")
         try:
             from core import whatsapp_watch as _wa_watch
             direct = _wa_watch.is_direct(account, item)
@@ -3001,8 +3470,14 @@ class JarvisLive:
         return ""
 
     def _synthesize_whatsapp_audio(self, text: str) -> str:
-        """TTS text → OGG/Opus file for a WhatsApp voice note."""
+        """TTS text → OGG/Opus file for a WhatsApp voice note.
+
+        Also leaves the exact text handed to the TTS in ``self._wa_tts_text``
+        so the Activity Log line can record the divergence from the message
+        shown when the owner audits a voice note.
+        """
         text = str(text or "").strip()
+        self._wa_tts_text = ""
         if not text or len(text) > 1200:
             return ""
         wav = ogg = None
@@ -3026,6 +3501,7 @@ class JarvisLive:
                 voice_text = text
             pcm = _b.synth_pcm24k(voice_text, st)
             if not pcm:
+                self._wa_tts_text = voice_text
                 return ""
             out_dir = BASE_DIR / "memory" / "whatsapp_media"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -3051,9 +3527,11 @@ class JarvisLive:
                     ogg.unlink(missing_ok=True)
                 except Exception:
                     pass
+                self._wa_tts_text = voice_text
                 return ""
             result = str(ogg)
             ogg = None
+            self._wa_tts_text = voice_text
             return result
         except Exception as e:
             print(f"[WhatsApp] TTS→áudio falhou: {e}")
@@ -3068,16 +3546,31 @@ class JarvisLive:
 
     def _send_whatsapp_answer(self, account: str | None, chat: str,
                               text: str, media_type: str = "text") -> bool:
-        """Send the final answer back to the WhatsApp chat, once."""
+        """Send the final answer back to the WhatsApp chat, once.
+
+        Leaves two facts for the Activity Log line the caller writes:
+        ``_wa_audio_sent`` (did the voice note actually go out?) and
+        ``_wa_tts_text`` (the exact text handed to the TTS, if any).
+        """
         text = str(text or "").strip()
         chat = str(chat or "").strip()
+        self._wa_audio_sent = False
+        self._wa_tts_text = ""
         if not text or not chat:
             return False
         account = str(account or "").strip() or None
         try:
             from core import whatsapp as _wa
             if str(media_type or "").lower() == "audio":
-                path = self._synthesize_whatsapp_audio(text)
+                # Espelho de formato: a resposta de um áudio sai em áudio. Se a
+                # síntese (ou a fila de áudio) falhar por qualquer motivo, a
+                # MESMA resposta sai em texto uma única vez — nunca as duas.
+                path = ""
+                try:
+                    path = self._synthesize_whatsapp_audio(text)
+                except Exception as e:
+                    print(f"[WhatsApp] TTS para áudio falhou: {e}")
+                    path = ""
                 if path:
                     try:
                         ok, msg = _wa.send_media(chat, path, "", account=account)
@@ -3089,6 +3582,7 @@ class JarvisLive:
                         except Exception:
                             pass
                     if ok:
+                        self._wa_audio_sent = True
                         return True
                     print(f"[WhatsApp] áudio não enviado: {msg}")
             ok, msg = _wa.send(chat, text, account=account)
@@ -3186,7 +3680,8 @@ class JarvisLive:
 
         With the flag on, the Qoder session is the only conversational brain:
         the economy model keeps handling only the gates that never reach a
-        model, plus tasks Qoder explicitly delegates through ``local_ask``.
+        model. (The old ``local_ask`` bridge endpoint still answers, but only
+        to say the local text model was retired.)
         """
         if self._qoder_started:
             return
@@ -3197,6 +3692,33 @@ class JarvisLive:
         self._qoder_live_enabled = bool(cfg.get("qoder_live_enabled", False))
         self._voice_id_enabled = bool(cfg.get("voice_id_enabled", False))
         self._restart_enabled = bool(cfg.get("restart_enabled", False))
+        try:
+            floor = cfg.get("voice_indulgence_gray_floor")
+            self._voice_indulgence_gray_floor = (
+                DEFAULT_VOICE_INDULGENCE_GRAY_FLOOR if floor is None
+                else max(0.0, min(1.0, float(floor))))
+        except (TypeError, ValueError):
+            self._voice_indulgence_gray_floor = \
+                DEFAULT_VOICE_INDULGENCE_GRAY_FLOOR
+        self._cinema_mode_enabled = bool(cfg.get("cinema_mode_enabled", True))
+        try:
+            self._cinema_trigger_count = max(
+                2, int(cfg.get("cinema_trigger_count")
+                       or DEFAULT_CINEMA_TRIGGER_COUNT))
+        except (TypeError, ValueError):
+            self._cinema_trigger_count = DEFAULT_CINEMA_TRIGGER_COUNT
+        try:
+            self._cinema_trigger_window_s = max(
+                5.0, float(cfg.get("cinema_trigger_window_seconds")
+                           or DEFAULT_CINEMA_TRIGGER_WINDOW_S))
+        except (TypeError, ValueError):
+            self._cinema_trigger_window_s = DEFAULT_CINEMA_TRIGGER_WINDOW_S
+        try:
+            self._cinema_idle_exit_s = max(
+                30.0, float(cfg.get("cinema_idle_exit_seconds")
+                            or DEFAULT_CINEMA_IDLE_EXIT_S))
+        except (TypeError, ValueError):
+            self._cinema_idle_exit_s = DEFAULT_CINEMA_IDLE_EXIT_S
         try:
             self._qoder_turn_timeout_s = max(
                 15.0, min(180.0, float(cfg.get("qoder_live_turn_timeout") or 45)))
@@ -3222,12 +3744,64 @@ class JarvisLive:
         if self._voice_id_enabled:
             try:
                 owner = str(cfg.get("user_name") or "Anthero").strip() or "Anthero"
-                self._speaker = _speaker_id.SpeakerId(owner_name=owner)
+                # Continuous enrollment: a confidently matched utterance grows
+                # the owner's EXPANDED set. Defaults live in core/speaker_id.py;
+                # every key is optional. The security gate still compares only
+                # the hand-enrolled samples.
+                try:
+                    auto_threshold = float(
+                        cfg.get("voice_auto_enroll_threshold")
+                        or _speaker_id.DEFAULT_AUTO_ENROLL_THRESHOLD)
+                except (TypeError, ValueError):
+                    auto_threshold = _speaker_id.DEFAULT_AUTO_ENROLL_THRESHOLD
+                try:
+                    auto_max = int(cfg.get("voice_auto_enroll_max")
+                                   or _speaker_id.DEFAULT_AUTO_ENROLL_MAX)
+                except (TypeError, ValueError):
+                    auto_max = _speaker_id.DEFAULT_AUTO_ENROLL_MAX
+                try:
+                    auto_min = float(
+                        cfg.get("voice_auto_enroll_min_seconds")
+                        or _speaker_id.DEFAULT_AUTO_ENROLL_MIN_SECONDS)
+                except (TypeError, ValueError):
+                    auto_min = _speaker_id.DEFAULT_AUTO_ENROLL_MIN_SECONDS
+                self._speaker = _speaker_id.SpeakerId(
+                    owner_name=owner,
+                    auto_enroll_enabled=bool(cfg.get("voice_auto_enroll", True)),
+                    auto_enroll_threshold=auto_threshold,
+                    auto_enroll_max=auto_max,
+                    auto_enroll_min_seconds=auto_min,
+                )
                 _health.set_component("voice_id", True, f"dono: {owner}")
             except Exception as e:
                 self._speaker = None
                 _health.set_component("voice_id", False, str(e)[:160])
                 print(f"[QoderLive] speaker id disabled: {e}")
+
+        # "Modo série": only meaningful with a voiceprint. The gate is built
+        # here (once) and reached by the STT listener through
+        # _series_precheck; its ON/OFF state survives a restart in
+        # memory/series_mode.json. The ceiling and thresholds are optional
+        # config keys; defaults live in core/series_gate.py.
+        if self._speaker is not None:
+            try:
+                self._series_gate = _series_gate_mod.SeriesGate(
+                    speaker=self._speaker,
+                    max_sample_seconds=float(
+                        cfg.get("series_gate_max_seconds") or
+                        _series_gate_mod.DEFAULT_MAX_SAMPLE_SECONDS),
+                    accept_threshold=cfg.get("series_gate_accept_threshold"),
+                    playback_confidence=float(
+                        cfg.get("series_gate_playback_confidence") or
+                        _series_gate_mod.DEFAULT_PLAYBACK_CONFIDENCE),
+                    logger=self._series_gate_log,
+                )
+                _health.set_component(
+                    "series_gate", True,
+                    "ligado" if self._series_gate.enabled else "desligado")
+            except Exception as e:
+                self._series_gate = None
+                print(f"[SeriesGate] disabled: {e}")
 
         if self._restart_enabled:
             try:
@@ -3305,6 +3879,7 @@ class JarvisLive:
                         host="127.0.0.1", port=attempt_port,
                         confirm=self._bridge_confirm,
                         preauthorize=_actiongate.whatsapp_reply_allowed,
+                        authorized=_actiongate.authorized,
                         logger=print,
                         audit_path=BASE_DIR / "logs" / "tool_bridge.log",
                         memory=self._chat_memory,
@@ -3354,6 +3929,7 @@ class JarvisLive:
             on_session=self._qoder_on_session,
             on_closed=self._qoder_on_closed,
             on_task=self._qoder_on_task,
+            on_subagent=self._qoder_on_subagent,
             on_persona_text=self._qoder_on_persona_text,
             on_persona_done=self._qoder_on_persona_done,
             on_persona_error=self._qoder_on_persona_error,
@@ -3374,7 +3950,8 @@ class JarvisLive:
             ok = self._qoder_live.start(90)
             if not ok:
                 self.ui.write_log("SYS: Qoder Live não ficou pronto — vou tentar "
-                                  "de novo; sem respostas do modelo local.")
+                                  "de novo; até lá a conversa fica em espera "
+                                  "(não há modelo local de texto).")
                 self._schedule_qoder_restart()
         except Exception as e:
             print(f"[QoderLive] start failed: {e!r}")
@@ -3527,8 +4104,8 @@ class JarvisLive:
         try:
             if getattr(self.ui, "muted", False):
                 return
-            self._say_now(text, log=True)
-            self.ui.write_log(f"SYS: {text}")
+            self._say_now(text, log=True, origin="sono",
+                          log_text=f"SYS: {text}")
         except Exception:
             pass
 
@@ -3585,6 +4162,16 @@ class JarvisLive:
                         "Execute o necessário agora; se for execução pesada, "
                         "delegue ao Agent em background e diga em uma frase que "
                         "está rodando. Responda curto.")
+                    # O log já nasce aqui para "me mostra trabalhando" abrir na
+                    # hora; a janela só aparece quando o subagente começar.
+                    try:
+                        _task_mirror.begin(task["id"], title, source="queue",
+                                           auto_open=False)
+                        _task_mirror.append(
+                            task["id"],
+                            "▸ tarefa da fila iniciada; preparando o executor")
+                    except Exception as e:
+                        print(f"[TaskMirror] fila: {e}")
                     self._qoder_turn(instruction, source="task", speak=True,
                                      task_id=task["id"])
                     break
@@ -3694,42 +4281,6 @@ class JarvisLive:
                 and not bool(getattr(self, "_brain_busy", False))
                 and not bool(getattr(self, "_reply_active", False)))
 
-    def _local_complete(self, prompt: str, *, system: str = "",
-                        max_tokens: int = 500, timeout: float = 45) -> str:
-        """One direct call to the local 7B, with no tools and no speech."""
-        st = getattr(self, "_brain_st", None) or {}
-        rung = next((r for r in st.get("chain", []) if r.get("provider") == "custom"), None)
-        if not rung:
-            return ""
-        base = str(rung.get("base_url") or "").rstrip("/")
-        model = str(rung.get("model") or "qwen2.5:7b-instruct")
-        if not base:
-            return ""
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        try:
-            import requests
-            r = requests.post(
-                f"{base}/chat/completions",
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "temperature": 0.2,
-                    "max_tokens": max_tokens,
-                    "stream": False,
-                },
-                timeout=timeout,
-            )
-            r.raise_for_status()
-            data = r.json()
-            message = ((data.get("choices") or [{}])[0].get("message") or {})
-            return str(message.get("content") or "").strip()
-        except Exception as e:
-            print(f"[Local] completion failed: {e}")
-            return ""
-
     def _start_qoder_task(self, task: str, mode: str = "answer",
                           approval: bool | None = None) -> str:
         """Start an execution in the independent Qoder job worker.
@@ -3748,27 +4299,38 @@ class JarvisLive:
             str(task or ""), mode=mode, player=self.ui, approval=approval)
 
     def _local_ask(self, prompt: str) -> str:
-        """The local model is never a conversational fallback."""
-        if self._qoder_live_enabled:
-            return ("O modelo local está desligado nesta arquitetura. "
-                    "Use o Qoder ou uma ferramenta do JARVIS.")
-        out = self._local_complete(
-            str(prompt or ""),
-            system=("Você é o modelo local do Gino, chamado pelo Qoder para uma "
-                    "tarefa pontual. Responda curto, em português, e não invente "
-                    "fatos que não estejam no pedido."),
-            max_tokens=400, timeout=30)
-        return out or "o modelo local não respondeu"
+        """The local text model was retired: there is no local conversation.
+
+        Kept as an explicit answer for the bridge endpoint (and for a stale
+        Qoder prompt that still calls it) instead of an empty string or a
+        silent disappearance — the caller must know it was turned off.
+        """
+        print("[Local] /local_ask recusado — modelo local de conversa desligado.")
+        from core.brain import LOCAL_CHAT_DISABLED
+        return LOCAL_CHAT_DISABLED
 
     def _memory_summarize(self, prompt: str) -> str:
-        """Ask the local 7B to turn recent turns into a short memory summary.
+        """Turn recent turns into a short memory summary — on Qoder, never local.
 
-        With the Qoder session live, the librarian uses its deterministic
-        fallback: the conversation itself never depends on the local model.
+        Runs in the librarian's background thread. The deterministic compaction
+        in core/memory_librarian.py still happens even if Qoder is unavailable;
+        a failure is logged instead of silently dropping the summary.
         """
-        if self._qoder_live_enabled:
+        try:
+            from core import qoder as _qoder
+            st = _qoder.settings(get_plugin_config, profile="fast")
+            text = _qoder.ask(
+                prompt, st=st, model=_qoder.FAST_MODEL,
+                system=("Você compacta a memória de uma conversa. Responda "
+                        "somente o JSON pedido, em português do Brasil, sem "
+                        "inventar fatos."),
+                max_tokens=800, timeout=90)
+            if not str(text or "").strip():
+                print("[Librarian] resumo Qoder voltou vazio.")
+            return text
+        except Exception as e:
+            print(f"[Librarian] resumo Qoder falhou: {e}")
             return ""
-        return self._local_complete(prompt, max_tokens=500, timeout=45)
 
     def _bridge_dispatch(self, name: str, args: dict) -> str:
         """Run a JARVIS action for the bridge from its worker thread."""
@@ -3885,6 +4447,26 @@ class JarvisLive:
             pass
         self._qoder_flush_pending()
 
+    def _announce_task_completion(self, ident: str, text: str) -> bool:
+        """Conclusão de execução: acorda se dormia e fala UMA vez.
+
+        Dormir fecha o microfone, não os alto-falantes — o dono pode estar
+        longe quando o trabalho termina. core/wake_announce deduplica pelo id
+        e chama wake() antes de falar; o aviso sai na hora, não vira "fala
+        guardada" esperando o próximo turno. `ui.muted` cala o microfone e
+        não o anúncio.
+        """
+        return _wake_announce.announce(
+            ident, text,
+            is_awake=lambda: bool(getattr(self, "_awake", True)),
+            wake=self.wake,
+            # `origin="aviso"` marca o canal dos anúncios de segundo plano: se
+            # o TTS cortar a linha, a conclusão volta no primeiro momento
+            # calmo (mesmo caminho de `_qoder_notice`).
+            say=lambda line: self._say_now(line, log=True, origin="aviso"),
+            log=self.ui.write_log,
+        )
+
     def _qoder_on_task(self, event: dict) -> None:
         """A background subagent started or finished — never blocks the chat."""
         phase = str(event.get("phase") or "")
@@ -3896,6 +4478,24 @@ class JarvisLive:
                 self.ui.write_log(f"QODER: segundo plano — {label}")
             except Exception:
                 pass
+            # O dono vê o trabalho acontecer: abre o terminal com o log do
+            # executor e segue o transcrito JSONL do subagente dali em diante.
+            try:
+                _task_mirror.start_subagent(
+                    task_id=event.get("task_id") or event.get("id"),
+                    title=label,
+                    session_id=str(event.get("session_id") or ""),
+                    cwd=str(BASE_DIR),
+                    auto_open=True)
+            except Exception as e:
+                print(f"[TaskMirror] iniciar: {e}")
+            return
+        if phase == "progress":
+            try:
+                _task_mirror.progress(event.get("task_id") or event.get("id"),
+                                      event)
+            except Exception as e:
+                print(f"[TaskMirror] progresso: {e}")
             return
         if phase != "done":
             return
@@ -3903,6 +4503,12 @@ class JarvisLive:
         summary = str(event.get("summary") or "").strip()
         if summary:
             print(f"[QoderLive] task {status or 'done'}: {summary[:300]}")
+        try:
+            _task_mirror.finish_subagent(
+                event.get("task_id") or event.get("id"),
+                status=status or "completed", summary=summary)
+        except Exception as e:
+            print(f"[TaskMirror] fim: {e}")
         try:
             if self._chat_memory is not None:
                 outcome = "concluído" if status == "completed" else (status or "encerrado")
@@ -3922,15 +4528,29 @@ class JarvisLive:
         except Exception:
             pass
         try:
-            if (self._memory_idle() and getattr(self, "_awake", True)
-                    and not getattr(self.ui, "muted", False)):
-                if status == "completed":
-                    self._say_now(f"Terminei em segundo plano: {label}.")
-                else:
-                    self._say_now("A tarefa em segundo plano falhou. "
-                                  "Os detalhes estão no log.")
+            # A conclusão acorda o assistente e sai na hora, mesmo dormindo:
+            # `ui.muted` silencia o microfone, não o alto-falante. A memória
+            # ocupada (um turno em curso) só faz a linha esperar a vez, nunca
+            # a engole — por isso não há `_memory_idle`/`_awake` aqui.
+            task_key = str(event.get("task_id") or event.get("id") or label)
+            if status == "completed":
+                self._announce_task_completion(
+                    f"subagent:{task_key}:done",
+                    f"Terminei em segundo plano: {label}.")
+            else:
+                self._announce_task_completion(
+                    f"subagent:{task_key}:{status or 'encerrado'}",
+                    "A tarefa em segundo plano falhou. "
+                    "Os detalhes estão no log.")
         except Exception:
             pass
+
+    def _qoder_on_subagent(self, event: dict) -> None:
+        """Ferramenta/texto de dentro do subagente — só para o espelho visível."""
+        try:
+            _task_mirror.subagent_event(event)
+        except Exception as e:
+            print(f"[TaskMirror] evento do subagente: {e}")
 
     def _qoder_on_closed(self) -> None:
         self._qoder_ready_at = 0.0
@@ -4066,15 +4686,13 @@ class JarvisLive:
                 return
             self._narration_spoken = True
             try:
-                self._say_now(decision.text, log=False)
+                self._say_now(decision.text, log=True, chan="voz",
+                              origin="narração",
+                              log_text=f"SYS: {self._asst_name} — {decision.text}")
             except Exception as e:
                 print(f"[Narração] falhou: {e}")
                 return
             self._narration_policy.note_spoken(decision.text, turn_id)
-            try:
-                self.ui.write_log(f"SYS: {self._asst_name} — {decision.text}")
-            except Exception:
-                pass
 
         timer = threading.Timer(remaining, _fire)
         timer.daemon = True
@@ -4124,10 +4742,10 @@ class JarvisLive:
                 return [buf[:cut].strip()], buf[cut:]
         return [], buf
 
-    def _qoder_say(self, turn_id: str, sentence: str) -> None:
+    def _qoder_say(self, turn_id: str, sentence: str) -> threading.Event | None:
         sentence = str(sentence or "").strip()
         if not sentence or self._qoder_ignore:
-            return
+            return None
         with self._qoder_lock:
             self._qoder_spoken.setdefault(turn_id, []).append(sentence)
         if not getattr(self, "_qoder_first_sentence", False):
@@ -4135,7 +4753,50 @@ class JarvisLive:
             elapsed = time.monotonic() - getattr(self, "_turn_t0", 0.0)
             _metrics.observe("qoder.ttft_s", elapsed)
             print(f"[Latência] texto → 1ª frase do Qoder Live: {elapsed:.1f}s")
-        self._say_now(sentence, log=False)
+        done = self._say_now(sentence, log=False, origin="qoder",
+                             chan=str(getattr(self, "_turn_input_chan", "") or ""))
+        if done is not None:
+            try:
+                events = getattr(self, "_qoder_say_events", None)
+                if events is None:
+                    events = {}
+                    self._qoder_say_events = events
+                events[turn_id] = done
+            except Exception:
+                pass
+        return done
+
+    def _qoder_notice(self, text: str) -> None:
+        """Anuncia em voz alta a resposta espontânea a uma tarefa de fundo.
+
+        O executor responde à notificação dentro da mesma sessão, sem um
+        `ask` nosso; por isso o texto chega sem id de turno e antes morria no
+        filtro de `_qoder_on_text`. É exatamente a conclusão que o dono tem
+        que ouvir, então ela entra no mesmo canal de fala proativa dos portões
+        e das narrações.
+        """
+        text = " ".join(str(text or "").split())
+        if not text or self._qoder_ignore:
+            return
+        # O executor responde à notificação sem id de turno: a chave é o texto
+        # normalizado, dentro da janela de repetição (core/wake_announce).
+        key = _wake_announce.text_key(text)
+        if key and not _wake_announce.claim(key):
+            return
+        if not getattr(self, "_awake", True):
+            # Uma conclusão chegando dormindo acorda o assistente: microfone
+            # reabre e o aviso sai agora, não na próxima fala do dono.
+            self.wake(reason=_wake_announce.WAKE_REASON)
+        try:
+            if self._chat_memory is not None:
+                self._chat_memory.append_turn("assistant", text)
+        except Exception as e:
+            print(f"[QoderLive] memory notice: {e}")
+        self._index_event("assistant", text, source="voice")
+        for sentence in re.split(r"(?<=[.!?…])\s+", text):
+            if sentence.strip():
+                self._say_now(sentence.strip(), log=True, chan="tarefa",
+                              origin="aviso")
 
     def _qoder_on_text(self, turn_id, text: str, delta: bool) -> None:
         if not text or self._qoder_ignore:
@@ -4143,19 +4804,27 @@ class JarvisLive:
         self._qoder_touch()
         self._cancel_narration(turn_id)
         with self._qoder_lock:
-            if self._qoder_current_id is not None and turn_id != self._qoder_current_id:
-                return
-            if turn_id not in self._qoder_turns:
-                return
-            meta = self._qoder_meta.get(turn_id) or {}
-            if meta.get("source") == "whatsapp" or not meta.get("speak", True):
-                # The answer travels through WhatsApp, not the room speakers.
-                self._qoder_text_buf[turn_id] = (
-                    self._qoder_text_buf.get(turn_id, "") + str(text))
-                return
-            buf = self._qoder_text_buf.get(turn_id, "") + str(text)
-            sentences, rest = self._qoder_split(buf)
-            self._qoder_text_buf[turn_id] = rest
+            if turn_id is None:
+                # Resposta a uma notificação de segundo plano: não há turno
+                # do dono, mas a fala tem que sair.
+                sentences = []
+            else:
+                if self._qoder_current_id is not None and turn_id != self._qoder_current_id:
+                    return
+                if turn_id not in self._qoder_turns:
+                    return
+                meta = self._qoder_meta.get(turn_id) or {}
+                if meta.get("source") == "whatsapp" or not meta.get("speak", True):
+                    # The answer travels through WhatsApp, not the room speakers.
+                    self._qoder_text_buf[turn_id] = (
+                        self._qoder_text_buf.get(turn_id, "") + str(text))
+                    return
+                buf = self._qoder_text_buf.get(turn_id, "") + str(text)
+                sentences, rest = self._qoder_split(buf)
+                self._qoder_text_buf[turn_id] = rest
+        if turn_id is None:
+            self._qoder_notice(str(text))
+            return
         for sentence in sentences:
             self._qoder_say(turn_id, sentence)
 
@@ -4173,6 +4842,10 @@ class JarvisLive:
             self._qoder_spoken.pop(turn_id, None)
             self._qoder_turns.pop(turn_id, None)
             self._qoder_meta.pop(turn_id, None)
+            try:
+                (self._qoder_say_events or {}).pop(turn_id, None)
+            except Exception:
+                pass
             if self._qoder_current_id == turn_id:
                 self._qoder_current_id = None
         if self._qoder_turn_started:
@@ -4203,7 +4876,8 @@ class JarvisLive:
         persona = _personas.get(slug) or {}
         name = str(persona.get("name") or slug or "persona")
         voice_id = str(persona.get("voice_id") or "") or None
-        self._say_now(text, log=True, voice_id=voice_id, label=name)
+        self._say_now(text, log=True, voice_id=voice_id, label=name,
+                      chan="persona", origin="persona")
 
     def _qoder_on_persona_text(self, slug: str, text: str) -> None:
         self._qoder_touch()
@@ -4300,15 +4974,13 @@ class JarvisLive:
             info = _personas.get(persona) or {}
             name = str(info.get("name") or persona)
             voice_id = str(info.get("voice_id") or "") or None
-            self._say_now(text, log=False, voice_id=voice_id, label=name)
-            log_name = name
+            self._say_now(text, log=True, voice_id=voice_id, label=name,
+                          chan="persona", origin="pensando",
+                          log_text=f"SYS: {name} pensando — {text}")
         else:
-            self._say_now(text, log=False, label=self._asst_name)
-            log_name = self._asst_name
-        try:
-            self.ui.write_log(f"SYS: {log_name} pensando — {text}")
-        except Exception:
-            pass
+            self._say_now(text, log=True, label=self._asst_name,
+                          chan="voz", origin="pensando",
+                          log_text=f"SYS: {self._asst_name} pensando — {text}")
 
     def _qoder_on_done(self, turn_id, text: str) -> None:
         if self._qoder_ignore:
@@ -4322,11 +4994,17 @@ class JarvisLive:
             spoken = list(self._qoder_spoken.pop(turn_id, []))
         if meta.get("source") == "whatsapp":
             full = str(text or rest or "").strip()
+            audio_sent = False
+            tts_text = ""
+            asked_audio = str(meta.get("media_type") or "").lower() == "audio"
             if full and not meta.get("wa_sent"):
                 self._send_whatsapp_answer(
                     meta.get("wa_account"), meta.get("wa_chat"), full,
                     meta.get("media_type") or "text")
+                audio_sent = bool(getattr(self, "_wa_audio_sent", False))
+                tts_text = str(getattr(self, "_wa_tts_text", "") or "")
             elif meta.get("wa_sent"):
+                asked_audio = False
                 try:
                     _actiongate.revoke_whatsapp_reply(
                         str(meta.get("wa_account") or ""),
@@ -4334,8 +5012,14 @@ class JarvisLive:
                 except Exception:
                     pass
             if full:
+                meta_flags = _activity.make_meta(
+                    turn=int(meta.get("turn_ref") or 0) or None,
+                    chan="whatsapp", requested=asked_audio,
+                    generated=bool(audio_sent), shown=full,
+                    spoken=tts_text or None, origin="whatsapp")
                 try:
-                    self.ui.write_log(f"WHATSAPP {self._asst_name}: {full[:300]}")
+                    self.ui.write_log(self._log_line(
+                        f"WHATSAPP {self._asst_name}: {full[:300]}", meta_flags))
                     self._session_log.append(f"WhatsApp {self._asst_name}: {full}")
                 except Exception:
                     pass
@@ -4353,33 +5037,78 @@ class JarvisLive:
                 except Exception as e:
                     print(f"[Librarian] tick: {e}")
             return
+        ev = None
         if rest.strip():
-            self._qoder_say(turn_id, rest.strip())
+            ev = self._qoder_say(turn_id, rest.strip())
             spoken.append(rest.strip())
         if not spoken and text:
             for sentence in re.split(r"(?<=[.!?…])\s+", str(text)):
                 if sentence.strip():
-                    self._qoder_say(turn_id, sentence.strip())
+                    ev = self._qoder_say(turn_id, sentence.strip()) or ev
                     spoken.append(sentence.strip())
+        if ev is None:
+            try:
+                ev = (self._qoder_say_events or {}).pop(turn_id, None)
+            except Exception:
+                ev = None
         full = " ".join(s for s in spoken if s).strip()
         if full:
+            # The line of the answer carries what the owner audits: the turn
+            # index, the channel, whether audio was requested, whether it was
+            # actually synthesised, and `tts=` when the spoken text differed.
+            # The flags are computed after the worker finishes the last
+            # sentence, so `audio_generated` is a fact and not a prediction.
             try:
-                self.ui.write_log(f"{self._asst_name}: {full}")
                 self._session_log.append(f"{self._asst_name}: {full}")
             except Exception:
                 pass
+            self._write_answer_line(
+                f"{self._asst_name}: {full}",
+                chan=str(meta.get("input_chan") or "voz"),
+                requested=bool(meta.get("speak", True)),
+                shown=full, turn=int(meta.get("turn_ref") or 0) or None,
+                only_origin="qoder", event=ev)
             try:
                 if self._chat_memory is not None:
                     self._chat_memory.append_turn("assistant", full)
             except Exception as e:
                 print(f"[QoderLive] memory assistant turn: {e}")
             self._index_event("assistant", full, source="voice")
+        elif meta.get("speak", True):
+            # The turn ended without a word. Silence is indistinguishable from
+            # a crash from the outside, so the log says it happened — and the
+            # flags mark it as the "deveria ter falado e não falou" case.
+            meta_flags = _activity.make_meta(
+                turn=int(meta.get("turn_ref") or 0) or None,
+                chan=str(meta.get("input_chan") or "voz"),
+                requested=True, generated=False, origin="qoder")
+            try:
+                self.ui.write_log(self._log_line(
+                    "SYS: Nada foi falado neste turno — a resposta do Qoder "
+                    "veio vazia.", meta_flags))
+            except Exception:
+                pass
         task_id = str(meta.get("task_id") or "")
         if task_id:
             try:
                 _task_queue.finish(task_id, True, full[:800])
             except Exception as e:
                 print(f"[Tasks] finish: {e}")
+            if not getattr(self, "_awake", True):
+                # A tarefa da fila terminou dormindo: a resposta já saiu pelos
+                # alto-falantes, mas o microfone tem que reabrir para a próxima
+                # fala. Sem isso o dono ouve a conclusão e continua surdo.
+                try:
+                    self.wake(reason=_wake_announce.WAKE_REASON)
+                except Exception as e:
+                    print(f"[Wake] tarefa da fila: {e}")
+            try:
+                # O turno acabou, mas o subagente segue trabalhando: não fecha
+                # o espelho; o task_notification do executor é que fecha.
+                _task_mirror.append(
+                    task_id, "» resposta entregue; o executor segue em segundo plano")
+            except Exception as e:
+                print(f"[TaskMirror] turno: {e}")
         self._qoder_finish(turn_id)
         _metrics.inc("qoder.done")
         if self._memory_librarian is not None:
@@ -4446,6 +5175,11 @@ class JarvisLive:
                     _task_queue.cancel(task_id)
                 except Exception as e:
                     print(f"[Tasks] cancel preempted: {e}")
+                try:
+                    _task_mirror.finish(task_id, "cancelled",
+                                        "turno substituído pela voz do dono")
+                except Exception as e:
+                    print(f"[TaskMirror] cancel preempted: {e}")
             self._qoder_finish(turn_id, flush=False)
             return
         _metrics.inc("qoder.error")
@@ -4463,6 +5197,10 @@ class JarvisLive:
                 _task_queue.finish(task_id, False, error=err or "erro")
             except Exception as e:
                 print(f"[Tasks] error finish: {e}")
+            try:
+                _task_mirror.finish(task_id, "error", err or "erro no turno")
+            except Exception as e:
+                print(f"[TaskMirror] erro: {e}")
         if spoken and self._memory_librarian is not None:
             try:
                 self._memory_librarian.tick()
@@ -4513,6 +5251,11 @@ class JarvisLive:
                     _task_queue.finish(task_id, False, error="interrompida")
                 except Exception as e:
                     print(f"[Tasks] preempt: {e}")
+                try:
+                    _task_mirror.finish(task_id, "cancelled",
+                                        "turno interrompido por uma nova fala")
+                except Exception as e:
+                    print(f"[TaskMirror] preempt: {e}")
             self._qoder_finish(old_id, flush=False)
 
     def _qoder_turn(self, text: str, pcm: bytes | None = None,
@@ -4537,7 +5280,16 @@ class JarvisLive:
             if self._power is not None and self._power.pending():
                 if self._handle_power_confirmation(text, pcm):
                     return
-            if self._try_action_consent(text):
+            if source == "owner" and self._cinema_mode_gate(
+                    text, pcm, log_heard=False):
+                return
+            if source == "owner" and reply_channel == "voice":
+                # Already logged as heard by _on_groq_text on the normal path.
+                if self._series_mode_gate(text, pcm, log_heard=False):
+                    return
+                if self._mirror_show_gate(text):
+                    return
+            if self._try_action_consent(text, pcm):
                 return
         with self._qoder_lock:
             busy = self._qoder_current_id is not None
@@ -4555,7 +5307,8 @@ class JarvisLive:
                 records = self._speaker.list()
                 owner_name = self._speaker.owner_name
                 has_owner = any(r.get("owner") for r in records)
-                transcribe = getattr(self._groq, "transcribe_pcm", None)
+                transcribe = getattr(getattr(self, "_groq", None),
+                                     "transcribe_pcm", None)
                 analysis = self._speaker.analyze_utterance(
                     pcm, transcribe=transcribe, full_text=text)
                 labeled_text = analysis.get("labeled_text") or text
@@ -4575,25 +5328,84 @@ class JarvisLive:
                         self._last_unknown_pcm = unknown.get("pcm")
                         self._last_unknown_emb = unknown.get("embedding")
                         self._last_unknown_at = time.monotonic()
-                    if not primary or not primary.get("known"):
-                        if self._only_owner_enrolled():
-                            # One enrolled person: a low score is more likely
-                            # the microphone than an intruder. Keep answering
-                            # as the owner; the guided enrollment fixes the
-                            # profile, and this stops once a guest exists.
+                    decision = self._series_decision_for(pcm)
+                    if (decision is not None
+                            and decision.get("verdict") == "accept"
+                            and decision.get("speaker")):
+                        # The progressive gate (1 s, 2 s, 3 s) already heard an
+                        # authorized voice; trust it over a single-slice
+                        # diarization that came back unknown or mismatched.
+                        speaker = decision.get("speaker")
+                        if not primary or not primary.get("known"):
+                            labeled_text = text
+                        self._cinema_observe("accept", pcm, text)
+                    elif not primary or not primary.get("known"):
+                        verdict = str(primary.get("verdict")
+                                      or analysis.get("verdict") or "unknown")
+                        effective = float(primary.get("effective_score") or 0.0)
+                        voiced = float(analysis.get("voiced_seconds") or 0.0)
+                        if self._voice_indulgence_ok(text, verdict,
+                                                     effective, voiced):
+                            # Surgical forgiveness: one enrolled voice (the
+                            # owner) and either a short/bare-address call or a
+                            # score already inside the gray band. A full TV
+                            # sentence far below the cluster never takes this
+                            # path (the 20:01:58 anomaly).
                             speaker = owner_name
                             labeled_text = text
+                            self._cinema_observe("accept", pcm, text)
                             self.ui.write_log(
-                                "SYS: confiança de voz baixa — único cadastrado "
-                                f"é o dono ({owner_name}); sigo como ele.")
+                                "SYS: indulgência: único cadastrado é o dono "
+                                f"(score={effective:.2f} s={voiced:.1f})")
                         else:
-                            self.ui.write_log("SYS: voz desconhecida — não respondi.")
+                            self._cinema_observe(verdict, pcm, text)
+                            if self._cinema_active_now():
+                                self.ui.write_log(
+                                    "SYS: modo cinema — fala descartada em "
+                                    f"silêncio ({verdict}).")
+                                _duck.up()
+                                return
+                            if self._series_mode_on() and decision is not None:
+                                # Normally the listener dropped this before
+                                # transcription; this is the last line of
+                                # defense for any path that still reached the
+                                # turn.
+                                self.ui.write_log(
+                                    "SYS: modo série — fala descartada em silêncio "
+                                    f"({decision.get('verdict')}).")
+                                _duck.up()
+                                return
+                            # No indulto: with the old "only the owner was
+                            # enrolled, so a low score must be the microphone"
+                            # rule every TV line became a turn. The gate's
+                            # progressive re-sampling is the help a bad
+                            # microphone gets; past it, an unknown voice is
+                            # simply unknown.
+                            self.ui.write_log(
+                                "SYS: voz desconhecida — não respondi. "
+                                f"(score={float(primary.get('effective_score') or 0.0):.2f} "
+                                f"sample={float(primary.get('sample_score') or 0.0):.2f} "
+                                f"s={float(analysis.get('voiced_seconds') or 0.0):.1f} "
+                                f"seg={len(analysis.get('segments') or [])})")
                             self._say_now("Não reconheço essa voz. Se for alguém autorizado, "
                                           "peça ao dono para me apresentar.")
                             _duck.up()
                             return
                     elif not primary.get("authorized"):
                         who = primary_name or "essa pessoa"
+                        self._cinema_observe("unauthorized", pcm, text)
+                        if self._cinema_active_now():
+                            self.ui.write_log(
+                                f"SYS: modo cinema — voz {who} conhecida, mas "
+                                "não autorizada: silêncio.")
+                            _duck.up()
+                            return
+                        if self._series_mode_on():
+                            self.ui.write_log(
+                                f"SYS: voz {who} conhecida, mas não autorizada — "
+                                "modo série: silêncio.")
+                            _duck.up()
+                            return
                         self.ui.write_log(f"SYS: voz {who} conhecida, mas não autorizada.")
                         self._say_now(f"Reconheço a voz de {who}, mas ela ainda não está "
                                       "autorizada a falar comigo.")
@@ -4601,10 +5413,18 @@ class JarvisLive:
                         return
                     else:
                         speaker = primary_name
+                        self._cinema_observe("accept", pcm, text)
                     emb = analysis.get("primary_embedding")
                     if emb:
                         self._last_known_emb = emb
                         self._last_known_at = time.monotonic()
+                    # Accepted conversational turn: let the profile grow. The
+                    # speaker re-checks the match against the trusted samples
+                    # and applies its own quality/confidence gates.
+                    try:
+                        self._auto_enroll_voice(analysis, pcm)
+                    except Exception as e:
+                        print(f"[VoiceAutoEnroll] ignorado: {e}")
             except Exception as e:
                 print(f"[QoderLive] full diarization failed: {e}")
                 speaker = None
@@ -4636,6 +5456,10 @@ class JarvisLive:
         # Register the turn BEFORE handing it to the sidecar: the first text
         # can arrive before ask() returns, and a late registration used to drop
         # the whole answer.
+        if str(source or "") == "task":
+            # Proactive task announcement: no owner utterance opened this turn,
+            # so it gets its own index for the Activity Log audit.
+            self._next_turn_ref("tarefa")
         turn_id = str(uuid.uuid4())
         with self._qoder_lock:
             self._qoder_current_id = turn_id
@@ -4651,6 +5475,8 @@ class JarvisLive:
                 "wa_chat": str(wa_chat or ""),
                 "wa_sent": False,
                 "task_id": str(task_id or ""),
+                "turn_ref": int(getattr(self, "_turn_ref", 0) or 0),
+                "input_chan": str(getattr(self, "_turn_input_chan", "") or "voz"),
             }
         try:
             self._qoder_live.ask(
@@ -4671,7 +5497,17 @@ class JarvisLive:
             self._qoder_turn_started = 0.0
             self._reply_active = False
             self._brain_busy = False
-            self._qoder_hold(text, pcm, "ask falhou")
+            # O turno guardado mantém o canal: um turno do WhatsApp re-tentado
+            # como se fosse fala da sala responderia no alto-falante e nunca
+            # chegaria ao chat de origem.
+            self._qoder_hold(
+                text, pcm, "ask falhou", announce=bool(speak),
+                meta={"source": str(source or "owner"),
+                      "reply_channel": str(reply_channel or "voice"),
+                      "speak": bool(speak),
+                      "media_type": str(media_type or "text"),
+                      "wa_account": str(wa_account or ""),
+                      "wa_chat": str(wa_chat or "")})
             return
         # No client-side turn timeout: the owner can always barge in, and a long
         # task runs in a background subagent without holding the conversation.
@@ -4696,42 +5532,155 @@ class JarvisLive:
             pass
         return 0
 
+    def _auto_enroll_voice(self, analysis: dict, pcm: bytes | None = None) -> None:
+        """Grow the matched voice's expanded set with this accepted utterance.
+
+        Called only after the conversational gate accepted the turn. Never
+        called from the confirmation paths; those compare against the trusted
+        samples in ``SpeakerId.identify`` (``include_auto=False``). The
+        speaker decides whether the utterance is confident, authorized and
+        clean enough — this method only reports the outcome in the Activity Log.
+        """
+        speaker = getattr(self, "_speaker", None)
+        enroll = getattr(speaker, "auto_enroll", None)
+        if enroll is None or not getattr(speaker, "auto_enroll_enabled", False):
+            return
+        data = analysis or {}
+        embedding = data.get("primary_embedding") or None
+        sample = data.get("primary_pcm") or pcm
+        if not sample and not embedding:
+            return
+        if not embedding and (data.get("unknown") or data.get("unauthorized")):
+            # Mixed window (TV, another person) still labelled through the
+            # progressive gate: without an isolated segment, don't train.
+            return
+        try:
+            result = enroll(sample, embedding=embedding)
+        except Exception as e:
+            print(f"[VoiceAutoEnroll] falhou: {e}")
+            return
+        if not result.get("enrolled"):
+            return
+        try:
+            self.ui.write_log(
+                f"SYS: auto-enroll {result.get('name')} +1 "
+                f"({result.get('samples')}/{result.get('max')}, "
+                f"sim={float(result.get('score') or 0.0):.2f})")
+        except Exception:
+            pass
+
     def _start_voice_training(self, why: str = "") -> None:
         owner = (self._speaker.owner_name or "Anthero") if self._speaker else "Anthero"
         total = len(_VOICE_TRAIN_PROMPTS)
-        self._voice_train = {"done": 0, "total": total, "owner": owner}
+        self._voice_train = {"done": 0, "total": total, "owner": owner,
+                             "fails": 0}
         self._voice_train_offered = True
         self.ui.write_log("SYS: cadastro de voz guiado — "
                           f"{total} frases ({why or 'pedido do dono'}).")
         self._say_now(f"Vou fazer como o Ok Google, {owner}: {total} frases curtas "
                       f"para eu aprender a sua voz. Repita: {_VOICE_TRAIN_PROMPTS[0]}")
 
+    def _voice_train_cancelled(self, text: str) -> bool:
+        """Cancel words ("cancela", "para") and refusals ("eu não pedi isso")."""
+        line = str(text or "")
+        return bool(_VOICE_TRAIN_CANCEL_RE.search(line)
+                    or _VOICE_TRAIN_REFUSE_RE.search(line))
+
+    def _voice_train_owner_ok(self, text: str,
+                              pcm: bytes | None) -> tuple[bool, float, str]:
+        """(confirmed, score, detail) — may this clip be enrolled as the owner?
+
+        The first enrollment has no owner to compare with: the explicit
+        request is the only evidence available. Every later sample must pass
+        the same voiceprint confirmation as spoken consent, gray-band
+        indulgência included (only-owner-enrolled, score >= floor).
+        """
+        if not pcm:
+            return False, 0.0, "sem áudio"
+        try:
+            if not self._has_owner_enrolled():
+                return True, 0.0, "primeira voz (sem cadastro)"
+            return self._owner_speaker_confirmed(text, pcm)
+        except Exception as e:
+            return False, 0.0, f"erro na voz: {e}"
+
+    def _voice_train_fail(self, session: dict, why: str,
+                          spoken: str = "Essa tentativa não valeu.") -> bool:
+        """A rejected clip: same phrase again, no progress, 3 strikes cancel."""
+        fails = int(session.get("fails") or 0) + 1
+        session["fails"] = fails
+        index = int(session.get("done") or 0)
+        prompt = _VOICE_TRAIN_PROMPTS[index]
+        try:
+            self.ui.write_log(
+                "SYS: cadastro de voz — tentativa "
+                f"{fails}/{_VOICE_TRAIN_MAX_FAILURES} recusada ({why}); "
+                f"mesma frase {index + 1}/{session['total']}.")
+        except Exception:
+            pass
+        if fails >= _VOICE_TRAIN_MAX_FAILURES:
+            self._voice_train = None
+            self._say_now("Cadastro de voz cancelado. Não consegui confirmar "
+                          "três frases seguidas.")
+            try:
+                self.ui.write_log("SYS: cadastro de voz cancelado após "
+                                  f"{fails} tentativas recusadas.")
+            except Exception:
+                pass
+            return True
+        self._say_now(f"{spoken} Repita: {prompt}")
+        return True
+
     def _voice_train_step(self, text: str, pcm: bytes | None) -> bool:
         session = self._voice_train
         if session is None:
             return False
         self._log_heard(text)
-        if _VOICE_TRAIN_CANCEL_RE.search(text):
+        if self._voice_train_cancelled(text):
             self._voice_train = None
             self._say_now("Cadastro de voz cancelado. Pode continuar normalmente.")
             return True
+        index = int(session["done"])
+        prompt = _VOICE_TRAIN_PROMPTS[index]
         if not pcm:
             self._say_now("Não recebi o áudio dessa frase. Repita: "
-                          f"{_VOICE_TRAIN_PROMPTS[session['done']]}")
+                          f"{prompt}")
             return True
         rate = int(getattr(self._speaker, "sample_rate", 16000) or 16000)
         secs = len(pcm) / float(2 * rate)
         if secs < 0.8:
-            self._say_now("Essa frase foi curta demais. Repita: "
-                          f"{_VOICE_TRAIN_PROMPTS[session['done']]}")
-            return True
+            return self._voice_train_fail(
+                session, f"áudio de {secs:.1f}s",
+                spoken="Essa frase foi curta demais.")
+        # (a) the transcript must be the phrase that was prompted — arbitrary
+        # audio ("Vai tomar no cú.") scored "Boa, 2 de 5" before this check.
+        score = _voice_phrase_score(text, prompt)
+        if score < _VOICE_TRAIN_MATCH_MIN:
+            return self._voice_train_fail(
+                session, f"frase diferente (semelhança {score:.2f} < "
+                         f"{_VOICE_TRAIN_MATCH_MIN:.2f})")
+        # (b) the speaker must be the owner — the TV repeating the phrase is
+        # not enrollment material.
+        ok, voice_score, detail = self._voice_train_owner_ok(text, pcm)
+        if not ok:
+            return self._voice_train_fail(
+                session, f"falante não confirmado (score={float(voice_score):.2f}, "
+                         f"{detail})")
+        try:
+            self.ui.write_log(
+                f"SYS: cadastro de voz — frase {index + 1}/{session['total']} "
+                f"aceita (semelhança {score:.2f}, voz={float(voice_score):.2f}, "
+                f"{detail}).")
+        except Exception:
+            pass
         try:
             emb = self._speaker.embedding(pcm)
             self._speaker.enroll(session["owner"], emb, authorized=True)
         except Exception as e:
-            self._say_now(f"Não consegui usar essa amostra: {str(e)[:80]}. "
-                          f"Repita: {_VOICE_TRAIN_PROMPTS[session['done']]}")
-            return True
+            return self._voice_train_fail(
+                session, f"embedding falhou: {str(e)[:60]}",
+                spoken="Não consegui usar essa amostra.")
+        session["fails"] = 0
         session["done"] += 1
         if session["done"] >= session["total"]:
             total = session["total"]
@@ -4747,22 +5696,52 @@ class JarvisLive:
         return True
 
     def _voice_train_gate(self, text: str, pcm: bytes | None = None) -> bool:
-        """Guided enrollment, handled before barge-in so prompts don't eat it."""
+        """Guided enrollment, handled before barge-in so prompts don't eat it.
+
+        Starts ONLY on an explicit first-person request ("quero cadastrar
+        minha voz", "cadastra minha voz"), never on a feature request that
+        merely mentions the words ("implemente uma ferramenta para registrar
+        minha voz"), never while cinema mode is active, and never from a voice
+        the speaker index does not confirm as the owner.
+        """
         if not (self._voice_id_enabled and self._speaker is not None):
             return False
         if self._voice_train is not None:
             return self._voice_train_step(text, pcm)
-        if not self._has_owner_enrolled() and pcm:
-            # First run: the first voice heard becomes the owner, but through
-            # the guided flow instead of a single accidental sample.
-            self._log_heard(text)
-            self._start_voice_training("primeira voz")
-            return True
-        if _VOICE_TRAIN_RE.search(text):
-            self._log_heard(text)
-            self._start_voice_training("pedido do dono")
-            return True
-        return False
+        line = str(text or "")
+        if not line or not _VOICE_TRAIN_RE.search(line):
+            return False
+        if _VOICE_TRAIN_FEATURE_RE.search(line):
+            # A tool/feature request is a conversational turn for the brain.
+            try:
+                self.ui.write_log("SYS: cadastro de voz não iniciado — "
+                                  "parece pedido de ferramenta, não cadastro.")
+            except Exception:
+                pass
+            return False
+        try:
+            cinema = self._cinema_active_now()
+        except Exception:
+            cinema = bool(getattr(self, "_cinema_active", False))
+        if cinema:
+            try:
+                self.ui.write_log("SYS: cadastro de voz ignorado — modo cinema "
+                                  "ativo (áudio pode ser da TV).")
+            except Exception:
+                pass
+            return False
+        ok, score, detail = self._voice_train_owner_ok(line, pcm)
+        if not ok:
+            try:
+                self.ui.write_log(
+                    "SYS: cadastro de voz ignorado — fala não confirmada como "
+                    f"dono (score={float(score or 0.0):.2f}, {detail}).")
+            except Exception:
+                pass
+            return False
+        self._log_heard(text)
+        self._start_voice_training("pedido do dono")
+        return True
 
     def _voice_training_hint(self) -> None:
         """One short request per run when the owner profile is still thin."""
@@ -4786,10 +5765,33 @@ class JarvisLive:
         except Exception:
             pass
 
-    def _voice_enroll_gate(self, text: str) -> bool:
+    def _voice_enroll_gate(self, text: str, pcm: bytes | None = None) -> bool:
         if not (self._voice_id_enabled and self._speaker is not None):
             return False
         if _VOICE_SELF_ENROLL_RE.search(text):
+            # Legacy auto-enroll has the same decision table as the guided
+            # gate: an explicit first-person request, never a FEATURE request
+            # that merely mentions enrollment ("implemente uma ferramenta para
+            # registrar minha voz" — the 19:43:57 hijack), and only from a
+            # voice the speaker index confirms as the owner. Otherwise the
+            # utterance continues as an ordinary conversation turn.
+            if _VOICE_TRAIN_FEATURE_RE.search(text):
+                try:
+                    self.ui.write_log("SYS: auto-cadastro de voz não iniciado — "
+                                      "parece pedido de ferramenta, não cadastro.")
+                except Exception:
+                    pass
+                return False
+            confirmed, score, detail = self._owner_speaker_confirmed(text, pcm)
+            if not confirmed:
+                try:
+                    self.ui.write_log(
+                        "SYS: auto-cadastro de voz ignorado — fala não "
+                        "confirmada como dono "
+                        f"(score={float(score or 0.0):.2f}, {detail}).")
+                except Exception:
+                    pass
+                return False
             # Only a recent sample counts: enrolling a voice captured many
             # minutes ago could bind the wrong person's timbre to the owner.
             now = time.monotonic()
@@ -4959,7 +5961,13 @@ class JarvisLive:
         return True
 
     def _owner_voice(self, pcm: bytes | None) -> tuple[bool, str]:
-        """(is_owner, detail) for the voiceprint in this utterance."""
+        """(is_owner, detail) for the voiceprint in this utterance.
+
+        SECURITY: this is the privileged comparison (restart, shutdown, send,
+        unlock). ``identify`` is called WITHOUT ``include_auto`` on purpose:
+        only the hand-enrolled trusted samples count here, never the ones the
+        assistant auto-enrolled during conversation.
+        """
         if not pcm or self._speaker is None:
             return False, "sem áudio"
         try:
@@ -4990,6 +5998,644 @@ class JarvisLive:
             return (len(records) == 1 and bool(records[0].get("owner")))
         except Exception:
             return False
+
+    # ── Indulgência cirúrgica do único dono ─────────────────────────────────
+    def _indulgence_floor(self) -> float:
+        """Gray-band floor: below it a full sentence is never forgiven."""
+        try:
+            return max(0.0, min(1.0, float(getattr(
+                self, "_voice_indulgence_gray_floor",
+                DEFAULT_VOICE_INDULGENCE_GRAY_FLOOR))))
+        except (TypeError, ValueError):
+            return DEFAULT_VOICE_INDULGENCE_GRAY_FLOOR
+
+    def _is_bare_address(self, text: str) -> bool:
+        """A wake call / bare address: the assistant's name in <= 4 words.
+
+        This is the shape the owner uses to call ("Gino.", "Gino, tá aí?").
+        A full TV line has many words and is not forgiven by name alone.
+        """
+        words = re.findall(r"[a-zA-ZÀ-ÿ]+", str(text or ""))
+        if not words or len(words) > 4:
+            return False
+        try:
+            return bool(self._addressed_to_me(text))
+        except Exception:
+            return False
+
+    def _voice_indulgence_ok(self, text: str, verdict: str,
+                             effective: float, voiced: float) -> bool:
+        """May this low-confidence utterance be answered as the only owner?
+
+        Narrow on purpose (the 20:01:58 TV line must not pass):
+          * only when exactly one voice is enrolled and it is the owner;
+          * ``indecisive_short`` (too little voiced audio to judge) is owner;
+          * ``unknown`` only for a bare address/wake call, or when the
+            effective score is already inside the gray band (>= floor).
+        Known-but-unauthorized never reaches here. A long sentence far below
+        the gray floor is rejected even with a single enrolled voice.
+        """
+        if not self._only_owner_enrolled():
+            return False
+        verdict = str(verdict or "")
+        if verdict == _speaker_id.VERDICT_INDECISIVE:
+            return True
+        if verdict != _speaker_id.VERDICT_UNKNOWN:
+            return False
+        if self._is_bare_address(text):
+            return True
+        try:
+            return float(effective) >= self._indulgence_floor()
+        except (TypeError, ValueError):
+            return False
+
+    def _owner_speaker_confirmed(self, text: str,
+                                 pcm: bytes | None) -> tuple[bool, float, str]:
+        """(confirmed, score, detail) — was this line spoken by the OWNER?
+
+        Spoken consent is the one place a word alone is not enough: the matcher
+        in core/rootgate.py cannot tell the owner's "pode" from the TV's
+        ("Você pode olhar." opened 120 s of action on 13:17:39) or from Gino's
+        own playback. The voiceprint decides.
+
+        Deliberately conversational, not privileged: the expanded (auto)
+        material counts and the single-owner gray-band indulgência is honoured
+        — that is the same forgiveness that lets the owner's own sentence be
+        answered as his. What it never tolerates is a known non-owner, a TV
+        line far below the cluster, or no audio at all.
+        """
+        speaker = getattr(self, "_speaker", None)
+        if not pcm:
+            return False, 0.0, "sem áudio"
+        if speaker is None:
+            return False, 0.0, "sem cadastro de voz"
+        owner = str(getattr(speaker, "owner_name", "") or "").strip().lower()
+        # The listener's progressive gate already evaluated this exact segment;
+        # consulting that cached verdict first is free and saves an embedding.
+        try:
+            decision = self._series_decision_for(pcm)
+        except Exception:
+            decision = None
+        if decision:
+            verdict = str(decision.get("verdict") or "")
+            score = float(decision.get("score") or 0.0)
+            who = str(decision.get("speaker") or "").strip().lower()
+            if verdict == "accept":
+                if owner and who == owner:
+                    return True, score, f"gate progressivo voz={who}"
+                return False, score, f"voz={who or 'autorizada'} (não o dono)"
+            if verdict in ("unauthorized", "playback"):
+                return False, score, f"voz={who or verdict}"
+        try:
+            emb = speaker.embedding(pcm)
+            match = _speaker_id.identify_conversational(speaker, emb)
+        except Exception as e:
+            return False, 0.0, f"erro na voz: {e}"
+        score = float(match.get("effective_score")
+                      or match.get("score") or 0.0)
+        verdict = str(match.get("verdict") or "")
+        name = str(match.get("name") or "").strip().lower()
+        if match.get("known") and match.get("authorized") and owner and name == owner:
+            return True, score, f"voz={match.get('name')}"
+        if self._voice_indulgence_ok(text, verdict, score, 0.0):
+            return True, score, "indulgência (faixa cinzenta)"
+        return False, score, f"voz={match.get('name') or 'desconhecida'}"
+
+    def _consent_speaker_refused(self, score: float, detail: str,
+                                 kind: str = "ação") -> None:
+        """One SYS line for a consent that must NOT open a window."""
+        line = ("SYS: consentimento ignorado — falante não confirmado como dono "
+                f"(score={float(score or 0.0):.2f}, {kind}: {detail})")
+        try:
+            self.ui.write_log(line)
+        except Exception:
+            pass
+        print(line)
+
+    # ── "Modo cinema": detect the TV, ask once, then stay silent ────────────
+    def _cinema_enabled(self) -> bool:
+        return bool(getattr(self, "_cinema_mode_enabled", True))
+
+    def _cinema_state_path(self) -> Path:
+        return Path(getattr(self, "_cinema_state_file", CINEMA_STATE_PATH))
+
+    def _cinema_load(self) -> bool:
+        """Read memory/cinema_mode.json once per process (or after a write)."""
+        if getattr(self, "_cinema_loaded", False):
+            return bool(getattr(self, "_cinema_active", False))
+        self._cinema_loaded = True
+        if not self._cinema_enabled():
+            return False
+        try:
+            data = json.loads(self._cinema_state_path().read_text(
+                encoding="utf-8"))
+        except Exception:
+            return False
+        if bool(data.get("active")):
+            now = time.monotonic()
+            self._cinema_active = True
+            self._cinema_since = now
+            self._cinema_last_audio = now
+            self._cinema_arm_timer()
+        return bool(self._cinema_active)
+
+    def _cinema_save_locked(self) -> None:
+        path = self._cinema_state_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps({
+                "active": bool(self._cinema_active),
+                "since": (time.strftime("%Y-%m-%dT%H:%M:%S")
+                          if self._cinema_active else ""),
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }, ensure_ascii=False)
+            fd, tmp = tempfile.mkstemp(prefix=".cinema-mode-", suffix=".tmp",
+                                       dir=str(path.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+                raise
+        except Exception as e:
+            print(f"[Cinema] não consegui salvar o estado: {e}")
+
+    def _cinema_cancel_timer(self) -> None:
+        timer = getattr(self, "_cinema_timer", None)
+        self._cinema_timer = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
+    def _cinema_arm_timer(self) -> None:
+        self._cinema_cancel_timer()
+        if not bool(getattr(self, "_cinema_active", False)):
+            return
+        delay = max(1.0, float(getattr(
+            self, "_cinema_idle_exit_s", DEFAULT_CINEMA_IDLE_EXIT_S)))
+        timer = threading.Timer(delay, self._cinema_check_idle)
+        timer.daemon = True
+        timer.name = "cinema-idle"
+        self._cinema_timer = timer
+        timer.start()
+
+    def _cinema_check_idle(self, now: float | None = None) -> bool:
+        """Auto-exit after the idle timeout with no audio events at all."""
+        self._cinema_load()
+        if not bool(getattr(self, "_cinema_active", False)):
+            return False
+        now = time.monotonic() if now is None else float(now)
+        last = float(getattr(self, "_cinema_last_audio", 0.0) or 0.0)
+        idle = max(30.0, float(getattr(
+            self, "_cinema_idle_exit_s", DEFAULT_CINEMA_IDLE_EXIT_S)))
+        if now - last >= idle:
+            self._cinema_exit("sem áudio por muito tempo")
+            return True
+        self._cinema_arm_timer()
+        return False
+
+    def _cinema_enter(self, why: str = "pedido do dono") -> None:
+        if getattr(self, "_cinema_lock", None) is None:
+            self._cinema_lock = threading.RLock()
+        with self._cinema_lock:
+            self._cinema_loaded = True
+            self._cinema_active = True
+            self._cinema_since = time.monotonic()
+            self._cinema_last_audio = self._cinema_since
+            self._cinema_events.clear()
+            self._cinema_pending = False
+            self._cinema_prompted_at = 0.0
+            self._cinema_save_locked()
+            self._cinema_arm_timer()
+        try:
+            self.ui.write_log("SYS: modo cinema ligado — a TV fica em "
+                              "silêncio; só a voz do dono passa.")
+        except Exception:
+            pass
+        self._say_now("Modo cinema ligado. A TV fica em silêncio; eu respondo "
+                      "só a você.")
+
+    def _cinema_exit(self, why: str = "", announce: bool = True) -> bool:
+        if getattr(self, "_cinema_lock", None) is None:
+            self._cinema_lock = threading.RLock()
+        with self._cinema_lock:
+            was = bool(getattr(self, "_cinema_active", False))
+            self._cinema_loaded = True
+            self._cinema_active = False
+            self._cinema_pending = False
+            self._cinema_events.clear()
+            self._cinema_cancel_timer()
+            if was:
+                self._cinema_save_locked()
+        if was:
+            try:
+                self.ui.write_log("SYS: modo cinema desligado"
+                                  + (f" — {why}" if why else "") + ".")
+            except Exception:
+                pass
+            if announce:
+                self._say_now("Modo cinema desligado.")
+        return was
+
+    def _cinema_active_now(self) -> bool:
+        if not self._cinema_enabled():
+            return False
+        self._cinema_load()
+        return bool(getattr(self, "_cinema_active", False))
+
+    def _cinema_touch_audio(self) -> None:
+        """Any audio event keeps cinema alive; silence is what exits it."""
+        if not bool(getattr(self, "_cinema_active", False)):
+            return
+        self._cinema_last_audio = time.monotonic()
+        self._cinema_arm_timer()
+
+    def _cinema_observe(self, verdict: str, pcm: bytes | None = None,
+                        text: str = "") -> None:
+        """Count suspicious non-owner speech and ask the owner ONCE.
+
+        ``accept`` means the owner was just confirmed: the window resets.
+        Repeated unknown/playback/unauthorized lines inside the window are
+        what a TV dialogue looks like from the microphone's point of view.
+        """
+        if not self._cinema_enabled():
+            return
+        self._cinema_load()
+        if getattr(self, "_cinema_lock", None) is None:
+            self._cinema_lock = threading.RLock()
+        if getattr(self, "_cinema_events", None) is None:
+            self._cinema_events = []
+        if getattr(self, "_cinema_counted", None) is None:
+            self._cinema_counted = {}
+        if bool(getattr(self, "_cinema_active", False)):
+            self._cinema_touch_audio()
+            return
+        if self._series_mode_on():
+            # The owner already chose the stricter mode; asking again is spam.
+            return
+        verdict = str(verdict or "")
+        if verdict == "accept":
+            with self._cinema_lock:
+                self._cinema_events.clear()
+            self._cinema_touch_audio()
+            return
+        if verdict not in ("unknown", "playback", "unauthorized",
+                           "not_voice", "indecisive"):
+            return
+        now = time.monotonic()
+        key = (int(hashlib.blake2b(bytes(pcm), digest_size=8).hexdigest(), 16)
+               if pcm else hash(str(text or "")))
+        with self._cinema_lock:
+            seen = self._cinema_counted.get(key)
+            if seen is not None and now - seen < 30.0:
+                # The same segment passes the listener precheck and later the
+                # conversational gate; it is one TV line, not two.
+                return
+            self._cinema_counted[key] = now
+            if len(self._cinema_counted) > 64:
+                cutoff = now - max(10.0, 2 * float(getattr(
+                    self, "_cinema_trigger_window_s",
+                    DEFAULT_CINEMA_TRIGGER_WINDOW_S)))
+                self._cinema_counted = {
+                    k: t for k, t in self._cinema_counted.items()
+                    if t >= cutoff}
+            window = max(5.0, float(getattr(
+                self, "_cinema_trigger_window_s",
+                DEFAULT_CINEMA_TRIGGER_WINDOW_S)))
+            self._cinema_events = [t for t in self._cinema_events
+                                   if now - t <= window]
+            self._cinema_events.append(now)
+            needs = max(2, int(getattr(
+                self, "_cinema_trigger_count", DEFAULT_CINEMA_TRIGGER_COUNT)))
+            if len(self._cinema_events) < needs:
+                return
+            ttl = max(5.0, float(getattr(
+                self, "_cinema_prompt_ttl_s", DEFAULT_CINEMA_PROMPT_TTL_S)))
+            if (self._cinema_pending
+                    and now - self._cinema_prompted_at <= ttl):
+                return
+            cooldown = max(30.0, float(getattr(
+                self, "_cinema_prompt_cooldown_s",
+                DEFAULT_CINEMA_PROMPT_COOLDOWN_S)))
+            if (self._cinema_prompted_at
+                    and now - self._cinema_prompted_at < cooldown):
+                return
+            self._cinema_events.clear()
+            self._cinema_pending = True
+            self._cinema_prompted_at = now
+        try:
+            self.ui.write_log("SYS: modo cinema — fala de não-dono repetida; "
+                              "perguntando ao dono uma vez.")
+        except Exception:
+            pass
+        self._say_now("Você está assistindo alguma coisa? Quer que eu ative "
+                      "o modo cinema?")
+
+    def _cinema_owner_ok(self, pcm: bytes | None) -> bool:
+        """Typed text is deliberate; voice must be an owner-authorised print."""
+        if pcm is None:
+            return True
+        try:
+            return bool(self._owner_voice_ok(pcm, allow_single=True))
+        except Exception:
+            return False
+
+    def _cinema_mode_gate(self, text: str, pcm: bytes | None = None,
+                          *, log_heard: bool = True) -> bool:
+        """Handle the cinema prompt answer, explicit activation and exit.
+
+        Runs before the brain and before the barge-in classification. It only
+        consumes utterances that are answers to its own prompt or explicit
+        mode commands; normal conversation falls through untouched.
+        """
+        if not self._cinema_enabled():
+            return False
+        raw = str(text or "").strip()
+        if not raw:
+            return False
+        self._cinema_load()
+        now = time.monotonic()
+        question = bool(_SERIES_QUESTION_RE.search(raw))
+        if bool(getattr(self, "_cinema_active", False)):
+            if (_CINEMA_MODE_RE.search(raw)
+                    and _CINEMA_EXIT_RE.search(raw) and not question):
+                if not self._cinema_owner_ok(pcm):
+                    try:
+                        self.ui.write_log("SYS: modo cinema — saída recusada "
+                                          "(voz não reconhecida).")
+                    except Exception:
+                        pass
+                    return True
+                if log_heard:
+                    self._log_heard(raw)
+                self._cinema_exit("pedido do dono")
+                return True
+            return False
+        ttl = max(5.0, float(getattr(
+            self, "_cinema_prompt_ttl_s", DEFAULT_CINEMA_PROMPT_TTL_S)))
+        pending = bool(getattr(self, "_cinema_pending", False))
+        if pending and now - float(getattr(
+                self, "_cinema_prompted_at", 0.0) or 0.0) > ttl:
+            self._cinema_pending = False
+            pending = False
+        explicit = bool(_CINEMA_MODE_RE.search(raw)
+                        and _CINEMA_ACTIVATE_RE.search(raw)
+                        and not question)
+        if pending and _CINEMA_NO_RE.search(raw) and not explicit:
+            self._cinema_pending = False
+            if log_heard:
+                self._log_heard(raw)
+            if self._cinema_owner_ok(pcm):
+                self._say_now("Tudo bem, sigo ouvindo normalmente.")
+            else:
+                try:
+                    self.ui.write_log("SYS: modo cinema — recusa ignorada "
+                                      "(voz não reconhecida).")
+                except Exception:
+                    pass
+            return True
+        if explicit or (pending and _CINEMA_YES_RE.search(raw)):
+            if not self._cinema_owner_ok(pcm):
+                try:
+                    self.ui.write_log("SYS: modo cinema — ativação recusada "
+                                      "(voz não reconhecida).")
+                except Exception:
+                    pass
+                return True
+            if log_heard:
+                self._log_heard(raw)
+            self._cinema_enter("confirmado pelo dono")
+            return True
+        return False
+
+    # ── "Modo série": progressive voice gate + spoken toggle ────────────────
+    def _series_gate_log(self, message: str) -> None:
+        """One SYS line in the panel for a silent discard, never a spoken one."""
+        text = str(message or "").strip()
+        if not text:
+            return
+        try:
+            print(text)
+        except Exception:
+            pass
+        try:
+            self.ui.write_log("SYS: " + text.replace("[SeriesGate] ", ""))
+        except Exception:
+            pass
+
+    def _series_precheck(self, pcm: bytes) -> bool:
+        """Listener hook: False drops the segment before any paid step.
+
+        Normal mode keeps its old behaviour (unknown lines are transcribed and
+        then refused by the conversational gate). Cinema mode is stricter here,
+        before transcription: unknown speech never becomes a turn and produces
+        no spoken reply; the only exception is the owner's gray band, which is
+        still allowed to reach the gate and be forgiven there.
+        """
+        gate = getattr(self, "_series_gate", None)
+        if gate is None:
+            return True
+        try:
+            allowed = bool(gate.precheck(pcm))
+            decision = gate.decision_for(pcm) or {}
+            verdict = str(decision.get("verdict") or "")
+            cinema_on = self._cinema_active_now()
+            if cinema_on:
+                self._cinema_touch_audio()
+            if verdict == "accept":
+                self._cinema_observe("accept", pcm)
+            elif verdict in ("unknown", "playback", "unauthorized",
+                             "indecisive"):
+                score = float(decision.get("score") or 0.0)
+                seconds = float(decision.get("seconds") or 0.0)
+                # A short/gray-band unknown may still be the owner; counting
+                # it as TV would ask the cinema question to the wrong person.
+                possible_owner = bool(
+                    verdict == "unknown" and self._only_owner_enrolled()
+                    and (score >= self._indulgence_floor()
+                         or seconds <= 2.0))
+                if not possible_owner:
+                    self._cinema_observe(verdict, pcm)
+            if not cinema_on:
+                return allowed
+            if allowed:
+                if verdict in ("accept", "indecisive_short"):
+                    return True
+                score = float(decision.get("score") or 0.0)
+                if (verdict == "unknown" and self._only_owner_enrolled()
+                        and score >= self._indulgence_floor()):
+                    return True
+                self._series_gate_log(
+                    "modo cinema — fala descartada em silêncio "
+                    f"({verdict or 'unknown'}).")
+            return False
+        except Exception as e:
+            # Never make the owner deaf because the gate broke.
+            print(f"[SeriesGate] precheck falhou ({e!r}) — seguindo")
+            return True
+
+    def _series_decision_for(self, pcm: bytes | None) -> dict | None:
+        gate = getattr(self, "_series_gate", None)
+        if gate is None:
+            return None
+        try:
+            return gate.decision_for(pcm)
+        except Exception:
+            return None
+
+    def _stt_speaker_is_owner(self) -> bool:
+        """Cheap, non-blocking answer for the STT cap hook (audio thread).
+
+        Reads the progressive gate's cached verdict — the LAST evaluated
+        segment, i.e. the voice that was on the microphone a moment ago —
+        instead of running the embedder mid-capture. Contract: any doubt or
+        failure is True (fail open), because returning False only tightens the
+        segment cap from 15 s to 8 s and a wrong "not owner" would chop the
+        owner's own sentence.
+
+        Negative evidence is deliberate and narrow: a known non-owner, a
+        playback artifact, or an unknown voice outside the single-owner gray
+        band. Stale evidence (older than the TTL) is not evidence at all.
+        """
+        gate = getattr(self, "_series_gate", None)
+        if gate is None:
+            return True
+        try:
+            last = gate.last_decision()
+        except Exception:
+            return True
+        if not last:
+            return True                     # never evaluated: fail open
+        try:
+            age = time.monotonic() - float(last.get("at") or 0.0)
+        except (TypeError, ValueError):
+            return True
+        if age > _STT_OWNER_EVIDENCE_TTL_S:
+            return True                     # stale: no recent negative evidence
+        verdict = str(last.get("verdict") or "")
+        score = float(last.get("score") or 0.0)
+        seconds = float(last.get("seconds") or 0.0)
+        if verdict == "accept":
+            owner = ""
+            speaker = getattr(self, "_speaker", None)
+            if speaker is not None:
+                owner = str(getattr(speaker, "owner_name", "") or "").strip().lower()
+            who = str(last.get("speaker") or "").strip().lower()
+            return bool(not who or not owner or who == owner)
+        if verdict in ("unauthorized", "playback", "not_voice", "indecisive"):
+            return False
+        if verdict == "unknown":
+            # Single-owner gray band: the same forgiveness spoken consent has.
+            try:
+                if self._only_owner_enrolled() and (
+                        score >= self._indulgence_floor() or seconds <= 2.0):
+                    return True
+            except Exception:
+                return True
+            return False
+        # indecisive_short and anything new: too little evidence to tighten.
+        return True
+
+    def _wire_stt_hooks(self, listener) -> None:
+        """Attach the owner-aware cap hook to a freshly built STT listener."""
+        if listener is None:
+            return
+        try:
+            listener.current_speaker_is_owner = self._stt_speaker_is_owner
+        except Exception as e:
+            print(f"[STT] não consegui ligar o gancho de locutor: {e}")
+
+    def _series_mode_on(self) -> bool:
+        gate = getattr(self, "_series_gate", None)
+        try:
+            return bool(gate is not None and gate.enabled)
+        except Exception:
+            return False
+
+    def _series_mode_gate(self, text: str, pcm: bytes | None = None,
+                          *, log_heard: bool = True) -> bool:
+        """Handle "modo série" / "sai do modo série" before the brain.
+
+        The state is persisted by the gate (memory/series_mode.json). Only a
+        voice the gate just accepted may change it, so a TV line that happened
+        to be transcribed can never toggle the mode.
+        """
+        if not _SERIES_MODE_RE.search(text or ""):
+            return False
+        if _SERIES_QUESTION_RE.search(text or ""):
+            return False          # "o que é o modo série?" is a question
+        gate = getattr(self, "_series_gate", None)
+        if gate is None:
+            try:
+                self._say_now("O modo série precisa da identificação de voz "
+                              "ligada; sem ela eu não consigo separar sua voz "
+                              "da TV.")
+            except Exception:
+                pass
+            return True
+        records = []
+        try:
+            records = self._speaker.list() if self._speaker is not None else []
+        except Exception:
+            records = []
+        if not records:
+            try:
+                self._say_now("Ainda não tenho sua voz cadastrada. Fale comigo "
+                              "normalmente uma vez e depois ative o modo série.")
+            except Exception:
+                pass
+            return True
+        if log_heard:
+            try:
+                self._log_heard(text)
+            except Exception:
+                pass
+        pcm = pcm if pcm is not None else getattr(self, "_current_pcm", None)
+        decision = self._series_decision_for(pcm)
+        allowed = True
+        if decision is not None:
+            allowed = decision.get("verdict") == "accept"
+        elif pcm and getattr(self, "_speaker", None) is not None:
+            allowed = self._owner_voice(pcm)[0]
+        if not allowed:
+            try:
+                self.ui.write_log("SYS: modo série — troca recusada "
+                                  "(voz não reconhecida como autorizada).")
+                self._say_now("Só uma voz autorizada pode mudar o modo série.")
+            except Exception:
+                pass
+            return True
+        want = not bool(_SERIES_OFF_RE.search(text or ""))
+        try:
+            gate.set_enabled(want)
+        except Exception as e:
+            print(f"[SeriesGate] não consegui mudar o modo: {e}")
+            return True
+        try:
+            _health.set_component("series_gate", True,
+                                  "ligado" if want else "desligado")
+        except Exception:
+            pass
+        self.ui.write_log(
+            "SYS: modo série " + ("ligado — só sua voz e convidados "
+                                  "autorizados passam; a TV fica em silêncio."
+                                  if want else
+                                  "desligado — volto a ouvir a sala."))
+        try:
+            self._say_now(
+                "Modo série ligado. Só respondo à sua voz e às vozes "
+                "autorizadas; o que vier da TV fica em silêncio."
+                if want else
+                "Modo série desligado. Voltei a ouvir a sala normalmente.")
+        except Exception:
+            pass
+        return True
 
     def _owner_voice_ok(self, pcm: bytes | None, *, allow_single: bool = True) -> bool:
         ok, detail = self._owner_voice(pcm)
@@ -5195,11 +6841,12 @@ class JarvisLive:
         except Exception as e:
             print(f"[QoderLive] nota de segundo plano: {e}")
         try:
-            if (not getattr(self.ui, "muted", False)
-                    and getattr(self, "_awake", True)
-                    and not bool(getattr(self, "_brain_busy", False))
-                    and not bool(getattr(self, "_is_speaking", False))):
-                self._say_now(spoken)
+            # Microfone mudo não é alto-falante mudo: a conclusão de um job
+            # acorda o assistente se ele dormia e sai na hora, uma vez por id.
+            # Não se exige dono falando nem memória livre: a linha espera a
+            # vez na fila de fala em vez de ser descartada.
+            kind_id = str(ev.get("id") or label)
+            self._announce_task_completion(f"job:{kind_id}:{kind}", spoken)
         except Exception:
             pass
 
@@ -5461,6 +7108,9 @@ class JarvisLive:
         # porque ela dormia fazia o campo de comando parecer quebrado.
         if self._wake_enabled and not self._awake:
             self.wake(reason="você digitou")
+        # The typed turn gets its own index, with the channel recorded so the
+        # answer line can say it came from text and not from the microphone.
+        self._next_turn_ref("texto")
         # The typed words belong to the same Qoder conversation. The UI has
         # already shown them; record them in the session log and memory, then
         # hand them to the persistent session without a gate in front.
@@ -5617,7 +7267,11 @@ class JarvisLive:
                 sample_rate=SEND_SAMPLE_RATE,
                 device=lst["device"], compute_type=lst["compute_type"],
                 prompt=self._stt_name_hint(lst["language"]),
-                fallback_transcribe=fallback)
+                fallback_transcribe=fallback,
+                precheck=self._series_precheck,
+                preroll_s=lst["preroll_s"],
+                max_utterance_s=lst.get("max_utterance_s"))
+            self._wire_stt_hooks(self._groq)
             self._groq.sleeping = self._wake_enabled and not self._awake
             self.ui.write_log(f"SYS: Ouvindo com Whisper local ({lst['model']}, "
                               f"{lst['language']}) — offline, nada sai da máquina"
@@ -5645,7 +7299,11 @@ class JarvisLive:
             on_text=self._on_groq_text,
             on_utterance=self._on_groq_text,
             on_status=lambda m: self.ui.write_log(f"SYS: {m}"),
-            sample_rate=SEND_SAMPLE_RATE, prompt=hint)
+            sample_rate=SEND_SAMPLE_RATE, prompt=hint,
+            precheck=self._series_precheck,
+            preroll_s=st["preroll_s"],
+            max_utterance_s=st.get("max_utterance_s"))
+        self._wire_stt_hooks(self._groq)
         self._groq.sleeping = self._wake_enabled and not self._awake
         self.ui.write_log(f"SYS: Ouvindo com Whisper no Groq ({st['model']}, "
                           f"{st['language'] or 'auto'}) — a fala chega ao Gemini como texto.")
@@ -5847,7 +7505,9 @@ class JarvisLive:
     def _log_heard(self, text: str) -> None:
         """Every utterance the user actually said belongs in the panel."""
         try:
-            self.ui.write_log(f"YOU: {text}")
+            meta = _activity.make_meta(turn=int(getattr(self, "_turn_ref", 0) or 0),
+                                       chan="voz")
+            self.ui.write_log(self._log_line(f"YOU: {text}", meta))
             self._session_log.append(f"User: {text}")
         except Exception:
             pass
@@ -5864,14 +7524,17 @@ class JarvisLive:
         # still being spoken.
         if self._restart is not None and self._restart.pending():
             if self._handle_restart_confirmation(text, pcm):
+                self._note_owner_speech("reinício")
                 return
         if self._power is not None and self._power.pending():
             if self._handle_power_confirmation(text, pcm):
+                self._note_owner_speech("energia")
                 return
         # Guided voice enrollment answers the assistant's own prompt, so it is
         # handled before barge-in classification — a sample must never be
         # mistaken for a complement.
         if self._voice_train_gate(text, pcm):
+            self._note_owner_speech("cadastro de voz")
             return
         # Spoken consent for a risky bridge action the assistant just asked
         # about (send_message, whatsapp_control, ...). This runs BEFORE the
@@ -5882,13 +7545,27 @@ class JarvisLive:
         # again. Same rule as root: matched here, before any model, and ONLY
         # while a request is pending — it is the answer to the assistant's own
         # question. The window is separate from the sudo window.
-        if self._try_action_consent(text):
+        if self._try_action_consent(text, pcm):
+            return
+        # "Modo série" is a local switch, not a conversational turn: it must
+        # work before the brain and before the barge-in classification, and it
+        # speaks its confirmation like any other gate.
+        if self._series_mode_gate(text, pcm):
+            self._note_owner_speech("modo série")
+            return
+        # The cinema prompt's answer / explicit mode command is local too: it
+        # must work while the prompt is still being spoken (before barge-in).
+        if self._cinema_mode_gate(text, pcm):
+            self._note_owner_speech("modo cinema")
             return
         # Spoken while Gino is talking: classify as interruption or complement
         # instead of starting a turn blindly. A complement must not cut him off.
         if getattr(self, "_reply_active", False) or self._is_speaking:
             self._handle_barge_in(text)
             return
+        # A new spoken utterance opens the index every later line of this turn
+        # (YOU, the answer, gate lines) points back to.
+        self._next_turn_ref("voz")
         if not _heard:
             self._log_heard(text)
         # Start of the stopwatch: everything the user waits for after speaking
@@ -5914,9 +7591,11 @@ class JarvisLive:
             if (not self._addressed_to_me(text)
                     and not _qoder_jobs.has_question()
                     and not _qoder_jobs.has_approval()):
-                print(f"[Wake] asleep — not addressed to me: {text[:60]!r}")
-                return
-            self.wake(reason=f"você chamou {self._asst_name}")
+                if not self._asleep_utterance_wakes(text, pcm):
+                    return
+                self.wake(reason="você falou comigo dormindo")
+            else:
+                self.wake(reason=f"você chamou {self._asst_name}")
         # A Qoder question/result held while muted reaches the user now that
         # there is a turn (and the mute is off).
         if getattr(self, "_qoder_pending", None) and not self.ui.muted:
@@ -5927,6 +7606,7 @@ class JarvisLive:
                 self.ui.write_log(f"SYS: Frase bloqueada ignorada («{blocked}»): «{text[:60]}»")
             except Exception:
                 pass
+            self._note_owner_speech("frase bloqueada")
             _duck.up()
             return
         # An explicit end-of-subject is the one topic boundary worth trusting
@@ -5958,17 +7638,27 @@ class JarvisLive:
         except Exception:
             _waiting = False
         if _rootgate.looks_like_authorization(text, pending=_waiting):
-            secs = _rootgate.open_window()
-            try:
-                self.ui.write_log(f"SYS: Autorização de administrador concedida "
-                                  f"({secs:.0f}s).")
-            except Exception:
-                pass
-            if _waiting:
-                self._run_pending_root()
+            # The matcher is only words: "Você pode olhar." from the TV matched
+            # it on 13:17:39 and opened 120 s of root. Only a voiceprint the
+            # speaker index confirms as the OWNER may open the window; anything
+            # else is logged and continues as an ordinary turn (root_exec still
+            # refuses without the window).
+            _ok, _score, _detail = self._owner_speaker_confirmed(text, pcm)
+            if not _ok:
+                self._consent_speaker_refused(_score, _detail, "sudo")
             else:
-                self._say_now("Autorizado.")
-            return
+                secs = _rootgate.open_window()
+                try:
+                    self.ui.write_log(f"SYS: Autorização de administrador concedida "
+                                      f"({secs:.0f}s).")
+                except Exception:
+                    pass
+                self._note_owner_speech("autorização de sudo")
+                if _waiting:
+                    self._run_pending_root()
+                else:
+                    self._say_now("Autorizado.")
+                return
         # Spoken consent for a risky bridge action was already handled at the
         # top of this method, before the barge-in classification (the owner
         # typically answers while the refusal is still being spoken).
@@ -5989,7 +7679,8 @@ class JarvisLive:
                               ("youtube", self._youtube_local),
                               ("apps", self._apps_gate),
                               ("tela", self._screen_gate),
-                              ("voz", self._voice_enroll_gate),
+                              ("voz", lambda _text: self._voice_enroll_gate(
+                                  _text, pcm)),
                               ("energia", self._power_gate),
                               ("reinício", self._restart_gate),
                               ("persona", self._persona_gate),
@@ -6004,6 +7695,7 @@ class JarvisLive:
                     print(f"[Gate] {_gname} levou {_dt:.1f}s neste turno")
             if _hit:
                 print(f"[Gate] {_gname} assumiu o turno: {text[:70]!r}")
+                self._note_owner_speech(f"gate {_gname}")
                 self._memory_record_user(text)
                 try:
                     if self._chat_memory is not None:
@@ -6091,7 +7783,7 @@ class JarvisLive:
             pass
 
     def interrupt(self) -> None:
-        """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
+        """Stop JARVIS mid-speech: kill sounding audio and open mic immediately."""
         self._interrupted = True
         # The UI INTERRUPT button and a voice barge-in both mean the owner
         # ended the turn: the sidecar's "Operation aborted" that follows is
@@ -6102,6 +7794,12 @@ class JarvisLive:
         # it after the owner has taken the floor.
         self._speech_epoch += 1
         self._reply_active = False
+        # Draining the queue is not enough: the batch already handed to the
+        # device keeps sounding for the device's own buffer depth, and at
+        # 24 kHz that is enough to talk over the owner's first word. Abort the
+        # output stream now (discarding that buffer); _play_audio restarts it
+        # for the next reply.
+        self._silence_output_now()
         try:
             if self._qoder_live is not None:
                 self._qoder_live.interrupt_persona("all")
@@ -6135,7 +7833,48 @@ class JarvisLive:
         self._play_cursor = 0.0     # next batch starts a fresh timeline
         if self._turn_done_event:
             self._turn_done_event.clear()
-        self.ui.write_log("SYS: Interrompido — ouvindo...")
+        # The barge-in path sets the line with the measured speech duration;
+        # the button and the transcript path keep the generic one.
+        note = str(getattr(self, "_interrupt_note", "") or "")
+        self._interrupt_note = ""
+        self.ui.write_log(note or "SYS: Interrompido — ouvindo...")
+
+    def _silence_output_now(self) -> None:
+        """Discard what the output device is already holding and stop writing.
+
+        `stream.write()` only means the buffer accepted a batch — the bytes can
+        still be up to one device buffer ahead (tens to hundreds of ms). A
+        barge-in has to kill that too, not only the queue: `abort()` terminates
+        the stream without waiting for pending buffers. `_play_audio` sees
+        `_play_abort` and starts the stream again before the next batch, so the
+        next (new) reply is unaffected. Safe when nothing is playing.
+        """
+        event = getattr(self, "_play_abort", None)
+        if event is None:
+            event = threading.Event()
+            self._play_abort = event
+        event.set()
+        self._play_abort_at = time.monotonic()
+        stream = getattr(self, "_out_stream", None)
+        if stream is None:
+            return
+        try:
+            stream.abort()
+            print("[Barge-in] playback abortado no dispositivo")
+        except Exception as e:
+            print(f"[Barge-in] abort do playback falhou: {e!r}")
+
+    def _restart_output_after_abort(self, stream) -> None:
+        """Start the output stream again once a barge-in aborted it."""
+        if not getattr(self, "_play_abort", None) or not self._play_abort.is_set():
+            return
+        try:
+            if not stream.active:
+                stream.start()
+        except Exception as e:
+            print(f"[Barge-in] reinício do playback falhou: {e!r}")
+            return      # keep the flag; the next tick retries the device
+        self._play_abort.clear()
 
     def _looks_like_own_voice(self, text: str) -> bool:
         """Is this transcript just our own playback leaking into the mic?
@@ -6155,7 +7894,36 @@ class JarvisLive:
                 return True
         return False
 
-    def _try_action_consent(self, text: str) -> bool:
+    def _mirror_show_gate(self, text: str) -> bool:
+        """Atende "me mostra trabalhando" antes do modelo.
+
+        O dono pediu que a janela abrisse imediatamente; esperar o modelo
+        decidir chamar a ação custaria segundos e uma fala. Só age em pedido
+        explícito (regex acima) e nunca levanta: se o espelho não abrir, diz o
+        motivo em uma frase.
+        """
+        if not _MIRROR_SHOW_RE.search(str(text or "")):
+            return False
+        try:
+            result = _task_mirror.show(query=text)
+        except Exception as e:
+            print(f"[TaskMirror] show: {e}")
+            self._say_now("Não consegui abrir o espelho agora.")
+            return True
+        try:
+            if result.get("ok"):
+                self.ui.write_log(
+                    f"SYS: espelho visível — {str(result.get('title') or 'execução')[:80]}")
+                self._say_now("Abrindo o espelho do que está rodando.")
+            else:
+                self._say_now(str(result.get("message")
+                                  or "Não há execução em andamento para mostrar."))
+        except Exception:
+            pass
+        return True
+
+    def _try_action_consent(self, text: str,
+                            pcm: bytes | None = None) -> bool:
         """The owner's short spoken answer to a refused bridge action.
 
         Opens the actiongate window and consumes the utterance.
@@ -6163,10 +7931,13 @@ class JarvisLive:
         model can never reach this matcher, so it can never open the window.
         Returns False, changing nothing, unless a bridge request is pending
         (mark_pending runs only on a refusal) AND the words are a consent
-        phrase (rootgate's matcher). While Gino is speaking, the own-voice
-        echo guard applies first: the refusal prompt itself can contain
-        "pode", and his playback leaking into the mic must not authorise
-        anything.
+        phrase (rootgate's matcher) AND the speaker is confirmed as the OWNER
+        by the voiceprint. The words alone authorise nothing: on 13:17:39 a TV
+        line ("Você pode olhar.") opened 120 s of whatsapp_control, and Gino's
+        own transcribed reply also matched. While Gino is speaking, the
+        own-voice echo guard applies first: the refusal prompt itself can
+        contain "pode", and his playback leaking into the mic must not
+        authorise anything.
         """
         try:
             if not _actiongate.has_pending():
@@ -6182,12 +7953,24 @@ class JarvisLive:
                 return False
         except Exception:
             return False
+        confirmed, score, detail = self._owner_speaker_confirmed(text, pcm)
+        if not confirmed:
+            self._consent_speaker_refused(score, detail, "ação")
+            if pcm:
+                # A TV/unknown voice saying "pode" must not become a turn nor
+                # authorise anything; the real answer stays pending.
+                return True
+            # No audio at all (typed line / WhatsApp message): there is no
+            # speaker to confirm, so no window — but the words are still the
+            # owner's and the turn must continue to be answered.
+            return False
         _asked = _actiongate.pending() or {}
         secs = _actiongate.open_window()
         _actiongate.clear_pending()
         self._log_heard(text)
+        self._note_owner_speech("consentimento de ação")
         print(f"[ActionGate] consentimento por voz: «{text[:60]}» → janela "
-              f"{secs:.0f}s para «{_asked.get('title', '')}»")
+              f"{secs:.0f}s para «{_asked.get('title', '')}» ({detail})")
         try:
             self.ui.write_log(f"SYS: Ação «{_asked.get('title', '')}» autorizada "
                               f"pela sua voz ({secs:.0f}s).")
@@ -6245,9 +8028,472 @@ class JarvisLive:
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
+    # ── Activity Log: rastro de áudio por vez ───────────────────────────────
+    def _next_turn_ref(self, chan: str = "") -> int:
+        """Abre uma vez nova e devolve o índice dela no Activity Log.
+
+        O índice é só um contador de sessão: `"turn":37` aparece na fala do
+        dono, na resposta e nas linhas avulsas daquela vez, então o dono (e a
+        revisão de comunicação) consegue reconstruir o contexto em volta de
+        qualquer linha. O registro de fala da vez anterior fica guardado para
+        a linha agregada ainda poder contar o que foi sintetizado.
+        """
+        lock = getattr(self, "_speech_audit_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._speech_audit_lock = lock
+        audit = getattr(self, "_speech_audit", None)
+        if audit is None:
+            audit = {}
+            self._speech_audit = audit
+        with lock:
+            self._turn_seq = int(getattr(self, "_turn_seq", 0) or 0) + 1
+            self._turn_ref = self._turn_seq
+            if chan:
+                self._turn_input_chan = str(chan)
+            # O log em disco é o registro permanente; aqui só o turno corrente
+            # e um punhado de anteriores bastam para montar as linhas.
+            if len(audit) > 40:
+                for key in sorted(audit)[:-40]:
+                    audit.pop(key, None)
+            audit[self._turn_ref] = []
+            latency = getattr(self, "_turn_first_audio_ms", None)
+            if isinstance(latency, dict) and len(latency) > 40:
+                for key in sorted(latency)[:-40]:
+                    latency.pop(key, None)
+            return self._turn_ref
+
+    def _note_first_audio(self, turn: int | None = None) -> int | None:
+        """Grava (uma vez por vez) a latência pergunta → primeiro áudio.
+
+        O cronômetro é o `_turn_t0` já usado pelos marcos de [Latência]. A
+        latência só é gravada quando a vez ainda é a atual e o marco é
+        recente; uma fala avulsa de um turno antigo nunca herda o relógio de
+        outro. O valor vai no sufixo [audio={...}] da linha, que é o que a
+        revisão lê — nada aqui inventa número.
+        """
+        ref = turn if isinstance(turn, int) else int(
+            getattr(self, "_turn_ref", 0) or 0)
+        if ref <= 0:
+            return None
+        if ref != int(getattr(self, "_turn_ref", 0) or 0):
+            return None
+        t0 = float(getattr(self, "_turn_t0", 0.0) or 0.0)
+        if t0 <= 0:
+            return None
+        elapsed = time.monotonic() - t0
+        if elapsed < 0 or elapsed > 300.0:
+            return None                    # relógio de outro turno
+        table = getattr(self, "_turn_first_audio_ms", None)
+        if not isinstance(table, dict):
+            table = {}
+            self._turn_first_audio_ms = table
+        if ref in table:
+            return table[ref]
+        table[ref] = int(round(elapsed * 1000.0))
+        return table[ref]
+
+    def _turn_latency_ms(self, turn: int | None = None) -> int | None:
+        ref = turn if isinstance(turn, int) else int(
+            getattr(self, "_turn_ref", 0) or 0)
+        table = getattr(self, "_turn_first_audio_ms", None)
+        if not isinstance(table, dict):
+            return None
+        value = table.get(ref)
+        return int(value) if isinstance(value, int) else None
+
+    def _log_line(self, line: str, meta: dict | None) -> str:
+        """Linha pronta para o painel/log, com as flags no fim."""
+        return _activity.with_meta(line, meta)
+
+    def _note_speech(self, shown: str, spoken: str, *, generated: bool,
+                     turn: int | None = None, origin: str = "",
+                     sanitized: str = "", cut: bool = False) -> int:
+        """Registra o que foi de fato para o TTS (ou por que não foi).
+
+        `sanitized` guarda os tipos que core/speech_guard trocou antes da
+        síntese; `cut` marca a fala cortada no meio (TTS morreu ou um novo
+        turno substituiu a resposta), para a linha final poder dizer
+        `audio_generated=false` sem inventar que nada foi gerado.
+        """
+        ref = turn if isinstance(turn, int) else int(
+            getattr(self, "_turn_ref", 0) or 0)
+        lock = getattr(self, "_speech_audit_lock", None)
+        audit = getattr(self, "_speech_audit", None)
+        if lock is None or audit is None:
+            return ref
+        try:
+            with lock:
+                audit.setdefault(ref, []).append({
+                    "shown": str(shown or ""),
+                    "tts": str(spoken or ""),
+                    "generated": bool(generated),
+                    "sanitized": str(sanitized or ""),
+                    "cut": bool(cut),
+                    "origin": str(origin or ""),
+                })
+        except Exception as e:
+            print(f"[Activity] registro de fala falhou: {e}")
+        return ref
+
+    def _speech_cut_conclusion(self, text: str) -> str:
+        """Conclusão curta de uma fala cortada — a frase, não o discurso."""
+        raw = " ".join(str(text or "").split())
+        if len(raw) < 12:
+            return ""
+        parts = [p for p in re.split(r"(?<=[.!?…])\s+", raw) if p.strip()]
+        last = parts[-1].strip(" .,!?;:—–") if parts else ""
+        words = last.split()
+        if len(words) > 18:
+            last = " ".join(words[:18])
+        return (last.strip(" .,!?;:—–") + ".") if last else ""
+
+    def _queue_speech_cut_note(self, text: str, turn: int | None = None,
+                               reason: str = "", announce: bool = False) -> None:
+        """Guarda a conclusão de uma fala cortada para o turno seguinte.
+
+        O dono pediu que o corte no meio (TTS morreu ou o turno foi trocado)
+        não ficasse mudo nem repetisse a resposta inteira: no turno seguinte
+        sai só a conclusão, uma frase. Os canais são os mesmos do Activity
+        Log — nada de formato paralelo.
+
+        `announce` marca a nota de um AVISO de segundo plano (job/subagente
+        terminou): ele não tem um turno seguinte garantido, então a conclusão
+        espera o primeiro momento calmo em vez de depender de outra resposta.
+        """
+        conclusion = self._speech_cut_conclusion(text)
+        if not conclusion:
+            return
+        ref = turn if isinstance(turn, int) else int(
+            getattr(self, "_turn_ref", 0) or 0)
+        lock = getattr(self, "_speech_audit_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._speech_audit_lock = lock
+        now = time.monotonic()
+        try:
+            with lock:
+                notes = getattr(self, "_speech_cut_notes", None)
+                if not isinstance(notes, list):
+                    notes = []
+                    self._speech_cut_notes = notes
+                if any(n.get("turn") == ref and n.get("text") == conclusion
+                       for n in notes):
+                    return
+                notes.append({"turn": ref, "text": conclusion, "at": now,
+                              "reason": str(reason or "")[:16],
+                              "announce": bool(announce)})
+                # Só as últimas conclusões pendentes; um loop de falha não
+                # pode virar uma fila de anúncios.
+                for stale in [n for n in notes
+                              if now - float(n.get("at") or 0.0) > 600.0]:
+                    notes.remove(stale)
+                del notes[:-3]
+                if announce:
+                    self._start_cut_note_watch_locked()
+        except Exception as e:
+            print(f"[Say] conclusão do corte não guardada: {e}")
+
+    def _flush_speech_cut_note(self, stale_after: float = 0.0) -> None:
+        """Anuncia, no turno seguinte, a conclusão de uma resposta cortada."""
+        if getattr(self, "_speech_cut_flushing", False):
+            return
+        lock = getattr(self, "_speech_audit_lock", None)
+        notes = getattr(self, "_speech_cut_notes", None)
+        if lock is None or not notes:
+            return
+        ref = int(getattr(self, "_turn_ref", 0) or 0)
+        now = time.monotonic()
+        take: list[dict] = []
+        try:
+            with lock:
+                keep = []
+                for note in list(notes):
+                    age = now - float(note.get("at") or 0.0)
+                    if age > 600.0:
+                        continue
+                    if note.get("announce"):
+                        # Conclusão de aviso: uma vez só, mesmo com notas
+                        # repetidas na fila ou já reanunciada pelo vigia.
+                        text_key = str(note.get("text") or "")
+                        seen = getattr(self, "_speech_cut_announced", None)
+                        if ((isinstance(seen, dict) and text_key in seen)
+                                or any(t.get("text") == text_key for t in take)):
+                            continue
+                    if int(note.get("turn") or 0) != ref and age >= stale_after:
+                        take.append(note)
+                    else:
+                        keep.append(note)
+                self._speech_cut_notes = keep
+        except Exception as e:
+            print(f"[Say] conclusão pendente ilegível: {e}")
+            return
+        if not take:
+            return
+        self._speech_cut_flushing = True
+        try:
+            for note in take:
+                self._mark_cut_note_announced(note)
+                line = f"Só para fechar o assunto anterior: {note['text']}"
+                self._say_now(line, log=True, chan="voz", origin="conclusão",
+                              log_text=f"{self._asst_name}: {line}")
+        except Exception as e:
+            print(f"[Say] reanúncio da conclusão falhou: {e}")
+        finally:
+            self._speech_cut_flushing = False
+
+    def _mark_cut_note_announced(self, note: dict) -> None:
+        """Marca a conclusão como já reanunciada — a mesma frase não volta."""
+        text = str((note or {}).get("text") or "")
+        if not text:
+            return
+        lock = getattr(self, "_speech_audit_lock", None)
+        now = time.monotonic()
+        try:
+            if lock is not None:
+                with lock:
+                    seen = getattr(self, "_speech_cut_announced", None)
+                    if not isinstance(seen, dict):
+                        seen = {}
+                        self._speech_cut_announced = seen
+                    seen[text] = now
+                    for old in [k for k, ts in seen.items()
+                                if now - float(ts or 0.0) > 3600.0]:
+                        seen.pop(old, None)
+        except Exception:
+            pass
+
+    def _cut_note_watch_step(self) -> bool:
+        """Um passo do vigia dos avisos cortados; True quando não sobra nada.
+
+        A checagem e a soltura do vigia acontecem sob o mesmo lock da fila:
+        uma nota que chegue depois encontra a marca vazia e abre outro vigia,
+        então nenhuma conclusão fica órfã.
+        """
+        lock = getattr(self, "_speech_audit_lock", None)
+        notes = getattr(self, "_speech_cut_notes", None)
+        if lock is None or not isinstance(notes, list):
+            return True
+        now = time.monotonic()
+        try:
+            with lock:
+                pending = any(n.get("announce")
+                              and now - float(n.get("at") or 0.0) <= 600.0
+                              for n in notes)
+                if not pending:
+                    if getattr(self, "_speech_cut_watch", None) is threading.current_thread():
+                        self._speech_cut_watch = None
+                    return True
+        except Exception as e:
+            print(f"[Say] vigia da conclusão: {e}")
+            return True
+        if self._cut_note_quiet_moment():
+            self._flush_speech_cut_note_quiet()
+        return False
+
+    def _start_cut_note_watch_locked(self) -> None:
+        """Um vigia só; ele morre quando não sobra conclusão de aviso."""
+        if getattr(self, "_speech_cut_watch", None) is not None:
+            return
+        watch = threading.Thread(target=self._cut_note_watch, daemon=True,
+                                 name="cut-note-watch")
+        self._speech_cut_watch = watch
+        try:
+            watch.start()
+        except Exception as e:
+            self._speech_cut_watch = None
+            print(f"[Say] vigia da conclusão não iniciou: {e}")
+
+    def _cut_note_watch(self) -> None:
+        """Espera o primeiro momento calmo e reanuncia o aviso cortado."""
+        deadline = time.monotonic() + 600.0
+        try:
+            while time.monotonic() < deadline:
+                if self._cut_note_watch_step():
+                    return
+                time.sleep(0.5)
+        except Exception as e:
+            print(f"[Say] vigia da conclusão parou: {e}")
+        finally:
+            lock = getattr(self, "_speech_audit_lock", None)
+            try:
+                if lock is not None:
+                    with lock:
+                        if getattr(self, "_speech_cut_watch", None) is threading.current_thread():
+                            self._speech_cut_watch = None
+                elif getattr(self, "_speech_cut_watch", None) is threading.current_thread():
+                    self._speech_cut_watch = None
+            except Exception:
+                pass
+
+    def _cut_note_quiet_moment(self) -> bool:
+        """Dono calado e assistente ocioso: hora de reanunciar a conclusão."""
+        speak_check = getattr(self, "_user_is_speaking", None)
+        if callable(speak_check):
+            try:
+                if speak_check():
+                    return False
+            except Exception:
+                return False
+        lock = getattr(self, "_speaking_lock", None)
+        try:
+            if lock is not None:
+                with lock:
+                    if getattr(self, "_is_speaking", False):
+                        return False
+            elif getattr(self, "_is_speaking", False):
+                return False
+            if getattr(self, "_brain_busy", False):
+                return False
+            q = getattr(self, "audio_in_queue", None)
+            if q is not None and not q.empty():
+                return False
+        except Exception:
+            return False
+        return True
+
+    def _flush_speech_cut_note_quiet(self, min_age: float = 2.0) -> None:
+        """Reanuncia a conclusão de um aviso cortado no primeiro momento calmo.
+
+        Aviso de segundo plano não tem turno seguinte garantido: a nota espera
+        o dono ficar calado e o assistente ocioso (ver `_cut_note_watch`). Cada
+        conclusão é marcada ao sair, e nota repetida é descartada, então a
+        mesma frase não é reanunciada duas vezes. O flush da linha da resposta
+        (`_flush_speech_cut_note`) segue igual.
+        """
+        if getattr(self, "_speech_cut_flushing", False):
+            return
+        lock = getattr(self, "_speech_audit_lock", None)
+        notes = getattr(self, "_speech_cut_notes", None)
+        if lock is None or not notes:
+            return
+        now = time.monotonic()
+        take: list[dict] = []
+        try:
+            with lock:
+                keep = []
+                seen = getattr(self, "_speech_cut_announced", None)
+                if not isinstance(seen, dict):
+                    seen = {}
+                for note in list(notes):
+                    age = now - float(note.get("at") or 0.0)
+                    if age > 600.0:
+                        continue
+                    if not note.get("announce") or age < min_age:
+                        keep.append(note)
+                        continue
+                    text_key = str(note.get("text") or "")
+                    if text_key in seen or any(t.get("text") == text_key
+                                               for t in take):
+                        continue    # já reanunciada: não repete
+                    take.append(note)
+                self._speech_cut_notes = keep
+        except Exception as e:
+            print(f"[Say] conclusão de aviso ilegível: {e}")
+            return
+        if not take:
+            return
+        self._speech_cut_flushing = True
+        try:
+            for note in take:
+                self._mark_cut_note_announced(note)
+                line = f"Só para fechar o assunto anterior: {note['text']}"
+                print(f"[Say] reanunciando conclusão de aviso cortado: "
+                      f"{str(note['text'])[:80]!r}")
+                self._say_now(line, log=True, chan="voz", origin="conclusão",
+                              log_text=f"{self._asst_name}: {line}")
+        except Exception as e:
+            print(f"[Say] reanúncio da conclusão do aviso falhou: {e}")
+        finally:
+            self._speech_cut_flushing = False
+
+    def _speech_meta(self, *, chan: str, requested: bool, shown: str,
+                     turn: int | None = None, origin: str = "",
+                     spoken: str | None = None,
+                     only_origin: str = "") -> dict:
+        """Flags de áudio de uma vez, a partir do que o TTS realmente viu.
+
+        `generated` só é True quando algum texto da vez chegou a ser
+        sintetizado e enfileirado; `tts` entra apenas quando a fala difere do
+        texto exibido — o caso que o dono quer caçar. `only_origin` restringe
+        aos registros da própria resposta (uma narração da mesma vez não entra
+        no texto que a resposta levou ao TTS).
+        """
+        ref = turn if isinstance(turn, int) else int(
+            getattr(self, "_turn_ref", 0) or 0)
+        lock = getattr(self, "_speech_audit_lock", None)
+        audit = getattr(self, "_speech_audit", None)
+        rows: list[dict] = []
+        if lock is not None and audit is not None:
+            with lock:
+                rows = [dict(r) for r in (audit.get(ref) or [])]
+        if only_origin:
+            rows = [r for r in rows if r.get("origin") == only_origin]
+        cut = any(r.get("cut") for r in rows)
+        kinds: list[str] = []
+        for row in rows:
+            for name in str(row.get("sanitized") or "").split("+"):
+                if name and name not in kinds:
+                    kinds.append(name)
+        # Corte no meio = a resposta não chegou inteira ao ouvido. A linha diz
+        # `audio_generated=false` e `cut=true`: nunca "falou tudo" nem "mudo".
+        generated = any(r.get("generated") for r in rows) and not cut
+        tts_parts = [r.get("tts") or "" for r in rows if r.get("generated")]
+        tts = " ".join(part for part in tts_parts if part).strip()
+        return _activity.make_meta(
+            turn=ref, chan=chan, requested=requested, generated=generated,
+            cut=cut or None,
+            latency_ms=self._turn_latency_ms(ref),
+            shown=shown, spoken=tts or None,
+            sanitized="+".join(kinds), origin=origin)
+
+    def _write_answer_line(self, line: str, *, chan: str, requested: bool,
+                           shown: str, turn: int | None = None,
+                           only_origin: str = "",
+                           event=None) -> None:
+        """Escreve a linha da resposta com as flags já confirmadas.
+
+        A síntese roda no say-worker. Se a última frase da vez ainda está na
+        fila, esperar aqui bloquearia a thread que lê o sidecar; então a
+        escrita vai para uma thread curta que só espera AQUELE item (com teto
+        de tempo) e então calcula os flags. Sem item pendente a linha sai na
+        hora, como sempre saiu.
+        """
+
+        def _emit() -> None:
+            if isinstance(event, threading.Event):
+                try:
+                    event.wait(20.0)
+                except Exception:
+                    pass
+            meta_flags = self._speech_meta(
+                chan=chan, requested=requested, shown=shown,
+                turn=turn, only_origin=only_origin)
+            try:
+                self.ui.write_log(self._log_line(line, meta_flags))
+            except Exception as e:
+                print(f"[Activity] linha da resposta falhou: {e}")
+            try:
+                self._flush_speech_cut_note()
+            except Exception:
+                pass
+
+        try:
+            pending = (isinstance(event, threading.Event)
+                       and not event.is_set())
+        except Exception:
+            pending = False
+        if pending:
+            threading.Thread(target=_emit, daemon=True,
+                             name="activity-turn").start()
+        else:
+            _emit()
+
     def _say_now(self, text: str, log: bool = True,
                  voice_id: str | None = None,
-                 label: str | None = None) -> None:
+                 label: str | None = None,
+                 chan: str = "", origin: str = "",
+                 log_text: str = "") -> threading.Event | None:
         """Queue one sentence to be spoken outside any turn (economy mode).
 
         Called by the local gates (sudo, memory, music, YouTube) — which run on
@@ -6259,17 +8505,37 @@ class JarvisLive:
         `log` mirrors the sentence into the UI panel. Gates speak through this
         path, so without it the panel stayed empty while the assistant talked —
         exactly what happened with "Não tem música tocando agora".
+
+        Returns an Event that the worker sets once this line has been
+        synthesised (or dropped). The turn's answer line waits on it before
+        writing `audio_generated`, so the flag is a fact, not a guess.
         """
         text = str(text or "").strip()
         if not text:
-            return
+            return None
+        is_answer = (str(origin or "") in ("qoder", "economia")
+                     or ((chan or "voz") == "voz" and not log))
+        done = threading.Event()
         try:
             self._ensure_say_worker()
             self._say_q.put_nowait(
                 (text, bool(log), getattr(self, "_speech_epoch", 0),
-                 str(voice_id or ""), str(label or "")))
+                 str(voice_id or ""), str(label or ""),
+                 str(chan or ""), str(origin or ""), str(log_text or ""),
+                 int(getattr(self, "_turn_ref", 0) or 0), done))
+            # Fala avulsa (portão, aviso) de um turno novo: a conclusão de uma
+            # resposta cortada sai logo depois, uma frase, sem esperar a
+            # próxima resposta inteira. Resposta em curso não é partida.
+            if not is_answer and str(origin or "") != "conclusão":
+                try:
+                    self._flush_speech_cut_note(stale_after=45.0)
+                except Exception:
+                    pass
+            return done
         except Exception as e:
             print(f"[Say] não consegui enfileirar: {e}")
+            done.set()
+            return None
 
     def _ensure_say_worker(self) -> None:
         if getattr(self, "_say_thread", None) is not None:
@@ -6280,27 +8546,54 @@ class JarvisLive:
         def _run() -> None:
             while True:
                 item = self._say_q.get()
+                done = None
                 try:
                     if isinstance(item, tuple):
-                        if len(item) >= 5:
+                        if len(item) >= 10:
+                            (text, log, epoch, voice_id, label,
+                             chan, origin, log_text, turn, done) = item[:10]
+                        elif len(item) >= 8:
+                            (text, log, epoch, voice_id, label,
+                             chan, origin, log_text) = item[:8]
+                            turn = None
+                        elif len(item) >= 5:
                             text, log, epoch = item[0], item[1], item[2]
                             voice_id, label = item[3], item[4]
+                            chan = origin = log_text = ""
+                            turn = None
                         elif len(item) >= 3:
                             text, log, epoch = item[0], item[1], item[2]
                             voice_id, label = "", ""
+                            chan = origin = log_text = ""
+                            turn = None
                         else:
                             text, log = item[0], item[1]
                             epoch, voice_id, label = None, "", ""
+                            chan = origin = log_text = ""
+                            turn = None
                     else:
                         text, log, epoch, voice_id, label = item, True, None, "", ""
+                        chan = origin = log_text = ""
+                        turn = None
                     if (epoch is not None
                             and epoch != getattr(self, "_speech_epoch", epoch)):
                         continue      # the owner interrupted before this line
                     self._say_blocking(text, log=log, epoch=epoch,
                                        voice_id=voice_id or None,
-                                       label=label or None)
+                                       label=label or None,
+                                       chan=chan, origin=origin,
+                                       log_text=log_text, turn=turn)
                 except Exception as e:
                     print(f"[Say] falhou: {e}")
+                finally:
+                    # Quem espera o resultado desta linha (a resposta da vez,
+                    # que precisa das flags de áudio) é liberado aqui, com o
+                    # registro já feito — nunca antes da síntese.
+                    if done is not None:
+                        try:
+                            done.set()
+                        except Exception:
+                            pass
 
         self._say_thread = threading.Thread(target=_run, daemon=True,
                                             name="say-worker")
@@ -6386,10 +8679,13 @@ class JarvisLive:
             if not self._is_speaking:
                 return
         print("[Barge-in] dono falando — parando e devolvendo o microfone")
-        try:
-            self.ui.write_log("SYS: você falou — parei para te ouvir.")
-        except Exception:
-            pass
+        _since = float(getattr(self, "_owner_voice_since", 0.0) or 0.0)
+        _spoke = max(0.0, time.monotonic() - _since) if _since else 0.0
+        # One SYS line, in the Activity Log style: what was cut and for how
+        # long the owner had already been talking on the microphone. interrupt()
+        # writes this instead of the generic line.
+        self._interrupt_note = (f"SYS: barge-in: TTS interrompido pelo dono "
+                                f"(falou {_spoke:.1f}s no áudio)")
         self._qoder_ignore = True
         self._mark_qoder_voice_preempt()
         try:
@@ -6398,6 +8694,21 @@ class JarvisLive:
         except Exception as e:
             print(f"[QoderLive] interrupt: {e!r}")
         self.interrupt()
+
+    def _barge_onset_counts(self, jarvis_speaking: bool) -> bool:
+        """May this voiced block count toward cutting the reply?
+
+        While our own playback is on, the first `_BARGE_SETTLE_S` of a fresh
+        burst are the attack of the TTS entering the microphone — the moment
+        the echo guard has the least history to subtract. The block still
+        raises the owner's floor and still reaches the segmenter; it just does
+        not confirm a barge-in, so the assistant cannot interrupt itself.
+        Outside a burst this is always True: a person talking over a sentence
+        in progress is exactly what we want to stop.
+        """
+        if not jarvis_speaking:
+            return True
+        return time.monotonic() >= float(getattr(self, "_play_burst_until", 0.0))
 
     def _wait_for_user_quiet(self, timeout: float = _USER_SPEECH_HOLD_S) -> bool:
         """Hold the calling worker while the owner speaks, at most `timeout` s.
@@ -6423,11 +8734,60 @@ class JarvisLive:
     def _say_blocking(self, text: str, log: bool = True,
                       epoch: int | None = None,
                       voice_id: str | None = None,
-                      label: str | None = None) -> None:
-        """Synthesise and queue one sentence onto the playback queue."""
+                      label: str | None = None,
+                      chan: str = "", origin: str = "",
+                      log_text: str = "", turn: int | None = None) -> None:
+        """Synthesise and queue one sentence onto the playback queue.
+
+        This is the one place outside the economy brain where text becomes
+        audio. It also records, for the Activity Log, the exact text handed to
+        the TTS (`voice_text`, after numwords) so the line logged here or at
+        the end of the turn can carry `tts=` when it diverges from what was
+        shown — the trace of the English/raw-error leak the owner audits.
+        """
         text = str(text or "").strip()
         if not text:
             return
+        ref = turn if isinstance(turn, int) else int(
+            getattr(self, "_turn_ref", 0) or 0)
+        # Fala não vira log de ferramenta nem inglês: a camada pura troca o
+        # vazamento por intenção humana ANTES do numwords/TTS. O texto exibido
+        # fica como veio; `tts=` mostra o que o ouvido recebeu e `sanitized=`
+        # diz o que foi trocado — a revisão conta isso em vez de adivinhar.
+        guard_lang = _activity.lang_of(text) or "pt"
+        guarded = _speech_guard.sanitize(text, lang=guard_lang)
+        spoken_src = guarded.text or text
+        sanitized_flag = "+".join(guarded.kinds)
+        is_answer = (origin in ("qoder", "economia")
+                     or ((chan or "voz") == "voz" and not log))
+        # Aviso de segundo plano (`_announce_task_completion`, `_qoder_notice`):
+        # não é resposta de turno, mas também tem conclusão para reanunciar se o
+        # TTS cortar a linha — ela volta no primeiro momento calmo.
+        is_announcement = (not is_answer and str(origin or "") == "aviso")
+        _cut_note = is_answer or is_announcement
+
+        def _log_line_out(spoken: str, generated: bool,
+                          cut: bool = False) -> None:
+            """A linha do log desta fala — inclusive quando ela NÃO saiu."""
+            if not log:
+                return
+            speaker = str(label or self._asst_name)
+            line = str(log_text or f"{speaker}: {text}")
+            meta = _activity.make_meta(
+                turn=ref, chan=(chan or "voz"), requested=True,
+                generated=generated,
+                cut=cut or None,
+                latency_ms=self._turn_latency_ms(ref),
+                shown=text, spoken=spoken,
+                sanitized=sanitized_flag,
+                origin=origin or ("narração" if log_text else speaker))
+            try:
+                self.ui.write_log(self._log_line(line, meta))
+                if generated:
+                    self._session_log.append(f"{speaker}: {text}")
+            except Exception:
+                pass
+
         if epoch is None:
             epoch = getattr(self, "_speech_epoch", 0)
         try:
@@ -6435,27 +8795,55 @@ class JarvisLive:
             st = _b.settings(get_plugin_config)
             try:
                 from core.numwords import speakable as _sp
-                voice_text = _sp(text, style="hybrid" if st.get("tts_engine") == "fish" else "words")
+                voice_text = _sp(spoken_src, style="hybrid" if st.get("tts_engine") == "fish" else "words")
             except Exception:
-                voice_text = text
+                voice_text = spoken_src
             if voice_id:
                 pcm = _b.synth_pcm24k(voice_text, st, voice_id=voice_id)
             else:
                 pcm = _b.synth_pcm24k(voice_text, st)
         except Exception as e:
             print(f"[Say] TTS failed: {e}")
+            if _cut_note:
+                self._queue_speech_cut_note(spoken_src, ref, "tts",
+                                            announce=is_announcement)
+            self._note_speech(text, spoken_src, generated=False, turn=ref,
+                              origin=origin or "tts",
+                              sanitized=sanitized_flag, cut=is_answer)
+            _log_line_out(spoken_src, False, cut=is_answer)
             return
         if not pcm or self.audio_in_queue is None or self._loop is None:
+            if _cut_note:
+                self._queue_speech_cut_note(spoken_src, ref, "vazio",
+                                            announce=is_announcement)
+            self._note_speech(text, spoken_src, generated=False, turn=ref,
+                              origin=origin or "tts",
+                              sanitized=sanitized_flag)
+            _log_line_out(spoken_src, False)
             return
         # The owner may have taken the floor while the TTS was being
         # synthesised. The epoch is bumped by interrupt(); an old line is
         # dropped here and never reaches the speakers.
         if epoch != getattr(self, "_speech_epoch", epoch):
+            if _cut_note:
+                self._queue_speech_cut_note(spoken_src, ref, "turno",
+                                            announce=is_announcement)
+            self._note_speech(text, voice_text, generated=False, turn=ref,
+                              origin=origin or "tts",
+                              sanitized=sanitized_flag, cut=True)
+            _log_line_out(voice_text, False, cut=True)
             return
         # Last gate before the line becomes audible: a background notification
         # (Qoder task, gate warning) waits for the owner's sentence to end.
         self._wait_for_user_quiet()
         if epoch != getattr(self, "_speech_epoch", epoch):
+            if _cut_note:
+                self._queue_speech_cut_note(spoken_src, ref, "turno",
+                                            announce=is_announcement)
+            self._note_speech(text, voice_text, generated=False, turn=ref,
+                              origin=origin or "tts",
+                              sanitized=sanitized_flag, cut=True)
+            _log_line_out(voice_text, False, cut=True)
             return
         self._recent_spoken_text = (
             getattr(self, "_recent_spoken_text", "") + " " + text)[-600:]
@@ -6463,18 +8851,32 @@ class JarvisLive:
             self.ui.holo_transcript(text)
         except Exception:
             pass
+        # pcm existe e a fila vai receber os pedaços: daqui para baixo o áudio
+        # foi de fato gerado, mesmo que uma interrupção corte a reprodução.
+        # O primeiro áudio da vez vira o `latency_ms` das linhas do turno; só
+        # a fala do canal de voz conta, para um aviso de tarefa não herdar a
+        # pergunta de um turno antigo.
+        if (chan or "voz") == "voz":
+            self._note_first_audio(ref)
+        self._note_speech(text, voice_text, generated=True, turn=ref,
+                          origin=origin or "tts",
+                          sanitized=sanitized_flag)
         for i in range(0, len(pcm), 2400):
             if epoch != getattr(self, "_speech_epoch", epoch):
+                # Tocou parte da frase? A linha precisa dizer isso: o áudio
+                # não saiu inteiro e a conclusão será reanunciada no turno
+                # seguinte (curta, não a frase toda).
+                self._note_speech(text, voice_text, generated=False, turn=ref,
+                                  origin=origin or "tts",
+                                  sanitized=sanitized_flag, cut=True)
+                if _cut_note:
+                    self._queue_speech_cut_note(spoken_src, ref, "meio",
+                                                announce=is_announcement)
+                _log_line_out(voice_text, False, cut=True)
                 return
             self._loop.call_soon_threadsafe(
                 self.audio_in_queue.put_nowait, pcm[i:i + 2400])
-        if log:
-            speaker = str(label or self._asst_name)
-            try:
-                self.ui.write_log(f"{speaker}: {text}")
-                self._session_log.append(f"{speaker}: {text}")
-            except Exception:
-                pass
+        _log_line_out(voice_text, True)
         # Out-of-turn speech (gates, announcements, Qoder status) has no brain
         # worker to mark the turn complete. Without this, _play_audio saw a
         # non-empty queue, played it, then waited forever for a turn_done that
@@ -6852,12 +9254,13 @@ class JarvisLive:
         return True
 
     def _screen_gate(self, text: str) -> bool:
-        """Look at this computer's screen now, with the local vision model.
+        """Look at this computer's screen now, with the vision backend.
 
         `screen_process` exists for this, but it needs the model to choose it
-        among 44 tools; asked plainly, a 7B answered that it could not see. The
-        capture and the description are both local calls — no model has to agree
-        with the request before it happens.
+        among 44 tools. The capture and the description happen without a model
+        agreeing first; the default backend is Qoder (image attached), and the
+        local VL only runs when `vision_provider = local`. When vision is off,
+        the normal pipeline answers instead.
         """
         raw = str(text or "").strip()
         if not raw or len(raw.split()) > 20:
@@ -6866,6 +9269,9 @@ class JarvisLive:
         if any(w in folded for w in _SCREEN_OTHER_DEVICE):
             return False
         if not _SCREEN_RE.search(raw):
+            return False
+        from core import vision as _vision_mod
+        if not _vision_mod.enabled(get_plugin_config("brain")):
             return False
 
         def _work() -> None:
@@ -6888,11 +9294,13 @@ class JarvisLive:
                         "pedido que aparece na tela e eu descrevo o que estiver "
                         "aberto.")
                     return
+                st = (getattr(self, "_brain_st", None)
+                      or _brain_mod.settings(get_plugin_config))
                 desc = _brain_mod.vision_describe(
                     img_b, mime_t,
                     "Descreva o que está aberto nesta tela: quais janelas, "
                     "aplicativos e textos aparecem. Responda em português.",
-                    getattr(self, "_brain_st", None))
+                    st)
                 self._say_now(str(desc)[:600])
             except Exception as e:
                 print(f"[Vision] gate falhou: {e!r}")
@@ -7061,18 +9469,18 @@ class JarvisLive:
         # schemas, so the prose catalogue above would be a second copy of the same
         # 34 names — ~1400 of the 8000 tokens Groq's free tier allows for a whole
         # request. Over that, the provider refuses the request outright (HTTP 413)
-        # and the turn is never answered, whatever the user said. The LOCAL brain
-        # has no such budget, and a 7B model tool-calls markedly better with the
-        # catalogue in prose than with schemas alone — so it keeps the full list.
-        _brain_provider = str(get_plugin_config("brain").get("provider") or "").strip().lower()
-        _econ_caps = (_describe_tools(_all_decls) if _brain_provider == "custom"
-                      else _ECON_CAPABILITIES)
+        # and the turn is never answered, whatever the user said. There is no
+        # local text model left to justify the full prose catalogue.
+        _brain_cfg = get_plugin_config("brain")
+        from core import vision as _vision_mod
+        _vision_on = _vision_mod.enabled(_brain_cfg)
+        _econ_caps = _ECON_CAPABILITIES
         econ_prompt = _strip_live_only_sections(_render_prompt(prompt_tmpl, {
             "assistant_name": self._asst_name,
             "platform": f"{_platform.system()} {_platform.release()}".strip(),
             "capabilities": _econ_caps,
             "limits": _describe_limits(
-                has_vision=_brain_provider == "custom",
+                has_vision=_vision_on,
                 has_mic=True,
             ),
         }))
@@ -7270,10 +9678,9 @@ class JarvisLive:
                     result = ("[CLIPBOARD TEXT] "
                               + payload.decode("utf-8", "replace"))[:4000]
                 elif kind == "image":
-                    if not getattr(self, "_local_vision", False):
-                        result = ("The clipboard holds an image, but reading images "
-                                  "needs the local vision model "
-                                  "(ollama pull qwen2.5vl:3b).")
+                    if not getattr(self, "_vision_enabled", False):
+                        result = ("The clipboard holds an image, but vision is off "
+                                  "(vision_provider = off in ECONOMY BRAIN).")
                     else:
                         _q = args.get("text") or (
                             "Descreva tudo o que aparece neste print, em pt-BR, "
@@ -7314,9 +9721,9 @@ class JarvisLive:
                         print(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
                         _stall = "screen"
                     if isinstance(self.session, _EconomySession):
-                        # Local eyes: the capture goes to the local vision model
-                        # on the same Ollama and comes back as the tool result —
-                        # the image never leaves the machine.
+                        # Vision backend: Qoder by default, with the image
+                        # attached to a CLI turn; the local Ollama VL only when
+                        # vision_provider = local. `vision_describe` routes.
                         _vst = getattr(self, "_brain_st", None)
                         try:
                             desc = await loop.run_in_executor(
@@ -7495,8 +9902,14 @@ class JarvisLive:
                 # calls the assistant by name wakes her (see _on_groq_text).
                 # Local only — asleep, room audio never leaves the machine.
                 g = self._groq
-                if g is not None and g.local:
-                    g.feed(indata)
+                if g is not None:
+                    if g.local:
+                        g.feed(indata)
+                    else:
+                        # Cloud Whisper must not transcribe room audio while
+                        # asleep — but the pre-roll ring keeps running, so the
+                        # 1.5 s before a wake call is not lost either.
+                        g.feed(indata, preroll_only=True)
                 return
             # ── The flag follows the SPEAKERS, not the turn ──────────────────
             # A Qoder turn (an agent working) keeps `_reply_active` True long
@@ -7517,8 +9930,16 @@ class JarvisLive:
                         and (not self._ptt_enabled or self._ptt_held))
             owner_voice = bool(mic_open) and self._owner_voice_block(raw, jarvis_speaking)
             if owner_voice:
-                self._owner_voice_until = time.monotonic() + _OWNER_VOICE_TAIL_S
-                self._barge_run += 1
+                _now = time.monotonic()
+                if _now >= getattr(self, "_owner_voice_until", 0.0):
+                    # New phrase: remember when he started, for the log line
+                    # that reports how long the TTS talked over him.
+                    self._owner_voice_since = _now
+                self._owner_voice_until = _now + _OWNER_VOICE_TAIL_S
+                if self._barge_onset_counts(jarvis_speaking):
+                    self._barge_run += 1
+                else:
+                    self._barge_run = 0
             else:
                 self._barge_run = 0
 
@@ -7537,6 +9958,12 @@ class JarvisLive:
                 if owner_voice and self._barge_run >= _BARGE_CONFIRM_BLOCKS:
                     self._barge_run = 0
                     loop.call_soon_threadsafe(self._owner_takes_floor)
+                if not owner_voice and self._groq is not None:
+                    # Our own voice is in the monitor: only the ring runs. It
+                    # gets the canceller-cleaned block, so the TTS tail does
+                    # not become the opening of the barge-in, while a block
+                    # carrying the owner passes untouched (core/playback_cancel).
+                    self._groq.feed(indata, preroll_only=True)
                 return
 
             # ── Echo tail ────────────────────────────────────────────────────
@@ -7550,6 +9977,10 @@ class JarvisLive:
                 try:
                     if not self._echo.is_user_speech(
                             indata, SEND_SAMPLE_RATE, _pcm_level(indata)):
+                        if self._groq is not None:
+                            # Still our own tail: keep the ring warm so the
+                            # owner speaking right after it arrives whole.
+                            self._groq.feed(indata, preroll_only=True)
                         return
                     self._tail_until = 0.0      # a real voice ends the tail early
                 except Exception:
@@ -7715,6 +10146,10 @@ class JarvisLive:
     async def _receive_audio(self):
         print("[JARVIS] 👂 Recv started")
         out_buf, in_buf = [], []
+        # Native-voice path: the model's audio IS the speech, so there is no
+        # separate TTS text. Counting the PCM bytes of this turn is the only
+        # honest way to fill `audio_generated`.
+        audio_seen = [0]
 
         try:
             while True:
@@ -7744,6 +10179,7 @@ class JarvisLive:
                             _audio_data = response.data
                             # 24 kHz int16 mono → 48 000 bytes per second of voice.
                             _usage.note("gemini", audio_out_s=len(_audio_data) / 48000.0)
+                            audio_seen[0] += len(_audio_data)
                             _SLICE = 2400
                             for _i in range(0, len(_audio_data), _SLICE):
                                 self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
@@ -7796,7 +10232,11 @@ class JarvisLive:
                             full_in = " ".join(in_buf).strip()
                             if full_in:
                                 self._last_out_logged = ""   # new exchange
-                                self.ui.write_log(f"You: {full_in}")
+                                meta_flags = _activity.make_meta(
+                                    turn=int(getattr(self, "_turn_ref", 0) or 0),
+                                    chan=str(getattr(self, "_turn_input_chan", "") or "voz"))
+                                self.ui.write_log(self._log_line(
+                                    f"You: {full_in}", meta_flags))
                                 self._session_log.append(f"User: {full_in}")
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
@@ -7815,7 +10255,17 @@ class JarvisLive:
                                     full_out = ""
                             if full_out:
                                 self._last_out_logged = full_out
-                                self.ui.write_log(f"{self._asst_name}: {full_out}")
+                                # Native voice: the transcription IS the spoken
+                                # text; `generated` comes from the PCM actually
+                                # received for this turn, not from a guess.
+                                meta_flags = _activity.make_meta(
+                                    turn=int(getattr(self, "_turn_ref", 0) or 0),
+                                    chan=str(getattr(self, "_turn_input_chan", "") or "voz"),
+                                    requested=True,
+                                    generated=audio_seen[0] > 0,
+                                    shown=full_out, origin="gemini")
+                                self.ui.write_log(self._log_line(
+                                    f"{self._asst_name}: {full_out}", meta_flags))
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
@@ -7824,6 +10274,7 @@ class JarvisLive:
                                         "ts": datetime.now().isoformat(),
                                     }))
                             out_buf = []
+                            audio_seen[0] = 0
 
                             if self._vision_close_pending:
                                 # This turn_complete IS the vision answer — close camera + release busy flag
@@ -7958,9 +10409,12 @@ class JarvisLive:
                   f"→ echo tail {(self._out_latency + _TAIL_MARGIN)*1000:.0f} ms")
         except Exception:
             pass
+        # interrupt()/the barge-in needs a handle to abort the device buffer.
+        self._out_stream = stream
 
         try:
             while True:
+                self._restart_output_after_abort(stream)
                 try:
                     chunk = await asyncio.wait_for(
                         self.audio_in_queue.get(),
@@ -7982,6 +10436,16 @@ class JarvisLive:
                     self._duck_check_drain()
                     continue
 
+                # The epoch of the reply this chunk belongs to. interrupt()
+                # bumps it, so a chunk dequeued before the barge-in can be
+                # checked again after the owner-floor wait and dropped instead
+                # of starting to sound after the stop.
+                _epoch = getattr(self, "_speech_epoch", 0)
+                if time.monotonic() - getattr(self, "_last_play_batch", 0.0) >= _BARGE_SETTLE_S:
+                    # A fresh burst: its attack is about to reach the mic and
+                    # must not confirm a barge-in (see _barge_onset_counts).
+                    self._play_burst_until = time.monotonic() + _BARGE_SETTLE_S
+
                 # ── The owner has the floor ──────────────────────────────────
                 # A new line never starts while his voice is on the microphone.
                 # The chunk stays here — not played, not discarded — and goes
@@ -8001,12 +10465,15 @@ class JarvisLive:
                         # The owner cut the turn while this line waited: it
                         # belongs to the answer he already interrupted.
                         continue
+                if _epoch != getattr(self, "_speech_epoch", _epoch):
+                    continue
 
                 self.set_speaking(True)
 
                 # Batch all immediately-available chunks into one write to reduce
                 # thread-pool round-trips (was one asyncio.to_thread per 50ms slice).
-                # Cap at ~200 ms so interrupt() still stops audio within ~200 ms.
+                # ~200 ms is the HUD's natural frame span; the barge-in no longer
+                # waits for it, because interrupt() aborts the device buffer.
                 batch = bytearray(chunk)
                 while len(batch) < 9600:   # 9600 bytes ≈ 200 ms at 24 kHz / 16-bit mono
                     try:
@@ -8064,10 +10531,43 @@ class JarvisLive:
                 except Exception:
                     pass
 
+                if _epoch != getattr(self, "_speech_epoch", _epoch):
+                    # The owner interrupted while this batch was being lined
+                    # up: it belongs to the answer already cut.
+                    continue
+
                 try:
                     await asyncio.to_thread(stream.write, bytes(batch))
-                except (RuntimeError, asyncio.CancelledError):
-                    break   # executor shutting down — exit cleanly
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    _flag = getattr(self, "_play_abort", None)
+                    _aborted = bool(_flag is not None and _flag.is_set())
+                    # Also cover the narrow race where the flag was already
+                    # cleared by a restart but the device is stopped: a
+                    # PortAudioError right after an abort is the barge-in, not
+                    # a device failure.
+                    if not _aborted and isinstance(exc, sd.PortAudioError):
+                        _aborted = (not getattr(stream, "active", True)
+                                    and (time.monotonic()
+                                         - float(getattr(self, "_play_abort_at", 0.0)))
+                                    < 2.0)
+                    if _aborted:
+                        # The barge-in aborted the stream mid-write. Drop this
+                        # batch; the next tick restarts the device for the
+                        # next reply.
+                        print(f"[Barge-in] lote descartado no write: {exc!r}")
+                        if not getattr(stream, "active", True):
+                            try:
+                                stream.start()
+                            except Exception as e2:
+                                print(f"[Barge-in] reinício do playback falhou: {e2!r}")
+                        if _flag is not None:
+                            _flag.clear()
+                        continue
+                    if isinstance(exc, RuntimeError):
+                        break   # executor shutting down — exit cleanly
+                    raise
                 # Proof the speakers just received voice: the duck probe and
                 # the drain release count silence from this instant, not from
                 # the speaking flag (a held turn never drops it).
@@ -8078,7 +10578,12 @@ class JarvisLive:
             raise
         finally:
             self.set_speaking(False)
-            stream.stop()
+            if getattr(self, "_out_stream", None) is stream:
+                self._out_stream = None
+            try:
+                stream.stop()
+            except Exception:
+                pass
             stream.close()
 
     # ── Morning briefing ────────────────────────────────────────────────────────

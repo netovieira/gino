@@ -46,6 +46,7 @@ import re
 import threading
 import time
 import unicodedata
+import weakref
 
 from core import rootgate
 
@@ -66,6 +67,38 @@ _until = 0.0
 _pending: dict | None = None
 # (account, chat) -> {"account": folded, "name": contact, "until": monotonic}
 _replies: dict[tuple[str, str], dict] = {}
+# Callbacks told when the owner grants a new window. The bridge uses this to
+# drop its "already denied" marks: a fresh "pode" is a new authorisation, so
+# the same call must be allowed to reach the normal gate again.
+_grant_listeners: list[weakref.ref] = []
+
+
+def add_grant_listener(callback) -> None:
+    """Call ``callback()`` whenever a spoken consent opens the window."""
+    if not callable(callback):
+        return
+    try:
+        ref = weakref.WeakMethod(callback)
+    except TypeError:
+        ref = weakref.ref(callback)
+    with _lock:
+        _grant_listeners.append(ref)
+
+
+def _notify_grant() -> None:
+    with _lock:
+        refs = list(_grant_listeners)
+    for ref in refs:
+        callback = ref()  # WeakMethod -> bound method; plain ref -> function
+        if callback is None:
+            with _lock:
+                if ref in _grant_listeners:
+                    _grant_listeners.remove(ref)
+            continue
+        try:
+            callback()
+        except Exception:
+            pass  # a broken listener must never block the consent itself
 
 
 def looks_like_consent(text: str) -> bool:
@@ -115,6 +148,9 @@ def open_window(seconds: float = WINDOW_SECONDS) -> float:
     global _until
     with _lock:
         _until = time.monotonic() + max(5.0, float(seconds))
+    # A new consent renews everything that had been refused: the bridge
+    # forgets the calls it had marked as "already denied".
+    _notify_grant()
     return max(5.0, float(seconds))
 
 

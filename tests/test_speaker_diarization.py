@@ -4,7 +4,16 @@ from __future__ import annotations
 import tempfile
 import unittest
 
-from core.speaker_id import SpeakerId
+import numpy as np
+
+from core.speaker_id import SpeakerId, SAMPLE_RATE
+
+
+def _tone(seconds: float) -> bytes:
+    """Audible mono PCM: analyze_utterance trims and measures voiced audio."""
+    t = np.arange(int(SAMPLE_RATE * seconds)) / SAMPLE_RATE
+    samples = 0.2 * np.sin(2 * np.pi * 220.0 * t)
+    return (samples * 32767).astype("<i2").tobytes()
 
 
 class AnalyzeUtteranceTest(unittest.TestCase):
@@ -17,7 +26,7 @@ class AnalyzeUtteranceTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_two_segments_are_labeled_and_primary_is_last(self):
-        pcm = b"\x01\x00" * 32_000  # 2 s at 16 kHz
+        pcm = _tone(2.0)
         self.speaker.diarize = lambda _pcm, num_speakers=-1: [
             {"start": 0.0, "end": 1.0, "speaker": 0, "embedding": [1.0, 0.0]},
             {"start": 1.0, "end": 2.0, "speaker": 1, "embedding": [0.0, 1.0]},
@@ -44,7 +53,7 @@ class AnalyzeUtteranceTest(unittest.TestCase):
         self.assertGreater(len(result["unknown"]["pcm"]), 0)
 
     def test_known_but_unauthorized_is_reported(self):
-        pcm = b"\x01\x00" * 16_000
+        pcm = _tone(1.0)
         self.speaker.diarize = lambda _pcm, num_speakers=-1: [
             {"start": 0.0, "end": 1.0, "speaker": 0, "embedding": [1.0, 0.0]},
         ]
@@ -57,7 +66,7 @@ class AnalyzeUtteranceTest(unittest.TestCase):
         self.assertIsNone(result["unknown"])
 
     def test_no_segments_falls_back_to_whole_utterance(self):
-        pcm = b"\x01\x00" * 16_000
+        pcm = _tone(1.0)
         self.speaker.diarize = lambda _pcm, num_speakers=-1: []
         self.speaker.embedding = lambda _pcm: [1.0, 0.0]
         self.speaker.identify = lambda _emb: {

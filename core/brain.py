@@ -13,8 +13,10 @@ out is billed. This mode replaces the whole session with three cheap pieces:
 Everything else the assistant does stays: the persona prompt, memory, every
 action and plugin (they are offered to the model as OpenAI tools), reminders,
 the briefing, the avatar's lip-sync (the voice is played through the same
-queue Gemini's audio used). What is lost: barge-in by voice, vision tools
-(deepseek-chat cannot see), and Gemini's native hearing of tone.
+queue Gemini's audio used). What is lost: barge-in by voice and Gemini's native
+hearing of tone. Vision is not lost: since phase 2 it goes to Qoder with the
+image attached (core/vision.py), because a chat model cannot see but the CLI's
+free Qwen3.8-Flash can.
 
 Settings come from ⚙ → PLUGIN SETTINGS → ECONOMY BRAIN (plugins/brain_economy.py),
 stored under plugin_config.brain in config/api_keys.json.
@@ -65,7 +67,6 @@ PRESETS = {
     "gemini":     {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
                    "model": "gemini-2.5-flash",
                    "key_url": "https://aistudio.google.com/app/apikey"},
-    "custom":     {"base_url": "http://localhost:11434/v1", "model": "llama3.2", "key_url": ""},
     # The `qoder` CLI the person already has installed and logged in, invoked
     # as a subprocess (`qoder -p …`). It is text-only — it exposes Qoder's own
     # built-in tools (bash, edit, grep), NOT this assistant's 44 tools — so it
@@ -78,14 +79,67 @@ PRESETS = {
                    "key_url": "qoder login (CLI)"},
 }
 PROVIDERS = tuple(PRESETS)
-# Offered in the FALLBACK dropdown. "none" ends the chain.
-FALLBACK_PROVIDERS = ("groq", "gemini", "qoder", "deepseek", "openrouter", "custom", "none")
+# Offered in the FALLBACK dropdown. "none" ends the chain. There is no local
+# conversation rung: the text model is always a cloud/Qoder provider. Local AI
+# in this project is limited to audio (STT/VAD) and to vision (see VISION_*).
+FALLBACK_PROVIDERS = ("groq", "gemini", "qoder", "deepseek", "openrouter", "none")
 FALLBACK_NONE = ("none", "", "-")
 
+# ── vision: Qoder by default, local Ollama as an option ─────────────────────
+# Conversation is 100% Qoder/cloud and, since phase 2, so is vision: the image
+# is attached to a `qoder -p` turn (core/vision.py). The local qwen2.5vl backend
+# is kept behind vision_provider=local until phase 3 removes it; the keys live
+# here so the flag is never inferred from a chat rung.
+VISION_DEFAULT_BASE = "http://127.0.0.1:11434/v1"
+VISION_DEFAULT_MODEL = "qwen2.5vl:3b"
+OLLAMA_TEXT_PORT = 11434
+# What the bridge's /local_ask answers now that the text model is gone. Kept
+# here so the endpoint, main.py and the tests all say the same thing.
+LOCAL_CHAT_DISABLED = (
+    "O modelo local de conversa foi desligado. O Gino responde somente pelo "
+    "Qoder (nuvem); para trabalho pesado, use Agent.")
+
+
+def _is_local_ollama(url: str) -> bool:
+    """True for the local Ollama endpoint that used to serve the 7B.
+
+    Checked on every rung so an old config pointing at :11434 can never put a
+    local model back into the conversation chain.
+    """
+    try:
+        parts = urlsplit(str(url or "").strip())
+        host = (parts.hostname or "").lower()
+        return parts.port == OLLAMA_TEXT_PORT and host in (
+            "127.0.0.1", "localhost", "::1", "0.0.0.0")
+    except Exception:
+        return False
+
+
+def _vision_settings(cfg: dict) -> dict:
+    """Vision config, independent from the conversation provider.
+
+    Phase 2: the backend is Qoder (core/vision.py) — the image is attached to a
+    CLI turn. The local Ollama VL stays as an option (`vision_provider=local`)
+    until phase 3 decides its fate; its URL and model are still carried here so
+    turning it back on needs no other edit.
+    """
+    from core import vision as _vision
+    v = _vision.settings(cfg)
+    base = (str(cfg.get("vision_base_url") or "").strip().rstrip("/")
+            or VISION_DEFAULT_BASE)
+    model = str(cfg.get("vision_model") or "").strip() or VISION_DEFAULT_MODEL
+    v.update({
+        "vision_local": v["vision_provider"] == "local",
+        "vision_base_url": base,
+        "vision_model": model,
+    })
+    return v
+
 # When a Groq key is configured but no fallback was spelled out, this is the
-# rung behind the local model: the strongest chat model the free Groq tier still
-# serves to every account. (llama-3.3-70b-versatile was retired — a name that
-# 404s is worse than no fallback at all, because it costs a round trip per turn.)
+# rung behind the primary (Qoder/cloud): the strongest chat model the free Groq
+# tier still serves to every account. (llama-3.3-70b-versatile was retired — a
+# name that 404s is worse than no fallback at all, because it costs a round trip
+# per turn.)
 GROQ_DEFAULT_MODEL = PRESETS["groq"]["model"]
 
 # A provider that failed this way is not worth paying for on the next turn for
@@ -137,16 +191,27 @@ _VISION_TOOLS = {"screen_process", "close_camera"}
 
 def settings(get_plugin_config: Callable[[str], dict]) -> dict:
     cfg = get_plugin_config(NAMESPACE)
-    provider = str(cfg.get("provider") or "deepseek").strip().lower()
-    preset = PRESETS.get(provider, PRESETS["deepseek"])
-    base = str(cfg.get("base_url") or "").strip().rstrip("/") or preset["base_url"]
-    model = str(cfg.get("model") or "").strip() or preset["model"]
+    raw_provider = str(cfg.get("provider") or "deepseek").strip().lower()
+    # Only a known cloud/Qoder preset can answer. A stale "custom" (the old
+    # local 7B) or any unknown name falls back to a cloud provider — the local
+    # model is not part of this chain any more.
+    provider = raw_provider if raw_provider in PRESETS else "deepseek"
+    preset = PRESETS[provider]
+    base = str(cfg.get("base_url") or "").strip().rstrip("/")
+    model = str(cfg.get("model") or "").strip()
+    # A stale base_url pointing at the local Ollama would put the 7B back on the
+    # wire under a cloud provider's name. Refuse it, and the model that went
+    # with it, so the rung is genuinely remote.
+    if _is_local_ollama(base) or (raw_provider not in PRESETS and raw_provider):
+        base = ""
+        model = ""
+    base = base or preset["base_url"]
+    model = model or preset["model"]
     voice = str(cfg.get("tts_voice") or DEFAULT_VOICE).strip() or DEFAULT_VOICE
     engine = str(cfg.get("tts_engine") or "edge").strip().lower()
     fish_model = str(cfg.get("fish_model") or FISH_MODELS[0]).strip() or FISH_MODELS[0]
-    vision_model = str(cfg.get("vision_model") or "qwen2.5vl:3b").strip()
     st = {
-        "provider": provider if provider in PRESETS else "deepseek",
+        "provider": provider,
         "base_url": base, "model": model,
         "api_key": str(cfg.get("api_key") or "").strip(),
         "tts_voice": voice,
@@ -154,39 +219,35 @@ def settings(get_plugin_config: Callable[[str], dict]) -> dict:
         "fish_api_key": str(cfg.get("fish_api_key") or "").strip(),
         "fish_voice_id": fish_voice_id(cfg.get("fish_voice_id")),
         "fish_model": fish_model if fish_model in FISH_MODELS else FISH_MODELS[0],
-        "vision_model": vision_model,
     }
+    st.update(_vision_settings(cfg))
     st["chain"] = build_chain(st, cfg, get_plugin_config)
     st["router"] = _router_settings(cfg, get_plugin_config)
-    # Vision runs on the LOCAL Ollama regardless of which rung answers the
-    # conversation: qwen2.5vl reads the screenshot on this machine and the image
-    # never leaves it. With qodercli/local as the chain, the primary provider is
-    # no longer "custom", so the plugins must ask THIS instead of testing the
-    # provider name themselves.
-    vision_base = ""
-    for rung in st["chain"]:
-        if rung.get("provider") == "custom" or ":11434" in str(rung.get("base_url") or ""):
-            vision_base = str(rung.get("base_url") or "").rstrip("/")
-            break
-    st["vision_base_url"] = vision_base or "http://127.0.0.1:11434/v1"
-    st["vision_local"] = bool(vision_base) or provider == "custom"
     return st
 
 
 def _router_settings(cfg: dict, get_plugin_config) -> dict:
     """Config of the small model that decides, per turn, which tools are needed.
 
-    The answer model (a local 7B) is weak at choosing among ~44 tool schemas,
-    so a separate, smarter-but-cheap model does only the choosing. The routing
-    request is ~1k tokens — far under Groq's per-minute budget, and it answers
-    in half a second. The key defaults to the brain's Groq fallback (or the
-    groq namespace's key); with no key the router is disabled and main.py falls
-    back to its keyword gate.
+    The answer model is a general chat model, not necessarily good at choosing
+    among ~44 tool schemas, so a separate, smarter-but-cheap model does only the
+    choosing. The routing request is ~1k tokens — far under Groq's per-minute
+    budget, and it answers in half a second. The key defaults to the brain's
+    Groq fallback (or the groq namespace's key); with no key the router is
+    disabled and main.py falls back to its keyword gate.
     """
     provider = str(cfg.get("router_provider") or "groq").strip().lower()
-    preset = PRESETS.get(provider, PRESETS["groq"])
+    # The router is a model call too: it may not run on the retired local rung.
+    if provider not in PRESETS:
+        provider = "groq"
+    preset = PRESETS[provider]
     model = str(cfg.get("router_model") or preset["model"]).strip() or preset["model"]
     base = str(cfg.get("router_base_url") or "").strip().rstrip("/") or preset["base_url"]
+    if _is_local_ollama(base):
+        provider = "groq"
+        preset = PRESETS["groq"]
+        base = preset["base_url"]
+        model = preset["model"]
     key = str(cfg.get("router_api_key") or "").strip()
     if not key and provider == "groq":
         if str(cfg.get("fallback_provider") or "").strip().lower() == "groq":
@@ -207,19 +268,25 @@ def _entry(provider: str, model: str = "", base_url: str = "", api_key: str = ""
 
     A rung needs a base_url; anything else it does not spell out comes from the
     preset of the same name, so "groq" alone is a complete answer.
+
+    Unknown provider names are refused, and so is the local Ollama endpoint:
+    an old ``"custom"`` entry must not be able to rebuild the 7B as a text
+    rung. Local AI in this project is audio and vision only.
     """
     provider = str(provider or "").strip().lower()
-    if provider in FALLBACK_NONE:
+    if provider in FALLBACK_NONE or provider not in PRESETS:
         return None
-    preset = PRESETS.get(provider, {})
+    preset = PRESETS[provider]
     url = (str(base_url or "").strip().rstrip("/")
            or str(preset.get("base_url") or "").rstrip("/"))
     # qodercli is a subprocess (`qoder -p`), not an HTTP endpoint — it is the
     # one rung that is complete without a base_url.
     if not url and provider != "qodercli":
         return None
+    if _is_local_ollama(url):
+        return None
     return {
-        "provider": provider if provider in PRESETS else "custom",
+        "provider": provider,
         "base_url": url,
         "model": str(model or "").strip() or str(preset.get("model") or ""),
         "api_key": str(api_key or "").strip(),
@@ -236,12 +303,11 @@ def build_chain(st: dict, cfg: dict,
     """The providers to try, in order: the configured one first, then the
     fallbacks.
 
-    The order is decided by what answers usefully, not by where the model runs:
-    a local rung that takes fifteen seconds and returns an empty completion for
-    a request carrying tools is not the voice of a conversation. chat_stream
-    still demotes a rung that provably needs longer than TTFT_BUDGET_S to start
-    speaking, because a correct answer that arrives after fourteen seconds of
-    silence is not a conversational answer.
+    Every rung is remote: Qoder or a cloud provider. The old local 7B ("custom")
+    is deliberately not a valid rung — see _entry. chat_stream still demotes a
+    rung that provably needs longer than TTFT_BUDGET_S to start speaking,
+    because a correct answer that arrives after fourteen seconds of silence is
+    not a conversational answer.
 
     Declared explicitly (both shapes work) in plugin_config.brain:
 
@@ -278,8 +344,18 @@ def build_chain(st: dict, cfg: dict,
         })
 
     for item in declared:
-        rung = _entry(item.get("provider", ""), item.get("model", ""),
-                      item.get("base_url", ""), item.get("api_key", ""))
+        provider = str(item.get("provider") or "").strip().lower()
+        api_key = str(item.get("api_key") or "").strip()
+        # The form says a blank fallback key reuses the GROQ key saved for the
+        # ears; honour that here too, or a saved "groq" fallback with an empty
+        # key would answer 401 instead of falling back.
+        if provider == "groq" and not api_key and get_plugin_config:
+            try:
+                api_key = str((get_plugin_config("groq") or {}).get("api_key") or "").strip()
+            except Exception:
+                api_key = ""
+        rung = _entry(provider, item.get("model", ""),
+                      item.get("base_url", ""), api_key)
         if rung:
             chain.append(rung)
 
@@ -512,19 +588,19 @@ def _order_rungs(chain: list[dict]) -> list[dict]:
     """The chain, sorted for this turn: fast rungs first, then slow ones, then
     the ones cooling down.
 
-    Config order decides between rungs of the same kind, so "local first" holds
-    until the local rung has shown it cannot start speaking inside
-    TTFT_BUDGET_S. Only rungs that actually answered are measured — an unknown
-    rung keeps its place, because the point is to trust the configured order
-    until there is evidence against it.
+    Config order decides between rungs of the same kind, so the primary holds
+    its place until it has shown it cannot start speaking inside TTFT_BUDGET_S.
+    Only rungs that actually answered are measured — an unknown rung keeps its
+    place, because the point is to trust the configured order until there is
+    evidence against it.
     """
     up = [r for r in chain if not _is_down(r)]
     down = [r for r in chain if _is_down(r)]
     # The qoder CLI is slow to START (it answers whole, ~7 s) but is the smartest
     # rung, and it only ever runs on turns WITHOUT tools. Demoting it behind the
-    # local model — which is what the TTFT rule would do after one turn — would
+    # fast fallback — which is what the TTFT rule would do after one turn — would
     # quietly throw away the reason it is first. It keeps its configured place;
-    # the local fallback still catches it when the CLI is down.
+    # the cloud fallback still catches it when the CLI is down.
     def _is_cli(r: dict) -> bool:
         return r.get("provider") == "qodercli"
     fast = [r for r in up
@@ -612,11 +688,11 @@ def chat_stream(messages: list, tools: list | None, st: dict,
                 should_stop: Callable[[], bool] = lambda: False) -> tuple[str, list[dict]]:
     """Stream one reply, walking the provider chain until one answers.
 
-    The chain (st["chain"]) is built by settings(): the local model first, the
-    network fallback behind it. A rung that fails is skipped for RETRY_AFTER_S
-    so a proxy that is not running costs one refused connection, once — not one
-    on every turn. A rung that answers but starts speaking too late is moved
-    behind the fast ones instead (see _order_rungs).
+    The chain (st["chain"]) is built by settings(): the configured cloud/Qoder
+    provider first, the fallbacks behind it. A rung that fails is skipped for
+    RETRY_AFTER_S so a proxy that is not running costs one refused connection,
+    once — not one on every turn. A rung that answers but starts speaking too
+    late is moved behind the fast ones instead (see _order_rungs).
 
     A retry only happens while NOTHING has been spoken yet. Once the voice has
     said the first sentence of an answer, switching providers would make it
@@ -629,17 +705,6 @@ def chat_stream(messages: list, tools: list | None, st: dict,
     """
     chain = st.get("chain") or [st]
     order = _order_rungs(chain)
-    if not tools:
-        # Conversation is local-first. The Qoder CLI is smarter, but every turn
-        # pays a fresh process cold start: the log showed 9.8 s to the first
-        # sentence against 3.6 s from the local 7B. A conversation that thinks
-        # for ten seconds is not a conversation. The CLI stays in the chain as
-        # the fallback when the local rung is down or answers nothing; explicit
-        # delegation still goes through qoder_agent with full tools.
-        live = [r for r in order if not _is_down(r)]
-        order = ([r for r in live if r.get("provider") != "qodercli"]
-                 + [r for r in live if r.get("provider") == "qodercli"]
-                 + [r for r in order if _is_down(r)])
     upward: list[int] = [0]
 
     def _say(sentence: str) -> None:
@@ -647,25 +712,28 @@ def chat_stream(messages: list, tools: list | None, st: dict,
         on_sentence(sentence)
 
     last = None
+    skipped_for_tools: list[dict] = []
     last_user = _last_user_text(messages)
     for i, rung in enumerate(order):
         # The `qoder` CLI has no access to this assistant's tools (it only has
         # its own bash/edit/grep). Sending it a tool turn would get a reply that
         # cannot act — so on any turn that CARRIES tools it is skipped and the
-        # next rung (the local model, which can call them) answers. Turn
-        # without tools (conversation, reasoning) keeps it first: that is where
-        # a smarter model pays off and the local 7B is weakest.
+        # next rung answers. That next rung is a cloud provider (Groq/DeepSeek);
+        # there is no local model in the chain any more.
         if tools and rung.get("provider") == "qodercli":
+            skipped_for_tools.append(rung)
             print(f"[Brain] {label(rung)} não tem as ferramentas do assistente — "
                   f"pulando neste turno com ferramentas.")
             continue
         # A short greeting does not deserve a thirty-second agent. A short
         # QUESTION does: "o que é X?", "você conhece Y?", "consegue auditar?"
-        # are exactly what the local 7B gets wrong.
+        # deserve the strong model. Skipped ONLY when a fallback rung exists,
+        # otherwise the greeting would be answered by nobody.
         if (not tools and rung.get("provider") == "qodercli"
                 and len(last_user.split()) <= 6
-                and (not _looks_like_question(last_user) or _is_small_talk(last_user))):
-            print(f"[Brain] {label(rung)} pulado — turno curto, respondo local.")
+                and (not _looks_like_question(last_user) or _is_small_talk(last_user))
+                and any(not _is_down(r) for r in order[i + 1:])):
+            print(f"[Brain] {label(rung)} pulado — turno curto, respondo pelo fallback.")
             continue
         # A rung that already returned an empty completion to a request carrying
         # tools will do it again: skipping it saves its whole round trip, which
@@ -756,6 +824,14 @@ def chat_stream(messages: list, tools: list | None, st: dict,
             nxt = order[i + 1] if i + 1 < len(order) else None
             where = f"{label(rung)} failed" if not nxt else f"{label(rung)} failed — trying {label(nxt)}"
             print(f"[Brain] {where}: {type(e).__name__}: {str(e)[:160]}")
+    if tools and skipped_for_tools and last is None:
+        # Honest failure instead of a generic "no provider answered": the only
+        # rung was the qoder CLI, which cannot call this assistant's tools.
+        names = ", ".join(label(r) for r in skipped_for_tools)
+        raise RuntimeError(
+            f"nenhum provedor pode responder a este turno com ferramentas: "
+            f"{names} não expõe as ferramentas do assistente e não há fallback "
+            f"de nuvem configurado (Groq/DeepSeek/Qoder).")
     raise last if last else RuntimeError("no provider answered")
 
 
@@ -810,12 +886,6 @@ def _payload(messages: list, tools: list | None, st: dict, stream: bool) -> dict
     # Only sent to the models known to accept the field — the others 400 on it.
     if "gpt-oss" in str(st.get("model") or ""):
         payload["reasoning_effort"] = "low"
-    # Ollama's default window is 4096 tokens — SMALLER than this assistant's own
-    # request (system prompt plus 34 tool schemas is ~6.5k). Without a bigger
-    # num_ctx the server truncates the conversation before the model reads it.
-    # The KV cache for 16k at 7B is ~1 GB, which is what the video memory is for.
-    if st.get("provider") == "custom" or ":11434" in str(st.get("base_url") or ""):
-        payload["options"] = {"num_ctx": 16384}
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -1075,7 +1145,7 @@ def _chat_stream_one(messages: list, tools: list | None, st: dict,
     return content, calls
 
 
-# ── vision: local model → what is in this image ────────────────────────────
+# ── vision: image → what is in it (Qoder by default) ────────────────────────
 
 # qwen2.5vl:3b no Ollama vem com num_ctx=4096 — uma screenshot Retina do
 # MacBook (5K) estoura isso sozinha (4099 tokens só de imagem), e o modelo
@@ -1102,11 +1172,34 @@ def _shrink_for_vision(image: bytes, mime: str) -> tuple[bytes, str]:
 
 
 def vision_describe(image: bytes, mime: str, question: str, st: dict) -> str:
+    """One door for every vision call site: what is in this image?
+
+    Phase 2 routes it to Qoder — the picture is written to a temp file and
+    attached to a `qoder -p` turn (core/vision.py), on the free Qwen3.8-Flash.
+    `vision_provider = local` still sends it to the Ollama VL below (same
+    machine, nothing leaves it); `off` raises, so callers say "visão desligada"
+    instead of answering from imagination.
+    """
+    st = st or {}
+    provider = str(st.get("vision_provider") or "qoder").strip().lower()
+    if provider == "local":
+        return _vision_describe_local(image, mime, question, st)
+    if provider == "off" or not st.get("vision_enabled", True):
+        raise RuntimeError(
+            "visão desligada (vision_provider = off em ECONOMY BRAIN)")
+    from core import vision as _vision
+    return _vision.describe(image, mime, question,
+                            model=st.get("vision_qoder_model"),
+                            timeout=st.get("vision_timeout"))
+
+
+def _vision_describe_local(image: bytes, mime: str, question: str, st: dict) -> str:
     """Ask the LOCAL vision model what is in the image.
 
-    Same Ollama, same machine: the screenshot never leaves it, which is the
-    whole point of a local brain. `keep_alive` is short on purpose — a VL model
-    parked in 8 GB of video memory would evict the conversation model.
+    Kept for phase 3 to decide on: `vision_provider = local` is the only way
+    here. Same Ollama, same machine: the screenshot never leaves it.
+    `keep_alive` is short on purpose — a VL model parked in 8 GB of video memory
+    would evict the speech models.
 
     The image is thumbnailed to 1280×720 JPEG first — see the comment above
     for why. Callers pass raw PNG bytes and don't have to think about it.

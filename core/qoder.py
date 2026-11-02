@@ -29,6 +29,7 @@ SETTINGS
         thinking   adaptive | enabled | disabled | auto
         reasoning_effort  low | medium | high | max
         context_window    tokens (e.g. 1000000 for the 1M window)
+        job_timeout seconds for one background job turn (default 600)
         workspace  the project folder                (default: this repo)
 
     TRANSPORTS
@@ -77,6 +78,11 @@ FAST_THINKING = "disabled"
 FAST_EFFORT = "low"
 FAST_CONTEXT = 32_768
 DEFAULT_TIMEOUT = 120
+# Background jobs (delegated work: edit, test, investigate) are allowed to run
+# much longer than an interactive answer. Overridable as `job_timeout` in the
+# same qoder plugin config; the fast/chat profile keeps DEFAULT_TIMEOUT.
+DEFAULT_JOB_TIMEOUT = 600
+JOB_TIMEOUT_MAX = 3_600
 
 # Only the free models are offered. The id on the left is what goes on the
 # wire; the label says what each one is for.
@@ -151,6 +157,10 @@ def settings(get_plugin_config=None, profile: str = "work") -> dict:
         timeout = int(cfg.get("timeout") or DEFAULT_TIMEOUT)
     except (TypeError, ValueError):
         timeout = DEFAULT_TIMEOUT
+    try:
+        job_timeout = int(cfg.get("job_timeout") or DEFAULT_JOB_TIMEOUT)
+    except (TypeError, ValueError):
+        job_timeout = DEFAULT_JOB_TIMEOUT
     # The CLI is the default transport: it reaches the free models without
     # depending on the container. "proxy" keeps the OpenAI-style path.
     transport = str(cfg.get("transport") or "cli").strip().lower()
@@ -186,6 +196,7 @@ def settings(get_plugin_config=None, profile: str = "work") -> dict:
         "workspace": os.path.expanduser(workspace),
         "auto_start": bool(cfg.get("auto_start", True)),
         "timeout": max(10, min(600, timeout)),
+        "job_timeout": max(60, min(JOB_TIMEOUT_MAX, job_timeout)),
         "transport": "proxy" if transport == "proxy" else "cli",
         "thinking": thinking if thinking in ("auto", "adaptive", "enabled", "disabled") else CLI_DEFAULT_THINKING,
         "reasoning_effort": effort if effort in ("low", "medium", "high", "max") else CLI_DEFAULT_EFFORT,
@@ -320,7 +331,9 @@ def ask_stream(prompt: str, st: dict | None = None,
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, bufsize=1,
                             cwd=str(cwd) if cwd else None)
-    limit = float(timeout or st.get("timeout") or DEFAULT_TIMEOUT)
+    # This is the delegated-job path (stream-json with progress); interactive
+    # answers go through ask() and keep the shorter `timeout`.
+    limit = float(timeout or st.get("job_timeout") or DEFAULT_JOB_TIMEOUT)
     timed_out = [False]
 
     def _kill() -> None:
@@ -448,6 +461,23 @@ def ask(prompt: str, st: dict | None = None, model: str | None = None,
                       timeout=timeout)
 
 
+def ask_with_file(prompt: str, attachment: str | os.PathLike,
+                  st: dict | None = None, model: str | None = None,
+                  max_tokens: int = 600,
+                  timeout: float | None = None) -> str:
+    """One prompt + one attached file (an image), answered from what it sees.
+
+    CLI-only, on purpose: the proxy speaks chat-completions without an
+    attachment field, so falling back there would answer from the prompt alone —
+    a description of an image nobody looked at. One attempt; a failure is raised
+    with the CLI's own message so the caller can say what went wrong.
+    """
+    st = st or settings()
+    return _ask_cli(prompt, st, model=model, max_tokens=max_tokens,
+                    timeout=timeout, attachment=str(attachment),
+                    tools_arg="")
+
+
 def _find_cli() -> str | None:
     """Path to the `qoder` binary: PATH first, then the known install dir."""
     for name in ("qoder", "qodercli"):
@@ -462,6 +492,28 @@ def find_cli() -> str | None:
     """Public check: is the CLI reachable? The job runner uses it to decide
     whether write mode means "edit directly" or "return JSON for us to apply"."""
     return _find_cli()
+
+
+# A JARVIS started from inside a Qoder session inherits that session's SDK
+# variables. This CLI release removed SDK worker sessions, so a child that sees
+# them refuses every turn with "sdk_worker_removed" — even a plain `-p` one.
+# They describe the CALLER's session, not this machine's login, so the child
+# gets a copy of the environment without them.
+_SDK_ENV_KEYS = (
+    "QODER_AGENT_SDK_ENTRYPOINT", "QODER_AGENT_SDK_VERSION",
+    "QODER_AGENT_SDK_DAEMON", "QODER_SDK_AUTH_PAYLOAD_FILE",
+    "QODER_PID", "QODER_WORKER_RUNTIME_ASSET_ROOT",
+    "QODERCLI_RUNTIME_PACKAGING",
+)
+
+
+def cli_env() -> dict[str, str]:
+    """The environment for a `qoder` child process (see _SDK_ENV_KEYS)."""
+    env = os.environ.copy()
+    for key in list(env):
+        if key in _SDK_ENV_KEYS or key.startswith(("QODER_AGENT_SDK", "QODER_SDK")):
+            env.pop(key, None)
+    return env
 
 
 def _cli_error(event: dict) -> RuntimeError:
@@ -493,7 +545,9 @@ def _cli_failed(event: dict) -> bool:
 def _ask_cli(prompt: str, st: dict, model: str | None = None,
              system: str | None = None, max_tokens: int = 1024,
              timeout: float | None = None,
-             cwd: str | os.PathLike | None = None) -> str:
+             cwd: str | os.PathLike | None = None,
+             attachment: str | None = None,
+             tools_arg: str | None = None) -> str:
     """One non-interactive `qoder -p` turn, returned as text.
 
     FULL ACCESS — deliberate, and asked for by the user. `--tools default` gives
@@ -503,6 +557,10 @@ def _ask_cli(prompt: str, st: dict, model: str | None = None,
     exactly what it sounds like: this agent can change files and run shell
     commands on this machine by itself. The model is clamped to the free
     allowlist so "full access" never becomes "paid model".
+
+    `attachment` hands a file (an image, for vision) to the same turn via
+    `--attachment`; `tools_arg` overrides the configured toolset, so vision can
+    run with `""` — it only has to look, never to act.
     """
     cli = _find_cli()
     if not cli:
@@ -510,7 +568,8 @@ def _ask_cli(prompt: str, st: dict, model: str | None = None,
     full = prompt if not system else f"{system}\n\n---\n\n{prompt}"
     model = free_model(model or st["model"])
     thinking = st.get("thinking") or CLI_DEFAULT_THINKING
-    tools_arg = str(st.get("tools") if st.get("tools") is not None else "default")
+    if tools_arg is None:
+        tools_arg = str(st.get("tools") if st.get("tools") is not None else "default")
     cmd = [cli, "-p", "--output-format", "json",
            "--model", model,
            "--thinking", thinking]
@@ -521,12 +580,15 @@ def _ask_cli(prompt: str, st: dict, model: str | None = None,
             "--tools", tools_arg,
             "--max-output-tokens", str(max(64, int(max_tokens))),
             "--no-session-persistence",
-            "--permission-mode", "bypass_permissions",
-            "--", full]
+            "--permission-mode", "bypass_permissions"]
+    if attachment:
+        cmd += ["--attachment", str(attachment)]
+    cmd += ["--", full]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=timeout or st["timeout"],
-                           cwd=str(cwd) if cwd else None)
+                           cwd=str(cwd) if cwd else None,
+                           env=cli_env())
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"o Qoder passou de {(timeout or st['timeout']):.0f}s sem terminar")
     out = (r.stdout or "").strip()

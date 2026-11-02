@@ -292,14 +292,15 @@ def _do_mac_screenshot(query: str) -> tuple[str, str]:
         from core import brain as _b
         from memory.config_manager import get_plugin_config
         st = _b.settings(get_plugin_config)
-        if not st.get("vision_local", st.get("provider") == "custom"):
-            return (f"screenshot salva em {local.name} (visão local só com o cérebro Ollama)",
+        if not st.get("vision_enabled", True):
+            return (f"screenshot salva em {local.name} (visão desligada — "
+                    "ligue em ECONOMY BRAIN → Vision provider)",
                     body)
         q = (f"{query}\n\nResponda em português, em uma frase curta, apenas "
              "com o que você REALMENTE vê nesta imagem.")
         desc = _b.vision_describe(data, "image/png", q, st) or ""
     except Exception as e:
-        return (f"screenshot salva em {local.name}, mas a visão local falhou: {e}",
+        return (f"screenshot salva em {local.name}, mas a visão falhou: {e}",
                 f"{body}\nvision: {e}")
     if not desc:
         return (f"screenshot salva em {local.name}, o modelo não respondeu", body)
@@ -441,13 +442,14 @@ def _do_ip_screenshot(query: str) -> tuple[str, str]:
         from core import brain as _b
         from memory.config_manager import get_plugin_config
         st = _b.settings(get_plugin_config)
-        if not st.get("vision_local", st.get("provider") == "custom"):
-            return (f"png em {local.name} (visão local só com o cérebro Ollama)", body)
+        if not st.get("vision_enabled", True):
+            return (f"png em {local.name} (visão desligada — "
+                    "ligue em ECONOMY BRAIN → Vision provider)", body)
         q = (f"{query}\n\nResponda em português, em uma frase curta, apenas com "
              "o que você REALMENTE vê nesta imagem.")
         desc = _b.vision_describe(data, "image/png", q, st) or ""
     except Exception as e:
-        return (f"png em {local.name}, mas a visão local falhou: {e}", str(e))
+        return (f"png em {local.name}, mas a visão falhou: {e}", str(e))
     if not desc:
         return (f"png em {local.name}, o modelo de visão não respondeu", body)
     return (desc.strip(), f"{body}\nvisão: {desc.strip()}")

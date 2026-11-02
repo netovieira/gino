@@ -35,42 +35,60 @@ def _hold_enabled(value) -> bool:
     }
 
 
-def _ptyxis_argv(binary: str, script: str, cwd: str | None) -> list[str]:
+def _ptyxis_argv(binary: str, script: str, cwd: str | None,
+                 title: str | None = None) -> list[str]:
     # `ptyxis [OPÇÃO…] [-- ARGUMENTOS DO COMANDO]`
     argv = [binary]
+    if title:
+        argv += ["--title", title]
     if cwd:
         argv += ["--working-directory", cwd]
     return argv + ["--", "bash", "-lc", script]
 
 
-def _xterm_argv(binary: str, script: str) -> list[str]:
-    return [binary, "-e", "bash", "-lc", script]
+def _xterm_argv(binary: str, script: str,
+                title: str | None = None) -> list[str]:
+    argv = [binary]
+    if title:
+        argv += ["-T", title]
+    return argv + ["-e", "bash", "-lc", script]
 
 
-def terminal_run(parameters, player=None, speak=None, session_memory=None) -> str:
+def open_terminal(parameters) -> dict:
+    """Abre a janela e devolve ``{"ok", "message", "pid"}``.
+
+    ``pid`` é o processo da janela que o app abriu (o cliente do ptyxis xterm).
+    Quem precisa fechar a janela depois — o espelho de execução — mata esse pid
+    em vez de adivinhar títulos de janela no gerenciador.
+    """
     p = parameters if isinstance(parameters, dict) else {}
 
     command = str(p.get("command") or "").strip()
     if not command:
-        return "Informe o comando para rodar no terminal."
+        return {"ok": False, "pid": None,
+                "message": "Informe o comando para rodar no terminal."}
 
     raw_cwd = str(p.get("cwd") or "").strip()
     cwd = os.path.abspath(os.path.expanduser(raw_cwd)) if raw_cwd else None
     if cwd and not Path(cwd).is_dir():
-        return f"Diretório não encontrado: {cwd}"
+        return {"ok": False, "pid": None,
+                "message": f"Diretório não encontrado: {cwd}"}
 
     script = command + ("; exec bash" if _hold_enabled(p.get("hold")) else "")
+    title = str(p.get("title") or "").strip()[:80] or None
 
     ptyxis = _available(PTYXIS)
     if ptyxis:
-        argv = _ptyxis_argv(ptyxis, script, cwd)
+        argv = _ptyxis_argv(ptyxis, script, cwd, title=title)
     else:
         xterm = _available(X_TERMINAL)
         if not xterm:
-            return "Não achei ptyxis nem x-terminal-emulator para abrir a tela."
-        argv = _xterm_argv(xterm, script)
+            return {"ok": False, "pid": None,
+                    "message": "Não achei ptyxis nem x-terminal-emulator "
+                               "para abrir a tela."}
+        argv = _xterm_argv(xterm, script, title=title)
     try:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -78,9 +96,19 @@ def terminal_run(parameters, player=None, speak=None, session_memory=None) -> st
             start_new_session=True,
         )
     except Exception as exc:
-        return f"Não consegui abrir o terminal: {exc}"
+        return {"ok": False, "pid": None,
+                "message": f"Não consegui abrir o terminal: {exc}"}
 
-    return f"Abri o terminal na tela e estou rodando: {command}."
+    try:
+        pid = int(getattr(proc, "pid", 0) or 0) or None
+    except Exception:
+        pid = None
+    return {"ok": True, "pid": pid,
+            "message": f"Abri o terminal na tela e estou rodando: {command}."}
+
+
+def terminal_run(parameters, player=None, speak=None, session_memory=None) -> str:
+    return str(open_terminal(parameters).get("message") or "")
 
 
 TOOL = {
@@ -109,6 +137,10 @@ TOOL = {
                 "type": "BOOLEAN",
                 "description": "true (padrão) deixa o bash aberto ao terminar; "
                                "false fecha a janela.",
+            },
+            "title": {
+                "type": "STRING",
+                "description": "Título da janela/aba (opcional).",
             },
         },
         "required": ["command"],

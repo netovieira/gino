@@ -466,6 +466,41 @@ def _ensure_certs() -> bool:
         return False
 
 
+def _port_owner(port: int) -> str:
+    """Best-effort "PID (process)" of whatever listens on *port*, for bind errors."""
+    import shutil
+    import subprocess
+    import sys
+
+    def run(cmd: list[str]) -> str:
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
+        except Exception:
+            return ""
+
+    if sys.platform == "win32":
+        for line in run(["netstat", "-ano", "-p", "TCP"]).splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[1].endswith(f":{port}") and parts[3] == "LISTENING":
+                pid = parts[4]
+                task = run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"])
+                name = task.split(",")[0].strip('"') if task.strip() else "?"
+                return f"PID {pid} ({name})"
+        return "unknown"
+
+    if shutil.which("ss"):
+        m = re.search(r'\(\("([^"]+)",pid=(\d+)', run(["ss", "-ltnp", f"sport = :{port}"]))
+        if m:
+            return f"PID {m.group(2)} ({m.group(1)})"
+    if shutil.which("lsof"):
+        lines = run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"]).splitlines()
+        for line in lines[1:]:
+            parts = line.split()
+            if len(parts) >= 2:
+                return f"PID {parts[1]} ({parts[0]})"
+    return "unknown"
+
+
 def _read(name: str) -> str:
     return (STATIC_DIR / name).read_text(encoding="utf-8")
 
@@ -511,9 +546,11 @@ class DashboardServer:
         return f"{proto}://{self._ip}:{PORT}"
 
     def get_manual_url(self) -> str:
-        """URL for manual browser entry. When HTTPS active, points to alias port (also HTTPS)."""
-        if self._ssl_enabled():
-            return f"{self._ip}:{PORT + 1}"
+        """URL for manual browser entry — always the configured dashboard port.
+
+        The old PORT+1 alias was removed: 8011 belongs to ToolBridge, and Chrome's
+        HTTPS upgrade works on the same port because this server already speaks TLS.
+        """
         return f"{self._ip}:{PORT}"
 
     def _aes_key(self, session_key: str) -> bytes:
@@ -858,20 +895,6 @@ class DashboardServer:
 
     # ── serve ─────────────────────────────────────────────────────────────
 
-    async def _serve_alias(self) -> None:
-        """Second HTTPS server on PORT+1 sharing the same app and in-memory state.
-        Chrome HTTPS-upgrades any bare IP:PORT the user types, so this port also needs TLS.
-        User types IP:8001 → Chrome tries https → self-signed cert warning → accept once → done."""
-        ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"
-        ssl_cert = BASE_DIR / "config" / "certs" / "jarvis.crt"
-        asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT + 1)
-        cfg = uvicorn.Config(
-            self.app, host="0.0.0.0", port=PORT + 1, log_level="warning",
-            ssl_keyfile=str(ssl_key), ssl_certfile=str(ssl_cert),
-        )
-        print(f"[Dashboard] Manual entry:  {self._ip}:{PORT + 1}  (type in browser, accept cert once)")
-        await uvicorn.Server(cfg).serve()
-
     async def serve(self) -> None:
         if not _DEPS_OK:
             print("[Dashboard] fastapi/uvicorn not installed — dashboard disabled.")
@@ -889,9 +912,6 @@ class DashboardServer:
         ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"
         ssl_cert = BASE_DIR / "config" / "certs" / "jarvis.crt"
 
-        if use_ssl:
-            asyncio.create_task(self._serve_alias())
-
         cfg = uvicorn.Config(
             self.app, host="0.0.0.0", port=PORT, log_level="warning",
             **({"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)} if use_ssl else {}),
@@ -900,4 +920,13 @@ class DashboardServer:
         proto = "https" if use_ssl else "http"
         print(f"[Dashboard] {proto}://{self._ip}:{PORT}")
         print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
-        await uvicorn.Server(cfg).serve()
+        try:
+            await uvicorn.Server(cfg).serve()
+        except (SystemExit, OSError) as exc:
+            # uvicorn calls sys.exit() when it cannot bind; inside this background
+            # task that used to vanish silently (the 8011 EADDRINUSE case).
+            reason = "address already in use" if isinstance(exc, SystemExit) else str(exc)
+            print(f"[Dashboard] ERROR: cannot bind 0.0.0.0:{PORT} — {reason}. "
+                  f"Port held by {_port_owner(PORT)}.")
+            print("[Dashboard] Dashboard is NOT running. Free the port or change "
+                  "'dashboard_port' in config/api_keys.json.")

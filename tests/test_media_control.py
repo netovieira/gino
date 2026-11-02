@@ -6,6 +6,7 @@ session bus, audio sink or browser.
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -97,6 +98,7 @@ class TransportTests(unittest.TestCase):
 class PlayTests(unittest.TestCase):
     def test_play_with_no_query_and_no_player_opens_youtube_music_visibly(self):
         with patch.object(mc, "players", return_value=[]), \
+                patch.object(mc, "_find_youtube_music_pwa", return_value=None), \
                 patch.object(mc, "_chrome_bin", return_value="google-chrome"), \
                 patch.object(mc.subprocess, "Popen") as popen:
             out = mc.media_control({"action": "play"})
@@ -116,7 +118,8 @@ class PlayTests(unittest.TestCase):
         self.assertTrue(run.call_args.args[0][-1].endswith(".Play"))
 
     def test_play_query_scrape_failure_opens_search_url(self):
-        with patch.object(mc.requests, "get", side_effect=RuntimeError("offline")), \
+        with patch.object(mc, "_find_youtube_music_pwa", return_value=None), \
+                patch.object(mc.requests, "get", side_effect=RuntimeError("offline")), \
                 patch.object(mc, "_chrome_bin", return_value="google-chrome"), \
                 patch.object(mc.subprocess, "Popen") as popen:
             out = mc.media_control({"action": "play", "query": "daft punk"})
@@ -133,7 +136,8 @@ class PlayTests(unittest.TestCase):
             '"videoId":"bbbbbbbbbbb"'
         )
         response = MagicMock(text=html)
-        with patch.object(mc.requests, "get", return_value=response) as get, \
+        with patch.object(mc, "_find_youtube_music_pwa", return_value=None), \
+                patch.object(mc.requests, "get", return_value=response) as get, \
                 patch.object(mc, "_chrome_bin", return_value="google-chrome"), \
                 patch.object(mc.subprocess, "Popen") as popen:
             out = mc.media_control({"action": "play", "query": "one more time"})
@@ -144,12 +148,158 @@ class PlayTests(unittest.TestCase):
         response_url = get.call_args.args[0]
         self.assertIn("music.youtube.com/search?q=one+more+time", response_url)
 
+    def test_play_query_reads_the_escaped_json_youtube_music_now_serves(self):
+        html = r'\x22videoId\x22:\x22FGBhQbmPwH8\x22'
+        response = MagicMock(text=html)
+        with patch.object(mc, "_find_youtube_music_pwa", return_value=None), \
+                patch.object(mc.requests, "get", return_value=response), \
+                patch.object(mc, "_chrome_bin", return_value="google-chrome"), \
+                patch.object(mc.subprocess, "Popen") as popen:
+            mc.media_control({"action": "play", "query": "daft punk"})
+        self.assertEqual(popen.call_args.args[0], [
+            "google-chrome", "--new-window",
+            "https://music.youtube.com/watch?v=FGBhQbmPwH8",
+        ])
+
+    def test_play_query_opens_silently_and_returns_the_result(self):
+        html = '"videoId":"bbbbbbbbbbb"'
+        response = MagicMock(text=html)
+        speak = MagicMock()
+        with patch.object(mc, "_find_youtube_music_pwa", return_value=None), \
+                patch.object(mc.requests, "get", return_value=response), \
+                patch.object(mc, "_chrome_bin", return_value="google-chrome"), \
+                patch.object(mc.subprocess, "Popen"):
+            out = mc.media_control({"action": "play", "query": "one more time"},
+                                   speak=speak)
+        self.assertIn("aberto no YouTube Music", out)
+        speak.assert_not_called()
+
+    def test_play_without_query_opens_youtube_music_silently(self):
+        speak = MagicMock()
+        with patch.object(mc, "players", return_value=[]), \
+                patch.object(mc, "_find_youtube_music_pwa", return_value=None), \
+                patch.object(mc, "_chrome_bin", return_value="google-chrome"), \
+                patch.object(mc.subprocess, "Popen"):
+            out = mc.media_control({"action": "play"}, speak=speak)
+        self.assertIn("YouTube Music", out)
+        speak.assert_not_called()
+
     def test_open_falls_back_to_xdg_open_without_chrome(self):
-        with patch.object(mc, "_chrome_bin", return_value=""), \
+        with patch.object(mc, "_find_youtube_music_pwa", return_value=None), \
+                patch.object(mc, "_chrome_bin", return_value=""), \
                 patch.object(mc.subprocess, "Popen") as popen:
             out = mc.media_control({"action": "play", "query": "x"})
         self.assertTrue(popen.called)
         self.assertEqual(popen.call_args.args[0][0], "xdg-open")
+
+
+class PwaTests(unittest.TestCase):
+    APP_ID = "abcdefghijklmnopabcdefghijklmnop"
+
+    def _shortcut(self, directory: str, filename: str, name: str, app_id: str,
+                  profile: str = "Default") -> None:
+        body = (
+            "[Desktop Entry]\n"
+            "Version=1.0\n"
+            "Terminal=false\n"
+            "Type=Application\n"
+            f"Name={name}\n"
+            "Exec=/opt/google/chrome/google-chrome "
+            f'--profile-directory="{profile}" --app-id={app_id}\n'
+            f"StartupWMClass=crx_{app_id}\n"
+        )
+        with open(f"{directory}/{filename}", "w", encoding="utf-8") as handle:
+            handle.write(body)
+
+    def test_detects_the_youtube_music_shortcut(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._shortcut(directory, "chrome-test-Default.desktop",
+                           "YouTube Music", self.APP_ID, "Profile 1")
+            with patch.object(mc, "_desktop_dirs", return_value=[directory]):
+                found = mc._find_youtube_music_pwa()
+        self.assertEqual(found, (self.APP_ID, "Profile 1"))
+
+    def test_ignores_chrome_shortcuts_that_are_not_youtube_music(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._shortcut(directory, "docs.desktop", "Google Docs", self.APP_ID)
+            self._shortcut(directory, "youtube.desktop", "YouTube",
+                           "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+            with patch.object(mc, "_desktop_dirs", return_value=[directory]):
+                self.assertIsNone(mc._find_youtube_music_pwa())
+
+    def test_query_launches_the_app_with_the_watch_url_and_no_new_window(self):
+        html = '"videoId":"bbbbbbbbbbb"'
+        response = MagicMock(text=html)
+        with patch.object(mc, "_find_youtube_music_pwa",
+                          return_value=(self.APP_ID, "Default")), \
+                patch.object(mc, "players", return_value=[]), \
+                patch.object(mc, "_await_playback", return_value=False), \
+                patch.object(mc.requests, "get", return_value=response), \
+                patch.object(mc, "_chrome_bin", return_value="google-chrome"), \
+                patch.object(mc.subprocess, "Popen") as popen:
+            out = mc.media_control({"action": "play", "query": "one more time"})
+        self.assertIn("app do YouTube Music", out)
+        cmd = popen.call_args.args[0]
+        self.assertEqual(cmd[0], "google-chrome")
+        self.assertIn(f"--app-id={self.APP_ID}", cmd)
+        self.assertIn("--profile-directory=Default", cmd)
+        self.assertIn(
+            "--app-launch-url-for-shortcuts-menu-item="
+            "https://music.youtube.com/watch?v=bbbbbbbbbbb",
+            cmd,
+        )
+        self.assertNotIn("--new-window", cmd)
+
+    def test_no_query_opens_the_app_home(self):
+        with patch.object(mc, "_find_youtube_music_pwa",
+                          return_value=(self.APP_ID, "Default")), \
+                patch.object(mc, "_chrome_bin", return_value="google-chrome"), \
+                patch.object(mc.subprocess, "Popen") as popen:
+            out = mc.media_control({"action": "play"})
+        self.assertIn("app instalado", out)
+        cmd = popen.call_args.args[0]
+        self.assertIn(f"--app-id={self.APP_ID}", cmd)
+        self.assertNotIn("--new-window", cmd)
+        self.assertFalse(any(c.startswith("--app-launch-url") for c in cmd))
+
+    def test_app_launch_failure_falls_back_to_new_window(self):
+        response = MagicMock(text='"videoId":"bbbbbbbbbbb"')
+        with patch.object(mc, "_find_youtube_music_pwa",
+                          return_value=(self.APP_ID, "Default")), \
+                patch.object(mc, "players", return_value=[]), \
+                patch.object(mc.requests, "get", return_value=response), \
+                patch.object(mc, "_spawn_app", return_value=False), \
+                patch.object(mc, "_chrome_bin", return_value="google-chrome"), \
+                patch.object(mc.subprocess, "Popen") as popen:
+            out = mc.media_control({"action": "play", "query": "one more time"})
+        cmd = popen.call_args.args[0]
+        self.assertEqual(cmd, ["google-chrome", "--new-window",
+                               "https://music.youtube.com/watch?v=bbbbbbbbbbb"])
+        self.assertIn("tela", out)
+
+    def test_await_playback_ignores_players_that_already_existed(self):
+        with patch.object(mc, "players", return_value=[SPOTIFY]), \
+                patch.object(mc, "mpris_call") as call:
+            ok = mc._await_playback({SPOTIFY}, timeout=0.6)
+        self.assertFalse(ok)
+        call.assert_not_called()
+
+    def test_await_playback_does_not_touch_an_existing_chrome_player(self):
+        player = "org.mpris.MediaPlayer2.chromium.instance4242"
+        with patch.object(mc, "players", return_value=[player]) as found, \
+                patch.object(mc, "mpris_call") as call:
+            ok = mc._await_playback({player}, timeout=5.0)
+        self.assertFalse(ok)
+        call.assert_not_called()
+        found.assert_not_called()
+
+    def test_await_playback_plays_a_new_chrome_player(self):
+        player = "org.mpris.MediaPlayer2.chrome.instance4242"
+        with patch.object(mc, "players", return_value=[player]), \
+                patch.object(mc, "mpris_call", return_value=(True, "ok")) as call:
+            ok = mc._await_playback(set(), timeout=0.6)
+        self.assertTrue(ok)
+        call.assert_called_once_with(player, "Play")
 
 
 class VolumeTests(unittest.TestCase):

@@ -73,6 +73,20 @@ class TriggerMatcherTests(unittest.TestCase):
                      "GINÓ"):
             self.assertTrue(whatsapp_watch.matches(text), text)
 
+    def test_trigger_is_the_configured_name_not_a_hardcoded_one(self):
+        from memory.config_manager import get_assistant_name
+        configured = get_assistant_name()
+        whatsapp_watch.set_assistant_name(configured)
+        self.addCleanup(whatsapp_watch.set_assistant_name, "Gino")
+        self.assertEqual(whatsapp_watch.trigger_name(), configured)
+        self.assertTrue(whatsapp_watch.matches(f"oi {configured}, tudo bem?"))
+
+    def test_accent_variant_of_the_configured_name_matches(self):
+        whatsapp_watch.set_assistant_name("Aurora")
+        self.addCleanup(whatsapp_watch.set_assistant_name, "Gino")
+        self.assertTrue(whatsapp_watch.matches("AURÓRA, me ajuda"))
+        self.assertTrue(whatsapp_watch.matches("fala aurora!"))
+
     def test_words_that_only_contain_the_name_do_not_match(self):
         for text in ("ginormous", "imagino", "o ginozinho", ""):
             self.assertFalse(whatsapp_watch.matches(text), text)
@@ -120,24 +134,68 @@ class TriggerGateTests(WatcherHarness):
             ACCOUNT, wa_item(ts=old)))
         self.assertEqual(self.calls, [])
 
+    def test_trigger_is_the_configured_name_not_a_hardcoded_one(self):
+        whatsapp_watch.set_assistant_name("Aurora")
+        self.addCleanup(whatsapp_watch.set_assistant_name, "Gino")
+        self.assertFalse(whatsapp_watch.handle(
+            ACCOUNT, wa_item("Gino, tudo bem?")))
+        self.assertTrue(whatsapp_watch.handle(
+            ACCOUNT, wa_item("AURÓRA, tudo bem?")))
+        self.assertEqual(len(self.calls), 1)
+
+
+class AllAccountsTests(WatcherHarness):
+    """O gatilho vale em toda conta pareada, não só na de saída."""
+
+    def test_each_paired_account_gets_the_name_trigger(self):
+        for n, account in enumerate(("principal", "trabalho")):
+            self.assertTrue(whatsapp_watch.handle(
+                account, wa_item("Gino, tudo bem?", id=f"acct-{n}")))
+        self.assertEqual([c[0] for c in self.calls], ["principal", "trabalho"])
+
 
 class DirectChatTests(WatcherHarness):
     def setUp(self):
         super().setUp()
         whatsapp_watch.set_direct_chat(ACCOUNT, CHAT)
         self.addCleanup(whatsapp_watch.set_direct_chat, "", "")
-        # The owner's real config may select another outbound account; the
-        # test pins the account it configured.
+        # The owner's real config may select another outbound account or have
+        # a real owner_chat; the test pins the account/chat it configured.
         acct = mock.patch(
             "core.whatsapp_watch.whatsapp.default_account_name",
             return_value=ACCOUNT)
         acct.start()
         self.addCleanup(acct.stop)
+        owner = mock.patch(
+            "memory.config_manager.get_plugin_setting",
+            side_effect=lambda _ns, key, default=None:
+                CHAT if key == "owner_chat" else default)
+        owner.start()
+        self.addCleanup(owner.stop)
 
     def test_direct_chat_does_not_need_the_name(self):
         self.assertTrue(whatsapp_watch.handle(
             ACCOUNT, wa_item("tudo bem? chegou o pedido")))
         self.assertEqual(len(self.calls), 1)
+
+    def test_owner_from_his_phone_is_a_turn_without_the_name(self):
+        """Dono -> número de saída, enviado do celular (from_me=True)."""
+        self.assertTrue(whatsapp_watch.handle(
+            ACCOUNT, wa_item("chegou o pedido", from_me=True, id="phone-1")))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_owner_voice_note_is_a_turn_with_its_media(self):
+        media = {"kind": "mensagem de voz", "ext": ".ogg", "seconds": 4}
+        self.assertTrue(whatsapp_watch.handle(
+            ACCOUNT, wa_item("[mensagem de voz de 4s]", from_me=True,
+                             id="phone-audio", media=media)))
+        self.assertEqual(self.calls[0][1]["media"], media)
+
+    def test_echo_of_our_own_reply_in_the_direct_chat_is_ignored(self):
+        with mock.patch("core.whatsapp.sent_by_me", return_value=True):
+            self.assertFalse(whatsapp_watch.handle(
+                ACCOUNT, wa_item("resposta do assistente", from_me=True)))
+        self.assertEqual(self.calls, [])
 
     def test_group_is_never_direct(self):
         self.assertFalse(whatsapp_watch.handle(

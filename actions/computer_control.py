@@ -314,8 +314,9 @@ def _load_brain_st() -> dict:
     """Configurações do cérebro, lidas direto do arquivo.
 
     Este módulo é invocado do thread de tools — o `st` do main.py não está ao
-    alcance aqui, e a resposta de visão precisa saber se o provedor atual é o
-    cérebro local (custom/Ollama) ou o Gemini.
+    alcance aqui, e a resposta de visão precisa saber qual backend descreve a
+    imagem (Qoder com anexo por padrão; `local` = Ollama/qwen2.5vl; `off` = cai
+    no Gemini).
     """
     try:
         from core import brain as _b
@@ -329,10 +330,10 @@ def _load_brain_st() -> dict:
 def _screen_find(description: str) -> tuple[int, int] | None:
     """Localiza um elemento na tela e devolve (x, y) do centro.
 
-    Usa primeiro o cérebro local (qwen2.5-vl no mesmo Ollama — o screenshot
-    nunca sai da máquina); se não estiver ativo, cai no Gemini. Assim o
-    `screen_click`/`screen_find` continuam funcionando com a cadeia
-    custom/qwen2.5:7b-instruct que roda hoje.
+    Usa primeiro a visão configurada (Qoder por padrão: a imagem vai como anexo
+    de um turno do CLI; `vision_provider=local` mantém o qwen2.5-vl no Ollama);
+    se a visão estiver desligada ou falhar, cai no Gemini. A visão é uma flag
+    própria, independente do provedor da conversa.
     """
     try:
         _require_pyautogui()
@@ -363,17 +364,17 @@ def _screen_find(description: str) -> tuple[int, int] | None:
 
     answer = ""
     st = _load_brain_st()
-    if st.get("vision_local", st.get("provider") == "custom"):
+    if st.get("vision_enabled", True):
         try:
             from core import brain as _b
             answer = _b.vision_describe(image_bytes, mime, prompt, st) or ""
         except Exception as e:
-            print(f"[ComputerControl] ⚠️ visão local falhou: {e}")
+            print(f"[ComputerControl] ⚠️ visão (Qoder) falhou: {e}")
 
     if not answer:
         api_key = _get_api_key()
         if not api_key:
-            print("[ComputerControl] ⚠️ sem visão: nem cérebro local nem Gemini disponíveis")
+            print("[ComputerControl] ⚠️ sem visão: Qoder indisponível e sem chave Gemini")
             return None
         try:
             from google import genai
@@ -571,8 +572,9 @@ TOOL = {
         "tool cannot reach, (c) press hotkeys and shortcuts, (d) scroll, drag, "
         "move the mouse, (e) bring a window to the front (focus_window), (f) "
         "see the screen and locate an element by natural description "
-        "(screen_find / screen_click — works offline through the local vision "
-        "model), (g) take a screenshot, (h) read or write the clipboard. If "
+        "(screen_find / screen_click — the screenshot is described by the "
+        "configured vision backend, Qoder by default), (g) take a screenshot, "
+        "(h) read or write the clipboard. If "
         "the user says 'clica em…', 'digita…', 'aperta…', 'rola a página', "
         "'procura na tela', 'vê o que está na tela' and there is no dedicated "
         "tool for that exact action, call this one. Prefer a dedicated tool "

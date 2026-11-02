@@ -13,6 +13,8 @@ switched on with the BRAIN button in the ⚙ drawer (or "brain_engine":
 from core.brain import (DEFAULT_VOICE, EDGE_VOICES, FALLBACK_PROVIDERS, FISH_MODELS,
                         NAMESPACE, PROVIDERS, TTS_ENGINES, label, test_connection,
                         voice_label)
+from core.vision import DEFAULT_MODEL as VISION_DEFAULT_MODEL
+from core.vision import PROVIDERS as VISION_PROVIDERS
 
 PLUGIN = {
     "name": "brain_status",
@@ -30,9 +32,9 @@ PLUGIN = {
 
 PLUGIN_SETTINGS = {
     "namespace": NAMESPACE,
-    "title": "ECONOMY BRAIN (local first, then a fallback — Qoder / Groq / DeepSeek)",
+    "title": "ECONOMY BRAIN (Qoder/cloud only — no local conversation model)",
     "fields": [
-        {"key": "provider", "label": "Primary provider (the local one goes first)",
+        {"key": "provider", "label": "Primary provider (Qoder or a cloud model)",
          "type": "choice", "options": list(PROVIDERS), "default": "qoder"},
         {"key": "base_url", "label": "Primary base URL (blank = provider default)",
          "type": "text", "placeholder": "http://127.0.0.1:3000/v1"},
@@ -46,6 +48,23 @@ PLUGIN_SETTINGS = {
          "type": "text", "placeholder": "openai/gpt-oss-120b"},
         {"key": "fallback_api_key", "label": "Fallback API key (blank = reuse the GROQ form key)",
          "type": "password", "placeholder": "gsk_..."},
+        # Vision: an image goes to Qoder as an attachment of a CLI turn by
+        # default (free Qwen3.8-Flash sees it). `local` keeps the Ollama VL
+        # backend; `off` removes the vision tools entirely. Phase 3 decides
+        # whether the local backend and its model are deleted.
+        {"key": "vision_provider", "label": "Vision provider (qoder = CLI with the image attached)",
+         "type": "choice", "options": list(VISION_PROVIDERS), "default": "qoder"},
+        {"key": "vision_qoder_model", "label": "Vision model (Qoder CLI)",
+         "type": "text", "placeholder": VISION_DEFAULT_MODEL,
+         "default": VISION_DEFAULT_MODEL},
+        {"key": "vision_timeout", "label": "Vision timeout (seconds)",
+         "type": "text", "default": "120"},
+        {"key": "vision_local", "label": "Local vision toggle (only for provider = local)",
+         "type": "toggle", "default": True},
+        {"key": "vision_base_url", "label": "Vision base URL (local Ollama, provider = local)",
+         "type": "text", "placeholder": "http://127.0.0.1:11434/v1"},
+        {"key": "vision_model", "label": "Vision model (local Ollama, provider = local)",
+         "type": "text", "placeholder": "qwen2.5vl:3b"},
         {"key": "tts_engine", "label": "Voice engine", "type": "choice",
          "options": list(TTS_ENGINES), "default": "edge"},
         {"key": "tts_voice", "label": "Voice (Edge TTS, free)", "type": "choice",
@@ -69,8 +88,8 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
     chain = " → ".join(label(r) for r in st["chain"])
     if get_brain_engine() == "economy":
         return (f"The economy brain is answering, read aloud by {voice_label(st)}. "
-                f"The chain is {chain}: the first one is local if it is the Qoder "
-                "proxy, the rest only answer if it fails. Gemini Live is not in use.")
+                f"The chain is {chain}: the first one answers, the rest only if it "
+                "fails. Gemini Live is not in use.")
     return ("Gemini Live is answering natively. The economy brain is configured for "
             f"{chain}; switch with the BRAIN button in the gear menu.")
 

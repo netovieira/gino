@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from core import rootgate
 from core import actiongate
+from core.brain import LOCAL_CHAT_DISABLED
 from core.tool_bridge import ACTION_TIERS, ToolBridge
 
 TOKEN = "test-token-123"
@@ -399,7 +400,7 @@ class DelegationTests(unittest.TestCase):
         }
         self.bridge = make_bridge(memory=self.memory, voice=self.voice,
                                   restart=self.restart,
-                                  local_ask=lambda prompt: f"local:{prompt}",
+                                  local_ask=lambda prompt: LOCAL_CHAT_DISABLED,
                                   start_task=lambda task, mode="answer", approval=None:
                                   f"task:{task}:{mode}:{approval}")
         self.client = TestClient(self.bridge.app)
@@ -457,11 +458,14 @@ class DelegationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["result"], "pc:pedido do dono")
 
-    def test_local_ask(self):
+    def test_local_ask_reports_the_model_is_disabled(self):
         response = self.client.post("/local_ask", headers=AUTH,
                                     json={"prompt": "resuma isto"})
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["result"], "local:resuma isto")
+        result = response.json()["result"]
+        self.assertIn("desligado", result.lower())
+        self.assertIn("Qoder", result)
+        self.assertEqual(result, LOCAL_CHAT_DISABLED)
 
     def test_task_start(self):
         response = self.client.post("/task/start", headers=AUTH,
@@ -624,6 +628,378 @@ class VoiceConfirmTests(unittest.TestCase):
         response = self._send()
         self.assertEqual(response.status_code, 403, response.text)
         self.assertEqual(self.dispatch.calls, [])
+
+
+class DenialMemoryTests(unittest.TestCase):
+    """A refused call stays refused without a new prompt; only a fresh spoken
+    consent (core/actiongate.open_window) lets the identical retry through."""
+
+    def setUp(self):
+        actiongate.close()
+        self.addCleanup(actiongate.close)
+        self.dispatch = RecordingDispatch()
+        self.bridge = make_bridge(dispatch=self.dispatch,
+                                  confirm=actiongate.confirm,
+                                  authorized=actiongate.authorized)
+        self.client = TestClient(self.bridge.app)
+        self.addCleanup(self.client.close)
+
+    def _send_whatsapp(self, to="Vida", text="oi"):
+        return self.client.post(
+            "/call", headers=AUTH,
+            json={"name": "whatsapp_control",
+                  "args": {"action": "send", "to": to, "text": text}},
+        )
+
+    def test_first_attempt_is_a_normal_refusal(self):
+        first = self._send_whatsapp()
+        self.assertEqual(first.status_code, 403, first.text)
+        self.assertEqual(first.json()["status"], "denied")
+        self.assertFalse(first.json().get("repeated"))
+        self.assertEqual(self.dispatch.calls, [])
+        self.assertTrue(actiongate.has_pending())
+
+    def test_identical_repeat_is_suppressed_without_reopening_the_request(self):
+        first = self._send_whatsapp()
+        self.assertEqual(first.status_code, 403, first.text)
+        parked = actiongate.pending()
+
+        second = self._send_whatsapp()
+        self.assertEqual(second.status_code, 403, second.text)
+        body = second.json()
+        self.assertTrue(body["repeated"])
+        self.assertTrue(body["awaiting_voice"])
+        self.assertEqual(body["status"], "denied")
+        self.assertIn("awaiting the owner's spoken", body["message"])
+        self.assertEqual(self.dispatch.calls, [])
+        # No new prompt: the parked request is exactly the first one.
+        self.assertEqual(actiongate.pending(), parked)
+        # The message body is never kept, only a short digest.
+        self.assertNotIn("oi", json.dumps(self.bridge._denials))
+
+    def test_new_spoken_consent_allows_the_same_call(self):
+        self.assertEqual(self._send_whatsapp().status_code, 403)
+        actiongate.open_window()          # the owner said "pode"
+        again = self._send_whatsapp()
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertEqual(self.dispatch.calls[0][0], "whatsapp_control")
+        self.assertEqual(self.bridge._denials, {})
+
+    def test_suppression_is_scoped_to_action_and_recipient(self):
+        self.assertEqual(self._send_whatsapp(to="Vida").status_code, 403)
+        other_contact = self._send_whatsapp(to="Ana")
+        self.assertFalse(other_contact.json().get("repeated"))
+        other_action = self.client.post(
+            "/call", headers=AUTH,
+            json={"name": "send_message", "args": {"text": "oi"}},
+        )
+        self.assertEqual(other_action.status_code, 403, other_action.text)
+        self.assertFalse(other_action.json().get("repeated"))
+
+    def test_a_lapsed_voice_park_is_rearmed_without_a_new_prompt(self):
+        # The bridge does not re-ask the model, but the owner's "pode" is still
+        # the answer to the original question; actiongate drops a park after
+        # five minutes, so a suppressed retry re-parks it (question, not prompt).
+        self.assertEqual(self._send_whatsapp().status_code, 403)
+        self.assertTrue(actiongate.has_pending())
+        self._lapse_the_park()
+        self.assertFalse(actiongate.has_pending())
+
+        repeat = self._send_whatsapp()
+        self.assertEqual(repeat.status_code, 403, repeat.text)
+        self.assertTrue(repeat.json()["repeated"])
+        self.assertTrue(actiongate.has_pending())
+        self.assertTrue(actiongate.looks_like_consent("pode"))
+
+    def test_the_cancelling_refusal_does_not_rearm_the_voice_park(self):
+        self.assertEqual(self._send_whatsapp().status_code, 403)   # 1
+        self._lapse_the_park()
+        self.assertEqual(self._send_whatsapp().status_code, 403)   # 2, re-armed
+        self.assertTrue(actiongate.has_pending())
+        self._lapse_the_park()
+        third = self._send_whatsapp()                              # 3, cancelled
+        self.assertEqual(third.status_code, 403, third.text)
+        self.assertTrue(third.json()["cancelled"])
+        self.assertFalse(actiongate.has_pending())
+
+    @staticmethod
+    def _lapse_the_park():
+        """Pretend the five-minute voice answer window elapsed."""
+        with actiongate._lock:
+            actiongate._pending["until"] = time.monotonic() - 1.0
+
+
+class ManualClock:
+    """Wall clock double: the pending ledger must use real time, so tests move
+    the clock instead of sleeping through a six-hour TTL."""
+
+    def __init__(self, now=1_000_000.0):
+        self.now = float(now)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += float(seconds)
+
+
+class PendingLedgerTests(unittest.TestCase):
+    """A refused request is pending, not a retry loop.
+
+    The 2026-10-31 incident: a voice-note joke was refused all night and still
+    came back ~10 times in 30 h with a reworded caption. The bridge now keeps
+    the refused request on disk, keyed by payload (not by caption), with a TTL,
+    a refusal limit, and a dead mark that survives a restart.
+    """
+
+    JOKE = "/tmp/piada-gino-20261031-235422.ogg"
+    PHONE = "5517981792464"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.pending = Path(self.tmp.name) / "logs" / "tool_bridge_pending.json"
+        self.clock = ManualClock()
+
+    # ── helpers ────────────────────────────────────────────────────────────
+
+    def _bridge(self, confirmed=False, authorized=lambda: False, logs=None,
+                clock=None, **kwargs):
+        logs = logs if logs is not None else []
+        prompts = []
+        dispatch = RecordingDispatch()
+
+        def confirm(title, message):
+            prompts.append((title, message))
+            return confirmed() if callable(confirmed) else confirmed
+
+        bridge = ToolBridge(FakeRegistry(), dispatch, TOKEN,
+                            logger=logs.append, confirm=confirm,
+                            authorized=authorized, pending_path=self.pending,
+                            clock=clock or self.clock, **kwargs)
+        client = TestClient(bridge.app)
+        self.addCleanup(client.close)
+        return bridge, client, prompts, dispatch, logs
+
+    def _send_joke(self, client, caption="Piada, em voz.", message=None):
+        args = {"action": "send_file", "to": self.PHONE, "path": self.JOKE,
+                "caption": caption}
+        if message is not None:
+            args["message"] = message
+        return client.post(
+            "/call", headers=AUTH,
+            json={"name": "whatsapp_control", "args": args},
+        )
+
+    def _entries(self):
+        return json.loads(self.pending.read_text(encoding="utf-8"))["entries"]
+
+    # ── TTL ────────────────────────────────────────────────────────────────
+
+    def test_pending_action_expires_after_the_ttl_and_is_marked_dead(self):
+        bridge, client, prompts, dispatch, logs = self._bridge(pending_ttl=3600)
+
+        first = self._send_joke(client)
+        self.assertEqual(first.status_code, 403, first.text)
+        self.assertEqual(len(prompts), 1)
+        entry = next(iter(self._entries().values()))
+        self.assertEqual(entry["status"], "denied")
+        self.assertEqual(entry["until"], self.clock.now + 3600)
+
+        # A retry does not renew the deadline: only the owner does.
+        self.clock.advance(1800)
+        repeat = self._send_joke(client, caption="Agora sim, vindo do zap do Gino")
+        self.assertEqual(repeat.status_code, 403, repeat.text)
+        self.assertTrue(repeat.json()["repeated"])
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(next(iter(self._entries().values()))["until"],
+                         self.clock.now - 1800 + 3600)
+
+        # One second past the TTL the request is dead, in the store.
+        self.clock.advance(1801)
+        expired = self._send_joke(client, caption="outra legenda qualquer")
+        self.assertEqual(expired.status_code, 403, expired.text)
+        body = expired.json()
+        self.assertTrue(body["expired"])
+        self.assertFalse(body["cancelled"])
+        self.assertFalse(body["awaiting_voice"])
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(dispatch.calls, [])
+        stored = next(iter(self._entries().values()))
+        self.assertEqual(stored["status"], "expired")
+        lines = [line for line in logs
+                 if line.startswith("SYS: ação pendente expirada: ")]
+        self.assertEqual(len(lines), 1, logs)
+        self.assertIn("whatsapp_control", lines[0])
+        # The log line appears once: a dead mark is never logged again.
+        self._send_joke(client, caption="mais uma")
+        self.assertEqual([line for line in logs
+                          if line.startswith("SYS: ação pendente expirada: ")],
+                         lines)
+
+    # ── refusal limit ──────────────────────────────────────────────────────
+
+    def test_three_refusals_cancel_the_pending_action_for_good(self):
+        bridge, client, prompts, dispatch, logs = self._bridge()
+
+        first = self._send_joke(client)
+        self.assertEqual(first.status_code, 403, first.text)
+        self.assertFalse(first.json().get("repeated"))
+
+        second = self._send_joke(client)
+        self.assertEqual(second.status_code, 403, second.text)
+        self.assertTrue(second.json()["repeated"])
+        self.assertFalse(second.json().get("cancelled"))
+        self.assertEqual(second.json()["attempts"], 2)
+
+        third = self._send_joke(client)
+        self.assertEqual(third.status_code, 403, third.text)
+        self.assertTrue(third.json()["cancelled"])
+        self.assertFalse(third.json()["awaiting_voice"])
+
+        cancelled = [line for line in logs
+                     if line.startswith("SYS: ação pendente cancelada por negativas (3x): ")]
+        self.assertEqual(len(cancelled), 1, logs)
+        self.assertIn("whatsapp_control", cancelled[0])
+        self.assertEqual(next(iter(self._entries().values()))["status"], "cancelled")
+
+        # One prompt total; a fourth attempt with another caption never prompts.
+        self.assertEqual(len(prompts), 1)
+        fourth = self._send_joke(client, caption="Agora sim, vindo do zap do Gino")
+        self.assertEqual(fourth.status_code, 403, fourth.text)
+        self.assertTrue(fourth.json()["cancelled"])
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(dispatch.calls, [])
+
+    def test_unanswered_confirmation_timeouts_count_too(self):
+        prompts = []
+        dispatch = RecordingDispatch()
+
+        def silent(title, message):
+            prompts.append((title, message))
+            time.sleep(0.3)
+            return False
+
+        bridge = ToolBridge(FakeRegistry(), dispatch, TOKEN,
+                            logger=lambda _m: None, confirm=silent,
+                            authorized=lambda: False, pending_path=self.pending,
+                            clock=self.clock, timeout=0.05)
+        client = TestClient(bridge.app)
+        self.addCleanup(client.close)
+
+        first = self._send_joke(client)
+        self.assertEqual(first.status_code, 504, first.text)   # unanswered
+        second = self._send_joke(client)
+        self.assertEqual(second.status_code, 403, second.text)
+        self.assertTrue(second.json()["repeated"])
+        third = self._send_joke(client)
+        self.assertEqual(third.status_code, 403, third.text)
+        self.assertTrue(third.json()["cancelled"])
+        self.assertEqual(len(prompts), 1)
+
+    # ── payload dedupe ────────────────────────────────────────────────────
+
+    def test_payload_dedupe_ignores_reworded_captions(self):
+        base = {"action": "send_file", "to": self.PHONE, "path": self.JOKE}
+        key_a = ToolBridge._denial_key(
+            "whatsapp_control", dict(base, caption="Piada, em voz."))
+        key_b = ToolBridge._denial_key(
+            "whatsapp_control", dict(base, caption="Agora sim, vindo do zap do Gino"))
+        key_c = ToolBridge._denial_key(
+            "whatsapp_control", dict(base, caption="x", message="outra legenda"))
+        self.assertEqual(key_a, key_b)
+        self.assertEqual(key_a, key_c)
+        other_file = ToolBridge._denial_key(
+            "whatsapp_control", dict(base, path="/tmp/outra.ogg"))
+        self.assertNotEqual(key_a, other_file)
+        # The message text is the payload for a text send: not cosmetic.
+        text_a = ToolBridge._denial_key(
+            "send_message", {"platform": "WhatsApp", "receiver": "Vida", "text": "oi"})
+        text_b = ToolBridge._denial_key(
+            "send_message", {"platform": "WhatsApp", "receiver": "Vida", "text": "outra"})
+        self.assertNotEqual(text_a, text_b)
+        # Nor are labels that actually select what runs: a window title and a
+        # code request are payload, not captions.
+        window_a = ToolBridge._denial_key(
+            "computer_control", {"action": "focus_window", "title": "Thiago York"})
+        window_b = ToolBridge._denial_key(
+            "computer_control", {"action": "focus_window", "title": "Terminal"})
+        self.assertNotEqual(window_a, window_b)
+        code_a = ToolBridge._denial_key(
+            "code_helper", {"action": "write", "description": "criar login"})
+        code_b = ToolBridge._denial_key(
+            "code_helper", {"action": "write", "description": "apagar login"})
+        self.assertNotEqual(code_a, code_b)
+
+    def test_reworded_caption_does_not_reopen_the_prompt(self):
+        bridge, client, prompts, dispatch, _logs = self._bridge()
+        self.assertEqual(self._send_joke(client).status_code, 403)
+        retry = self._send_joke(client, caption="Agora sim, vindo do zap do Gino",
+                                message="legenda nova")
+        self.assertEqual(retry.status_code, 403, retry.text)
+        self.assertTrue(retry.json()["repeated"])
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(len(self._entries()), 1)
+
+    def test_the_ledger_never_stores_the_message_body(self):
+        bridge, client, _prompts, _dispatch, _logs = self._bridge()
+        self.assertEqual(self._send_joke(client, caption="Piada, em voz.").status_code, 403)
+        blob = self.pending.read_text(encoding="utf-8") + json.dumps(bridge._denials)
+        self.assertNotIn("Piada", blob)
+        self.assertNotIn(self.JOKE, blob)
+
+    # ── persistence across restarts ───────────────────────────────────────
+
+    def test_cancelled_state_survives_a_restart(self):
+        _bridge, client, _prompts, _dispatch, _logs = self._bridge()
+        for _ in range(3):
+            self.assertEqual(self._send_joke(client).status_code, 403)
+        self.assertEqual(next(iter(self._entries().values()))["status"], "cancelled")
+
+        # A fresh process, same store: the dead mark is loaded, not forgotten.
+        restarted, client2, prompts2, dispatch2, _logs2 = self._bridge(confirmed=True)
+        response = self._send_joke(client2, caption="legenda totalmente nova")
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertTrue(response.json()["cancelled"])
+        self.assertEqual(prompts2, [])
+        self.assertEqual(dispatch2.calls, [])
+        self.assertEqual(restarted.pending_actions()[0]["status"], "cancelled")
+
+    def test_restart_applies_the_ttl_before_anything_can_replay(self):
+        _bridge, client, prompts, _dispatch, _logs = self._bridge(pending_ttl=3600)
+        self.assertEqual(self._send_joke(client).status_code, 403)
+        self.assertEqual(len(prompts), 1)
+
+        later = ManualClock(self.clock.now + 3601)
+        logs2 = []
+        restarted, client2, prompts2, dispatch2, _logs2 = self._bridge(
+            confirmed=True, clock=later, logs=logs2, pending_ttl=3600)
+        self.assertTrue(any(line.startswith("SYS: ação pendente expirada: ")
+                            for line in logs2), logs2)
+        self.assertEqual(next(iter(self._entries().values()))["status"], "expired")
+
+        response = self._send_joke(client2, caption="legenda nova")
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertTrue(response.json()["expired"])
+        self.assertEqual(prompts2, [])
+        self.assertEqual(dispatch2.calls, [])
+
+    def test_a_fresh_owner_consent_reopens_the_request(self):
+        consent = {"open": False}
+        bridge, client, prompts, dispatch, _logs = self._bridge(
+            confirmed=lambda: consent["open"],
+            authorized=lambda: consent["open"])
+        for _ in range(3):
+            self.assertEqual(self._send_joke(client).status_code, 403)
+        self.assertTrue(next(iter(self._entries().values()))["status"] == "cancelled")
+
+        consent["open"] = True          # the owner said "pode"
+        response = self._send_joke(client, caption="Agora sim, vindo do zap do Gino")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(dispatch.calls[0][0], "whatsapp_control")
+        self.assertEqual(bridge._denials, {})
+        self.assertEqual(self._entries(), {})
+        self.assertGreaterEqual(len(prompts), 2)   # the consent reopened it
 
 
 if __name__ == "__main__":

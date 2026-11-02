@@ -17,9 +17,12 @@ this module: the caller gets a sentence it can speak instead of a traceback.
 """
 from __future__ import annotations
 
+import glob
+import os
 import re
 import shutil
 import subprocess
+import time
 from urllib.parse import quote_plus
 
 try:
@@ -52,12 +55,20 @@ _UA = {
     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
 }
 
-_VIDEO_ID_RE = re.compile(r'"videoId":"([A-Za-z0-9_-]{11})"')
+# YouTube Music serves the results JSON with escaped quotes (\x22videoId\x22)
+# while other YouTube pages still use plain quotes; accept both forms.
+_VIDEO_ID_RE = re.compile(
+    r'(?:"|\\x22)videoId(?:"|\\x22)\s*:\s*(?:"|\\x22)([A-Za-z0-9_-]{11})')
 _SHORTS_ID_RE = re.compile(r"/shorts/([A-Za-z0-9_-]{11})")
 
 _YT_MUSIC_HOME = "https://music.youtube.com"
 _YT_MUSIC_SEARCH = "https://music.youtube.com/search?q={query}"
 _YT_MUSIC_WATCH = "https://music.youtube.com/watch?v={video_id}"
+
+# Chrome shortcuts installed as PWAs keep the app id and the profile in Exec.
+_APP_ID_RE = re.compile(r"--app-id(?:=|\s+)[\"']?([A-Za-z0-9]{10,})[\"']?")
+_PROFILE_RE = re.compile(
+    r"--profile-directory(?:=|\s+)(?:\"([^\"]+)\"|'([^']+)'|(\S+))")
 
 
 def _run(cmd: list[str], timeout: float = 6.0):
@@ -125,6 +136,120 @@ def _chrome_bin() -> str:
     return ""
 
 
+def _desktop_dirs() -> list[str]:
+    """The standard directories where .desktop shortcuts are installed."""
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    dirs = [os.path.join(data_home, "applications")]
+    data_dirs = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
+    for entry in data_dirs.split(":"):
+        if entry:
+            dirs.append(os.path.join(entry, "applications"))
+    return dirs
+
+
+def _read_desktop_entry(path: str) -> dict[str, str]:
+    """Keys of the ``[Desktop Entry]`` section of one .desktop file."""
+    entry: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return entry
+    in_entry = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_entry = stripped == "[Desktop Entry]"
+            continue
+        if not in_entry or not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        entry[key.strip()] = value.strip()
+    return entry
+
+
+def _find_youtube_music_pwa() -> tuple[str, str] | None:
+    """(app_id, profile_directory) of the installed YouTube Music PWA, or None.
+
+    Chrome does not expose installed apps through a queryable API, so the
+    shortcut files are the source of truth: a shortcut whose Exec carries
+    ``--app-id`` and whose name/URL points at music.youtube.com is the app.
+    """
+    for directory in _desktop_dirs():
+        for path in sorted(glob.glob(os.path.join(directory, "*.desktop"))):
+            entry = _read_desktop_entry(path)
+            exec_line = entry.get("Exec", "")
+            app_match = _APP_ID_RE.search(exec_line)
+            if not app_match:
+                continue
+            haystack = " ".join([
+                exec_line,
+                entry.get("Name", ""),
+                entry.get("X-ChromeURL", ""),
+                entry.get("StartupWMClass", ""),
+            ]).lower()
+            if "music.youtube.com" not in haystack and "youtube music" not in haystack:
+                continue
+            profile_match = _PROFILE_RE.search(exec_line)
+            profile = "Default"
+            if profile_match:
+                profile = next(
+                    (group for group in profile_match.groups() if group), "Default")
+            return app_match.group(1), profile
+    return None
+
+
+def _spawn_app(pwa: tuple[str, str], url: str = "") -> bool:
+    """Open the installed PWA window, optionally already on ``url``.
+
+    ``--app-launch-url-for-shortcuts-menu-item`` is the switch Chrome's own
+    shortcut menu uses: it navigates inside the app window instead of opening
+    a normal browser tab.
+    """
+    chrome = _chrome_bin()
+    if not chrome:
+        return False
+    app_id, profile = pwa
+    cmd = [
+        chrome,
+        f"--profile-directory={profile}",
+        f"--app-id={app_id}",
+    ]
+    if url:
+        cmd.append(f"--app-launch-url-for-shortcuts-menu-item={url}")
+    try:
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _await_playback(before: set[str], timeout: float = 4.0) -> bool:
+    """Send Play once a *new* Chrome MPRIS player shows up, briefly.
+
+    A player that was already on the bus before the launch is left alone:
+    Chrome shares one MPRIS name per browser, and pressing Play there could
+    resume an unrelated tab instead of the app window that was just opened.
+    In that case there is nothing to wait for either.
+    """
+    if any("chrom" in name.lower() for name in before):
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for name in players():
+            if name in before or "chrom" not in name.lower():
+                continue
+            ok, _ = mpris_call(name, "Play")
+            return ok
+        time.sleep(0.5)
+    return False
+
+
 def _spawn_visible(url: str) -> bool:
     """Open a URL in a visible Chrome window, else through xdg-open."""
     chrome = _chrome_bin()
@@ -174,7 +299,11 @@ def _scrape_video_id(query: str) -> str:
 
 
 def _open_youtube_music(query: str) -> str:
+    pwa = _find_youtube_music_pwa()
+
     if not query:
+        if pwa and _spawn_app(pwa):
+            return "YouTube Music aberto no app instalado."
         ok = _spawn_visible(_YT_MUSIC_HOME)
         if ok:
             return "YouTube Music aberto na tela."
@@ -183,15 +312,28 @@ def _open_youtube_music(query: str) -> str:
     video_id = _scrape_video_id(query)
     if video_id:
         url = _YT_MUSIC_WATCH.format(video_id=video_id)
+        opening = f"'{query}' aberto no app do YouTube Music."
+    else:
+        url = _YT_MUSIC_SEARCH.format(query=quote_plus(query))
+        opening = f"Busca de '{query}' aberta no app do YouTube Music."
+
+    if pwa:
+        before = set(players())
+        if _spawn_app(pwa, url):
+            # Autoplay inside the app may be blocked; nudge it if a player
+            # shows up, but the app window is the reliable outcome.
+            _await_playback(before)
+            return opening
+
+    if video_id:
         ok = _spawn_visible(url)
         if ok:
-            return f"Abrindo '{query}' no YouTube Music, na tela."
+            return f"'{query}' aberto no YouTube Music, na tela."
         return f"Achei '{query}', mas não consegui abrir a janela."
 
-    url = _YT_MUSIC_SEARCH.format(query=quote_plus(query))
     ok = _spawn_visible(url)
     if ok:
-        return f"Abrindo a busca de '{query}' no YouTube Music, na tela."
+        return f"Busca de '{query}' aberta no YouTube Music, na tela."
     return f"Não consegui abrir a busca de '{query}' no YouTube Music."
 
 
@@ -210,7 +352,9 @@ def _say(player, speak, message: str) -> str:
 def _play(parameters: dict, player, speak) -> str:
     query = str(parameters.get("query") or "").strip()
     if query:
-        return _say(player, speak, _open_youtube_music(query))
+        # Opening YouTube Music is local and instant: the result is returned to
+        # the model, but the action never speaks a "Abrindo..." pre-announcement.
+        return _open_youtube_music(query)
 
     open_players = players()
     if open_players:
@@ -218,7 +362,7 @@ def _play(parameters: dict, player, speak) -> str:
         if not ok:
             return _say(player, speak, f"Não consegui tocar: {message}")
         return _say(player, speak, message)
-    return _say(player, speak, _open_youtube_music(""))
+    return _open_youtube_music("")
 
 
 def _transport(action: str, player, speak) -> str:
@@ -366,11 +510,12 @@ TOOL = {
         "volume', 'mudo', 'que música está tocando?', and for 'toca <música>' "
         "when the user wants it in the external player/YouTube Music. "
         "action='play' with a query searches YouTube Music and opens the first "
-        "non-Shorts result in a visible window; without a query it resumes the "
-        "open player or opens YouTube Music. Transport and volume commands are "
-        "sent without checking the player's state first. Do NOT use this for "
-        "the assistant's own HUD music (use music_control) and do not use it to "
-        "play a video on the assistant's display (use video_player)."
+        "non-Shorts result in the installed YouTube Music app window when that "
+        "PWA is installed, otherwise in a visible Chrome window; without a query "
+        "it resumes the open player or opens YouTube Music. Transport and volume "
+        "commands are sent without checking the player's state first. Do NOT use "
+        "this for the assistant's own HUD music (use music_control) and do not "
+        "use it to play a video on the assistant's display (use video_player)."
     ),
     "parameters": {
         "type": "OBJECT",

@@ -211,5 +211,127 @@ class OwnerInterruptClassificationTest(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class TrueBargeInTest(unittest.TestCase):
+    """O onset do dono mata o áudio que já está no dispositivo e a fila.
+
+    A fila vazia não basta: `stream.write()` só prova que o buffer aceitou o
+    lote, e o dispositivo ainda pode ter dezenas/centenas de ms para tocar.
+    `interrupt()` agora aborta o stream (`abort()`), e `_play_audio` reinicia
+    o dispositivo para a próxima resposta.
+    """
+
+    class _Stream:
+        def __init__(self):
+            self.aborts = 0
+            self.starts = 0
+            self.active = True
+
+        def abort(self):
+            self.aborts += 1
+            self.active = False
+
+        def start(self):
+            self.starts += 1
+            self.active = True
+
+    class _Queue:
+        def __init__(self, items):
+            self.items = list(items)
+
+        def empty(self):
+            return not self.items
+
+        def get_nowait(self):
+            if not self.items:
+                raise IndexError("empty")
+            return self.items.pop(0)
+
+    def _obj(self, *, speaking: bool = True, chunks: int = 3):
+        obj = object.__new__(main.JarvisLive)
+        obj.ui = _FakeUI()
+        obj._speaking_lock = threading.Lock()
+        obj._is_speaking = speaking
+        obj._speech_epoch = 7
+        obj._reply_active = True
+        obj._interrupted = False
+        obj._qoder_live = None
+        obj._qoder_lock = threading.RLock()
+        obj._persona_text_buf = {}
+        obj._persona_seen = set()
+        obj._qoder_current_id = None
+        obj._qoder_meta = {}
+        obj._visemes = type("V", (), {"reset": lambda self: None})()
+        obj._play_cursor = 1.0
+        obj._turn_done_event = None
+        obj._interrupt_note = ""
+        obj._mark_qoder_voice_preempt = lambda: None
+        obj.audio_in_queue = self._Queue([b"chunk"] * chunks)
+        obj._out_stream = self._Stream()
+        obj._play_abort = threading.Event()
+        obj.set_speaking = lambda value: setattr(obj, "_is_speaking", value)
+        obj.interrupt = lambda: main.JarvisLive.interrupt(obj)
+        return obj
+
+    def test_interrupt_aborts_the_device_and_drops_pending_chunks(self):
+        obj = self._obj(chunks=4)
+        stream = obj._out_stream
+        main.JarvisLive.interrupt(obj)
+        self.assertEqual(stream.aborts, 1, "o buffer do dispositivo não foi abortado")
+        self.assertEqual(obj.audio_in_queue.items, [],
+                         "sobraram chunks da resposta interrompida na fila")
+        self.assertEqual(obj._speech_epoch, 8)
+        self.assertFalse(obj._is_speaking)
+        self.assertTrue(obj._play_abort.is_set(),
+                        "o loop de playback não foi avisado para reiniciar")
+
+    def test_owner_onset_during_playback_stops_and_logs_barge_in(self):
+        obj = self._obj(chunks=2)
+        obj._owner_voice_until = time.monotonic() + 5.0
+        obj._owner_voice_since = time.monotonic() - 0.8
+        main.JarvisLive._owner_takes_floor(obj)
+        self.assertEqual(obj._out_stream.aborts, 1)
+        self.assertEqual(obj.audio_in_queue.items, [])
+        barge = [line for line in obj.ui.logs if line.startswith("SYS: barge-in:")]
+        self.assertEqual(len(barge), 1, obj.ui.logs)
+        self.assertIn("falou 0.8s no áudio", barge[0])
+        self.assertNotIn("SYS: Interrompido — ouvindo...", obj.ui.logs,
+                         "o barge-in deve gravar uma linha só")
+
+    def test_no_false_trigger_when_nothing_is_playing(self):
+        obj = self._obj(speaking=False, chunks=2)
+        main.JarvisLive._owner_takes_floor(obj)
+        self.assertEqual(obj._out_stream.aborts, 0)
+        self.assertEqual(obj.audio_in_queue.items, [b"chunk", b"chunk"])
+        self.assertEqual(obj.ui.logs, [])
+        self.assertFalse(obj._play_abort.is_set())
+
+    def test_a_fresh_burst_does_not_confirm_a_barge_in_by_itself(self):
+        obj = self._obj()
+        obj._play_burst_until = time.monotonic() + 0.25
+        self.assertFalse(main.JarvisLive._barge_onset_counts(obj, True),
+                         "o ataque do nosso próprio TTS abriu um barge-in")
+        # Sem playback não há eco nosso para confundir: o bloco conta.
+        self.assertTrue(main.JarvisLive._barge_onset_counts(obj, False))
+        obj._play_burst_until = time.monotonic() - 1.0
+        self.assertTrue(main.JarvisLive._barge_onset_counts(obj, True))
+
+    def test_playback_loop_restarts_the_device_after_the_abort(self):
+        obj = self._obj()
+        stream = obj._out_stream
+        obj._play_abort.set()
+        stream.active = False
+        main.JarvisLive._restart_output_after_abort(obj, stream)
+        self.assertEqual(stream.starts, 1)
+        self.assertTrue(stream.active)
+        self.assertFalse(obj._play_abort.is_set())
+
+    def test_silence_without_playback_is_safe(self):
+        obj = self._obj()
+        obj._out_stream = None
+        obj._play_abort.clear()
+        main.JarvisLive._silence_output_now(obj)
+        self.assertTrue(obj._play_abort.is_set())
+
+
 if __name__ == "__main__":
     unittest.main()

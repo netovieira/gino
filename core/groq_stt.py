@@ -19,10 +19,14 @@ Settings live in config/api_keys.json under plugin_config.groq, written by the
     api_key   gsk_...            (https://console.groq.com/keys)
     model     whisper-large-v3-turbo | whisper-large-v3
     language  pt | en | ... | auto
+    preroll_s 1.5                seconds of audio kept before the first phoneme
+    max_utterance_s 15           voiced seconds before a live segment is cut
 """
 from __future__ import annotations
 
+import collections
 import io
+import math
 import os
 import queue
 import threading
@@ -42,12 +46,28 @@ NAMESPACE = "groq"
 # Segmenter, in 64 ms blocks at 16 kHz (CHUNK_SIZE 1024 in main.py).
 _START_BLOCKS = 3        # ~190 ms above threshold opens an utterance
 _END_BLOCKS = 11         # ~700 ms below closes it
-# ~1.2 s kept from before the start. Long on purpose: while asleep the block is
-# cut by TIME (see _SLEEP_CAP_BLOCKS), and the cut can land in the middle of the
-# name — this overlap is what makes a call split across two blocks arrive whole.
-_PREROLL = 19
+# Pre-roll: audio kept from BEFORE the first phoneme. ONE place sizes the ring
+# (override: plugin_config.groq.preroll_s in config/api_keys.json).
+_PREROLL_S = 1.5
+_MIN_PREROLL_S = 0.0     # a disabled ring still keeps _START_BLOCKS to fire
+_MAX_PREROLL_S = 5.0     # a small cap keeps a typo from eating memory
+_BLOCK_SECONDS = 0.064   # one microphone frame: CHUNK_SIZE 1024 at 16 kHz
 _MIN_SPEECH = 5          # ~320 ms of voiced blocks, else dropped as noise
 _MAX_BLOCKS = 600        # ~38 s hard cap, then sent as-is
+# A live utterance used to grow to that 38 s cap whenever nobody paused — a TV
+# monologue, music, a fan — and 38 s is not transcribable: Whisper gave up on
+# the whole blob ("não reconheceu nada no que ouvi") and the owner's words
+# inside it went with it. Past ~15 s of VOICED audio the segment is handed
+# over and a new one starts on the same breath, so a monologue yields chunks
+# that transcribe while a normal owner turn (< 10 s) is never chopped.
+# Override: plugin_config.groq.max_utterance_s in config/api_keys.json.
+_UTTERANCE_CAP_S = 15.0
+_MIN_UTTERANCE_S = 5.0
+_MAX_UTTERANCE_S = _MAX_BLOCKS * _BLOCK_SECONDS   # never looser than the hard cap
+# Known non-owner voice (a TV the gate can already identify) is cut tighter:
+# none of it deserves a long turn, and short chunks keep an owner sentence
+# spoken over the TV from hiding inside one blob.
+_NON_OWNER_CAP_S = 8.0
 # While the assistant is speaking only echo-guard-approved blocks reach this
 # segmenter, but a stray one must not grow into a minute of self-audio: cut it
 # short so a barge-in phrase still works and a false start costs 2.5 s, not 38.
@@ -113,6 +133,53 @@ def _boost_quiet(pcm16: bytes) -> bytes:
     return (y * 32767.0).astype(np.int16).tobytes()
 
 
+class _ForcedChunk(bytes):
+    """A chunk closed by the time boundary instead of by a pause.
+
+    Same bytes, one extra fact for the worker: Smart Turn must not merge it
+    with the continuation — two 15 s pieces glued back together are the same
+    untranscribable blob this boundary exists to prevent.
+    """
+
+
+def preroll_from_config(cfg: dict | None) -> float:
+    """Seconds of pre-roll, clamped. One key: plugin_config.groq.preroll_s.
+
+    A bad value (text, negative, huge) must never leave the microphone
+    unbounded or crash the listener: fall back to the default.
+    """
+    try:
+        value = float((cfg or {}).get("preroll_s", _PREROLL_S))
+    except (TypeError, ValueError):
+        value = _PREROLL_S
+    return min(_MAX_PREROLL_S, max(_MIN_PREROLL_S, value))
+
+
+def ring_blocks(preroll_s: float) -> int:
+    """How many 64 ms frames the ring holds.
+
+    The detector needs `_START_BLOCKS` voiced blocks before it fires, and those
+    blocks are part of the ring; the extra room is what keeps the full
+    `preroll_s` of honest pre-speech audio even after that detection lag.
+    """
+    frames = int(math.ceil(max(0.0, float(preroll_s)) / _BLOCK_SECONDS))
+    return frames + _START_BLOCKS
+
+
+def utterance_cap_from_config(cfg: dict | None) -> float:
+    """Seconds of voiced audio allowed in one live segment, clamped.
+
+    One key: plugin_config.groq.max_utterance_s. The floor keeps a typo from
+    chopping a normal sentence; the ceiling keeps the old 38 s blob from
+    coming back through configuration.
+    """
+    try:
+        value = float((cfg or {}).get("max_utterance_s", _UTTERANCE_CAP_S))
+    except (TypeError, ValueError):
+        value = _UTTERANCE_CAP_S
+    return min(_MAX_UTTERANCE_S, max(_MIN_UTTERANCE_S, value))
+
+
 def settings(get_plugin_config: Callable[[str], dict]) -> dict:
     cfg = get_plugin_config(NAMESPACE)
     model = str(cfg.get("model") or MODELS[0]).strip()
@@ -121,6 +188,8 @@ def settings(get_plugin_config: Callable[[str], dict]) -> dict:
         "api_key": str(cfg.get("api_key") or "").strip(),
         "model": model if model in MODELS else MODELS[0],
         "language": "" if lang in ("auto", "") else lang,
+        "preroll_s": preroll_from_config(cfg),
+        "max_utterance_s": utterance_cap_from_config(cfg),
     }
 
 
@@ -193,7 +262,10 @@ class GroqListener:
                  engine_label: str = "Groq",
                  usage_key: str = "groq",
                  fallback_transcribe: Callable[[bytes], str] | None = None,
-                 on_utterance: Callable[[str, bytes], None] | None = None) -> None:
+                 on_utterance: Callable[[str, bytes], None] | None = None,
+                 precheck: Callable[[bytes], bool] | None = None,
+                 preroll_s: float | None = None,
+                 max_utterance_s: float | None = None) -> None:
         self._key, self._model, self._lang = api_key, model, language
         self.prompt = prompt
         # Optional local transcriber (core.local_stt): same segmentation and
@@ -213,6 +285,11 @@ class GroqListener:
         # turn reaches the brain. When None (the default), behavior is exactly
         # on_text(text) as before — main.py and core.local_stt keep working.
         self._on_utterance = on_utterance
+        # Optional veto that runs on the STT worker BEFORE any transcription.
+        # It receives the exact int16 PCM of the utterance and returns False to
+        # drop it silently (the "modo série" gate: a TV line must cost no paid
+        # transcription and must never reach the brain).
+        self._precheck = precheck
         self._on_status = on_status or (lambda m: None)
         self._sr = sample_rate
         self._q: queue.Queue = queue.Queue()
@@ -221,8 +298,31 @@ class GroqListener:
         self._above = 0
         self._below = 0
         self._voiced = 0
-        self._pre: list[bytes] = []
+        # The pre-roll ring. It is written on EVERY block that reaches feed()
+        # and discards the oldest frame by itself; the microphone callback
+        # keeps feeding it while asleep (and during our own playback), so the
+        # 1.5 s before the first phoneme is never lost. Bounded by construction.
+        self._preroll_s = preroll_from_config({"preroll_s": preroll_s}) \
+            if preroll_s is not None else _PREROLL_S
+        self._ring_blocks = ring_blocks(self._preroll_s)
+        self._pre: collections.deque[bytes] = collections.deque(
+            maxlen=self._ring_blocks)
         self._seg: list[bytes] = []
+        # Forced boundary for a live segment, in voiced 64 ms blocks. Voiced,
+        # not elapsed: the pre-roll silence and the pauses inside a sentence do
+        # not count against the owner, a TV that never stops talking does.
+        self._utterance_s = utterance_cap_from_config(
+            {"max_utterance_s": max_utterance_s}) \
+            if max_utterance_s is not None else _UTTERANCE_CAP_S
+        self._owner_cap_blocks = int(round(self._utterance_s / _BLOCK_SECONDS))
+        self._non_owner_cap_blocks = int(round(
+            min(self._utterance_s, _NON_OWNER_CAP_S) / _BLOCK_SECONDS))
+        # Optional speaker awareness, set from outside ONCE (main.py): a
+        # callable returning True while the voice on the microphone is the
+        # owner's. Default None = owner-agnostic, only the time cap applies.
+        # It runs on the audio callback thread: keep it cheap, no I/O.
+        self.current_speaker_is_owner: Callable[[], bool] | None = None
+        self._cap_hook_warned = False
         self._stop = threading.Event()
         self._worker = threading.Thread(target=self._run, name="groq-stt", daemon=True)
         self._worker.start()
@@ -241,6 +341,26 @@ class GroqListener:
     def local(self) -> bool:
         """True when transcription happens on this machine (core.local_stt)."""
         return self._transcribe_fn is not None
+
+    @property
+    def preroll_seconds(self) -> float:
+        """Configured pre-roll, seconds before the first voiced frame."""
+        return self._preroll_s
+
+    @property
+    def preroll_blocks(self) -> int:
+        """Ring capacity in frames; also the hard ceiling tests assert on."""
+        return self._ring_blocks
+
+    @property
+    def preroll_bytes(self) -> int:
+        """Upper bound of the ring in bytes (one channel, int16)."""
+        return self._ring_blocks * int(round(_BLOCK_SECONDS * self._sr)) * 2
+
+    @property
+    def utterance_seconds(self) -> float:
+        """Voiced seconds allowed in one live segment before a forced cut."""
+        return self._utterance_s
 
     def set_assistant_speaking(self, value: bool) -> None:
         """Called by the playback path: a reply is (not) coming out now."""
@@ -261,12 +381,21 @@ class GroqListener:
 
     # ── audio thread ────────────────────────────────────────────────────────
 
-    def feed(self, block) -> None:
+    def feed(self, block, preroll_only: bool = False) -> None:
         x = np.asarray(block, dtype=np.float32).ravel()
         if x.size == 0:
             return
-        level = float(np.sqrt(np.mean(x * x))) / 32768.0
         raw = np.asarray(block, dtype=np.int16).tobytes()
+        # Record FIRST, before any gate below can return: the ring is the only
+        # copy of the audio that precedes a detection, and it must keep running
+        # while the stream is open (asleep, echo tail, our own playback).
+        self._pre.append(raw)
+        if preroll_only:
+            # Only the ring — used while the assistant's own voice is in the
+            # monitor, so the segmenter does not open on our echo, but the
+            # owner's first phoneme still survives for a barge-in.
+            return
+        level = float(np.sqrt(np.mean(x * x))) / 32768.0
 
         if self._drop_segment:
             # The reply started: whatever was half-open belongs to the previous
@@ -296,16 +425,16 @@ class GroqListener:
             self._peak, self._peak_t = 0.0, now
 
         if not self._active:
-            self._pre.append(raw)
-            if len(self._pre) > _PREROLL:
-                self._pre.pop(0)
             if level > thresh:
                 self._above += 1
                 if self._above >= _START_BLOCKS:
                     self._active = True
                     self.speaking = True
+                    # The ring already holds the full pre-roll plus the blocks
+                    # the detector needed to fire: hand the whole thing to the
+                    # utterance, then start a fresh ring for the continuation.
                     self._seg = list(self._pre)
-                    self._pre = []
+                    self._pre.clear()
                     self._voiced = self._above
                     self._below = 0
                     # The room includes the speakers: while a sentence is open
@@ -337,15 +466,67 @@ class GroqListener:
             cap = _SLEEP_CAP_BLOCKS if self.sleeping else _MAX_BLOCKS
         if self._below >= _END_BLOCKS or len(self._seg) >= cap:
             self._close(capped=len(self._seg) >= cap)
+            return
+        if not self.assistant_speaking and not self.sleeping:
+            # Nobody paused: hand over a transcribable chunk instead of letting
+            # the utterance run to the 38 s hard cap (see _cut_segment).
+            voiced_cap = self._soft_cap_blocks()
+            if self._voiced >= voiced_cap:
+                self._cut_segment(voiced_cap)
+
+    def _soft_cap_blocks(self) -> int:
+        """Voiced blocks this live segment may hold before a forced boundary.
+
+        `current_speaker_is_owner` is the injected hook (main.py may set it):
+        when it says the voice is NOT the owner's, the cap tightens from the
+        configured `max_utterance_s` (15 s) to `_NON_OWNER_CAP_S` (8 s). The
+        hook is only asked once the segment is already long enough to matter,
+        so short turns never pay for it.
+
+        A hook that raises fails OPEN: the owner/agnostic cap stays, which
+        costs longer chunks at worst — never a chopped owner sentence.
+        """
+        if self.current_speaker_is_owner is None:
+            return self._owner_cap_blocks
+        if self._voiced < self._non_owner_cap_blocks:
+            return self._owner_cap_blocks
+        try:
+            is_owner = bool(self.current_speaker_is_owner())
+        except Exception as e:
+            if not self._cap_hook_warned:
+                self._cap_hook_warned = True
+                print(f"[{self.label}] hook de locutor falhou ({e!r}) — "
+                      f"valendo só o teto de tempo")
+            return self._owner_cap_blocks
+        return self._owner_cap_blocks if is_owner else self._non_owner_cap_blocks
+
+    def _cut_segment(self, cap_blocks: int) -> None:
+        """Soft boundary: hand the captured audio over and keep listening.
+
+        Unlike `_close()`, the utterance stays OPEN — VAD, duck, `_below` and
+        `speaking` are untouched — and the next block simply starts a fresh
+        segment. That is what guarantees no frame is dropped, repeated or
+        reordered at the boundary: every block fed belongs to exactly one
+        emitted chunk, in the order it arrived.
+        """
+        seg, voiced = self._seg, self._voiced
+        self._seg, self._voiced = [], 0
+        print(f"[{self.label}] fala contínua de {len(seg) * _BLOCK_SECONDS:.1f}s — "
+              f"cortando em trechos transcrevíveis (teto de "
+              f"{cap_blocks * _BLOCK_SECONDS:.0f}s de voz)")
+        self._emit(seg, voiced, forced=True)
 
     def _close(self, capped: bool = False) -> None:
         seg, voiced = self._seg, self._voiced
         self._seg, self._active, self.speaking = [], False, False
         self._above = self._below = self._voiced = 0
+        # The closed utterance is already going to the STT: its frames must not
+        # become the pre-roll of the next sentence (that would duplicate words).
+        self._pre.clear()
         # Cut by time while asleep: the tail becomes the opening of the next
         # window, so "Gino" ending at the boundary is still heard once.
-        if capped and self.sleeping and len(seg) > _PREROLL:
-            self._pre = seg[-_PREROLL:]
+        if capped and self.sleeping and len(seg) > self._ring_blocks:
+            self._pre.extend(seg[-self._ring_blocks:])
         # Owner's spec (31/10): the volumes come back when the SPEECH stops,
         # never waiting on the reply or on background jobs. If a reply is
         # already playing the assistant is still talking — its playback keeps
@@ -360,6 +541,11 @@ class GroqListener:
             # the model answered the fragment as if it were complete.
             print(f"[{self.label}] utterance hit the {_MAX_BLOCKS}-block cap — "
                   f"transcribing the captured part only")
+        self._emit(seg, voiced)
+
+    def _emit(self, seg: list[bytes], voiced: int,
+              forced: bool = False) -> None:
+        """Send one finished chunk to the STT worker, or drop it as noise."""
         if voiced >= _MIN_SPEECH:
             pcm = b"".join(seg)
             secs = len(pcm) / (2 * self._sr)
@@ -372,7 +558,8 @@ class GroqListener:
             else:
                 if not self.sleeping:
                     self._on_status(f"Ouvi {secs:.1f}s — transcrevendo no {self.label}…")
-                self._q.put(_boost_quiet(pcm))
+                payload = _boost_quiet(pcm)
+                self._q.put(_ForcedChunk(payload) if forced else payload)
         else:
             print(f"[Groq] dropped a {voiced}-block blip as noise")
             _duck.up()          # it opened an utterance (and ducked) for nothing
@@ -471,6 +658,15 @@ class GroqListener:
             if self.sleeping:
                 self._process_utterance(pcm)
                 continue
+            if isinstance(pcm, _ForcedChunk):
+                # Closed by the time boundary, not by a pause: it is already a
+                # complete piece, and gluing it to the next one would rebuild
+                # exactly the long blob the boundary exists to avoid.
+                if pending:
+                    self._process_utterance(pending)
+                    pending, pending_at = b"", 0.0
+                self._process_utterance(pcm)
+                continue
 
             now = time.monotonic()
             if pending:
@@ -511,6 +707,20 @@ class GroqListener:
                     _w.writeframes(pcm)
             except Exception:
                 pass
+        # Awake only: asleep, the local path is the wake word's ear and must
+        # keep transcribing name calls. Awake, this is the first and cheapest
+        # place to drop a TV line — before Whisper and before the brain.
+        if self._precheck is not None and not self.sleeping:
+            try:
+                keep = bool(self._precheck(pcm))
+            except Exception as e:
+                # A broken gate must not make the assistant deaf: fail open,
+                # but say so on the console.
+                print(f"[{self.label}] pré-portão falhou ({e!r}) — seguindo")
+                keep = True
+            if not keep:
+                _duck.up()
+                return
         try:
             if self._transcribe_fn is not None:
                 try:

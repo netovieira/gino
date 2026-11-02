@@ -21,7 +21,15 @@ PROTOCOL (see ``qoder_live/index.mjs`` for the source of truth)
         {"type": "session", "id": "..."}            (resumable session id)
         {"type": "session", "id": "...", "persona": "<slug>"}
         {"type": "text", "id": "...", "text": "...", "delta": true|false}
+        {"type": "text", "id": null, "text": "...", "delta": false}
+            (resposta espontânea a task_notification: sem turno do dono)
         {"type": "tool", "id": "...", "name": "...", "input": {...}}
+        {"type": "subagent", "id": "...", "task_id": "...",
+         "tool_use_id": "...", "name": "...", "input": {...}}
+        {"type": "subagent", "id": "...", "task_id": "...",
+         "tool_use_id": "...", "kind": "text", "text": "..."}
+        {"type": "task", "phase": "started|progress|done", "id": "...",
+         "description": "...", "summary": "...", "status": "..."}
         {"type": "persona_text", "persona": "<slug>", "text": "...", "delta": false}
         {"type": "persona_done", "persona": "<slug>", "text": "...", "status": "ok"|"error"|"interrupted"}
         {"type": "persona_error", "persona": "<slug>", "error": "..."}
@@ -98,6 +106,7 @@ class QoderLive:
         on_session: Optional[Callable[[str], None]] = None,
         on_closed: Optional[Callable[[], None]] = None,
         on_task: Optional[Callable[[dict[str, Any]], None]] = None,
+        on_subagent: Optional[Callable[[dict[str, Any]], None]] = None,
         on_persona_text: Optional[Callable[[str, str], None]] = None,
         on_persona_done: Optional[Callable[[str, str, str], None]] = None,
         on_persona_error: Optional[Callable[[str, str], None]] = None,
@@ -121,6 +130,7 @@ class QoderLive:
         self.on_session = on_session
         self.on_closed = on_closed
         self.on_task = on_task
+        self.on_subagent = on_subagent
         self.on_persona_text = on_persona_text
         self.on_persona_done = on_persona_done
         self.on_persona_error = on_persona_error
@@ -529,6 +539,8 @@ class QoderLive:
             )
         elif kind == "task":
             self._emit("on_task", message)
+        elif kind == "subagent":
+            self._emit("on_subagent", message)
         elif kind == "models":
             models = message.get("models")
             self._emit("on_models", models if isinstance(models, list) else [])

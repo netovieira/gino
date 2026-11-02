@@ -43,6 +43,7 @@ from typing import Callable
 
 import numpy as np
 
+from core import groq_stt as _groq_stt
 from core.groq_stt import GroqListener
 
 NAMESPACE = "local_stt"
@@ -68,6 +69,9 @@ _BEAM_MAX_SECONDS = 8.0
 _NO_SPEECH_THRESHOLD = 0.75
 _LOGPROB_THRESHOLD = -1.2
 _COMPRESSION_THRESHOLD = 2.4
+# Dormindo, a chamada é uma palavra só ("Gino", "oi Gino") e chega com
+# no_speech_prob alta; até este valor ela ainda é transcrita para acordar.
+WAKE_NO_SPEECH_THRESHOLD = 0.92
 # A quiet microphone is not silence: lower the internal Silero threshold so a
 # soft sentence survives, while keeping the model's own anti-hallucination.
 _VAD_PARAMETERS = {
@@ -141,6 +145,12 @@ def settings(get_plugin_config: Callable[[str], dict]) -> dict:
         cfg = get_plugin_config(NAMESPACE) or {}
     except Exception:
         cfg = {}
+    # The pre-roll ring is sized in ONE place (core.groq_stt); the key lives in
+    # the groq namespace so local and cloud Whisper share the same setting.
+    try:
+        groq_cfg = get_plugin_config("groq") or {}
+    except Exception:
+        groq_cfg = {}
     model = str(cfg.get("model") or DEFAULT_MODEL).strip().lower()
     if model not in MODELS:
         model = DEFAULT_MODEL
@@ -154,6 +164,9 @@ def settings(get_plugin_config: Callable[[str], dict]) -> dict:
         "language": lang or DEFAULT_LANGUAGE,
         "device": str(cfg.get("device") or "cpu").strip().lower(),
         "compute_type": str(cfg.get("compute_type") or "int8").strip().lower(),
+        "preroll_s": _groq_stt.preroll_from_config(groq_cfg),
+        # Same cap as the cloud listener: one key in plugin_config.groq.
+        "max_utterance_s": _groq_stt.utterance_cap_from_config(groq_cfg),
     }
 
 
@@ -235,8 +248,14 @@ class _Whisper:
         except Exception as e:
             print(f"[STT] warm-up falhou: {e}")
 
-    def transcribe_pcm(self, pcm: bytes, prompt: str = "") -> str:
-        """int16 mono PCM at the listener's sample rate → text."""
+    def transcribe_pcm(self, pcm: bytes, prompt: str = "",
+                       wake: bool = False) -> str:
+        """int16 mono PCM at the listener's sample rate → text.
+
+        ``wake`` is True while the assistant sleeps: the call is short, so the
+        anti-hallucination no-speech gate is relaxed (see
+        WAKE_NO_SPEECH_THRESHOLD) instead of dropping the owner's own name.
+        """
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
         seconds = len(audio) / float(self._sr) if self._sr else 0.0
         # Distant microphones deliver speech at a level the model reads as a
@@ -256,7 +275,7 @@ class _Whisper:
         # more, and greedy holds up well enough.
         beam = 5 if 0.0 < seconds <= _BEAM_MAX_SECONDS else 1
         try:
-            return self._decode(audio, beam, prompt)
+            return self._decode(audio, beam, prompt, wake=wake)
         except Exception as e:
             # Same reasoning as the load: a CUDA failure during decode (out of
             # memory because Ollama took the card, a missing .so) is recovered
@@ -264,16 +283,17 @@ class _Whisper:
             if self._device == "cpu":
                 raise
             self._fall_back_to_cpu(e)
-            return self._decode(audio, beam, prompt)
+            return self._decode(audio, beam, prompt, wake=wake)
 
-    def _decode(self, audio, beam: int, prompt: str) -> str:
+    def _decode(self, audio, beam: int, prompt: str, wake: bool = False) -> str:
         model = self._ensure()
+        no_speech = WAKE_NO_SPEECH_THRESHOLD if wake else _NO_SPEECH_THRESHOLD
         kw = dict(
             language=self._language,
             beam_size=beam,
             condition_on_previous_text=False,
             initial_prompt=prompt or self._prompt or None,
-            no_speech_threshold=_NO_SPEECH_THRESHOLD,
+            no_speech_threshold=no_speech,
             log_prob_threshold=_LOGPROB_THRESHOLD,
             compression_ratio_threshold=_COMPRESSION_THRESHOLD,
         )
@@ -299,7 +319,7 @@ class _Whisper:
             # Belt and braces: enforce the thresholds here too, because whether
             # faster-whisper itself drops a segment by no_speech_prob depends on
             # the version and on whether VAD ran.
-            if seg.no_speech_prob > _NO_SPEECH_THRESHOLD:
+            if seg.no_speech_prob > no_speech:
                 continue
             if seg.avg_logprob < _LOGPROB_THRESHOLD:
                 continue
@@ -323,7 +343,10 @@ class LocalWhisperListener(GroqListener):
                  compute_type: str = "int8",
                  prompt: str = "",
                  fallback_transcribe: Callable[[bytes], str] | None = None,
-                 on_utterance: Callable[[str, bytes], None] | None = None) -> None:
+                 on_utterance: Callable[[str, bytes], None] | None = None,
+                 precheck: Callable[[bytes], bool] | None = None,
+                 preroll_s: float | None = None,
+                 max_utterance_s: float | None = None) -> None:
         whisper = _Whisper(model, language, device, compute_type,
                            on_status or (lambda m: None), prompt=prompt,
                            sample_rate=sample_rate)
@@ -333,10 +356,14 @@ class LocalWhisperListener(GroqListener):
             prompt=prompt, transcribe_fn=None,
             engine_label="Whisper local", usage_key="whisper",
             fallback_transcribe=fallback_transcribe,
-            on_utterance=on_utterance)
+            on_utterance=on_utterance,
+            precheck=precheck,
+            preroll_s=preroll_s,
+            max_utterance_s=max_utterance_s)
         # Read self.prompt at call time, not now: the assistant's name is only
         # settled later in startup, and the hint has to carry the real one.
-        self._transcribe_fn = lambda pcm: whisper.transcribe_pcm(pcm, self.prompt)
+        self._transcribe_fn = lambda pcm: whisper.transcribe_pcm(
+            pcm, self.prompt, wake=self.sleeping)
         # Warm the model while the microphone and the brain are still coming up,
         # so the FIRST thing the user says is not the one that pays for CUDA
         # kernels and cache fills (measured: 3.4 s for a 2.4 s clip, warm ~0.3 s).

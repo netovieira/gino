@@ -7,10 +7,10 @@ WHAT IT DOES
     the recent turns into a short summary, open threads and topic files.
 
 WHY BACKGROUND
-    Summarising ten turns with a local model takes a second or two. Doing it
-    inside a conversation turn would add exactly the latency this project is
-    trying to remove. The librarian is single-flight: a second trigger while
-    one is running is dropped, not queued.
+    Summarising ten turns takes a few seconds on Qoder (the local text model
+    was retired). Doing it inside a conversation turn would add exactly the
+    latency this project is trying to remove. The librarian is single-flight: a
+    second trigger while one is running is dropped, not queued.
 
 PROMPT BUDGET
     The model sees only the last few hours of turns, truncated. It must answer

@@ -33,6 +33,11 @@ PLUGIN_SETTINGS = {
          "options": list(MODELS), "default": MODELS[0]},
         {"key": "language", "label": "Language (pt, en, es... or auto)", "type": "text",
          "default": "pt", "placeholder": "pt"},
+        # Audio kept before the first phoneme (core/groq_stt ring). Text on
+        # purpose: the settings form has no numeric field, and the listener
+        # accepts "1.5" the same way it accepts a JSON number.
+        {"key": "preroll_s", "label": "Pre-roll before speech (seconds)",
+         "type": "text", "default": "1.5", "placeholder": "1.5"},
     ],
     "action": {"label": "TEST CONNECTION", "run": test_connection},
 }

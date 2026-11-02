@@ -141,6 +141,7 @@ class Recorder:
         self.persona_sessions = []
         self.models = []
         self.thinking = []
+        self.subagent = []
 
     def handlers(self):
         return {
@@ -168,6 +169,7 @@ class Recorder:
             "on_thinking": lambda persona, text: self.thinking.append(
                 (persona, text)
             ),
+            "on_subagent": lambda event: self.subagent.append(event),
         }
 
 
@@ -380,6 +382,18 @@ def test_task_events_are_forwarded_to_the_owner():
                     "status": "completed", "summary": "ok"})
     assert [e["phase"] for e in seen] == ["started", "done"]
     assert seen[1]["status"] == "completed"
+
+
+def test_subagent_events_are_forwarded():
+    seen = []
+    live = QoderLive(on_subagent=seen.append, logger=lambda *_a: None)
+    live._dispatch({"type": "subagent", "task_id": "t1", "tool_use_id": "call_1",
+                    "name": "Bash", "input": {"command": "pytest -q"}})
+    live._dispatch({"type": "subagent", "task_id": "t1", "tool_use_id": "call_1",
+                    "text": "Trabalhando no executor."})
+    assert seen[0]["name"] == "Bash"
+    assert seen[0]["task_id"] == "t1"
+    assert seen[1]["text"] == "Trabalhando no executor."
 
 
 def test_interrupt_does_not_clear_inflight_delivery(make_live):

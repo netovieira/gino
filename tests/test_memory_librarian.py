@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta
+from unittest import mock
 
 from core.chat_memory import ChatMemory
 from core.memory_librarian import MemoryLibrarian
@@ -13,8 +14,16 @@ from core.memory_librarian import MemoryLibrarian
 class MemoryLibrarianTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="memory-librarian-")
+        # Data fixa: com datetime.now() real, _fill() (now - 10 min) caía no
+        # dia anterior quando a suíte rodava entre 00:00 e 00:10, e não havia
+        # arquivo de hora do dia "de hoje" para indexar. O relógio do módulo
+        # de memória também é congelado (note/hot usam _now).
+        self.now = datetime(2026, 10, 31, 14, 3, 0)
+        patcher = mock.patch("core.chat_memory._now",
+                             side_effect=lambda: self.now)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.memory = ChatMemory(base_dir=self.tmp)
-        self.now = datetime.now().replace(microsecond=0)
 
     def tearDown(self):
         import shutil

@@ -8,9 +8,13 @@ window was never opened and the retry was refused again.
 
 The fix matches the consent BEFORE the barge-in classification, still
 voice-only: the window opens only when (a) a request is pending (mark_pending
-runs only on a bridge refusal, core/actiongate.py confirm()) and (b) the
-owner's short utterance matches rootgate's consent matcher. A model never
-reaches this path; an echo of Gino's own voice never reaches it either.
+runs only on a bridge refusal, core/actiongate.py confirm()), (b) the owner's
+short utterance matches rootgate's consent matcher and (c) the VOICEPRINT
+confirms the owner. (c) is the 01/11 security fix: at 13:17:39 a TV line
+("Você pode olhar.") matched (b) and opened 120 s of whatsapp_control, and
+Gino's own transcribed reply ("pode ser algo em 6 em 6 horas") matched too.
+A model never reaches this path; an echo of Gino's own voice never reaches it
+either.
 """
 from __future__ import annotations
 
@@ -21,6 +25,9 @@ from unittest import mock
 import main
 from core import actiongate, rootgate
 
+OWNER = "Anthero"
+OWNER_PCM = b"\x01\x00" * 8000
+
 
 class FakeUI:
     def __init__(self):
@@ -30,11 +37,54 @@ class FakeUI:
         self.logs.append(text)
 
 
-def _obj(speaking=False, own_echo=False):
+class FakeSpeaker:
+    """A voice index whose answer the test decides: owner, guest, or TV."""
+
+    def __init__(self, name=OWNER, known=True, authorized=True,
+                 score=0.82, verdict="known", records=None):
+        self.owner_name = OWNER
+        self._name = name
+        self._known = known
+        self._authorized = authorized
+        self._score = score
+        self._verdict = verdict
+        self._records = (records if records is not None else
+                         [{"name": OWNER, "owner": True, "authorized": True}])
+
+    def embedding(self, pcm):
+        return [1.0, 0.0]
+
+    def identify(self, embedding, include_auto=False, voiced_seconds=None):
+        return {
+            "name": self._name,
+            "score": self._score,
+            "sample_score": self._score,
+            "effective_score": self._score,
+            "known": self._known,
+            "authorized": self._authorized,
+            "verdict": self._verdict,
+        }
+
+    def list(self):
+        return list(self._records)
+
+
+def tv_speaker(score: float = 0.12) -> FakeSpeaker:
+    """A TV voice far below the gray floor: never the owner, even alone."""
+    return FakeSpeaker(name=None, known=False, authorized=False,
+                       score=score, verdict="unknown")
+
+
+def _obj(speaking=False, own_echo=False, speaker=None, name="Gino"):
     """A JarvisLive bare enough for the consent matcher — no loop, no mic."""
     obj = object.__new__(main.JarvisLive)
     obj._is_speaking = speaking
     obj._reply_active = speaking
+    obj._asst_name = name
+    obj._speaker = speaker if speaker is not None else FakeSpeaker()
+    obj._series_gate = None
+    obj._series_decision_for = lambda pcm: None
+    obj._last_user_speech = 0.0
     obj.ui = FakeUI()
     obj.said: list[str] = []
     obj._say_now = lambda text, log=True: obj.said.append(text)
@@ -79,7 +129,8 @@ class SpokenConsentWindowTests(unittest.TestCase):
         # narration. It must open the window, not be kept as a complement.
         self._refuse_once()
         obj = _obj(speaking=True)
-        self.assertTrue(main.JarvisLive._try_action_consent(obj, "Pode enviar"))
+        self.assertTrue(main.JarvisLive._try_action_consent(
+            obj, "Pode enviar", OWNER_PCM))
         self.assertTrue(actiongate.authorized())
         self.assertFalse(actiongate.has_pending())
         self.assertIn("Pode, autorizado.", obj.said)
@@ -87,11 +138,14 @@ class SpokenConsentWindowTests(unittest.TestCase):
         # call does not spend the window — only the 120 s deadline closes it.
         self.assertTrue(actiongate.confirm("Confirm 'whatsapp_control'", "again"))
         self.assertTrue(actiongate.authorized())
+        # FIX 1: the gate that consumed the owner's words restarts the clock.
+        self.assertGreater(obj._last_user_speech, 0.0)
 
     def test_bare_pode_answers_a_pending_request(self):
         self._refuse_once()
         obj = _obj(speaking=False)
-        self.assertTrue(main.JarvisLive._try_action_consent(obj, "pode"))
+        self.assertTrue(main.JarvisLive._try_action_consent(
+            obj, "pode", OWNER_PCM))
         self.assertTrue(actiongate.authorized())
 
     def test_window_lasts_the_deadline_not_a_single_use(self):
@@ -99,7 +153,8 @@ class SpokenConsentWindowTests(unittest.TestCase):
         with _patch_clock(clock):
             self._refuse_once()
             obj = _obj()
-            self.assertTrue(main.JarvisLive._try_action_consent(obj, "pode enviar"))
+            self.assertTrue(main.JarvisLive._try_action_consent(
+                obj, "pode enviar", OWNER_PCM))
             self.assertTrue(actiongate.confirm("Confirm 'whatsapp_control'", "first"))
             # Still open near the end of the window: a first call does not
             # spend the consent on the handler's behalf.
@@ -113,14 +168,16 @@ class SpokenConsentWindowTests(unittest.TestCase):
     def test_stray_consent_without_pending_opens_nothing(self):
         # No refusal happened: nothing on the table, nothing authorisable.
         obj = _obj()
-        self.assertFalse(main.JarvisLive._try_action_consent(obj, "pode"))
+        self.assertFalse(main.JarvisLive._try_action_consent(
+            obj, "pode", OWNER_PCM))
         self.assertFalse(actiongate.authorized())
 
     def test_echo_of_our_own_refusal_does_not_open_the_window(self):
         # Gino's playback leaking into the mic must not self-authorise.
         self._refuse_once()
         obj = _obj(speaking=True, own_echo=True)
-        self.assertFalse(main.JarvisLive._try_action_consent(obj, "pode enviar"))
+        self.assertFalse(main.JarvisLive._try_action_consent(
+            obj, "pode enviar", OWNER_PCM))
         self.assertFalse(actiongate.authorized())
         self.assertTrue(actiongate.has_pending())  # kept for the real answer
 
@@ -129,9 +186,61 @@ class SpokenConsentWindowTests(unittest.TestCase):
         obj = _obj()
         too_long = ("eu acho que voce pode me dizer depois que horas ficam "
                     "quando o sol se poe la no horizonte")
-        self.assertFalse(main.JarvisLive._try_action_consent(obj, too_long))
+        self.assertFalse(main.JarvisLive._try_action_consent(
+            obj, too_long, OWNER_PCM))
         self.assertFalse(actiongate.authorized())
         self.assertTrue(actiongate.has_pending())
+
+    # ── FIX 2: words alone never authorise; the voiceprint must be the owner ─
+    def test_tv_voice_saying_pode_opens_nothing(self):
+        # 13:17:39: "Você pode olhar." from the TV opened 120 s of
+        # whatsapp_control. Same words, unknown voice: no window.
+        self._refuse_once()
+        obj = _obj(speaker=tv_speaker())
+        self.assertTrue(main.JarvisLive._try_action_consent(
+            obj, "Você pode olhar.", OWNER_PCM))
+        self.assertFalse(actiongate.authorized())
+        self.assertTrue(actiongate.has_pending())
+        self.assertTrue(any("consentimento ignorado" in line
+                            for line in obj.ui.logs))
+        self.assertTrue(any("falante não confirmado como dono" in line
+                            for line in obj.ui.logs))
+        self.assertNotIn("Pode, autorizado.", obj.said)
+
+    def test_gray_band_owner_indulgence_still_opens_the_window(self):
+        # One enrolled voice (the owner) and a score inside the gray band:
+        # the same indulgence that answers his sentence as his authorises it.
+        self._refuse_once()
+        obj = _obj(speaker=FakeSpeaker(name=None, known=False,
+                                       authorized=False, score=0.45,
+                                       verdict="unknown"))
+        self.assertTrue(main.JarvisLive._try_action_consent(
+            obj, "pode enviar", OWNER_PCM))
+        self.assertTrue(actiongate.authorized())
+
+    def test_known_guest_voice_cannot_authorise(self):
+        # An authorised guest is not the owner for a risky action.
+        self._refuse_once()
+        records = [{"name": OWNER, "owner": True, "authorized": True},
+                   {"name": "Ana", "owner": False, "authorized": True}]
+        obj = _obj(speaker=FakeSpeaker(name="Ana", known=True,
+                                       authorized=True, score=0.9,
+                                       records=records))
+        self.assertTrue(main.JarvisLive._try_action_consent(
+            obj, "pode enviar", OWNER_PCM))
+        self.assertFalse(actiongate.authorized())
+        self.assertTrue(actiongate.has_pending())
+
+    def test_consent_without_audio_opens_nothing(self):
+        # The economy path can hand over text with no PCM: unconfirmed, so no
+        # window — but the text is still the owner's and the turn goes on.
+        self._refuse_once()
+        obj = _obj()
+        self.assertFalse(main.JarvisLive._try_action_consent(
+            obj, "pode enviar", None))
+        self.assertFalse(actiongate.authorized())
+        self.assertTrue(actiongate.has_pending())
+        self.assertTrue(any("sem áudio" in line for line in obj.ui.logs))
 
 
 class EconomyQoderTurnConsentTests(unittest.TestCase):
@@ -159,14 +268,14 @@ class EconomyQoderTurnConsentTests(unittest.TestCase):
         return obj
 
     def test_consent_words_entering_qoder_turn_open_the_window(self):
-        # The exact live scenario: the bridge refused, the words enter
-        # through the economy path (_qoder_turn(text), no pcm).
+        # The exact live scenario: the bridge refused, the owner's answer
+        # enters through the economy path with its PCM.
         self.assertFalse(actiongate.confirm(
             "Confirm 'whatsapp_control'",
             "Risk: medium. Arguments: action=send contato=Vida"))
         self.assertTrue(actiongate.has_pending())
         obj = self._obj()
-        main.JarvisLive._qoder_turn(obj, "Pode enviar")
+        main.JarvisLive._qoder_turn(obj, "Pode enviar", OWNER_PCM)
         self.assertTrue(actiongate.authorized())
         self.assertFalse(actiongate.has_pending())
         # The following bridge call passes — this is what failed 22 times.
@@ -174,13 +283,27 @@ class EconomyQoderTurnConsentTests(unittest.TestCase):
         self.assertTrue(actiongate.authorized())    # still inside the 120 s window
         self.assertIn("Pode, autorizado.", obj.said)
 
+    def test_consent_words_without_audio_do_not_open_the_window(self):
+        # FIX 2: the same entry with text only (no PCM to compare) is an
+        # unconfirmed speaker — no window. The words still reach the model,
+        # which by construction cannot open the window.
+        self.assertFalse(actiongate.confirm(
+            "Confirm 'whatsapp_control'", "Risk: medium. Arguments: action=send"))
+        obj = self._obj()
+        with self.assertRaises(Exception):   # reaches the model
+            main.JarvisLive._qoder_turn(obj, "Pode enviar")
+        self.assertFalse(actiongate.authorized())
+        self.assertTrue(actiongate.has_pending())
+        self.assertTrue(any("consentimento ignorado" in line
+                            for line in obj.ui.logs))
+
     def test_retry_replay_does_not_run_the_gates(self):
         # retry=True replays the SAME words to the model; re-gating them
         # would let the assistant's own retried prompt authorise itself.
         self.assertFalse(actiongate.confirm("Confirm 'whatsapp_control'", "x"))
         obj = self._obj()
         with self.assertRaises(Exception):
-            main.JarvisLive._qoder_turn(obj, "Pode enviar", retry=True)
+            main.JarvisLive._qoder_turn(obj, "Pode enviar", OWNER_PCM, retry=True)
         self.assertFalse(actiongate.authorized())
         self.assertTrue(actiongate.has_pending())   # still waiting for a voice
 
@@ -189,7 +312,7 @@ class EconomyQoderTurnConsentTests(unittest.TestCase):
         # refused request on the table, nothing authorises.
         obj = self._obj()
         with self.assertRaises(Exception):   # reaches the model, as it should
-            main.JarvisLive._qoder_turn(obj, "pode")
+            main.JarvisLive._qoder_turn(obj, "pode", OWNER_PCM)
         self.assertFalse(actiongate.authorized())
 
 

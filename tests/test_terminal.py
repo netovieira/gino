@@ -86,12 +86,37 @@ def test_ptyxis_cwd_option_comes_before_double_dash(popen, only, tmp_path):
     assert kwargs["cwd"] == str(tmp_path)
 
 
+def test_ptyxis_title_comes_before_double_dash(popen, only):
+    only("ptyxis")
+
+    action.terminal_run({"command": "tail -f log", "title": "JARVIS · tarefa"})
+
+    argv = popen[0][0]
+    assert argv[:4] == ["ptyxis", "--title", "JARVIS · tarefa", "--"]
+    assert argv[-3:] == ["bash", "-lc", "tail -f log; exec bash"]
+
+
 def test_command_is_a_single_argument(popen, only):
     only("ptyxis")
 
     action.terminal_run({"command": "echo 'a b' && ls"})
 
     assert popen[0][0][-1] == "echo 'a b' && ls; exec bash"
+
+
+def test_open_terminal_reports_the_pid_of_the_window(monkeypatch, only):
+    only("ptyxis")
+
+    class Proc:
+        pid = 4242
+
+    monkeypatch.setattr(action.subprocess, "Popen", lambda *a, **k: Proc())
+
+    result = action.open_terminal({"command": "tail -F log", "hold": False})
+
+    assert result == {"ok": True, "pid": 4242,
+                      "message": "Abri o terminal na tela e estou rodando: "
+                                 "tail -F log."}
 
 
 # ── fallback x-terminal-emulator ───────────────────────────────────────────

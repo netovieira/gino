@@ -3010,10 +3010,11 @@ class AgendaOverlay(QWidget):
         self.reload()
 
 
-class WhatsAppOverlay(QWidget):
+class WhatsAppOverlay(_HudOverlay):
     """CRUD das contas pareadas + chat direto do dono."""
 
     _OW = 780
+    closed = pyqtSignal()          # o diálogo saiu da tela (botão ou Esc)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3035,13 +3036,29 @@ class WhatsAppOverlay(QWidget):
             f"QPushButton:hover {{ background: {C.PRI_GHO}; border-color: {C.PRI}; }}")
         self._selected = ""
         self._accounts = []
+        self._pairing_account = ""    # conta cuja espera de QR esta tela iniciou
         self._qr_timer = QTimer(self)
         self._qr_timer.timeout.connect(self._poll_pairing)
+        # O Esc global da janela interrompe a fala; aqui ele fecha este painel.
+        # A janela desliga o atalho dela enquanto o overlay está à vista, senão
+        # os dois seriam ambíguos e nenhum dispararia.
+        self._esc = QShortcut(QKeySequence("Escape"), self)
+        self._esc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._esc.activated.connect(self._close)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 14, 20, 14)
         root.setSpacing(8)
-        root.addWidget(self._label("📱  WHATSAPP", 12, True))
+        header = QHBoxLayout()
+        header.addWidget(self._label("📱  WHATSAPP", 12, True))
+        header.addStretch(1)
+        close_btn = QPushButton("✕  FECHAR")
+        close_btn.setStyleSheet(self._btn_style)
+        close_btn.setToolTip("Fechar (Esc)")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(self._close)
+        header.addWidget(close_btn)
+        root.addLayout(header)
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet(f"color: {C.BORDER};")
         root.addWidget(sep)
@@ -3092,8 +3109,7 @@ class WhatsAppOverlay(QWidget):
                          ("EDITAR", self._edit_selected),
                          ("EXCLUIR", self._delete_selected),
                          ("PAREAR / CONECTAR", self._pair_selected),
-                         ("ATUALIZAR", self._reload),
-                         ("FECHAR", self.hide)):
+                         ("ATUALIZAR", self._reload)):
             b = QPushButton(text); b.setStyleSheet(self._btn_style)
             b.clicked.connect(fn); row.addWidget(b)
         lay.addLayout(row)
@@ -3264,6 +3280,9 @@ class WhatsAppOverlay(QWidget):
             "outra será promovida.")
         if answer != QMessageBox.StandardButton.Yes:
             return
+        if self._pairing_account == self._selected:
+            self._pairing_account = ""
+            self._qr_timer.stop()
         try:
             ok = self._wa().remove_account(self._selected)
         except Exception as exc:
@@ -3288,6 +3307,11 @@ class WhatsAppOverlay(QWidget):
             self._status.setText(f"Falha ao conectar: {exc}")
             return
         self._status.setText(str(msg))
+        try:
+            connected = bool(wa.status(self._selected).get("connected"))
+        except Exception:
+            connected = False
+        self._pairing_account = "" if connected else self._selected
         self._qr_timer.start(2000)
         self._poll_pairing()
 
@@ -3308,6 +3332,7 @@ class WhatsAppOverlay(QWidget):
                 + (f" · {st.get('number')}" if st.get("number") else ""))
             self._qr.hide()
             self._qr_timer.stop()
+            self._pairing_account = ""
             self._reload()
             return
         path = st.get("qr_path") or ""
@@ -3331,6 +3356,36 @@ class WhatsAppOverlay(QWidget):
             self._status.setText("Configuração geral do WhatsApp salva.")
         except Exception as exc:
             self._status.setText(f"Falha ao salvar: {exc}")
+
+    def _close(self):
+        """Fecha o painel e encerra a espera de QR que ele mesmo iniciou."""
+        acct = self._pairing_account
+        self._pairing_account = ""
+        self.hide()
+        if not acct:
+            return
+
+        def cancel():
+            # Só derruba a sessão se ela ainda não pareou; se conectou, fica.
+            try:
+                wa = self._wa()
+                if not wa.status(acct).get("connected"):
+                    wa.stop(acct)
+            except Exception:
+                pass
+
+        threading.Thread(target=cancel, daemon=True,
+                         name="jarvis-wa-pair-cancel").start()
+
+    def hideEvent(self, event):
+        # Qualquer caminho de fechamento (botão, Esc, pai escondido) para o
+        # poll do QR e avisa quem desligou o atalho global de Esc.
+        self._qr_timer.stop()
+        qr = getattr(self, "_qr", None)
+        if qr is not None:
+            qr.hide()
+        self.closed.emit()
+        super().hideEvent(event)
 
 
 class PersonaOverlay(QWidget):
@@ -4569,8 +4624,9 @@ class MainWindow(QMainWindow):
         sc_mute.activated.connect(self._toggle_mute)
         sc_full = QShortcut(QKeySequence("F11"), self)
         sc_full.activated.connect(self._toggle_fullscreen)
-        sc_intr = QShortcut(QKeySequence("Escape"), self)
-        sc_intr.activated.connect(self._do_interrupt)
+        # Guardado para ceder o Esc ao WhatsApp enquanto o painel está aberto.
+        self._esc_shortcut = QShortcut(QKeySequence("Escape"), self)
+        self._esc_shortcut.activated.connect(self._do_interrupt)
 
     def _show_camera_frame(self, img_bytes: bytes):
         """Slot — display camera preview overlay (main thread)."""
@@ -7459,8 +7515,16 @@ class MainWindow(QMainWindow):
         oh = min(720, cw.height() - 16)
         ov.setGeometry((cw.width() - ow) // 2,
                        (cw.height() - oh) // 2, ow, oh)
+        # Enquanto o painel está à vista, o Esc fecha o painel em vez de
+        # interromper a fala; os dois atalhos iguais seriam ambíguos e nenhum
+        # dispararia. Ao fechar, o atalho global volta.
+        esc = getattr(self, "_esc_shortcut", None)
+        if esc is not None:
+            esc.setEnabled(False)
+            ov.closed.connect(lambda: esc.setEnabled(True))
         ov.show()
         ov.raise_()
+        ov.setFocus(Qt.FocusReason.OtherFocusReason)
         self._whatsapp_overlay = ov
 
     def _open_personas(self):

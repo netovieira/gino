@@ -90,9 +90,16 @@ let abortTimer = null;
 let turnTools = 0;
 let turnHadTool = false;
 let finalCandidate = "";
+// Resposta espontânea a uma task_notification: não existe `ask` nosso, então
+// ela chega sem id de turno. Marcada aqui para sair como fala proativa no
+// Python em vez de morrer no filtro de turnos desconhecidos.
+let noticeOpen = false;
 let sharedActionUntil = 0;   // explicit owner window for a git push
 const SHARED_ACTION_WINDOW_MS = 10 * 60 * 1000;
 const taskDescriptions = new Map();
+// tool_use_id do Agent -> task_id do subagente: as mensagens internas do
+// executor chegam com parent_tool_use_id e só assim dá para dizer de quem são.
+const taskByToolUse = new Map();
 const MAX_TOOLS_PER_TURN = 10;
 const queue = [];
 let chatQuery = null;
@@ -1091,7 +1098,7 @@ function denyBudget(toolUseID) {
 }
 
 function orchestrationPrompt() {
-  return `[LIVE ORCHESTRATOR]\nVocê é ${ASSISTANT_NAME} na mesma conversa contínua desde o início do app. Nunca trate um turno como uma conversa nova: o histórico inteiro desta sessão é seu contexto. Fale curto e falável, em pt-BR, a menos que o dono mude de idioma. Nunca narre chamadas de ferramenta em voz alta, nunca leia JSON ou erro cru, e nunca invente um resultado. Use as ferramentas jarvis para ações rápidas (música, apps, arquivos, memória, status) e nunca finja que fez algo sem o resultado da ferramenta.\n[EXECUÇÃO] Toda execução — editar arquivos, testar, instalar, rodar comandos longos, investigar código, git — acontece em um subagente em segundo plano: chame Agent com run_in_background=true, subagent_type="executor". A conversa NUNCA espera a execução. Depois de delegar, diga em UMA frase curta o que está rodando e pare de falar; não faça o usuário esperar e não repita atualizações de andamento. O resultado chega sozinho nesta mesma sessão quando terminar; aí sim você comenta em uma ou duas frases. Nunca use Bash/Edit/Write no chat ao vivo para execuções: o gancho de permissão bloqueia, e tentar só atrasa a resposta.\n[STATUS] Atualizações automáticas de andamento não são suas e não viram fala do usuário. Não responda a elas; só o dono fala com você. Se uma tarefa terminar, comente o resultado na próxima vez que fizer sentido, sem transformar a conversa num relatório.\n[CONTEXTO INTERNO] Blocos [CONTEXTO INTERNO ...] são metadados do sistema (pausa, fonte da mensagem, canal). Nunca os leia em voz alta nem os trate como fala do dono; use-os para saber se é continuação, novo assunto ou WhatsApp.\n[RECALL] O índice com níveis e os últimos turnos vêm no prompt do sistema a cada início. Use o nível 0 (esta sessão) para o que acabou de ser dito; níveis 1-2 (hot/estado) para as últimas horas; memory_search/memory_read para horas, dias e tópicos antigos; e diga que não lembra quando o registro não existir, em vez de reconstruir. Um "deixa eu lembrar" antes de uma busca de memória é natural.\n[SKILLS] As skills ativas abaixo são a política do dono. Siga-as como regras, não como sugestões: elas explicam quando usar cada ferramenta, como pedir confirmação e o que nunca fazer.\n[FALANTES] Linhas podem começar com [FALANTE: nome]. Isso é metadado: nunca leia o rótulo em voz alta. Use para saber com quem está falando; se a voz for desconhecida, não finja conhecê-la.\n[CONFIRMAÇÕES] Ações irreversíveis (reiniciar, desligar, suspender, enviar mensagem, publicar) só acontecem depois de uma confirmação explícita do dono NA CONVERSA. Peça a frase exata, espere a resposta dele e só então chame a ferramenta. Você nunca confirma por ele nem chama uma ação de confirmação sozinho. Reinício e energia só são confirmados pela fala do dono, nunca pelo modelo: use a ferramenta, diga a frase exata e pare.\n[FALA] Toda resposta é falada por TTS ou enviada como áudio. Escreva para o ouvido: frases curtas, sem markdown, sem blocos de código, sem JSON, sem logs e sem caminhos longos. Nunca narre código linha a linha; diga o que ele faz e ofereça mostrar o trecho em texto/arquivo.\n[LÍNGUA] Toda frase em português do Brasil. Se escapar palavra em outro idioma, reescreva a frase em português antes de terminar.`;
+  return `[LIVE ORCHESTRATOR]\nVocê é ${ASSISTANT_NAME} na mesma conversa contínua desde o início do app. Nunca trate um turno como uma conversa nova: o histórico inteiro desta sessão é seu contexto. Fale curto e falável, em pt-BR, a menos que o dono mude de idioma. Nunca narre chamadas de ferramenta em voz alta, nunca leia JSON ou erro cru, e nunca invente um resultado. Use as ferramentas jarvis para ações rápidas (música, apps, arquivos, memória, status) e nunca finja que fez algo sem o resultado da ferramenta.\n[EXECUÇÃO] Toda execução — editar arquivos, testar, instalar, rodar comandos longos, investigar código, git — acontece em um subagente em segundo plano: chame Agent com run_in_background=true, subagent_type="executor". A conversa NUNCA espera a execução. Depois de delegar, diga em UMA frase curta o que está rodando e pare de falar; não faça o usuário esperar e não repita atualizações de andamento. O resultado chega sozinho nesta mesma sessão quando terminar; aí sim você comenta em uma ou duas frases. Nunca use Bash/Edit/Write no chat ao vivo para execuções: o gancho de permissão bloqueia, e tentar só atrasa a resposta.\n[STATUS] Atualizações automáticas de andamento não são falas do dono e não pedem resposta. Uma notificação de conclusão de tarefa em segundo plano é diferente: anuncie o resultado na hora, em voz alta e em uma frase; nunca espere a próxima pergunta nem faça um relatório.\n[CONTEXTO INTERNO] Blocos [CONTEXTO INTERNO ...] são metadados do sistema (pausa, fonte da mensagem, canal). Nunca os leia em voz alta nem os trate como fala do dono; use-os para saber se é continuação, novo assunto ou WhatsApp.\n[RECALL] O índice com níveis e os últimos turnos vêm no prompt do sistema a cada início. Use o nível 0 (esta sessão) para o que acabou de ser dito; níveis 1-2 (hot/estado) para as últimas horas; memory_search/memory_read para horas, dias e tópicos antigos; e diga que não lembra quando o registro não existir, em vez de reconstruir. Um "deixa eu lembrar" antes de uma busca de memória é natural.\n[SKILLS] As skills ativas abaixo são a política do dono. Siga-as como regras, não como sugestões: elas explicam quando usar cada ferramenta, como pedir confirmação e o que nunca fazer.\n[FALANTES] Linhas podem começar com [FALANTE: nome]. Isso é metadado: nunca leia o rótulo em voz alta. Use para saber com quem está falando; se a voz for desconhecida, não finja conhecê-la.\n[CONFIRMAÇÕES] Ações irreversíveis (reiniciar, desligar, suspender, enviar mensagem, publicar) só acontecem depois de uma confirmação explícita do dono NA CONVERSA. Peça a frase exata, espere a resposta dele e só então chame a ferramenta. Você nunca confirma por ele nem chama uma ação de confirmação sozinho. Reinício e energia só são confirmados pela fala do dono, nunca pelo modelo: use a ferramenta, diga a frase exata e pare.\n[FALA] Toda resposta é falada por TTS ou enviada como áudio. Escreva para o ouvido: frases curtas, sem markdown, sem blocos de código, sem JSON, sem logs e sem caminhos longos. Nunca narre código linha a linha; diga o que ele faz e ofereça mostrar o trecho em texto/arquivo.\n[LÍNGUA] Toda frase em português do Brasil. Se escapar palavra em outro idioma, reescreva a frase em português antes de terminar.`;
 }
 
 function loadSkills() {
@@ -1215,32 +1222,65 @@ function finishTurn(ok, textOrError, subtype = "") {
   currentId = null;
   busy = false;
   sawDelta = false;
-  if (!id) return;
+  if (!id) {
+    // Turno espontâneo da notificação de tarefa: o relatório já saiu como
+    // `text` em handleAssistant; aqui só se limpa o estado do turno.
+    noticeOpen = false;
+    finalCandidate = "";
+    turnHadTool = false;
+    pumpQueue();
+    return;
+  }
   if (ok) {
     const answer = String(textOrError || finalCandidate || "");
     out({ type: "done", id, text: answer, subtype });
   } else {
     out({ type: "error", id, error: String(textOrError || subtype || "erro") });
   }
+  finalCandidate = "";
+  turnHadTool = false;
   pumpQueue();
 }
 
 function handleAssistant(msg) {
-  if (msg?.parent_tool_use_id) return;   // subagent chatter never reaches TTS
+  if (msg?.parent_tool_use_id) {
+    // O que o executor faz é exatamente o que o dono quer ver no espelho.
+    // Continua fora do TTS: aqui só vai para o log/terminal visível.
+    handleSubagent(msg);
+    return;
+  }
   const content = msg?.message?.content || [];
   const hasTool = content.some((block) => block?.type === "tool_use");
+  const notice = currentId === null;
+  if (notice) {
+    // Sem ask em andamento: é a resposta a uma notificação de tarefa de fundo.
+    // Estado limpo para o relatório não herdar ferramenta/candidato do turno
+    // anterior do dono.
+    if (!noticeOpen) {
+      noticeOpen = true;
+      turnHadTool = false;
+      finalCandidate = "";
+    }
+  }
   if (hasTool) turnHadTool = true;
   for (const block of content) {
     if (block?.type === "tool_use") {
       out({ type: "tool", id: currentId, name: block.name || "", input: block.input || {} });
-    } else if (block?.type === "text" && !hasTool) {
+    } else if (block?.type === "text") {
       const text = String(block.text || "");
-      if (turnHadTool) {
-        // After a tool, this is likely the final answer composed across
-        // messages: keep the last one for the result, never speak plans.
-        finalCandidate = text;
-      } else {
-        out({ type: "text", id: currentId, text, delta: false });
+      if (notice) {
+        // Notificação de tarefa: todo texto é relatório para o dono, mesmo
+        // quando a mesma mensagem também chama uma ferramenta. Antes ele
+        // morria aqui e o dono não ouvia a conclusão.
+        if (text) out({ type: "text", id: null, text, delta: false });
+      } else if (!hasTool) {
+        if (turnHadTool) {
+          // After a tool, this is likely the final answer composed across
+          // messages: keep the last one for the result, never speak plans.
+          finalCandidate = text;
+        } else {
+          out({ type: "text", id: currentId, text, delta: false });
+        }
       }
     }
   }
@@ -1251,6 +1291,27 @@ function handleStreamEvent(_msg) {
   // ver o log" before every tool would say its plan to the user. Full
   // assistant messages are filtered by handleAssistant; tool-using turns speak
   // only the final result.
+}
+
+// Subagent chatter: never spoken, but streamed to Python so the visible mirror
+// can show each command/file the executor touches as it happens.
+function handleSubagent(msg) {
+  const parent = msg.parent_tool_use_id;
+  const taskId = taskByToolUse.get(parent) || "";
+  const content = msg?.message?.content || [];
+  for (const block of content) {
+    if (block?.type === "tool_use") {
+      out({ type: "subagent", id: currentId, task_id: taskId,
+            tool_use_id: parent, name: block.name || "",
+            input: block.input || {} });
+    } else if (block?.type === "text") {
+      const text = String(block.text || "").trim();
+      if (text) {
+        out({ type: "subagent", id: currentId, task_id: taskId,
+              tool_use_id: parent, kind: "text", text });
+      }
+    }
+  }
 }
 
 function handleResult(msg) {
@@ -1274,17 +1335,33 @@ async function chatLoop() {
         if (msg.session_id) out({ type: "session", id: msg.session_id });
       } else if (msg.type === "system" && msg.subtype === "task_started") {
         taskDescriptions.set(msg.task_id, msg.description || "");
+        if (msg.tool_use_id) taskByToolUse.set(msg.tool_use_id, msg.task_id);
         out({ type: "task", phase: "started", id: msg.task_id,
-              description: msg.description || "" });
+              task_id: msg.task_id, tool_use_id: msg.tool_use_id || "",
+              description: msg.description || "",
+              subagent_type: msg.subagent_type || "",
+              session_id: msg.session_id || "" });
         // A background subagent never holds the conversation. The main session
         // keeps running; the task notification arrives in this same session
         // when it finishes, so the context is never lost.
+      } else if (msg.type === "system" && msg.subtype === "task_progress") {
+        out({ type: "task", phase: "progress", id: msg.task_id,
+              task_id: msg.task_id, tool_use_id: msg.tool_use_id || "",
+              description: msg.description || "",
+              last_tool_name: msg.last_tool_name || "",
+              summary: msg.summary || "",
+              usage: msg.usage || null,
+              session_id: msg.session_id || "" });
       } else if (msg.type === "system" && msg.subtype === "task_notification") {
         const description = taskDescriptions.get(msg.task_id) || "";
         taskDescriptions.delete(msg.task_id);
+        if (msg.tool_use_id) taskByToolUse.delete(msg.tool_use_id);
         out({ type: "task", phase: "done", id: msg.task_id,
+              task_id: msg.task_id, tool_use_id: msg.tool_use_id || "",
               status: msg.status || "", description,
-              summary: msg.summary || "" });
+              summary: msg.summary || "", output_file: msg.output_file || "",
+              usage: msg.usage || null,
+              session_id: msg.session_id || "" });
       } else if (msg.type === "stream_event") {
         handleStreamEvent(msg);
       } else if (msg.type === "assistant") {
@@ -1311,6 +1388,7 @@ function pushAsk(item) {
   turnTools = 0;
   turnHadTool = false;
   finalCandidate = "";
+  noticeOpen = false;
   personaCallsThisAsk = 0;   // persona fan-out budget is per owner turn
   const text = String(item.text || "");
   // The owner's own words open a short window for the background agent to
