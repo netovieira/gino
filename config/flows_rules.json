@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "_comment": "Tabela declarativa do roteador. Editar aqui muda rota, prazo e confirmação sem tocar em código. 'overrides' vence todas as demais regras, na ordem em que aparecem.",
+  "defaults": {
+    "flow": "reasoning",
+    "action": "reason",
+    "deadline_ms": 8000
+  },
+  "overrides": [
+    {
+      "id": "dono-confirma-antes-de-mexer-na-maquina",
+      "note": "regra do dono: nada que reinicie/desligue a máquina ou apague dado sai sem a frase de confirmação",
+      "flow": "reasoning",
+      "action": "confirm",
+      "deadline_ms": 3000,
+      "requires_confirm": true,
+      "match": {
+        "any": ["reiniciar o computador", "reiniciar o pc", "desligar o computador",
+                "desligar o pc", "formatar", "apagar tudo", "restaurar o sistema"]
+      }
+    }
+  ],
+  "rules": [
+    {
+      "id": "hora",
+      "flow": "reasoning",
+      "action": "lookup_time",
+      "deadline_ms": 3000,
+      "priority": 60,
+      "match": {
+        "any": ["que horas", "hora agora", "horas sao"],
+        "regex": "\\bhoras?\\b"
+      }
+    },
+    {
+      "id": "musica",
+      "flow": "reasoning",
+      "action": "media_control",
+      "deadline_ms": 5000,
+      "priority": 50,
+      "match": {
+        "any": ["toca", "coloca uma musica", "poe uma musica", "spotify",
+                "proxima musica", "pausa a musica"]
+      }
+    },
+    {
+      "id": "abrir-aplicativo",
+      "flow": "reasoning",
+      "action": "open_app",
+      "deadline_ms": 4000,
+      "priority": 45,
+      "match": {
+        "regex": "\\b(abre|abrir|abri|abre o|abre a)\\b"
+      }
+    },
+    {
+      "id": "lembrete",
+      "flow": "reasoning",
+      "action": "reminder",
+      "deadline_ms": 4000,
+      "priority": 40,
+      "match": {
+        "any": ["me lembra", "lembrete", "lembra de"]
+      }
+    },
+    {
+      "id": "whatsapp",
+      "flow": "reasoning",
+      "action": "send_message",
+      "deadline_ms": 6000,
+      "priority": 40,
+      "match": {
+        "any": ["whatsapp", "manda um oi", "manda mensagem", "envia mensagem"]
+      }
+    },
+    {
+      "id": "email",
+      "flow": "reasoning",
+      "action": "email_control",
+      "deadline_ms": 6000,
+      "priority": 40,
+      "match": {
+        "any": ["e-mail", "email", "meu correio", "caixa de entrada"]
+      }
+    },
+    {
+      "id": "consulta",
+      "flow": "reasoning",
+      "action": "lookup",
+      "deadline_ms": 7000,
+      "priority": 20,
+      "match": {
+        "any": ["quanto", "qual", "quando", "previsao do tempo", "cotacao"]
+      }
+    },
+    {
+      "id": "conversa",
+      "flow": "reasoning",
+      "action": "reason",
+      "deadline_ms": 8000,
+      "priority": 0,
+      "match": {
+        "regex": ".*"
+      }
+    }
+  ]
+}

@@ -1,0 +1,242 @@
+"""Executor de ferramentas — sem modelo próprio (topologia do dono).
+
+Recebe do orquestrador ferramenta + argumentos PRONTOS, verifica se a
+ferramenta existe no catálogo, executa no processo dele e devolve um fato. Ele
+não conversa, não escolhe ferramenta e não confirma nada:
+
+* ``requires_owner_confirm`` nunca vira execução: devolve ``pending_confirm``
+  (lei b); a autoridade continua no gate de voz do app;
+* ferramenta fora do catálogo é recusada antes de qualquer efeito;
+* o runner é injetado (o app decide como executa). Sem runner, o executor é
+  um stub declarado e devolve erro — jamais finge sucesso.
+
+O fato só vira asserção (``assertion=True``) quando o runner devolve sucesso
+real, não simulado, sem confirmação pendente e sem cancelamento. É esse campo
+que o guard da boca consulta.
+"""
+from __future__ import annotations
+
+import concurrent.futures
+import time
+from dataclasses import dataclass, field
+from threading import Event
+from typing import Any, Callable
+
+Runner = Callable[[str, dict[str, Any]], Any]
+
+
+def readonly_runner(tool: str, args: dict[str, Any] | None = None) -> Any:
+    """Runner real de leitura: não muda estado, não pede rede, não mente.
+
+    Existe para o portão de ferramenta ter pelo menos uma ferramenta REAL
+    atrás dele (``hora`` e ``runtime_status``). Qualquer outra ferramenta é
+    recusada aqui — o portão e o catálogo já recusariam antes, mas o runner
+    também não finge. Ferramentas que mudam estado continuam no app/Qoder.
+    """
+    tool = str(tool or "")
+    if tool == "hora":
+        import datetime as _dt
+        now = _dt.datetime.now()
+        return {"ok": True, "spoken": f"são {now.strftime('%H:%M')}",
+                "detail": "relógio local"}
+    if tool == "runtime_status":
+        import os as _os
+        return {"ok": True,
+                "spoken": f"o assistente está de pé (pid {_os.getpid()})",
+                "detail": f"pid={_os.getpid()}"}
+    return {"ok": False, "spoken": "essa ferramenta não é de leitura",
+            "detail": f"readonly_runner recusou {tool}"}
+
+
+def default_catalog() -> set[str]:
+    """Catálogo de ferramentas conhecidas (sem importar módulos de ação)."""
+    names: set[str] = set()
+    try:
+        from core.tool_bridge import ACTION_TIERS  # import barato, sem Qt
+        names.update(str(k) for k in ACTION_TIERS)
+    except Exception:
+        pass
+    names.update({
+        "hora", "media_control", "open_app", "reminder", "restart_assistant",
+        "open_in", "memory_index", "tasks", "runtime_status", "system_monitor",
+        "web_search", "weather_report", "send_message", "email_control",
+        "whatsapp_control", "home_control", "computer_settings",
+    })
+    return names
+
+
+@dataclass
+class ExecutorResult:
+    task_id: str
+    ok: bool = False
+    cancelled: bool = False
+    pending_confirm: bool = False
+    facts: list[dict[str, Any]] = field(default_factory=list)
+    ms: float = 0.0
+    error: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id, "ok": self.ok,
+            "cancelled": self.cancelled,
+            "pending_confirm": self.pending_confirm,
+            "facts": self.facts, "ms": round(self.ms, 1),
+            "error": self.error,
+        }
+
+
+def pending_phrase(tool: str, args: dict[str, Any] | None = None) -> str:
+    args = args or {}
+    if tool == "restart_assistant":
+        return "confirmo reiniciar o assistente"
+    if tool in ("send_message", "whatsapp_control", "email_control",
+                "mail_control"):
+        target = str(args.get("to") or args.get("recipient")
+                     or args.get("contact") or "").strip()
+        return f"confirmo enviar mensagem para {target}".strip()
+    if tool.startswith("restart") or tool in ("power", "shutdown"):
+        return "confirmo reiniciar o computador"
+    return f"confirmo executar {tool}".strip()
+
+
+class Executor:
+    def __init__(self, runner: Runner | None = None,
+                 catalog: set[str] | None = None,
+                 timeout_ms: int = 4000,
+                 enabled: bool = True):
+        self.runner = runner
+        self.catalog = set(catalog) if catalog is not None else default_catalog()
+        self.timeout_ms = max(100, int(timeout_ms))
+        self.enabled = bool(enabled)
+
+    def knows(self, tool: str) -> bool:
+        return str(tool) in self.catalog
+
+    def run(self, task_id: str, tool: str, args: dict[str, Any] | None = None,
+            *, requires_confirm: bool = False,
+            cancel_event: Event | None = None) -> ExecutorResult:
+        started = time.monotonic()
+        args = dict(args or {})
+        result = ExecutorResult(task_id=str(task_id))
+
+        def finish() -> ExecutorResult:
+            result.ms = (time.monotonic() - started) * 1000.0
+            return result
+
+        if cancel_event is not None and cancel_event.is_set():
+            result.cancelled = True
+            result.facts = [{
+                "spoken": "nada foi executado; o pedido foi cancelado",
+                "ok": False, "assertion": False, "simulated": False,
+                "cancelled": True, "detail": "cancel_event",
+            }]
+            return finish()
+
+        if not self.knows(tool):
+            result.error = "ferramenta fora do catálogo"
+            result.facts = [{
+                "spoken": "a ferramenta não existe; nada foi executado",
+                "ok": False, "assertion": False, "simulated": False,
+                "detail": result.error,
+            }]
+            return finish()
+
+        if requires_confirm:
+            # Lei (b): não executa, só prepara e pede a frase falada.
+            result.ok = True
+            result.pending_confirm = True
+            result.facts = [{
+                "spoken": "só falta a sua confirmação falada",
+                "ok": True, "assertion": False, "simulated": False,
+                "pending_confirm": pending_phrase(tool, args),
+                "detail": "pending_confirm; nada foi executado",
+            }]
+            return finish()
+
+        if not self.enabled:
+            result.error = "executor desligado por config"
+            result.facts = [{
+                "spoken": "o executor está desligado; nada foi executado",
+                "ok": False, "assertion": False, "simulated": False,
+                "detail": result.error,
+            }]
+            return finish()
+
+        if self.runner is None:
+            result.error = "sem runner (stub declarado)"
+            result.facts = [{
+                "spoken": "não há executor ligado; nada foi executado",
+                "ok": False, "assertion": False, "simulated": False,
+                "detail": result.error,
+            }]
+            return finish()
+
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="flows-exec")
+        try:
+            future = pool.submit(self.runner, str(tool), args)
+            try:
+                payload = future.result(timeout=self.timeout_ms / 1000.0)
+            finally:
+                # wait=False: um runner travado não segura a resposta ao dono.
+                pool.shutdown(wait=False, cancel_futures=True)
+        except concurrent.futures.TimeoutError:
+            result.error = "timeout do executor"
+            result.facts = [{
+                "spoken": "a ferramenta demorou demais; não sei o resultado",
+                "ok": False, "assertion": False, "simulated": False,
+                "detail": result.error,
+            }]
+            return finish()
+        except Exception as exc:
+            result.error = f"{type(exc).__name__}: {exc}"
+            result.facts = [{
+                "spoken": "a ferramenta falhou; nada foi confirmado",
+                "ok": False, "assertion": False, "simulated": False,
+                "detail": result.error,
+            }]
+            return finish()
+
+        if cancel_event is not None and cancel_event.is_set():
+            result.cancelled = True
+            result.facts = [{
+                "spoken": "pedido cancelado; não sei se algo chegou a rodar",
+                "ok": False, "assertion": False, "simulated": False,
+                "cancelled": True, "detail": "cancel após a chamada",
+            }]
+            return finish()
+
+        if isinstance(payload, dict):
+            ok = bool(payload.get("ok", True))
+            simulated = bool(payload.get("simulated", False))
+            spoken = str(payload.get("spoken") or "").strip()
+            detail = str(payload.get("detail") or "")
+            fact = {
+                "spoken": spoken or ("ação concluída" if ok else "ação falhou"),
+                "ok": ok,
+                # Simulação nunca autoriza a boca a afirmar resultado.
+                "assertion": bool(ok and not simulated
+                                  and not payload.get("pending_confirm")),
+                "simulated": simulated,
+                "detail": detail,
+            }
+            result.ok = ok
+            result.facts = [fact]
+            return finish()
+        if isinstance(payload, (list, tuple)):
+            facts = [f for f in payload if isinstance(f, dict)]
+            for fact in facts:
+                fact["assertion"] = bool(
+                    fact.get("ok") and not fact.get("simulated")
+                    and not fact.get("pending_confirm"))
+            result.ok = all(bool(f.get("ok")) for f in facts)
+            result.facts = facts
+            return finish()
+
+        result.error = "runner devolveu formato inesperado"
+        result.facts = [{
+            "spoken": "a ferramenta respondeu num formato que não entendo",
+            "ok": False, "assertion": False, "simulated": False,
+            "detail": result.error,
+        }]
+        return finish()

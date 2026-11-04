@@ -149,6 +149,29 @@ class OwnerFloorTest(unittest.TestCase):
         self.assertTrue(main.JarvisLive._owner_has_floor(obj))
         self.assertTrue(main.JarvisLive._user_is_speaking(obj))
 
+    def test_room_energy_alone_does_not_hold_the_assistant(self):
+        # Chuva abre o segmento por energia; com o VAD carregado e sem voz
+        # humana no piso, a linha do assistente não fica muda por 30 s.
+        obj = self._obj(echo_user=True, vad_speech=True)
+        obj._last_user_speech = 0.0
+        obj._stt_has_open_segment = lambda: True
+        self.assertFalse(main.JarvisLive._user_is_speaking(obj))
+
+    def test_without_vad_the_open_segment_still_holds(self):
+        # Sem o modelo de voz, o segmento de energia é a única prova: manter
+        # a espera antiga é melhor do que falar por cima do dono.
+        obj = self._obj(echo_user=True, vad_speech=True)
+        obj._barge_vad = None
+        obj._last_user_speech = 0.0
+        obj._stt_has_open_segment = lambda: True
+        self.assertTrue(main.JarvisLive._user_is_speaking(obj))
+
+    def test_just_accepted_transcript_still_holds(self):
+        obj = self._obj(echo_user=True, vad_speech=True)
+        obj._last_user_speech = time.monotonic()
+        obj._stt_has_open_segment = lambda: True
+        self.assertTrue(main.JarvisLive._user_is_speaking(obj))
+
 
 class OwnerTakesFloorTest(unittest.TestCase):
     def test_owner_floor_stops_the_reply(self):

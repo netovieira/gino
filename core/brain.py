@@ -1371,10 +1371,15 @@ def _fish_out_of_credits(r) -> bool:
     return False
 
 
-def tts_fish_pcm24k(text: str, st: dict) -> bytes:
+def tts_fish_pcm24k(text: str, st: dict, style: str | None = None) -> bytes:
     """Synthesise `text` with Fish Audio (POST /v1/tts) in the configured voice
     and return mono int16 PCM at 24 kHz. The audio is requested as WAV and
     decoded with miniaudio, so the playback path is the same as Edge's.
+
+    ``style`` is an optional natural-language delivery tag the model accepts
+    in the text itself (``[calm]``, ``[excited]``, ``[soft tone]``). It is the
+    only way to ask S2.1 for a tone: the API has no emotion parameter. The tag
+    is prepended to the request text — never to a transcript or a log line.
 
     The official SDK sends the body as MessagePack; the API also takes JSON.
     JSON is used here so no extra package is needed."""
@@ -1383,8 +1388,14 @@ def tts_fish_pcm24k(text: str, st: dict) -> bytes:
     key = st.get("fish_api_key") or ""
     if not key:
         raise RuntimeError("Fish Audio API key missing (⚙ → PLUGIN SETTINGS → ECONOMY BRAIN)")
+    tag = str(style or "").strip()
+    payload_text = str(text or "").strip()
+    if tag:
+        # A tag já presente no texto não é duplicada: a peça já pode vir com
+        # a marca quando o chamador também a passou por engano.
+        payload_text = f"{tag} {strip_style_tags(payload_text)}".strip()
     body = {
-        "text": text,
+        "text": payload_text,
         "format": "wav",
         "sample_rate": 24000,
         "latency": "balanced",
@@ -1433,6 +1444,18 @@ def tts_fish_pcm24k(text: str, st: dict) -> bytes:
 
 _FISH_SPLIT = re.compile(r"(?<=[,;:])\s+")
 _FISH_GAP = b"\x00" * int(24000 * 0.22) * 2      # 220 ms of silence between pieces
+
+# Marcadores naturais de tom do Fish (`[calm]`, `[excited]`, `[soft tone]`).
+# O Edge não entende nada disso: ele lê cada caractere, então a tag TEM que
+# sair do texto antes de chegar lá. Aqui só se remove o que está no começo —
+# colchetes no meio de uma frase podem ser conteúdo legítimo.
+_STYLE_TAG = re.compile(r"^\s*(?:\[[^\[\]\n]{1,40}\]\s*)+")
+
+
+def strip_style_tags(text: str) -> str:
+    """Drop leading Fish style tags from ``text``. Edge voices read every
+    character, so a tag must never survive on that path."""
+    return _STYLE_TAG.sub("", str(text or ""), count=1).strip()
 
 
 def _fish_pieces(text: str) -> list[str]:
@@ -1486,26 +1509,42 @@ def refresh_fish_voice(st: dict, voice_id: str | None = None,
     return st
 
 
-def synth_pcm24k(text: str, st: dict, voice_id: str | None = None) -> bytes:
+def synth_pcm24k(text: str, st: dict, voice_id: str | None = None,
+                 style: str | None = None) -> bytes:
     """One sentence → 24 kHz PCM with whichever voice engine is configured.
 
     ``voice_id`` is a per-line Fish override (persona voice). It never mutates
     the caller's settings dict or the global config.
+
+    ``style`` is a Fish delivery tag (``[calm]``) for THIS line. It belongs to
+    the Fish path only — the text is split first and the tag goes at the start
+    of every piece, so each request keeps the tone instead of only the first.
+    Edge ignores it and the tag is stripped before synthesis: an Edge voice
+    would otherwise pronounce "calm" out loud.
     """
+    tag = str(style or "").strip()
     if st.get("tts_engine") == "fish":
         override = bool(voice_id)
         state = dict(st) if override else st
         refresh_fish_voice(state, voice_id=voice_id, override=override)
-        pieces = _fish_pieces(text)
+        clean = strip_style_tags(text) if tag else str(text or "")
+        if tag and not clean:
+            return b""
+        pieces = _fish_pieces(clean)
         if len(pieces) <= 1:
-            return tts_fish_pcm24k(text, state)
+            if tag:
+                return tts_fish_pcm24k(clean, state, style=tag)
+            return tts_fish_pcm24k(clean, state)
         out = bytearray()
         for i, piece in enumerate(pieces):
             if i:
                 out.extend(_FISH_GAP)
-            out.extend(tts_fish_pcm24k(piece, state))
+            if tag:
+                out.extend(tts_fish_pcm24k(piece, state, style=tag))
+            else:
+                out.extend(tts_fish_pcm24k(piece, state))
         return bytes(out)
-    return tts_pcm24k(text, st["tts_voice"])
+    return tts_pcm24k(strip_style_tags(text), st["tts_voice"])
 
 
 def fish_balance(key: str) -> float | None:

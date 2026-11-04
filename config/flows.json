@@ -1,0 +1,67 @@
+{
+  "enabled": true,
+  "router": {
+    "enabled": true,
+    "fallback": "remote",
+    "fallback_timeout_ms": 450
+  },
+  "mouth": {
+    "enabled": true,
+    "model": "qwen3:4b-instruct-2507-q4_K_M",
+    "url": "http://127.0.0.1:11434",
+    "timeout_s": 25.0,
+    "keep_alive": "10m",
+    "brief_max_tokens": 40,
+    "complement_max_tokens": 70,
+    "brief_routes": [
+      "musica",
+      "hora",
+      "app",
+      "lembrete",
+      "confirma",
+      "consulta",
+      "contexto",
+      "acao",
+      "livre"
+    ]
+  },
+  "partial": {
+    "prewarm": true,
+    "speech": true,
+    "stability_ms": 500,
+    "min_chars": 1,
+    "min_words": 1
+  },
+  "executor": {
+    "enabled": true,
+    "timeout_ms": 4000
+  },
+  "supervisor": {
+    "reasoning": {
+      "tokens": 40000,
+      "ttl_s": 0,
+      "soft_at": 0.8,
+      "ephemeral": false
+    },
+    "executor": {
+      "tokens": 16000,
+      "ttl_s": 600,
+      "soft_at": 0.8,
+      "ephemeral": true
+    },
+    "monitor": {
+      "tokens": 8000,
+      "ttl_s": 0,
+      "soft_at": 0.8,
+      "ephemeral": true
+    },
+    "media_monitor": {
+      "tokens": 8000,
+      "ttl_s": 300,
+      "soft_at": 0.8,
+      "ephemeral": true
+    }
+  },
+  "duplicate_window_s": 2.0,
+  "log_events": true
+}

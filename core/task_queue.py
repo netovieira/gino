@@ -54,6 +54,10 @@ OPEN_STATUSES = ("queued", "running")
 TERMINAL_STATUSES = ("done", "error", "cancelled")
 HISTORY_PER_STATUS = 500
 _VERSION = 1
+# A real owner task may run for hours (heavy Agent job, batch); past this age
+# the "running" claim is treated as a wedged leftover and the item goes back
+# to the queue instead of blocking every later tick forever.
+RUNNING_MAX_AGE_S = 6 * 3600.0
 
 
 # ── date helpers ────────────────────────────────────────────────────────────
@@ -121,6 +125,75 @@ def _iso(value) -> str | None:
 def _timestamp(value) -> float:
     dt = _parse_dt(value)
     return dt.timestamp() if dt is not None else 0.0
+
+
+# ── process identity (for wedge detection) ─────────────────────────────────
+
+def _boot_id() -> str:
+    """Identifier of this OS boot; empty when the platform does not expose one."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _pid_alive(pid: int) -> bool:
+    """True while ``pid`` names a live process (PermissionError counts as live).
+
+    ``os.kill(pid, 0)`` is a probe on POSIX only; on Windows it maps to
+    TerminateProcess, so there the boot id / age checks carry the decision.
+    """
+    if pid <= 0:
+        return False
+    if os.name != "posix":
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _payload_of(row: dict) -> dict:
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+        row["payload"] = payload
+    return payload
+
+
+def _requeue(row: dict, reason: str) -> None:
+    """Return a wedged ``running`` row to ``queued`` and record why."""
+    payload = _payload_of(row)
+    payload.pop("_runner", None)
+    payload["_recovered"] = {"reason": str(reason)[:80],
+                             "at": _iso(_now())}
+    row["status"] = "queued"
+    row["started"] = None
+    row["finished"] = None
+
+
+def _running_is_stale(row: dict, now: datetime) -> str:
+    """Why this ``running`` claim can no longer be trusted ("" when it can)."""
+    runner = _payload_of(row).get("_runner")
+    if isinstance(runner, dict):
+        claimed_boot = str(runner.get("boot_id") or "")
+        if claimed_boot and _boot_id() and claimed_boot != _boot_id():
+            return "boot antigo"
+        pid = _to_int(runner.get("pid"), 0)
+        if pid and not _pid_alive(pid):
+            return "pid morto"
+    started = _parse_dt(row.get("started")) or _parse_dt(row.get("created"))
+    if started is not None:
+        age = (now - started).total_seconds()
+        if age > RUNNING_MAX_AGE_S:
+            return f"idade {int(age)}s"
+    return ""
 
 
 # ── task helpers ────────────────────────────────────────────────────────────
@@ -286,17 +359,22 @@ def _read_locked() -> list[dict]:
     rows: list[dict] = []
     running_seen = False
     changed = False
+    now = _now()
     for raw in raw_rows:
         row = _normalise_task(raw)
         if row is None:
             changed = True
             continue
         if row["status"] == "running":
-            if running_seen:         # invariant repair: only one task runs
-                row["status"] = "queued"
-                row["started"] = None
+            stale = _running_is_stale(row, now)
+            if stale:                # wedge repair: dead pid / old boot / age
+                _requeue(row, stale)
                 changed = True
-            running_seen = True
+            elif running_seen:       # invariant repair: only one task runs
+                _requeue(row, "segundo running")
+                changed = True
+            else:
+                running_seen = True
         rows.append(row)
 
     pruned = _prune(rows)
@@ -309,6 +387,18 @@ def _read_locked() -> list[dict]:
 
 def load() -> list[dict]:
     """Read every stored task (repairing a malformed file to an empty queue)."""
+    with lock:
+        return _read_locked()
+
+
+def recover() -> list[dict]:
+    """Repair wedged open items before the first scheduler pass.
+
+    Called once at boot so a ``running`` item left by the previous process
+    (dead pid, old boot, or absurd age) goes back to ``queued`` even if no
+    tick would otherwise touch it. Same repair as ``load``; the name is the
+    contract the scheduler needs at startup.
+    """
     with lock:
         return _read_locked()
 
@@ -417,6 +507,9 @@ def start(id, now=None) -> dict | None:
         row["status"] = "running"
         row["started"] = _iso(now if now is not None else _now())
         row["finished"] = None
+        # Who claims the item: after a reboot the pid is gone (or reused), so
+        # the boot id is the proof that this ``running`` row has an owner.
+        _payload_of(row)["_runner"] = {"pid": os.getpid(), "boot_id": _boot_id()}
         _write_locked(tasks)
         return copy.deepcopy(row)
 
@@ -454,6 +547,92 @@ def cancel(id) -> dict | None:
         row["finished"] = _iso(_now())
         _write_locked(tasks)
         return copy.deepcopy(row)
+
+
+def cancel_open_by_origin(origin, *, session=None, max_age=None, now=None,
+                          reason="") -> list[dict]:
+    """Cancel open items whose ``payload.origin`` matches.
+
+    ``session`` restricts to one producer session (same boot/process);
+    ``max_age`` restricts to items whose payload ``asked_at`` (or ``created``)
+    is older than that many seconds. Terminal items are never touched. Used by
+    the carryover path to supersede older unanswered questions instead of
+    letting them pile up in the queue.
+    """
+    wanted = str(origin or "").strip()
+    if not wanted:
+        return []
+    current = _parse_dt(now) if now is not None else _now()
+    if current is None:
+        current = _now()
+    cutoff = None
+    if max_age is not None:
+        try:
+            cutoff = current.timestamp() - max(0.0, float(max_age))
+        except (TypeError, ValueError):
+            cutoff = None
+    cancelled: list[dict] = []
+    with lock:
+        tasks = _read_locked()
+        changed = False
+        for row in tasks:
+            if row.get("status") not in OPEN_STATUSES:
+                continue
+            payload = row.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("origin") or "") != wanted:
+                continue
+            if session is not None:
+                try:
+                    if abs(float(payload.get("session")) - float(session)) > 1e-3:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            if cutoff is not None:
+                stamp = _timestamp(payload.get("asked_at") or row.get("created"))
+                if stamp > cutoff:
+                    continue
+            row["status"] = "cancelled"
+            row["finished"] = _iso(_now())
+            if reason:
+                payload["_cancel_reason"] = str(reason)[:80]
+            changed = True
+            cancelled.append(copy.deepcopy(row))
+        if changed:
+            _write_locked(tasks)
+    return cancelled
+
+
+def purge_by_origin(origin, statuses=None) -> int:
+    """Delete stored rows with ``payload.origin`` (optionally by status).
+
+    Maintenance tool for junk produced by a broken producer: the rows are
+    removed from storage entirely, including terminal history when no
+    ``statuses`` filter is given. Real owner tasks have no origin payload and
+    are never affected.
+    """
+    wanted = str(origin or "").strip()
+    if not wanted:
+        return 0
+    allowed = None
+    if statuses is not None:
+        allowed = {str(s).strip().lower() for s in statuses}
+    removed = 0
+    with lock:
+        tasks = _read_locked()
+        kept: list[dict] = []
+        for row in tasks:
+            payload = row.get("payload")
+            match = (isinstance(payload, dict)
+                     and str(payload.get("origin") or "") == wanted)
+            if match and (allowed is None or row.get("status") in allowed):
+                removed += 1
+                continue
+            kept.append(row)
+        if removed:
+            _write_locked(kept)
+    return removed
 
 
 def tick(now=None) -> list[dict]:

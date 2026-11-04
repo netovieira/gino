@@ -181,6 +181,9 @@ def _jarvis(awake):
     obj.wake = lambda reason="": obj.events.append(("wake", reason))
     obj._say_now = lambda text, **kwargs: obj.events.append(("say", text))
     obj._index_event = lambda *args, **kwargs: None
+    # O texto extra no WhatsApp do dono é testado em test_completion_whatsapp;
+    # aqui só interessa o anúncio falado, e este stub evita thread/toque real.
+    obj._completion_notify_owner = lambda *args, **kwargs: False
     return obj
 
 
