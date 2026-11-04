@@ -1,0 +1,433 @@
+# CI/CD Integration
+
+## Watching CI from the CLI
+
+When waiting on PR CI from the command line (or an agent), use the native
+watchers — do not hand-roll a poll loop:
+
+```bash
+# Wait for all PR checks; exits non-zero if any required check fails.
+gh pr checks <pr> --repo <owner/repo> --watch --fail-fast
+
+# Watch a single workflow run by ID (when you have the run, not the PR).
+gh run watch <run-id> --repo <owner/repo> --exit-status
+```
+
+Gate on the **exit code**, not on parsed output. `gh pr checks` and
+`gh run watch` already handle pending-state representation, the appearance of
+newly-triggered runs, and refresh.
+
+### `$(gh api … || echo "")` captures the ERROR BODY as data
+
+On an HTTP error (404, 403 rate limit, 5xx) `gh api` prints the JSON error
+body to **stdout** and does not apply `--jq` to it — so the classic fallback
+capture poisons the variable instead of emptying it:
+
+```bash
+# Wrong: on a 404, $rel holds '{"message":"Not Found",…}' — non-empty,
+# and every [[ -n "$rel" ]] downstream believes it is real data
+rel=$(gh api "repos/$R/releases/latest" --jq .tag_name 2>/dev/null || echo "")
+
+# Right: output reaches the variable only when the call SUCCEEDED
+if out=$(gh api "repos/$R/releases/latest" 2>/dev/null); then
+  rel=$(jq -r '.tag_name // empty' <<<"$out")
+else
+  rel=""
+fi
+```
+
+Verified with gh 2.97 (2026-08-13): a fleet survey using the wrong form
+classified never-released repos from their own error bodies. The same trap
+applies to `glab api` — gate on the exit code, never on non-empty stdout.
+
+### `gh run watch` takes the RUN id — a check-run's `details_url` ends in the JOB id
+
+Reaching for `gh run watch` from a check-run means extracting an id from its
+`details_url`, which looks like `…/actions/runs/<RUN>/job/<JOB>`. Taking the
+trailing number hands over the **job** id, and that failure is silent in the
+worst way: the API answers `404`, `gh run watch` prints `failed to get run` and
+**still exits 0**. Under `--exit-status`, in a background waiter, that reads as
+"the run finished, and it passed" — the waiter never waited at all.
+
+```bash
+# Wrong: trailing number is the job id
+rid=$(gh api "repos/$R/check-runs/$ID" --jq '.details_url' | grep -oE '[0-9]+$')
+
+# Right: name the segment
+rid=$(gh api "repos/$R/check-runs/$ID" --jq '.details_url' \
+      | grep -oE 'runs/[0-9]+' | cut -d/ -f2)
+
+# Or take the run id straight from the commit's check-runs
+gh api "repos/$R/commits/$SHA/check-runs?per_page=100" --paginate \
+  --jq '.check_runs[] | select(.status != "completed")
+        | "\(.name)\trun=\(.details_url | capture("runs/(?<r>[0-9]+)").r)"'
+```
+
+Because the exit code cannot distinguish "watched and passed" from "never
+found the run", assert the run exists before watching it, or re-read the
+check's state afterwards rather than trusting the watcher's return.
+
+### `commits/<sha>/check-runs` returns one entry per run, not per check
+
+A second workflow run on the **same commit** — a closed-and-reopened pull
+request, a `workflow_dispatch`, an `on: schedule` firing — adds another set of
+check-runs beside the first. The old ones keep their old conclusion, so a
+counter over that endpoint reports failures that no longer exist:
+
+```
+All security checks:           success   22:13:53
+All security checks:           failure   22:10:01   <- previous run, same SHA
+fuzz / Preflight (event gate): success   22:11:32
+fuzz / Preflight (event gate): failure   22:09:34   <- previous run, same SHA
+```
+
+Measured on a pull request whose fuzz preflight was red until an upstream
+workflow was fixed, then closed and reopened. On that one commit:
+
+| Query | Failures reported |
+| --- | --- |
+| every check-run with `conclusion == "failure"` | 2 |
+| newest run per name only | 0 |
+| `gh pr checks` | 0 |
+
+Note which names duplicate: the two that had actually failed. Checks that were
+green in both runs duplicate too, but silently — so a spot check on a green
+name shows two identical entries and looks harmless.
+
+`gh run rerun` does **not** do this — it updates the existing check-run in
+place. Verified on two pull requests where a rerun turned a red check green:
+one entry each, conclusion `success`.
+
+So when the question is "is this pull request green now":
+
+```bash
+# Right: gh pr checks reports the latest attempt per check
+gh pr checks "$PR" --repo "$R" --json name,bucket
+
+# If you must use the API, keep only the newest run per name
+gh api "repos/$R/commits/$SHA/check-runs?per_page=100" --paginate \
+  --jq '[.check_runs[]] | group_by(.name)
+        | map(max_by(.started_at)) | map(select(.conclusion == "failure")) | length'
+```
+
+### Ask which step failed before reading any log
+
+The jobs API names it in one call, and the name is usually enough to reproduce
+the failure locally:
+
+```bash
+gh api repos/$R/actions/jobs/$JOB \
+  --jq '.steps[] | select(.conclusion=="failure") | .name'
+```
+
+Reaching for the log first costs rounds that return nothing, because the
+failing step's output is often not in what you get back (see the next section)
+and every keyword filter then matches the surrounding noise instead —
+provisioning, `tar` invocations, a `harden-runner` audit stream, and in one case
+a validator's own green `Errors: 0` summary. Four such calls produced no
+information about a failure whose step was called `Python lint`; the API call
+above answered on the first try.
+
+### A green pre-commit run is not a green CI lint step
+
+Two distinct reasons, and the second is the one that is easy to miss.
+
+**The run was not green.** `pre-commit` reports a reformatting hook as a
+failure, and the report is easy to discard: `pre-commit run --files … | grep -vE
+'Skipped|Passed' | tail -4` printed `- files were modified by this hook` and `2
+files reformatted`, which was read as success. Never filter or truncate
+`pre-commit` output — `files were modified by this hook` is a failed run, and
+the hook names are how you tell which.
+
+**The versions differ.** Even a genuinely green run proves only what the
+*pinned* version thinks. `.pre-commit-config.yaml` pins
+`astral-sh/ruff-pre-commit` by `rev`, while the CI step pins its own
+(`uvx ruff@0.16.0 check`). Measured on the same file: ruff 0.15.14, the
+pre-commit pin, reported `All checks passed!` while ruff 0.16.0, the CI pin,
+failed it on `SIM905`. The rule was newer than the hook. So keep the two pins in
+parity and let dependency updates move them together; when they disagree, the
+CI's version is the one that decides, and running the linter merely "by name" is
+not enough.
+
+### The step output of a failed job comes from the RUN's log archive
+
+`gh api repos/$R/actions/jobs/$JOB/logs` and `gh run view --job $JOB --log`
+routinely hand back only the runner's own preamble — image provisioning,
+hardening-agent chatter, `Cleaning up orphan processes` — with the failing
+step's output absent entirely. One of them can also return an empty body and
+exit 0. Filtering that noise then produces nothing and reads as "the log says
+nothing about why it failed", which sends you diagnosing the wrong layer.
+
+Download the **run's** archive instead. It contains one text file per job, with
+the real step output:
+
+```bash
+gh api "repos/$R/actions/runs/$RUN/logs" > /tmp/logs.zip
+unzip -q -o /tmp/logs.zip -d /tmp/logs
+grep -rn '##\[error\]' /tmp/logs | grep -viE 'armour|agentservice|pam_unix'
+```
+
+On 2026-08-12 this was the difference between three unexplained merge-queue
+ejections and one line — `[ERROR] Undefined constant …PHPUnitSetList::PHPUNIT_110`
+— that named the cause outright. The job-level calls had been tried first and
+showed nothing but setup.
+
+**While the run is still in progress, the archive does not exist yet** —
+`gh run view --log` answers `run … is still in progress; logs will be
+available when it is complete`, and so does the run-archive endpoint. A job
+that has already FAILED inside that running run is still readable through the
+job endpoint, with two traps: `gh api` refuses a body containing terminal
+escape sequences unless told otherwise, and the body arrives ANSI-colored:
+
+```bash
+gh api "repos/$R/actions/jobs/$JOB/logs" --allow-escape-sequences \
+  | sed 's/\x1b\[[0-9;]*m//g'
+```
+
+Without the flag the only output is
+`the response contains terminal escape sequences; pass --allow-escape-sequences
+to output it anyway` — one line, exit 0, easy to mistake for an empty log.
+Measured on 2026-08-18 (a matrix leg had failed while the rest of the run was
+still executing): the job-level body carried the full PHPUnit failure, so "job
+logs show only preamble" (above) is a per-job lottery, not a law — try the job
+endpoint first while the run lives, fall back to the run archive once it is
+complete.
+
+Note the archive is per *run*, so for a queue ejection you need the
+`gh-readonly-queue/*` run, not the pull request's own:
+
+```bash
+gh run list --repo "$R" --limit 20 --json headBranch,databaseId,conclusion \
+  --jq '.[] | select(.headBranch | startswith("gh-readonly-queue"))'
+```
+
+Hand-rolled `gh pr checks | jq` poll loops re-derive those semantics from
+undocumented field shapes (a running check's `conclusion` may be `""`, `null`,
+or absent) and are a recurring source of bugs. The sharpest one: a poll run
+**immediately after a push, reopen, or re-trigger** reads "0 pending" *before*
+the freshly-queued run has registered, so the loop reports a false "all green"
+and you act prematurely. A bare `[ "$pending" -eq 0 ] && break` snapshot is true
+both before runs start and after they finish — it cannot tell the two apart.
+
+If you must hand-roll (e.g. watching something with no native watcher), gate on
+a **named required check reaching a terminal `pass`/`fail` state**, never on a
+zero-pending count, and confirm the run belongs to the current head SHA first.
+
+`pr-status.sh --json` answers this in one field: **`checks_settled`** is true
+only when nothing is pending *and* every required context has reported at
+least once. Gate on that rather than re-deriving it — and note the `NEXT:` line
+does not carry it, because the review branches of the ladder outrank every CI
+branch. On a repo with the `copilot_code_review` ruleset, `NEXT:` says
+`request-review` from the second a commit lands and keeps saying it; the CI
+state now rides along in that answer's `why`, but a script should read the
+field.
+
+**`gh run list --jq` is not `jq`: it takes no `--arg`.** The filter is evaluated
+by `gh`'s embedded jq, which accepts the expression and nothing else, so
+`--jq --arg s "$SHA" '… select(.headSha==$s) …'` exits with
+`unknown command "s" for "gh run list"`. Inside a poll loop that failure is
+silent in the worst way: `pending=$(gh run list … )` captures the empty output,
+the `[ "$pending" = "0" ]` test is false forever, and the loop reports "still
+running" until its timeout — describing a condition it never actually
+evaluated. Filter with the flag instead of a jq variable:
+
+```bash
+gh run list --repo "$R" --commit "$SHA" --json name,status,conclusion \
+  --jq '.[] | "\(.status) \(if (.conclusion // "") == "" then "-" else .conclusion end) \(.name)"'
+```
+
+**`//` does not catch the empty string, and a running run's `conclusion` is `""`.**
+jq's alternative operator only replaces `null` and `false`, so `\(.conclusion // "-")`
+renders a running run as an empty field, and a loop that treats "conclusion is
+non-empty" — or `.conclusion // .status` — as "finished" reports a run that is
+still going as done. Test the emptiness explicitly, as above, or filter on
+`.status != "completed"`. This cost a false "all green" on three workflows that
+were still queued.
+
+`--commit` (`-c`) is the supported way to scope runs to one SHA, and it is what
+the merge-triggered runs on the base branch need after a merge — `--branch main`
+alone also matches the runs of every earlier merge.
+
+The general rule behind it: **a polling loop must distinguish "the query failed"
+from "the condition is not met yet"**, and it has to *act* on the difference.
+Counting instead of testing emptiness is not enough on its own — a failed query
+still yields the empty string, and `[ "$pending" = "0" ]` reads that as "not met"
+and keeps polling. Gate on the exit status, or refuse a value that is not a
+number:
+
+```bash
+if ! out=$(gh run list --repo "$R" --commit "$SHA" --json status 2>&1); then
+  echo "query failed: $out" >&2; exit 1
+fi
+pending=$(printf '%s' "$out" | jq '[.[] | select(.status != "completed")] | length')
+case $pending in ''|*[!0-9]*) echo "unusable count: ${pending@Q}" >&2; exit 1 ;; esac
+[ "$pending" -eq 0 ] && break
+```
+
+A loop that cannot fail loudly waits out its whole timeout and then reports on a
+condition it never evaluated.
+
+## Before you add or edit a workflow file: read the repo's Actions policy
+
+A workflow that violates the repository's Actions policy fails at **`Set up job`**
+— before a single step runs — so the log shows no step output and the failure
+looks unrelated to the change. One API call answers it:
+
+```bash
+gh api repos/$R/actions/permissions --jq '{allowed_actions, sha_pinning_required}'
+gh api orgs/${R%/*}/actions/permissions --jq '{allowed_actions, sha_pinning_required}'
+```
+
+Check the **org** as well: it can require pinning that the repo's own setting
+does not mention. With `sha_pinning_required: true`, every `uses:` needs a full
+commit SHA — a tag ref (`actions/checkout@v6`) is refused:
+
+```bash
+gh api repos/actions/checkout/git/ref/tags/v6 --jq '.object.sha'   # then: @<sha> # v6
+```
+
+The same policy is what the workflow-security linters enforce, so the cost of
+skipping this check is not one red check but several: adding a job with two
+unpinned `uses:` turned **six** checks red at once — `Set up job`, zizmor,
+Opengrep, CodeQL, SonarCloud and the aggregate security gate — all reporting the
+same two lines. Prefer dropping an action over pinning it where the runner
+already provides the tool (`setup-php` for a script that needs no extensions,
+`setup-node` for a plain `npx`).
+
+## A CI linter's finding is not refuted by a differently-scoped local run
+
+Running the same linter locally and getting the same *number* of findings is not
+evidence that they are the same findings. Two axes differ routinely:
+
+- **Scope.** A CI integration usually reports only what the pull request
+  *changed*; a local invocation lints the whole file or the whole tree.
+- **Policy source.** The CI action may load a config, a baseline, or an
+  organisation policy the local binary does not see — and vice versa.
+
+Observed: a local `zizmor` run flagged three unpinned `uses:` and the same three
+appeared on the base branch, which read as "pre-existing, not mine". CI's zizmor
+reports changed code only, and its three findings were the author's own two new
+lines plus a note on them. Same count, disjoint findings, and the wrong
+conclusion was stated publicly before the alerts were read.
+
+Compare **locations**, not counters:
+
+```bash
+gh api "repos/$R/code-scanning/alerts?tool_name=<tool>&pr=$PR&state=open" \
+  --jq '.[] | "\(.rule.id)\t\(.most_recent_instance.location.path):\(.most_recent_instance.location.start_line)"'
+```
+
+If the paths and lines are yours, the finding is yours — whatever the local run
+says.
+
+## A presence check is not a correctness check: assert the count, not the existence
+
+A pipeline gate written as "the thing is there" passes for every wrong number of
+the thing. One repository ended its publish job with
+
+```bash
+grep -q '<select name="repository"' public/index.html \
+  || { echo "dropdown injection failed" >&2; exit 1; }
+```
+
+which is satisfied by one copy and equally by the 190 that had silently
+accumulated, because the injecting script was not idempotent and each run
+appended another. The gate existed precisely to catch a broken injection and was
+structurally blind to the failure that happened. It shipped 496 KB index pages
+for months.
+
+Where a build injects, generates or de-duplicates something, the assertion is a
+count and an equality, across every artifact rather than the one that happens to
+be convenient:
+
+```bash
+seen=0
+while IFS= read -r -d '' f; do
+  seen=$((seen + 1))
+  n=$(grep -o '<select name="repository"' "$f" | wc -l)
+  [ "$n" -eq 1 ] || { echo "$f carries $n, expected exactly 1" >&2; exit 1; }
+done < <(find public -name index.html -print0)
+[ "$seen" -gt 0 ] || { echo "no index.html found — nothing was checked" >&2; exit 1; }
+```
+
+Three shapes in that loop, each of which has silently broken a gate:
+
+- **`-print0` with a NUL-delimited read**, not `for f in $(find …)`. The
+  unquoted substitution word-splits, so a path containing a space becomes two
+  paths and the gate checks neither.
+- **Process substitution, not a pipe.** `find … | while …` puts the loop in a
+  subshell, where `exit 1` ends the subshell and leaves the caller running — the
+  gate then reports its failure to nobody, unless `set -e` and `pipefail` happen
+  to be on in whatever copied it.
+- **Fail closed on an empty list.** Finding no artifacts is not a pass. A gate
+  that validated zero files is exactly as green as one that validated all of
+  them, which is how a renamed output directory goes unnoticed.
+
+Two habits follow:
+
+- **`grep -q` answers "at least one".** Count instead — but count *matches*:
+  `grep -c` counts matching **lines**, so generated or minified output that puts
+  several occurrences on one line reads as 1 and the gate passes on exactly the
+  artifact most likely to be wrong. `grep -o … | wc -l` is the one that answers
+  the question asked.
+- **Prove the guard fails.** Disable the fix, run the gate, watch it exit
+  non-zero with the message you expect, restore. A gate never seen red is a
+  claim; the run that reddens it is the evidence. The same session's idempotency
+  fix passed its own count check while still growing the file by one byte per
+  run — the count was right and the artifact was not, which only a
+  byte-comparison of two consecutive runs surfaced.
+
+## Git Mirror Repositories
+
+Use `git clone --mirror` + `git push --mirror` to keep a target repository in sync with an
+upstream source — for example, mirroring a public TYPO3 repository into a private GitLab
+instance or creating read-only forks for controlled distribution.
+
+```bash
+git clone --mirror "$SOURCE_URL" repo.git
+cd repo.git
+git push --mirror "$TARGET_URL"
+```
+
+### Default Branch Requirement
+
+`git push --mirror` pushes **all** refs from the source and **deletes** any ref at the target
+that no longer exists in the source. GitLab and GitHub will refuse to delete their repository's
+default branch, causing the push to fail with an error like:
+
+```
+remote: GitLab: You can only delete protected branches using the web interface.
+error: failed to push some refs to 'git@gitlab.example.com:org/repo.git'
+```
+
+**Root cause**: the target was initialised with a default branch (e.g. `main`) that does not
+exist in the upstream (e.g. source uses `12.4`). Every mirror run tries to delete `main` and
+GitLab refuses.
+
+**Fix — preferred**: create the target as an **empty project** (no README, no initial commit).
+The default branch is then set automatically when the first `git push --mirror` runs.
+
+**Fix — existing repo**: change the default branch in Settings before mirroring. On GitLab:
+*Settings → Repository → Default branch*. On GitHub: *Settings → Branches → Default branch*.
+
+### Notes-Ref Gotcha
+
+`git push --mirror` deletes any ref at the target that does not exist in the upstream. If you
+store cache data (e.g. split commit maps) in `refs/notes/*` on the mirror target, those refs
+will be wiped on every sync run because they are absent from the upstream.
+
+Do not rely on `refs/notes/*` for persistent caching in mirror repositories. Store such state
+in a separate repository, a file in object storage, or a CI/CD cache artifact.
+
+### Example CI Job (GitLab)
+
+```yaml
+mirror-sync:
+  image: alpine/git:2.43.0
+  script:
+    - git clone --mirror "$SOURCE_URL" repo.git
+    - cd repo.git
+    - git push --mirror "$TARGET_URL"
+  only:
+    - schedules
+```
