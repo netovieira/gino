@@ -23,6 +23,7 @@ import numpy as np
 
 import main
 from core import groq_stt
+from tests.audio_fixtures import voice_block
 
 
 class _FakeEcho:
@@ -73,7 +74,7 @@ class RepeatedPlaybackBatchesTest(unittest.TestCase):
             sample_rate=16000,
             transcribe_fn=lambda _pcm: "",
         )
-        self.block = np.full(1024, 9000, dtype=np.int16)
+        self.block = voice_block(9000)
 
     def tearDown(self):
         self.listener.stop()

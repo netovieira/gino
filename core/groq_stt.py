@@ -32,7 +32,7 @@ import queue
 import threading
 import time
 import wave
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import numpy as np
 import requests
@@ -84,9 +84,12 @@ _NON_OWNER_CAP_S = 8.0
 _SPEAK_CAP_BLOCKS = 40
 # Quiet, distant microphones: Whisper sees a whisper and gives up. Level is
 # raised after the utterance is cut, never before the VAD, so the segmenter
-# still tracks the real room floor.
-_TARGET_RMS = 0.055
-_MAX_GAIN = 10.0
+# still tracks the real room floor. The ceiling is deliberately MODEST: a room
+# noise at 0.005 RMS multiplied by 10x became "speech" for Whisper and reached
+# the voiceprint as a turn (owner, 04/11/2026). 3x lifts a distant voice into
+# transcribable range without turning a weak hum into a loud one.
+_TARGET_RMS = 0.04
+_MAX_GAIN = 3.0
 # Asleep, the 25 s cap is worthless: it only closes on 700 ms of silence, and a
 # room with music or a fan never gives that. The block grew to the full 25 s and
 # was then thrown away for being "too long for a wake call" — every single time.
@@ -98,6 +101,47 @@ _THRESH_MIN = 0.006      # the quietest threshold we accept (≈ -44 dBFS)
 _FLOOR_MULT = 2.2        # speech must be this many times the room floor
 _LEVEL_LOG_S = 5.0       # console line with the mic level, to tune the above
 _SLEEP_MAX_S = 4.0        # asleep, longer "utterances" are music/TV, not a call
+
+# ── Portão de transitório: tecla, clique e impacto não abrem turno ──────────
+# The microphone stays open all day, and energy alone is not voice: a key, a
+# mouse click or a table impact crossed the threshold for a few frames and
+# produced ghost turns. The measurement the owner already accepted as the
+# discriminator: a transient carries its energy OUTSIDE the voice band and has
+# a NARROW envelope. An analyzed window is "possible voice" only when ALL THREE
+# hold (fractions, so the level does not matter):
+#   * 300–3400 Hz holds at least 35% of the energy (a thump is all bass);
+#   * the envelope's active run is at least 25 ms wide (a click is 1–3 ms);
+#   * spectral entropy inside the voice band is at least 0.45 (a beep, a tone
+#     and a ringing impact concentrate in a few bins).
+_VOICE_BAND_LO_HZ = 300.0
+_VOICE_BAND_HI_HZ = 3400.0
+_VOICE_MIN_BAND_FRAC = 0.35
+_VOICE_MIN_ENVELOPE_S = 0.025
+_VOICE_MIN_ENTROPY = 0.45
+# The window is a few 64 ms blocks, NOT the utterance: the callback thread can
+# pay one small rFFT per voiced frame, never a multi-second transform. Three
+# blocks (192 ms) make all three measurements stable without adding latency —
+# a turn still opens after _START_BLOCKS voiced frames.
+_VOICE_WINDOW_BLOCKS = 3
+_VOICE_ANALYSIS_MAX_SAMPLES = 8192   # public voice_proof() cap: 512 ms
+# Envelope resolution: 8 ms sub-frames inside the analysis window.
+_ENVELOPE_SUBFRAME = 128
+_ENVELOPE_REL_FLOOR = 0.25           # "active" = sub-frame >= 25% of the peak
+# Safety valve against a false negative, which the owner fears far more than a
+# ghost: a transient is SHORT. Energy that stays above the threshold for
+# ~1.3 s without ever passing the voice proof is not a click — it is a strange
+# but sustained sound (a filtered mic, a rumble), and it opens the turn just
+# like before this gate. Counted separately, never silent.
+_VOICE_BYPASS_BLOCKS = 20
+# A clip is only emitted when its segment carried voice proof. This is the
+# second half of the same rule: no proof -> no transcription, no voiceprint.
+_EMIT_MIN_VOICE_BLOCKS = _START_BLOCKS
+# Stable reason codes for a refused clip. main.py logs these strings, so they
+# are a contract: "banda", "envelope" and "entropia" are the three failed
+# proofs; "silencio"/"curto" mean there was nothing to measure; "sem_prova"
+# means the segment reached the emit path without ever proving voice.
+VOICE_GATE_REASONS = ("banda", "envelope", "entropia", "silencio", "curto",
+                      "sem_prova")
 
 # Endpointing: a pause is not necessarily the end of a turn. Smart Turn v3.2
 # looks at the last 8 s and decides; if it says "incomplete", the next segment
@@ -156,6 +200,103 @@ def _speech_seconds(f: np.ndarray) -> float:
                  * _SPEECH_FRAME_SAMPLES) / 16000.0
 
 
+class VoiceProof(NamedTuple):
+    """The three numbers behind "this window can be a voice", and the verdict.
+
+    ``reason`` is ``""`` when ``ok`` is True, otherwise the first failed test
+    in the fixed order ``banda``, ``envelope``, ``entropia`` (plus the special
+    cases ``silencio`` and ``curto``). It is the string ``main.py`` receives in
+    the gate-drop callback, so it must stay stable and human-readable.
+    """
+
+    ok: bool
+    band_frac: float
+    envelope_s: float
+    entropy: float
+    reason: str
+
+
+# Cached Hann windows / band masks / bin frequencies per window length. The
+# gate runs on the audio callback: one small FFT per voiced frame, no
+# allocation of the transform tables after the first call.
+_VOICE_TABLES: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+
+
+def _voice_tables(n: int, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
+    key = (int(n), int(sample_rate))
+    tables = _VOICE_TABLES.get(key)
+    if tables is None:
+        window = np.hanning(n).astype(np.float32)
+        freqs = np.fft.rfftfreq(n, 1.0 / float(sample_rate))
+        band = (freqs >= _VOICE_BAND_LO_HZ) & (freqs <= _VOICE_BAND_HI_HZ)
+        tables = (window, band)
+        if len(_VOICE_TABLES) > 8:      # only a handful of sizes are in use
+            _VOICE_TABLES.clear()
+        _VOICE_TABLES[key] = tables
+    return tables
+
+
+def voice_proof(blocks, sample_rate: int = 16000) -> VoiceProof:
+    """Does this audio carry the three proofs of a possible voice?
+
+    ``blocks`` is one int16 array or an iterable of them (the listener hands it
+    the last few microphone frames). The measurement is amplitude-independent
+    — every test is a ratio — so a quiet, distant voice measures the same as a
+    loud one, and the level gate keeps being the segmenter's job.
+
+    Cheap by construction: the analysis window is capped at
+    `_VOICE_ANALYSIS_MAX_SAMPLES` (512 ms), the transform tables are cached and
+    the envelope is read from a cumsum-free reshape of 8 ms sub-frames.
+    """
+    if isinstance(blocks, np.ndarray):
+        pcm = blocks.ravel()
+    else:
+        parts = [np.asarray(b).ravel() for b in blocks]
+        pcm = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int16)
+    if pcm.size > _VOICE_ANALYSIS_MAX_SAMPLES:
+        pcm = pcm[-_VOICE_ANALYSIS_MAX_SAMPLES:]
+    if pcm.size < _ENVELOPE_SUBFRAME:
+        return VoiceProof(False, 0.0, 0.0, 0.0, "curto")
+    x = pcm.astype(np.float32) / 32768.0
+    x -= x.mean()
+    n = x.size
+    window, band = _voice_tables(n, sample_rate)
+    spec = np.fft.rfft(x * window)
+    power = spec.real * spec.real + spec.imag * spec.imag
+    total = float(power[1:].sum())
+    if total <= 1e-18:
+        return VoiceProof(False, 0.0, 0.0, 0.0, "silencio")
+    band_power = power[band]
+    band_sum = float(band_power.sum())
+    band_frac = band_sum / total
+    entropy = 0.0
+    if band_sum > 0.0 and band_power.size > 1:
+        q = band_power / band_sum
+        q = q[q > 0.0]
+        entropy = float(-(q * np.log2(q)).sum() / math.log2(band_power.size))
+    # Envelope: contiguous 8 ms sub-frames at >= 25% of the window's peak.
+    usable = (n // _ENVELOPE_SUBFRAME) * _ENVELOPE_SUBFRAME
+    envelope_s = 0.0
+    if usable >= _ENVELOPE_SUBFRAME:
+        frames = x[:usable].reshape(-1, _ENVELOPE_SUBFRAME)
+        levels = np.sqrt(np.mean(frames * frames, axis=1))
+        peak = float(levels.max())
+        if peak > 0.0:
+            best = run = 0
+            for active in levels >= peak * _ENVELOPE_REL_FLOOR:
+                run = run + 1 if active else 0
+                if run > best:
+                    best = run
+            envelope_s = best * _ENVELOPE_SUBFRAME / float(sample_rate)
+    if band_frac < _VOICE_MIN_BAND_FRAC:
+        return VoiceProof(False, band_frac, envelope_s, entropy, "banda")
+    if envelope_s < _VOICE_MIN_ENVELOPE_S:
+        return VoiceProof(False, band_frac, envelope_s, entropy, "envelope")
+    if entropy < _VOICE_MIN_ENTROPY:
+        return VoiceProof(False, band_frac, envelope_s, entropy, "entropia")
+    return VoiceProof(True, band_frac, envelope_s, entropy, "")
+
+
 class HeardClip(bytes):
     """int16 PCM carrying how it was pre-processed for transcription.
 
@@ -165,13 +306,17 @@ class HeardClip(bytes):
     by 7x is not the same evidence as a full-level voice saying it.
     ``speech_s`` is how long the original clip stayed above the frame level a
     nearby voice reaches — the length half of the same proof, so one loud
-    thump is not a call. Bytes subclasses compare and behave exactly like
-    ``bytes`` everywhere else.
+    thump is not a call. ``voice_proven`` is the transient-gate verdict for
+    the segment that produced this clip (`core.groq_stt.voice_proof`): False
+    means it only opened through the sustained-energy valve, so main.py can
+    log that at the voiceprint instead of taking the clip as a voice. Bytes
+    subclasses compare and behave exactly like ``bytes`` everywhere else.
     """
 
     boost_gain: float = 1.0
     pre_rms: float | None = None
     speech_s: float | None = None
+    voice_proven: bool = True
 
     def __new__(cls, pcm: bytes, *, boost_gain: float = 1.0,
                 pre_rms: float | None = None,
@@ -372,6 +517,7 @@ class GroqListener:
                  on_utterance: Callable[[str, bytes], None] | None = None,
                  precheck: Callable[[bytes], bool] | None = None,
                  on_lost: Callable[[str, str, float], None] | None = None,
+                 on_gate_drop: Callable[[str, float], None] | None = None,
                  preroll_s: float | None = None,
                  max_utterance_s: float | None = None) -> None:
         self._key, self._model, self._lang = api_key, model, language
@@ -404,6 +550,13 @@ class GroqListener:
         # "repete". Signature: (kind, reason, seconds), kind in
         # {"inicio", "audio"} — "inicio" means the retained head of a sentence.
         self._on_lost = on_lost
+        # Called when a captured clip is THROWN AWAY because it never passed
+        # the voice gate ("não é voz, é um transitório"). Signature
+        # (reason, seconds); reason is one of core.groq_stt.VOICE_GATE_REASONS.
+        # main.py uses it to log the discard instead of losing the trace, and
+        # the same data is available without a callback through
+        # `voice_gate_stats()`.
+        self._on_gate_drop = on_gate_drop
         self._on_status = on_status or (lambda m: None)
         self._sr = sample_rate
         self._q: queue.Queue = queue.Queue()
@@ -412,6 +565,27 @@ class GroqListener:
         self._above = 0
         self._below = 0
         self._voiced = 0
+        # ── voice gate state (see voice_proof above) ────────────────────────
+        # Rolling window of the last candidate blocks, the count of blocks
+        # that passed inside the current run/segment, whether the open segment
+        # ever proved voice, and the public counters main.py reads.
+        self._proof_buf: collections.deque[np.ndarray] = collections.deque(
+            maxlen=_VOICE_WINDOW_BLOCKS)
+        self._above_voice = 0
+        self._seg_voice = 0
+        self._voice_proven = False
+        self._bypass_open = False
+        self._last_proof: VoiceProof | None = None
+        self._last_gate_drop: dict | None = None
+        self._gate_stats: dict = {
+            "blocks": 0,           # candidate blocks measured by the gate
+            "voice": 0,            # ...that passed all three proofs
+            "rejected": 0,         # ...that did not
+            "by_reason": {reason: 0 for reason in VOICE_GATE_REASONS},
+            "turns_opened": 0,
+            "turns_opened_by_bypass": 0,   # sustained energy, no proof
+            "clips_dropped": 0,            # emitted clips refused by the gate
+        }
         # The pre-roll ring. It is written on EVERY block that reaches feed()
         # and discards the oldest frame by itself; the microphone callback
         # keeps feeding it while asleep (and during our own playback), so the
@@ -463,6 +637,9 @@ class GroqListener:
         # reopen, so the same audio can never reach the STT twice.
         self._held_pcm: bytes = b""
         self._held_voiced = 0
+        # Did the retained segment pass the voice gate? True unless it opened
+        # through the sustained-energy valve.
+        self._held_proven = True
 
     @property
     def local(self) -> bool:
@@ -552,6 +729,7 @@ class GroqListener:
             return False
         self._seg, self._active, self.speaking = [], False, False
         self._above = self._below = self._voiced = 0
+        self._reset_voice_state()
         # The ring holds audio from before this instant. After a mute it is
         # stale, and prepending it to the next sentence would paste words said
         # with the microphone closed onto the front of it.
@@ -580,6 +758,7 @@ class GroqListener:
         seg, voiced = list(self._seg), self._voiced
         self._seg, self._active, self.speaking = [], False, False
         self._above = self._below = self._voiced = 0
+        self._reset_voice_state()
         self._pre.clear()
         if not self.assistant_speaking:
             _duck.up()
@@ -595,6 +774,7 @@ class GroqListener:
                     "lost": True}
         self._held_pcm = pcm
         self._held_voiced = voiced
+        self._held_proven = bool(self._voice_proven)
         return {"held": True, "seconds": secs, "voiced": voiced, "lost": False}
 
     @property
@@ -637,7 +817,9 @@ class GroqListener:
     def _release_held(self) -> None:
         """Hand the retained head to the worker as pending, exactly once."""
         pcm, voiced = self._held_pcm, self._held_voiced
+        proven = self._held_proven
         self._held_pcm, self._held_voiced = b"", 0
+        self._held_proven = True
         if not pcm:
             return
         secs = len(pcm) / (2 * self._sr)
@@ -647,11 +829,13 @@ class GroqListener:
             self._lost("inicio", "curto demais para transcrever", secs)
             return
         payload = _boost_quiet(pcm)
-        self._q.put(_HeldChunk(
+        chunk = _HeldChunk(
             payload,
             boost_gain=getattr(payload, "boost_gain", 1.0),
             pre_rms=getattr(payload, "pre_rms", None),
-            speech_s=getattr(payload, "speech_s", None)))
+            speech_s=getattr(payload, "speech_s", None))
+        chunk.voice_proven = bool(proven)
+        self._q.put(chunk)
         print(f"[{self.label}] fala retida durante o mute devolvida ao STT "
               f"({secs:.1f}s) — o agregador decide se junta com a continuação")
 
@@ -686,6 +870,7 @@ class GroqListener:
             # turn, not to a mixed utterance with the assistant's own voice.
             self._seg, self._active, self.speaking = [], False, False
             self._above = self._below = self._voiced = 0
+            self._reset_voice_state()
             self._drop_segment = False
 
         if not self._active:
@@ -711,30 +896,30 @@ class GroqListener:
         if not self._active:
             if level > thresh:
                 self._above += 1
-                if self._above >= _START_BLOCKS:
-                    self._active = True
-                    self.speaking = True
-                    # The ring already holds the full pre-roll plus the blocks
-                    # the detector needed to fire: hand the whole thing to the
-                    # utterance, then start a fresh ring for the continuation.
-                    self._seg = list(self._pre)
-                    self._pre.clear()
-                    self._voiced = self._above
-                    self._below = 0
-                    # The room includes the speakers: while a sentence is open
-                    # the music drops, and comes back when it closes — without
-                    # this, Whisper transcribes the lyrics along with the user.
-                    # Asleep, every cough would pump the volume: don't.
-                    if not self.sleeping:
-                        _duck.down()
+                # Energy is not voice. Every candidate frame is measured by the
+                # transient gate; only frames that pass count towards opening
+                # the turn, so a key/click/impact cannot manufacture one.
+                if self._probe_voice(raw).ok:
+                    self._above_voice += 1
+                if (self._above_voice >= _START_BLOCKS
+                        or self._above >= _VOICE_BYPASS_BLOCKS):
+                    self._open_segment()
             else:
                 self._above = 0
+                self._above_voice = 0
+                # A real pause ends the proof window: a click after silence
+                # must not borrow the spectrum of the sentence before it.
+                self._proof_buf.clear()
             return
 
         self._seg.append(raw)
         if level > thresh:
             self._voiced += 1
             self._below = 0
+            if self._probe_voice(raw).ok:
+                self._seg_voice += 1
+                if self._seg_voice >= _EMIT_MIN_VOICE_BLOCKS:
+                    self._voice_proven = True
             # The duck opened with this utterance; a block with actual voice
             # in it is what says the owner is speaking RIGHT NOW (a float
             # assignment — never a dropout). Silence inside an open segment
@@ -744,6 +929,7 @@ class GroqListener:
             _duck.heartbeat()
         else:
             self._below += 1
+            self._proof_buf.clear()
         if self.assistant_speaking:
             cap = _SPEAK_CAP_BLOCKS
         else:
@@ -757,6 +943,104 @@ class GroqListener:
             voiced_cap = self._soft_cap_blocks()
             if self._voiced >= voiced_cap:
                 self._cut_segment(voiced_cap)
+
+    # ── voice gate ──────────────────────────────────────────────────────────
+
+    def _probe_voice(self, raw: bytes) -> VoiceProof:
+        """Measure the transient gate on the last few candidate blocks."""
+        self._proof_buf.append(np.frombuffer(raw, dtype=np.int16))
+        proof = voice_proof(self._proof_buf, self._sr)
+        self._last_proof = proof
+        stats = self._gate_stats
+        stats["blocks"] += 1
+        if proof.ok:
+            stats["voice"] += 1
+        else:
+            stats["rejected"] += 1
+            by_reason = stats["by_reason"]
+            by_reason[proof.reason] = by_reason.get(proof.reason, 0) + 1
+        return proof
+
+    def _reset_voice_state(self) -> None:
+        """Forget voice proof of a segment that is being dropped or closed."""
+        self._above_voice = 0
+        self._seg_voice = 0
+        self._voice_proven = False
+        self._bypass_open = False
+        self._proof_buf.clear()
+
+    def _open_segment(self) -> None:
+        """Open an utterance on the current block (proof already counted)."""
+        self._active = True
+        self.speaking = True
+        # The ring already holds the full pre-roll plus the blocks the detector
+        # needed to fire: hand the whole thing to the utterance, then start a
+        # fresh ring for the continuation.
+        self._seg = list(self._pre)
+        self._pre.clear()
+        self._voiced = self._above
+        self._seg_voice = self._above_voice
+        self._below = 0
+        self._voice_proven = self._above_voice >= _START_BLOCKS
+        self._bypass_open = not self._voice_proven
+        stats = self._gate_stats
+        stats["turns_opened"] += 1
+        if self._bypass_open:
+            # Safety valve: sustained energy that never passed the proof is
+            # not a transient (see _VOICE_BYPASS_BLOCKS). Never silent.
+            stats["turns_opened_by_bypass"] += 1
+            print(f"[{self.label}] energia sustentada por "
+                  f"{self._above * _BLOCK_SECONDS:.2f}s sem prova de voz — "
+                  f"abrindo o turno mesmo assim")
+        # The room includes the speakers: while a sentence is open the music
+        # drops, and comes back when it closes — without this, Whisper
+        # transcribes the lyrics along with the user. Asleep, every cough would
+        # pump the volume: don't.
+        if not self.sleeping:
+            _duck.down()
+
+    def voice_gate_stats(self) -> dict:
+        """Public snapshot of the transient gate, for main.py to log.
+
+        Returns counters plus the last measurement and the last refused clip::
+
+            {"blocks", "voice", "rejected", "by_reason": {...},
+             "turns_opened", "turns_opened_by_bypass", "clips_dropped",
+             "last_proof": {"ok", "reason", "band_frac", "envelope_s",
+                            "entropy"} | None,
+             "last_drop": {"reason", "seconds", "at"} | None}
+
+        Reasons are the strings in `VOICE_GATE_REASONS`; a delta of
+        ``clips_dropped`` between two calls is exactly the number of clips that
+        would otherwise have reached the voiceprint.
+        """
+        stats = {key: (dict(value) if isinstance(value, dict) else value)
+                 for key, value in self._gate_stats.items()}
+        proof = self._last_proof
+        stats["last_proof"] = None if proof is None else {
+            "ok": proof.ok,
+            "reason": proof.reason,
+            "band_frac": round(proof.band_frac, 3),
+            "envelope_s": round(proof.envelope_s, 3),
+            "entropy": round(proof.entropy, 3),
+        }
+        stats["last_drop"] = (None if self._last_gate_drop is None
+                              else dict(self._last_gate_drop))
+        return stats
+
+    def _note_gate_drop(self, reason: str, seconds: float) -> None:
+        """Record (and announce) a clip refused for having no voice proof."""
+        self._gate_stats["clips_dropped"] += 1
+        self._last_gate_drop = {"reason": str(reason),
+                                "seconds": float(seconds),
+                                "at": time.monotonic()}
+        print(f"[{self.label}] clipe descartado sem prova de voz "
+              f"({reason}, {seconds:.2f}s) — nada vai ao STT nem ao voiceprint")
+        if self._on_gate_drop is not None:
+            try:
+                self._on_gate_drop(str(reason), float(seconds))
+            except Exception as e:
+                print(f"[{self.label}] aviso de descarte falhou ({e!r})")
 
     def _soft_cap_blocks(self) -> int:
         """Voiced blocks this live segment may hold before a forced boundary.
@@ -794,16 +1078,22 @@ class GroqListener:
         emitted chunk, in the order it arrived.
         """
         seg, voiced = self._seg, self._voiced
+        proven, bypass = self._voice_proven, self._bypass_open
         self._seg, self._voiced = [], 0
+        # The utterance stays OPEN: its voice proof belongs to the whole
+        # utterance, not to this chunk. Only the per-chunk counter restarts.
+        self._seg_voice = 0
         print(f"[{self.label}] fala contínua de {len(seg) * _BLOCK_SECONDS:.1f}s — "
               f"cortando em trechos transcrevíveis (teto de "
               f"{cap_blocks * _BLOCK_SECONDS:.0f}s de voz)")
-        self._emit(seg, voiced, forced=True)
+        self._emit(seg, voiced, forced=True, proven=proven, bypass=bypass)
 
     def _close(self, capped: bool = False) -> None:
         seg, voiced = self._seg, self._voiced
+        proven, bypass = self._voice_proven, self._bypass_open
         self._seg, self._active, self.speaking = [], False, False
         self._above = self._below = self._voiced = 0
+        self._reset_voice_state()
         # The closed utterance is already going to the STT: its frames must not
         # become the pre-roll of the next sentence (that would duplicate words).
         self._pre.clear()
@@ -825,11 +1115,34 @@ class GroqListener:
             # the model answered the fragment as if it were complete.
             print(f"[{self.label}] utterance hit the {_MAX_BLOCKS}-block cap — "
                   f"transcribing the captured part only")
-        self._emit(seg, voiced)
+        self._emit(seg, voiced, proven=proven, bypass=bypass)
 
     def _emit(self, seg: list[bytes], voiced: int,
-              forced: bool = False) -> None:
-        """Send one finished chunk to the STT worker, or drop it as noise."""
+              forced: bool = False, proven: bool = False,
+              bypass: bool = False) -> None:
+        """Send one finished chunk to the STT worker, or drop it as noise.
+
+        ``proven`` says the segment this chunk came from carried voice proof
+        from the transient gate (`voice_proof`). Without it the clip is NOT
+        emitted: it would reach the transcription AND the voiceprint in main.py
+        (``analyze_utterance``) as if a voice had produced it. That was the
+        second defect — a click with enough energy to cross the VAD opened a
+        segment and its PCM still arrived at the speaker identification. The
+        discard is counted and announced (`voice_gate_stats`), never silent.
+
+        ``bypass`` is the sustained-energy valve: the clip IS emitted (throwing
+        away 1.3 s of possible speech would be a silent loss) but it travels
+        with ``voice_proven=False`` so main.py can log that at the voiceprint.
+        """
+        if voiced >= _MIN_SPEECH and not (proven or bypass):
+            pcm = b"".join(seg)
+            secs = len(pcm) / (2 * self._sr)
+            last = self._last_proof
+            reason = last.reason if (last is not None and not last.ok) else "sem_prova"
+            self._note_gate_drop(reason, secs)
+            if not self.assistant_speaking:
+                _duck.up()      # the segment opened an utterance (and ducked)
+            return
         if voiced >= _MIN_SPEECH:
             pcm = b"".join(seg)
             secs = len(pcm) / (2 * self._sr)
@@ -843,12 +1156,16 @@ class GroqListener:
                 if not self.sleeping:
                     self._on_status(f"Ouvi {secs:.1f}s — transcrevendo no {self.label}…")
                 payload = _boost_quiet(pcm)
+                # Per-clip proof, for main.py's voiceprint logging: a clip
+                # from the sustained-energy valve says so itself.
+                payload.voice_proven = bool(proven)
                 if forced:
                     payload = _ForcedChunk(
                         payload,
                         boost_gain=getattr(payload, "boost_gain", 1.0),
                         pre_rms=getattr(payload, "pre_rms", None),
                         speech_s=getattr(payload, "speech_s", None))
+                    payload.voice_proven = bool(proven)
                 self._q.put(payload)
         else:
             print(f"[Groq] dropped a {voiced}-block blip as noise")
@@ -983,6 +1300,11 @@ class GroqListener:
                                        getattr(pcm, "boost_gain", 1.0)),
                         pre_rms=_min_pre_rms(pending, pcm),
                         speech_s=_sum_speech_s(pending, pcm))
+                    # A merge keeps the WEAKEST proof: if either half came
+                    # from the sustained-energy valve, the clip says so.
+                    merged.voice_proven = bool(
+                        getattr(pending, "voice_proven", True)
+                        and getattr(pcm, "voice_proven", True))
                     if getattr(pending, "held_head", False):
                         # The retained head survives the merge, so a clip that
                         # still transcribes to nothing is announced as "perdi

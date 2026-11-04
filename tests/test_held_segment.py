@@ -26,6 +26,7 @@ import numpy as np
 
 import main
 from core import groq_stt
+from tests.audio_fixtures import voice_block
 
 _SR = 16000
 _FRAME = 1024          # CHUNK_SIZE de main.py: 64 ms a 16 kHz
@@ -33,8 +34,8 @@ _SILENCE = np.zeros(_FRAME, dtype=np.int16)
 
 
 def _tone(amplitude: int = 4800) -> np.ndarray:
-    t = np.arange(_FRAME)
-    return (np.sin(2 * np.pi * 440 * t / _SR) * amplitude).astype(np.int16)
+    """Fala sintética: passa no portão de voz (um senoide puro não passa)."""
+    return voice_block(amplitude)
 
 
 class _Harness(unittest.TestCase):

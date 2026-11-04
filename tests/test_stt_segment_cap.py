@@ -18,6 +18,7 @@ import unittest
 import numpy as np
 
 from core import groq_stt
+from tests.audio_fixtures import voice_block
 
 _SR = 16000
 _FRAME = 1024          # CHUNK_SIZE de main.py: 64 ms a 16 kHz
@@ -25,9 +26,8 @@ _SILENCE = np.zeros(_FRAME, dtype=np.int16)
 
 
 def _tone(amplitude: int = 4800) -> np.ndarray:
-    """Um quadro de senoide — a 'fala' sintética dos testes (bem acima do limiar)."""
-    t = np.arange(_FRAME)
-    return (np.sin(2 * np.pi * 440 * t / _SR) * amplitude).astype(np.int16)
+    """Um quadro de fala sintética — um senoide puro não abre mais turno."""
+    return voice_block(amplitude)
 
 
 class SegmentCapTest(unittest.TestCase):

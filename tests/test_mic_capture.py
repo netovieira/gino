@@ -7,6 +7,7 @@ import unittest
 import numpy as np
 
 from core import groq_stt
+from tests.audio_fixtures import voice_block
 
 
 class BoostQuietTest(unittest.TestCase):
@@ -60,7 +61,7 @@ class SpeakingCapTest(unittest.TestCase):
     def test_reply_cuts_self_audio_instead_of_38_seconds(self):
         listener = self._listener()
         listener.set_assistant_speaking(True)
-        block = np.full(1024, 9000, dtype=np.int16)
+        block = voice_block(9000)
         try:
             for _ in range(groq_stt._SPEAK_CAP_BLOCKS + 2):
                 listener.feed(block)
@@ -72,7 +73,7 @@ class SpeakingCapTest(unittest.TestCase):
 
     def test_reply_start_drops_a_half_open_segment(self):
         listener = self._listener()
-        block = np.full(1024, 9000, dtype=np.int16)
+        block = voice_block(9000)
         try:
             for _ in range(5):
                 listener.feed(block)

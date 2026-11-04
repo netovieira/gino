@@ -19,6 +19,7 @@ import numpy as np
 
 import main
 from core import duck, groq_stt
+from tests.audio_fixtures import voice_block
 
 
 def _others() -> list[tuple[str, str, int, str, str]]:
@@ -251,7 +252,7 @@ class UserSpeechEndTest(unittest.TestCase):
         segmento continua vivo (ainda < _END_BLOCKS de silêncio)."""
         listener = self._listener()
         try:
-            loud = np.full(1024, 8000, dtype=np.int16)
+            loud = voice_block(8000)
             silent = np.zeros(1024, dtype=np.int16)
             for _ in range(6):        # 3 abrem o segmento; 3 com voz ativa
                 listener.feed(loud)

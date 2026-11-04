@@ -13,6 +13,7 @@ import unittest
 import numpy as np
 
 from core import groq_stt
+from tests.audio_fixtures import voice_block
 
 _SR = 16000
 _FRAME = 1024          # CHUNK_SIZE de main.py: 64 ms a 16 kHz
@@ -20,9 +21,13 @@ _SILENCE = np.zeros(_FRAME, dtype=np.int16)
 
 
 def _tone(amplitude: int = 8000) -> np.ndarray:
-    """Um quadro de senoide — a 'fala' sintética dos testes."""
-    t = np.arange(_FRAME)
-    return (np.sin(2 * np.pi * 440 * t / _SR) * amplitude).astype(np.int16)
+    """Um quadro de FALA sintética — o portão de voz recusa um senoide puro.
+
+    Estes testes são do pré-roll/segmentação, não do detector de voz: o sinal
+    só precisa cruzar o limiar E passar no portão de transitório (banda,
+    envelope, entropia) como uma voz passaria.
+    """
+    return voice_block(amplitude)
 
 
 class PrerollTest(unittest.TestCase):

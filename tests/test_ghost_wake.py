@@ -317,7 +317,13 @@ class BoostMetadataTest(unittest.TestCase):
         loud = np.full(16000, 3000, dtype=np.int16).tobytes()  # rms ~0.09
         boosted = groq_stt._boost_quiet(quiet)
         full = groq_stt._boost_quiet(loud)
-        self.assertGreater(boosted.boost_gain, 4.0)
+        # O teto do boost foi cortado de 10x para 3x em 04/11/2026: um ruído
+        # de sala a 0.005 RMS multiplicado por 10 virava "fala" para o Whisper
+        # e chegava ao voiceprint como turno. O teste fixa o teto NOVO — não o
+        # valor antigo: a prova de que o clipe foi ampliado passa a ser "chegou
+        # ao máximo permitido", não "passou de 4x".
+        self.assertEqual(boosted.boost_gain, groq_stt._MAX_GAIN)
+        self.assertGreater(boosted.boost_gain, 1.5)
         self.assertLess(boosted.pre_rms, main.BARE_ADDRESS_MIN_RMS)
         self.assertEqual(full.boost_gain, 1.0)
         self.assertGreaterEqual(full.pre_rms, main.BARE_ADDRESS_MIN_RMS)
