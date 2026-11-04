@@ -41,8 +41,30 @@ def test_ttl_kills_executor_but_not_reasoning_or_monitors():
     assert not sup.chats["chat_ferramentas"].alive
 
 
-def test_ttl_kills_monitors_at_thirty_minutes():
-    clock, sup, _ = _supervisor()
+def test_code_default_monitors_never_die_without_touch():
+    """Sem flows.json, o default do código também é TTL 0."""
+    clock = Clock()
+    sup = Supervisor(clock=clock)
+    cfg = FlowsConfig()               # defaults do código, sem arquivo
+    assert cfg.monitor.ttl_s == 0.0
+    assert cfg.monitor.tokens == 8000
+    assert cfg.monitor.ephemeral is True
+    sup.register("chat_whatsapp", KIND_MONITOR, cfg.monitor, now=clock.now)
+    sup.register("chat_email", KIND_MONITOR, cfg.monitor, now=clock.now)
+    clock.advance(12 * 3600)
+    assert sup.expire(now=clock.now) == []
+    assert sup.chats["chat_whatsapp"].alive
+    assert sup.chats["chat_email"].alive
+
+
+def test_monitor_with_positive_ttl_is_still_killed():
+    """TTL positivo em chat efêmero continua matando por silêncio."""
+    clock = Clock()
+    sup = Supervisor(clock=clock)
+    sup.register("chat_whatsapp", KIND_MONITOR,
+                 Budget(8000, 1800.0, 0.8, True), now=clock.now)
+    sup.register("chat_email", KIND_MONITOR,
+                 Budget(8000, 1800.0, 0.8, True), now=clock.now)
     clock.advance(1801)
     killed = dict(sup.expire(now=clock.now))
     assert "chat_whatsapp" in killed
@@ -124,6 +146,7 @@ def test_each_process_has_its_own_budget_object():
     assert cfg.reasoning.ephemeral is False
     assert cfg.executor.tokens == 16000
     assert cfg.monitor.tokens == 8000
+    assert cfg.monitor.ttl_s == 0
     assert cfg.media_monitor.ttl_s == 300
     assert cfg.executor.ttl_s == 600
     assert Budget(1).ephemeral is True

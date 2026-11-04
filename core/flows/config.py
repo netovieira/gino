@@ -90,13 +90,13 @@ class FlowsConfig:
     executor_timeout_ms: int = 4000
 
     # 40k raciocínio (compacta em 80%), 16k executor, 8k monitores;
-    # 10 min executor, 30 min monitores, 5 min monitor de mídia.
+    # 10 min executor, monitores sem TTL, 5 min monitor de mídia.
     reasoning: Budget = field(
         default_factory=lambda: Budget(40000, 0.0, 0.8, False))
     executor: Budget = field(
         default_factory=lambda: Budget(16000, 600.0, 0.8, True))
     monitor: Budget = field(
-        default_factory=lambda: Budget(8000, 1800.0, 0.8, True))
+        default_factory=lambda: Budget(8000, 0.0, 0.8, True))
     media_monitor: Budget = field(
         default_factory=lambda: Budget(8000, 300.0, 0.8, True))
 
