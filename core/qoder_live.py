@@ -21,6 +21,8 @@ PROTOCOL (see ``qoder_live/index.mjs`` for the source of truth)
         {"type": "session", "id": "..."}            (resumable session id)
         {"type": "session", "id": "...", "persona": "<slug>"}
         {"type": "text", "id": "...", "text": "...", "delta": true|false}
+        {"type": "partial", "id": "...", "text": "<delta>", "delta": true}
+            (pré-aquecimento do orquestrador; nunca é falado por si só)
         {"type": "text", "id": null, "text": "...", "delta": false}
             (resposta espontânea a task_notification: sem turno do dono)
         {"type": "tool", "id": "...", "name": "...", "input": {...}}
@@ -99,6 +101,7 @@ class QoderLive:
         env: Optional[dict[str, str]] = None,
         node_cmd: str = "node",
         on_text: Optional[Callable[[Optional[str], str, bool], None]] = None,
+        on_partial: Optional[Callable[[Optional[str], str], None]] = None,
         on_tool: Optional[Callable[[Optional[str], str, dict[str, Any]], None]] = None,
         on_done: Optional[Callable[[Optional[str], str], None]] = None,
         on_error: Optional[Callable[[Optional[str], str], None]] = None,
@@ -123,6 +126,7 @@ class QoderLive:
         self.node_cmd = str(node_cmd)
 
         self.on_text = on_text
+        self.on_partial = on_partial
         self.on_tool = on_tool
         self.on_done = on_done
         self.on_error = on_error
@@ -528,6 +532,12 @@ class QoderLive:
                 message.get("id"),
                 str(message.get("text") or ""),
                 bool(message.get("delta")),
+            )
+        elif kind == "partial":
+            self._emit(
+                "on_partial",
+                message.get("id"),
+                str(message.get("text") or ""),
             )
         elif kind == "tool":
             tool_input = message.get("input")

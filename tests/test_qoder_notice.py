@@ -26,6 +26,9 @@ class _Fake:
         obj._qoder_say = lambda *a, **k: obj.said.append(("SAY", a, k))
         obj._say_now = lambda text, **k: obj.said.append((text, k))
         obj._index_event = lambda *a, **k: obj.notes.append((a, k))
+        # O canal de texto é coberto em test_completion_whatsapp; aqui não se
+        # toca no WhatsApp real (sem config/rede/thread).
+        obj._completion_notify_owner = lambda *a, **k: False
         self.obj = obj
 
 

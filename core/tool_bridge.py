@@ -99,12 +99,18 @@ ACTION_TIERS: dict[str, str] = {
     # ── medium: sending / uploads / purchases / remote devices ─────────────
     "send_message": TIER_MEDIUM,
     "email_control": TIER_MEDIUM,
+    "mail_control": TIER_MEDIUM,
     "whatsapp_control": TIER_MEDIUM,
     "trello_control": TIER_MEDIUM,
     "cakto_sales": TIER_MEDIUM,
     "android_control": TIER_MEDIUM,
     "iphone_control": TIER_MEDIUM,
     "mac_control": TIER_MEDIUM,
+    # Simple house actions (on/off, brightness, scene) are reversible and are
+    # whitelisted in actions/home_control.auto_authorized(), so the bridge does
+    # not ask for a spoken confirmation. The tier stays medium because it
+    # changes shared state in the owner's home.
+    "home_control": TIER_MEDIUM,
     "browser_control": TIER_MEDIUM,
     "computer_control": TIER_MEDIUM,
     "upload": TIER_MEDIUM,
@@ -135,6 +141,10 @@ _ESCALATING_ARGS: dict[str, frozenset[str]] = {
     "file_controller": frozenset({"delete", "remove", "trash", "erase", "format",
                                   "wipe", "destroy", "rm", "rmdir"}),
     "desktop_control": frozenset({"clean", "purge"}),
+    # Sending mail is irreversible. The tool itself refuses to send (it parks
+    # the message until the owner's VOICE releases it); this tier makes the
+    # bridge ask for its own confirmation on top, never instead.
+    "mail_control": frozenset({"send", "enviar", "manda", "mandar"}),
 }
 
 _ARG_SCAN_KEYS = ("action", "operation", "op", "command", "mode", "task")

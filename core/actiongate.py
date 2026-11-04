@@ -39,6 +39,16 @@ AUTONOMOUS WHATSAPP REPLIES
     same contact on the same account, for AUTO_REPLY_SECONDS. Any other
     action, contact or account still reaches the owner's voice window, and
     this grant never opens the sudo window.
+
+CONSENT SPOKEN BEFORE THE REQUEST IS PARKED
+    The owner answers "pode enviar" as soon as he hears the question, but the
+    bridge only parks the request when the model's tool call arrives — often
+    seconds later. On 02/11/2026 the words came at 16:04:16 and 16:12:11 and
+    the refusals at 16:04:33 and 16:12:27, so a window that required a pending
+    request at the exact moment of the utterance lost both. arm_send_window()
+    keeps that consent alive for CONSENT_TTL_SECONDS (15 min) and confirm()
+    honours it only for whatsapp_control. It is a bounded window, never a
+    standing grant, and it does not open the sudo window.
 """
 from __future__ import annotations
 
@@ -53,6 +63,13 @@ from core import rootgate
 # How long a spoken consent for a pending bridge request lasts once accepted.
 WINDOW_SECONDS = 120.0
 
+# How long a consent that arrived BEFORE the bridge parked its request stays
+# valid for the next WhatsApp send. The owner answers the question he hears
+# while the model is still composing the tool call; the call lands seconds
+# later. Fifteen minutes covers the composition and the retry, without being
+# a standing grant.
+CONSENT_TTL_SECONDS = 900.0
+
 # How long a refused request stays on the table, waiting for the user's answer.
 # Shorter than the window itself: the question "posso enviar?" should be
 # answered now or the intent is stale.
@@ -64,6 +81,7 @@ AUTO_REPLY_SECONDS = 600.0
 
 _lock = threading.Lock()
 _until = 0.0
+_send_until = 0.0
 _pending: dict | None = None
 # (account, chat) -> {"account": folded, "name": contact, "until": monotonic}
 _replies: dict[tuple[str, str], dict] = {}
@@ -154,21 +172,59 @@ def open_window(seconds: float = WINDOW_SECONDS) -> float:
     return max(5.0, float(seconds))
 
 
-def remaining() -> float:
+def arm_send_window(seconds: float = CONSENT_TTL_SECONDS) -> float:
+    """Remember a consent spoken BEFORE the bridge parked its request.
+
+    The live failure of 02/11/2026: the owner answered "Pode enviar" at
+    16:04:16 and 16:12:11, but the bridge only parked the whatsapp_control
+    request at 16:04:33 and 16:12:27 — after the words. ``confirm()`` then
+    found no pending request at the moment of the utterance and the consent
+    was lost. This armed window is checked when the call finally arrives and
+    authorises only a WhatsApp send, for a bounded time. It is not a standing
+    grant and it never opens the sudo window.
+    """
+    global _send_until
     with _lock:
-        return max(0.0, _until - time.monotonic())
+        _send_until = time.monotonic() + max(5.0, float(seconds))
+    _notify_grant()
+    return max(5.0, float(seconds))
 
 
-def authorized() -> bool:
-    """True while the user's spoken authorisation is still in force."""
+def _window_open() -> bool:
     with _lock:
         return time.monotonic() < _until
 
 
+def _send_window_open() -> bool:
+    with _lock:
+        return time.monotonic() < _send_until
+
+
+def remaining() -> float:
+    with _lock:
+        now = time.monotonic()
+        return max(0.0, _until - now, _send_until - now)
+
+
+def authorized() -> bool:
+    """True while the user's spoken authorisation is still in force.
+
+    Includes the 15-minute window armed by a "pode enviar" that arrived before
+    the bridge's request was parked (``arm_send_window``). The bridge uses
+    this probe to reopen a previously refused request; ``confirm`` scopes that
+    armed window to whatsapp_control, so an unrelated risky action still needs
+    the ordinary 120 s pending window.
+    """
+    with _lock:
+        now = time.monotonic()
+        return now < _until or now < _send_until
+
+
 def close() -> None:
-    global _until, _pending
+    global _until, _send_until, _pending
     with _lock:
         _until = 0.0
+        _send_until = 0.0
         _pending = None
         _replies.clear()
 
@@ -176,17 +232,21 @@ def close() -> None:
 def confirm(title: str, message: str) -> bool:
     """The bridge's confirmation channel — voice-only, bounded by time.
 
-    Returns True exactly while the owner's spoken consent window is open. The
+    Returns True while the owner's spoken consent window is open, or while the
+    armed send window is open and the call is a whatsapp_control action. The
     window is not spent here: the bridge asks before the action runs, and a
     handler that aborts to ask for a missing argument (whatsapp_control without
     a contact answers "para quem?") would otherwise burn the consent on a
-    question. The 120 s deadline is the lock. Outside it the request is parked
-    as pending (so the next short "pode" is understood as the answer) and this
+    question. The deadline is the lock. Outside it the request is parked as
+    pending (so the next short "pode" is understood as the answer) and this
     returns False, which the bridge turns into "was not confirmed". A model can
     never reach True here by itself: only the utterance matcher can open the
     window.
     """
-    if authorized():
+    if _window_open():
+        clear_pending()
+        return True
+    if _send_window_open() and "whatsapp_control" in str(title or "").lower():
         clear_pending()
         return True
     mark_pending(title, message)
@@ -198,6 +258,42 @@ def confirm(title: str, message: str) -> bool:
 def _fold(value: object) -> str:
     text = unicodedata.normalize("NFKD", str(value or ""))
     return "".join(c for c in text if not unicodedata.combining(c)).strip().lower()
+
+
+# A short consent said WITHOUT a pending request must not match an ordinary
+# sentence that happens to contain "pode". Only a send-shaped phrase ("pode
+# enviar", "pode mandar") or a bare consent word qualifies.
+_SEND_CONSENT_RE = re.compile(
+    r"\b(?:pode|podes)\s+(?:enviar|mandar|envia|manda)\b")
+_BARE_CONSENT = frozenset({"pode", "podes", "autorizo", "autorizado",
+                           "manda", "envia", "vai"})
+_CONSENT_FILLERS = frozenset({"gino", "jarvis", "eu", "falei", "disse", "ja",
+                              "entao", "sim", "ok", "okay", "claro", "beleza",
+                              "por", "favor", "agora", "isso", "mesmo", "ai",
+                              "para", "pra", "de", "o", "a", "meu", "minha"})
+_MAX_SHORT_CONSENT_WORDS = 8
+
+
+def looks_like_short_consent(text: str) -> bool:
+    """True when the utterance itself is a short "pode" / "pode enviar".
+
+    This is the matcher for a consent spoken before the bridge has parked a
+    request (the owner answers the question he heard; the tool call arrives
+    later). It is deliberately stricter than ``looks_like_consent``: a normal
+    sentence such as "você pode me dizer as horas" must never arm a send
+    window. Punctuation is flattened so "Pode enviar, por favor." still
+    matches.
+    """
+    folded = _fold(text)
+    for mark in (",", ".", "!", "?", ";"):
+        folded = folded.replace(mark, " ")
+    words = folded.split()
+    if not words or len(words) > _MAX_SHORT_CONSENT_WORDS:
+        return False
+    if _SEND_CONSENT_RE.search(folded):
+        return True
+    return (any(w in _BARE_CONSENT for w in words)
+            and all(w in _BARE_CONSENT or w in _CONSENT_FILLERS for w in words))
 
 
 def _digits(value: object) -> str:

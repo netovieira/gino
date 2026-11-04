@@ -78,6 +78,29 @@ class QoderPreemptAbortTest(unittest.TestCase):
         self.assertEqual(len(obj.retried), 1)
         self.assertFalse(any("pode repetir" in text.lower() for text in _spoken(obj)))
 
+    def test_old_turn_failure_is_silent_when_a_newer_turn_is_live(self):
+        # 02/11 13:16: the owner spoke, the sidecar aborted the old turn and
+        # the app relaunched it over the new question ("turno falhou —
+        # relançando a mesma fala"), adding 20–49 s of stale work.
+        fake = _Fake()
+        obj = fake.obj
+        obj._qoder_current_id = "t2"
+
+        main.JarvisLive._qoder_on_error(obj, "t1", "Operation aborted")
+
+        self.assertEqual(obj.retried, [])
+        self.assertEqual(_spoken(obj), [])
+        self.assertEqual(obj.finished, [("t1", False)])
+
+    def test_current_turn_failure_still_retries(self):
+        fake = _Fake()
+        obj = fake.obj
+        obj._qoder_current_id = "t1"
+
+        main.JarvisLive._qoder_on_error(obj, "t1", "provider falhou: 500")
+
+        self.assertEqual(len(obj.retried), 1)
+
     def test_second_failure_is_held_instead_of_asking_to_repeat(self):
         fake = _Fake()
         obj = fake.obj

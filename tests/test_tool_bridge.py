@@ -623,6 +623,27 @@ class VoiceConfirmTests(unittest.TestCase):
         self.assertEqual(response.status_code, 403, response.text)
         self.assertFalse(actiongate.authorized())
 
+    def test_consent_spoken_before_the_bridge_parks_the_send_is_not_lost(self):
+        # 02/11/2026: the owner said "Pode enviar" at 16:04:16 and 16:12:11,
+        # but the whatsapp_control call only parked the request at 16:04:33
+        # and 16:12:27 — after the words. The armed send window must let the
+        # call that lands later through, scoped to WhatsApp.
+        actiongate.arm_send_window()
+        self.assertFalse(actiongate.has_pending())
+        response = self.client.post(
+            "/call", headers=AUTH,
+            json={"name": "whatsapp_control",
+                  "args": {"action": "send", "to": "Vida", "text": "oi"}},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.dispatch.calls[0][0], "whatsapp_control")
+
+    def test_armed_send_window_does_not_authorise_another_tool(self):
+        actiongate.arm_send_window()
+        response = self._send()   # send_message, not whatsapp_control
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertEqual(self.dispatch.calls, [])
+
     def test_root_window_does_not_authorise_common_actions(self):
         rootgate.open_window()
         response = self._send()
