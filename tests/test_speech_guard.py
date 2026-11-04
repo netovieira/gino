@@ -271,24 +271,31 @@ class SayPipelineTest(unittest.TestCase):
     def test_persona_voice_phone_and_path_never_reach_the_tts(self):
         """A fala da persona usa a mesma esteira guardada de `_say_blocking`."""
         obj = self._obj()
-        seen = []
-        with mock.patch("core.brain.settings", return_value={}), \
-                mock.patch("core.numwords.speakable",
-                           side_effect=lambda text, style="words": text), \
-                mock.patch("core.brain.synth_pcm24k",
-                           side_effect=lambda text, st, **_kw:
-                               seen.append(text) or b"\x00" * 2400):
-            obj._say_blocking(
-                "já estou mandando a mensagem pra +5517997111056",
-                label="Arnaldo", voice_id="v-arnaldo",
-                chan="persona", origin="persona")
-            obj._say_blocking(
-                "Vou ler /projects/therotv", label="Arnaldo",
-                voice_id="v-arnaldo", chan="persona", origin="persona")
-        self.assertEqual(len(seen), 2)
-        self.assertFalse(any(ch.isdigit() for ch in seen[0]), seen[0])
-        self.assertIn("destinatário", seen[0])
-        self.assertNotIn("/projects", seen[1])
+
+        def _speak(text):
+            units = []
+            with mock.patch("core.brain.settings", return_value={}), \
+                    mock.patch("core.numwords.speakable",
+                               side_effect=lambda text, style="words": text), \
+                    mock.patch("core.brain.synth_pcm24k",
+                               side_effect=lambda text, st, **_kw:
+                                   units.append(text) or b"\x00" * 2400):
+                obj._say_blocking(
+                    text, label="Arnaldo", voice_id="v-arnaldo",
+                    chan="persona", origin="persona")
+            return units
+
+        phone_units = _speak("já estou mandando a mensagem pra +5517997111056")
+        path_units = _speak("Vou ler /projects/therotv")
+        # A boca abre por unidade curta: todas as unidades que chegam ao TTS
+        # precisam estar guardadas, não só a primeira.
+        self.assertTrue(phone_units)
+        self.assertTrue(path_units)
+        self.assertFalse(
+            any(ch.isdigit() for unit in phone_units for ch in unit),
+            phone_units)
+        self.assertIn("destinatário", " ".join(phone_units))
+        self.assertFalse(any("/projects" in unit for unit in path_units))
         persona_phone = activity.parse(obj.ui.logs[-2])
         persona_path = activity.parse(obj.ui.logs[-1])
         self.assertEqual(persona_phone["origin"], "persona")
@@ -297,24 +304,33 @@ class SayPipelineTest(unittest.TestCase):
 
     def test_narration_phone_and_path_never_reach_the_tts(self):
         obj = self._obj()
-        seen = []
-        with mock.patch("core.brain.settings", return_value={}), \
-                mock.patch("core.numwords.speakable",
-                           side_effect=lambda text, style="words": text), \
-                mock.patch("core.brain.synth_pcm24k",
-                           side_effect=lambda text, st: seen.append(text) or b"\x00" * 2400):
-            obj._say_blocking(
-                "deixa comigo: a mensagem chega em 5517997248315 já",
-                label="Gino", chan="voz", origin="narração",
-                log_text="SYS: Gino — deixa comigo: a mensagem chega em "
-                         "5517997248315 já")
-            obj._say_blocking(
-                "Vou ler /projects/therotv", label="Gino", chan="voz",
-                origin="narração", log_text="SYS: Gino — Vou ler /projects/therotv")
-        self.assertEqual(len(seen), 2)
-        self.assertFalse(any(ch.isdigit() for ch in seen[0]), seen[0])
-        self.assertIn("destinatário", seen[0])
-        self.assertNotIn("/projects", seen[1])
+
+        def _speak(text, log_text):
+            units = []
+            with mock.patch("core.brain.settings", return_value={}), \
+                    mock.patch("core.numwords.speakable",
+                               side_effect=lambda text, style="words": text), \
+                    mock.patch("core.brain.synth_pcm24k",
+                               side_effect=lambda text, st:
+                                   units.append(text) or b"\x00" * 2400):
+                obj._say_blocking(text, label="Gino", chan="voz",
+                                  origin="narração", log_text=log_text)
+            return units
+
+        phone_units = _speak(
+            "deixa comigo: a mensagem chega em 5517997248315 já",
+            "SYS: Gino — deixa comigo: a mensagem chega em "
+            "5517997248315 já")
+        path_units = _speak(
+            "Vou ler /projects/therotv",
+            "SYS: Gino — Vou ler /projects/therotv")
+        self.assertTrue(phone_units)
+        self.assertTrue(path_units)
+        self.assertFalse(
+            any(ch.isdigit() for unit in phone_units for ch in unit),
+            phone_units)
+        self.assertIn("destinatário", " ".join(phone_units))
+        self.assertFalse(any("/projects" in unit for unit in path_units))
         phone = activity.parse(obj.ui.logs[-2])
         path = activity.parse(obj.ui.logs[-1])
         self.assertEqual(phone["origin"], "narração")

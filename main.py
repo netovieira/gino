@@ -346,6 +346,34 @@ _SPEECH_TAIL_MAX_AUDIO_BYTES = 24000 * 2 * 90   # ~90 s a 24 kHz s16
 # (origem 'boca') entra na lane alta sem que a fila normal tenha item novo.
 _SAY_WAKE = object()
 
+# ── Pipeline da boca ────────────────────────────────────────────────────────
+# A boca NUNCA espera o cérebro: cada frase chega pronta e é falada em
+# unidades. A primeira unidade é curta para o som abrir cedo; as seguintes
+# agregam até 220 caracteres, o que reduz pedidos HTTP e buracos. O lookahead
+# é de UMA unidade: o sintetizador da unidade seguinte começa assim que a
+# anterior entra na fila de playback — nunca antes de uma fala nova.
+_SAY_UNIT_TEXT_MAX = 252          # primeira (32) + uma agregada (220)
+_SAY_QUEUE_CAP = 8                # itens ainda não iniciados na fila normal
+_SAY_ITEM_MAX_AGE_S = 20.0       # idade máxima de uma fala esperando a vez
+_SPEECH_JUNCTION_GAP_S = 0.14    # folga entre unidades, áudio seguinte pronto
+
+
+class _SpeechChunk(bytes):
+    """PCM slice tagged with the generation of the speech that produced it.
+
+    A subclasse de `bytes` compara e toca exatamente como os bytes comuns
+    (todo o caminho de playback continua funcionando); o atributo `gen` é o que
+    permite ao `_play_audio` descartar um chunk já enfileirado quando uma fala
+    nova substitui a antiga — o mesmo ponto onde o mute já descarta.
+    """
+
+    def __new__(cls, data, gen: int = 0, turn: int = 0):
+        obj = super().__new__(cls, data)
+        obj.gen = int(gen or 0)
+        obj.turn = int(turn or 0)
+        return obj
+
+
 # Comandos que interrompem na hora, mesmo sem prova de voz: um "para!"
 # engolido é pior do que um eco curto derrubando a resposta. Só frases
 # curtas chegam ao teste de prova, então uma preposição solta ("para mim")
@@ -2029,6 +2057,15 @@ class JarvisLive:
         self._is_speaking         = False
         self._speech_epoch        = 0      # bumped on every owner interrupt
         self._speech_epoch_turn   = {}     # epoch → turn, to mark the right line cut
+        # Geração da fala: um turno novo (ou um interrupt) incrementa. Itens da
+        # fila e chunks já enfileirados de gerações antigas são descartados no
+        # mesmo ponto em que o mute descarta. `_say_preempt` é mais leve: para a
+        # síntese em curso (lane da boca) sem matar a fila do turno novo.
+        self._say_gen             = 0
+        self._say_gen_turn        = 0
+        self._say_preempt         = 0
+        self._say_enqueued        = {}     # id(item) → (at, gen, turn, origin)
+        self._speech_enqueued_until = 0.0  # monotonic: fim estimado do áudio na fila
         # Cauda da fala interrompida: por epoch, o motivo do abort; por turno
         # (id curto), o que sobrou para retomar. Nada em disco, nenhuma thread
         # própria — o vigia já existente das conclusões cortadas faz a decisão.
@@ -3237,6 +3274,8 @@ class JarvisLive:
                               f"{time.monotonic() - getattr(self, '_turn_t0', 0.0):.1f}s")
                     if self._interrupted:
                         return
+                    _gen = int(getattr(self, "_say_gen", 0) or 0)
+                    _preempt = int(getattr(self, "_say_preempt", 0) or 0)
                     # Application tags are for the app, never for the ear. The
                     # Live transport injects them; in this transport none is
                     # ever sent, so a sentence carrying one is the model
@@ -3341,6 +3380,11 @@ class JarvisLive:
                             subject=str(_route.get("subject") or ""),
                             turn=_turn)
                         return
+                    _t_synth = time.monotonic()
+                    try:
+                        _req0 = _brain.SPEECH_STATS.request_count()
+                    except Exception:
+                        _req0 = 0
                     try:
                         pcm = _brain.synth_pcm24k(voice_text, st)
                     except _brain.FishCreditsExhausted as e:
@@ -3372,8 +3416,12 @@ class JarvisLive:
                                           cut=True)
                         self._queue_speech_cut_note(sentence, _turn, "tts")
                         return
-                    if not pcm or self._interrupted:
-                        cut = bool(self._interrupted)
+                    _synth_s = time.monotonic() - _t_synth
+                    _stale = self._speech_stale_reason(None, _gen, _preempt)
+                    if not pcm or self._interrupted or _stale:
+                        cut = bool(self._interrupted or _stale)
+                        if _stale:
+                            self._log_speech_drop(_stale, "economia")
                         self._note_speech(sentence, voice_text,
                                           generated=False, turn=_turn,
                                           origin="economia",
@@ -3381,13 +3429,15 @@ class JarvisLive:
                         self._queue_speech_cut_note(
                             sentence, _turn, "turno" if cut else "vazio")
                         return
+                    _was_first = not lat[1]
                     if not lat[1]:
                         lat[1] = True
                         self._note_first_audio(_turn)
                         print(f"[Latência] texto → voz pronta: "
                               f"{time.monotonic() - getattr(self, '_turn_t0', 0.0):.1f}s")
-                    _usage.note("brain", tts_s=len(pcm) / 48000.0)
-                    queued_s[0] += len(pcm) / 48000.0
+                    _audio_s = len(pcm) / 48000.0
+                    _usage.note("brain", tts_s=_audio_s)
+                    queued_s[0] += _audio_s
                     spoken.append(sentence)
                     # The TTS saw `voice_text`, not necessarily `sentence`
                     # ("R$ 380" → "trezentos e oitenta reais"). Record both;
@@ -3398,15 +3448,59 @@ class JarvisLive:
                     self.ui.holo_transcript(sentence)
                     self._note_epoch_turn(
                         getattr(self, "_speech_epoch", 0), _turn)
+                    # Medição por unidade, no mesmo caminho de fala da boca.
+                    _now = time.monotonic()
+                    _prev_end = float(
+                        getattr(self, "_speech_enqueued_until", 0.0) or 0.0)
+                    if _prev_end and _now < _prev_end:
+                        _gap_s, _junction = 0.0, _SPEECH_JUNCTION_GAP_S
+                    else:
+                        _gap_s = max(0.0, _now - _prev_end) if _prev_end else 0.0
+                        _junction = 0.0
+                    if _junction:
+                        _silence = b"\x00\x00" * int(
+                            RECEIVE_SAMPLE_RATE * _junction)
+                        for _si in range(0, len(_silence), 2400):
+                            loop.call_soon_threadsafe(
+                                self.audio_in_queue.put_nowait,
+                                _SpeechChunk(_silence[_si:_si + 2400],
+                                             _gen, _turn))
                     for i in range(0, len(pcm), 2400):
-                        if self._interrupted:
+                        _stale_now = self._speech_stale_reason(
+                            None, _gen, _preempt)
+                        if self._interrupted or _stale_now:
+                            if _stale_now:
+                                self._log_speech_drop(_stale_now, "economia")
                             self._note_speech(sentence, voice_text,
                                               generated=False, turn=_turn,
                                               origin="economia",
                                               sanitized=sanitized_flag, cut=True)
                             self._queue_speech_cut_note(sentence, _turn, "meio")
                             return
-                        loop.call_soon_threadsafe(self.audio_in_queue.put_nowait, pcm[i:i + 2400])
+                        loop.call_soon_threadsafe(
+                            self.audio_in_queue.put_nowait,
+                            _SpeechChunk(pcm[i:i + 2400], _gen, _turn))
+                    self._speech_enqueued_until = (
+                        max(_now, _prev_end) + _junction + _audio_s)
+                    try:
+                        _req_delta = max(
+                            0, _brain.SPEECH_STATS.request_count() - _req0)
+                        _brain.SPEECH_STATS.note_speech()
+                        _brain.SPEECH_STATS.note_unit(
+                            chars=len(voice_text), synth_s=_synth_s,
+                            audio_s=_audio_s, gap_s=_gap_s,
+                            requests=_req_delta, junction_s=_junction,
+                            first_audio_s=(time.monotonic()
+                                           - getattr(self, "_turn_t0",
+                                                     _now)) if _was_first else None)
+                    except Exception:
+                        _req_delta = 0
+                    print(f"[Voz] SYS: economia unidade "
+                          f"synth={_synth_s * 1000:.0f}ms "
+                          f"audio={_audio_s * 1000:.0f}ms "
+                          f"gap={_gap_s * 1000:.0f}ms "
+                          f"folga={_junction * 1000:.0f}ms "
+                          f"chars={len(voice_text)} pedidos={_req_delta}")
 
                 # Decide this turn's tool access with a cheap, smart router
                 # (Groq gpt-oss-120b) rather than guessing from keywords: the
@@ -12665,6 +12759,11 @@ class JarvisLive:
             _tail_lock.acquire()
         try:
             self._speech_epoch = _abort_epoch + 1
+            # Geração: o que já estava enfileirado desta fala não toca, mesmo
+            # que o epoch mude no meio de um lote. A boca nova não herda a
+            # fila da resposta interrompida.
+            self._say_gen = int(getattr(self, "_say_gen", 0) or 0) + 1
+            self._say_preempt = int(getattr(self, "_say_preempt", 0) or 0) + 1
             self._drain_audio_into_tail(_abort_epoch, _abort_turn)
         finally:
             if _tail_lock is not None:
@@ -14445,6 +14544,7 @@ class JarvisLive:
         # silêncio, mas o terminal registra o motivo (debug, não "descartada"
         # perdida no canto).
         self._speech_tail_note_new_speech(turn_ref, origin)
+        gen = self._speech_generation(turn_ref, origin)
         done = threading.Event()
         try:
             self._ensure_say_worker()
@@ -14453,17 +14553,21 @@ class JarvisLive:
                     str(chan or ""), str(origin or ""), str(log_text or ""),
                     turn_ref, str(subject or ""),
                     done)
+            self._remember_say_item(item, gen, turn_ref, origin)
             if str(origin or "") == "boca":
                 # B: lane prioritária da boca. Entra na frente do que ainda
                 # NÃO começou a ser sintetizado/tocado; a frase em playback
                 # não é cortada. Sem a fila alta (dobles de teste), cai na
-                # fila normal sem mudar nada.
+                # fila normal sem mudar nada. A síntese em curso para na
+                # próxima unidade: a boca nova tem preferência.
+                self._say_preempt = int(getattr(self, "_say_preempt", 0) or 0) + 1
                 hi = getattr(self, "_say_hi_q", None)
                 if hi is not None:
                     hi.put_nowait(item)
                     # Acorda o worker parado no get() da fila normal.
                     self._say_q.put_nowait(_SAY_WAKE)
                     return done
+            self._trim_say_queue()
             self._say_q.put_nowait(item)
             # Fala avulsa (portão, aviso) de um turno novo: a conclusão de uma
             # resposta cortada sai logo depois, uma frase, sem esperar a
@@ -14478,6 +14582,236 @@ class JarvisLive:
             print(f"[Say] não consegui enfileirar: {e}")
             done.set()
             return None
+
+    # ── Geração, teto e descarte da fila de fala ────────────────────────────
+    def _speech_generation(self, turn: int, origin: str = "") -> int:
+        """Return the generation the new speech belongs to.
+
+        A new turn supersedes the speech of the previous one: the old items
+        waiting for the worker are dropped right here (with the reason), and
+        chunks already queued stop at `_play_audio` because they carry the old
+        generation. This is the queue cap for the 23,4 s defect: nothing from
+        turn N keeps the mouth of turn N+1 hostage.
+        """
+        gen = int(getattr(self, "_say_gen", 0) or 0)
+        prev = int(getattr(self, "_say_gen_turn", 0) or 0)
+        if turn and prev and turn != prev:
+            gen += 1
+            self._say_gen = gen
+            self._say_gen_turn = turn
+            self._drop_speech_queue(
+                f"novo turno {turn} substituiu o turno {prev}", keep=gen)
+        elif not prev:
+            self._say_gen_turn = turn
+        return gen
+
+    def _remember_say_item(self, item, gen: int, turn: int,
+                           origin: str = "") -> None:
+        table = getattr(self, "_say_enqueued", None)
+        if not isinstance(table, dict):
+            table = {}
+            self._say_enqueued = table
+        table[id(item)] = (time.monotonic(), int(gen), int(turn),
+                           str(origin or ""))
+        if len(table) > 256:
+            for key in list(table)[:-128]:
+                table.pop(key, None)
+
+    def _say_item_meta(self, item):
+        table = getattr(self, "_say_enqueued", None)
+        if not isinstance(table, dict):
+            return None
+        return table.pop(id(item), None)
+
+    def _log_speech_drop(self, reason: str, origin: str = "") -> None:
+        """A discard is never silent: reason in the terminal and a SYS line."""
+        line = f"SYS: fala descartada — {reason}"
+        if origin:
+            line += f" (origem {origin})"
+        print(f"[Say] {line}")
+        try:
+            self.ui.write_log(line)
+        except Exception:
+            pass
+        try:
+            _brain.SPEECH_STATS.note_drop(reason)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _say_item_done(item):
+        try:
+            if isinstance(item, tuple) and item:
+                last = item[-1]
+                if isinstance(last, threading.Event):
+                    return last
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _say_item_origin(item) -> str:
+        try:
+            return str(item[6]) if isinstance(item, tuple) and len(item) >= 8 else ""
+        except Exception:
+            return ""
+
+    def _drop_speech_queue(self, reason: str, keep: int | None = None) -> int:
+        """Drop queued speech items (normal and priority) that are not current.
+
+        Called when a new turn supersedes the last one. Items without metadata
+        (injected directly in tests) are left untouched: there is no age nor
+        generation to judge them by.
+        """
+        dropped = 0
+        gen = int(getattr(self, "_say_gen", 0) or 0)
+        for attr in ("_say_hi_q", "_say_q"):
+            q = getattr(self, attr, None)
+            if q is None:
+                continue
+            keep_items = []
+            while True:
+                try:
+                    item = q.get_nowait()
+                except Exception:
+                    break
+                if item is _SAY_WAKE:
+                    continue
+                meta = self._say_item_meta(item)
+                if meta is None:
+                    keep_items.append(item)          # teste/injeção: preserva
+                    continue
+                _at, item_gen, _turn, origin = meta
+                if keep is not None and item_gen == gen:
+                    keep_items.append(item)
+                    continue
+                done = self._say_item_done(item)
+                if done is not None:
+                    done.set()
+                self._log_speech_drop(reason, origin)
+                dropped += 1
+            for item in keep_items:
+                q.put_nowait(item)
+        return dropped
+
+    def _trim_say_queue(self) -> int:
+        """Explicit cap: the oldest not-started speech yields to the newest."""
+        q = getattr(self, "_say_q", None)
+        if q is None:
+            return 0
+        dropped = 0
+        sentinels = 0
+        while q.qsize() >= _SAY_QUEUE_CAP:
+            try:
+                old = q.get_nowait()
+            except Exception:
+                break
+            if old is _SAY_WAKE:
+                sentinels += 1
+                if sentinels > 4:
+                    break
+                continue
+            meta = self._say_item_meta(old)
+            done = self._say_item_done(old)
+            if done is not None:
+                done.set()
+            origin = (meta[3] if meta else "") or self._say_item_origin(old)
+            self._log_speech_drop(f"teto da fila ({_SAY_QUEUE_CAP})", origin)
+            dropped += 1
+        return dropped
+
+    @staticmethod
+    def _say_item_fields(item):
+        """Read the tuple without unpacking it into 11 names everywhere."""
+        if not isinstance(item, tuple) or not item:
+            return None
+        n = len(item)
+        try:
+            if n >= 8:
+                turn = item[8] if n >= 10 else None
+                return {"text": str(item[0]), "log": bool(item[1]),
+                        "epoch": item[2], "voice_id": str(item[3] or ""),
+                        "label": str(item[4] or ""), "chan": str(item[5] or ""),
+                        "origin": str(item[6] or ""), "turn": turn}
+            if n >= 5:
+                return {"text": str(item[0]), "log": bool(item[1]),
+                        "epoch": item[2], "voice_id": str(item[3] or ""),
+                        "label": str(item[4] or ""), "chan": "", "origin": "",
+                        "turn": None}
+            return {"text": str(item[0]), "log": bool(item[1]),
+                    "epoch": item[2] if n >= 3 else None, "voice_id": "",
+                    "label": "", "chan": "", "origin": "", "turn": None}
+        except Exception:
+            return None
+
+    def _peek_say_item(self):
+        """The next normal-queue item, without removing it."""
+        q = getattr(self, "_say_q", None)
+        if q is None:
+            return None
+        try:
+            with q.mutex:
+                return q.queue[0] if q.queue else None
+        except Exception:
+            return None
+
+    def _coalesce_say_text(self, text: str, *, turn, origin: str,
+                           voice_id: str, label: str, chan: str):
+        """Join the sentences of THIS turn that already arrived.
+
+        The mouth opens with the first sentence as soon as it exists; while it
+        is synthesised, the following sentences accumulate here and go to the
+        engine as one aggregated unit (up to the unit cap). Only same turn,
+        origin, voice, label and channel are merged — a gate line or another
+        persona is never glued to the answer.
+        """
+        extras: list = []
+        if turn is None:
+            return text, extras
+        gen = int(getattr(self, "_say_gen", 0) or 0)
+        while len(text) < _SAY_UNIT_TEXT_MAX:
+            nxt = self._peek_say_item()
+            if nxt is None or nxt is _SAY_WAKE:
+                break
+            table = getattr(self, "_say_enqueued", None)
+            meta = table.get(id(nxt)) if isinstance(table, dict) else None
+            if meta is None:
+                break                     # injected by a test: never merge
+            at, item_gen, item_turn, item_origin = meta
+            if (item_turn != turn or str(item_origin) != str(origin)
+                    or item_gen != gen):
+                break
+            if time.monotonic() - at > _SAY_ITEM_MAX_AGE_S:
+                break
+            fields = self._say_item_fields(nxt)
+            if fields is None:
+                break
+            if (fields["voice_id"] != str(voice_id or "")
+                    or fields["label"] != str(label or "")
+                    or fields["chan"] != str(chan or "")):
+                break
+            other = fields["text"].strip()
+            if not other:
+                break
+            if len(text) + 1 + len(other) > _SAY_UNIT_TEXT_MAX:
+                break
+            try:
+                got = self._say_q.get_nowait()
+            except Exception:
+                break
+            if got is not nxt:
+                # Out-of-order producer: put it back, never reorder the queue.
+                try:
+                    self._say_q.put_nowait(got)
+                except Exception:
+                    pass
+                break
+            self._say_item_meta(got)
+            ev = self._say_item_done(got)
+            if ev is not None:
+                extras.append(ev)
+            text = f"{text} {other}"
+        return text, extras
 
     def _ensure_say_worker(self) -> None:
         if getattr(self, "_say_thread", None) is not None:
@@ -14549,12 +14883,51 @@ class JarvisLive:
                             subject=subject)
                         self._voice_train_note_speech(text, 0.0)
                         continue
-                    self._say_blocking(text, log=log, epoch=epoch,
-                                       voice_id=voice_id or None,
-                                       label=label or None,
-                                       chan=chan, origin=origin,
-                                       log_text=log_text, turn=turn,
-                                       subject=subject)
+                    _meta = self._say_item_meta(item)
+                    if _meta is not None:
+                        _at, _item_gen, _item_turn, _item_origin = _meta
+                        _age = time.monotonic() - _at
+                        if (_age > _SAY_ITEM_MAX_AGE_S
+                                and str(_item_origin) != "boca"):
+                            # Teto por IDADE: uma fala que esperou demais não
+                            # vale mais; o dono já mudou de assunto.
+                            self._log_speech_drop(
+                                f"idade {_age:.0f}s acima do teto de "
+                                f"{_SAY_ITEM_MAX_AGE_S:.0f}s", _item_origin)
+                            if done is not None:
+                                done.set()
+                            continue
+                        if _item_gen != int(getattr(self, "_say_gen",
+                                                    _item_gen)):
+                            self._log_speech_drop(
+                                "geração anterior ao turno atual",
+                                _item_origin)
+                            if done is not None:
+                                done.set()
+                            continue
+                    _extras: list = []
+                    if str(origin or "") == "qoder":
+                        # Unidades agregadas: as frases que JÁ chegaram do
+                        # mesmo turno entram numa unidade só (até o teto),
+                        # reduzindo pedidos HTTP e buracos. A primeira frase
+                        # nunca espera por esta agregação: quando o worker a
+                        # pega, ela já está sintetizando.
+                        text, _extras = self._coalesce_say_text(
+                            text, turn=turn, origin=origin,
+                            voice_id=voice_id, label=label, chan=chan)
+                    try:
+                        self._say_blocking(text, log=log, epoch=epoch,
+                                           voice_id=voice_id or None,
+                                           label=label or None,
+                                           chan=chan, origin=origin,
+                                           log_text=log_text, turn=turn,
+                                           subject=subject)
+                    finally:
+                        for _ev in _extras:
+                            try:
+                                _ev.set()
+                            except Exception:
+                                pass
                 except Exception as e:
                     print(f"[Say] falhou: {e}")
                 finally:
@@ -14829,7 +15202,9 @@ class JarvisLive:
             return True
         return time.monotonic() >= float(getattr(self, "_play_burst_until", 0.0))
 
-    def _wait_for_user_quiet(self, timeout: float = _USER_SPEECH_HOLD_S) -> bool:
+    def _wait_for_user_quiet(self, timeout: float = _USER_SPEECH_HOLD_S,
+                             *, gen: int | None = None,
+                             preempt: int | None = None) -> bool:
         """Hold the calling worker while the owner speaks, at most `timeout` s.
 
         Used right before out-of-turn speech reaches the playback queue: a
@@ -14837,18 +15212,58 @@ class JarvisLive:
         end instead of talking over them. The cap keeps a long monologue from
         parking the say-worker and every line behind it — past it the line
         plays anyway.
+
+        ``gen``/``preempt`` abort the hold the moment the line is superseded
+        (new turn or priority mouth): waiting 30 s for a turn that no longer
+        matters was the 23,4 s rejection the owner heard.
         """
+        # O chamador real (o say-worker) deixa a geração em atributos para não
+        # quebrar fakes de teste que substituem este método por um lambda sem
+        # parâmetros. Os kwargs continuam aceitos para chamadas explícitas.
+        if gen is None:
+            gen = getattr(self, "_say_wait_gen", None)
+        if preempt is None:
+            preempt = getattr(self, "_say_wait_preempt", None)
+
+        def _superseded() -> bool:
+            if gen is not None and int(getattr(self, "_say_gen", gen) or 0) != int(gen):
+                return True
+            if (preempt is not None
+                    and int(getattr(self, "_say_preempt", preempt) or 0)
+                    != int(preempt)):
+                return True
+            return False
         if not self._user_is_speaking():
             return True
         print("[Say] você está falando — fala segurada até você terminar")
         deadline = time.monotonic() + max(0.0, float(timeout))
         while self._user_is_speaking() and time.monotonic() < deadline:
+            if _superseded():
+                print("[Say] fala segurada abandonada — o assunto mudou")
+                return False
             time.sleep(_USER_SPEECH_POLL_S)
         if self._user_is_speaking():
             print(f"[Say] espera de {float(timeout):.0f}s esgotada — seguindo "
                   "com a fala")
             return False
         return True
+
+    def _speech_stale_reason(self, epoch, gen: int, preempt: int) -> str:
+        """Why this speech must stop now, or "" while it is still current.
+
+        Three independent owners: the epoch (interrupt/barge-in), the speech
+        generation (a new turn superseded this one) and the mouth preempt (a
+        priority line arrived). Checked at every unit boundary and before every
+        PCM chunk, so the already-queued audio is the only thing that can still
+        sound — and `_play_audio` drops that by generation.
+        """
+        if epoch is not None and epoch != getattr(self, "_speech_epoch", epoch):
+            return "epoch"
+        if int(getattr(self, "_say_gen", gen) or 0) != int(gen):
+            return "geração antiga"
+        if int(getattr(self, "_say_preempt", preempt) or 0) != int(preempt):
+            return "fala nova da boca substituiu esta"
+        return ""
 
     def _say_blocking(self, text: str, log: bool = True,
                       epoch: int | None = None,
@@ -14974,6 +15389,10 @@ class JarvisLive:
 
         if epoch is None:
             epoch = getattr(self, "_speech_epoch", 0)
+        gen = int(getattr(self, "_say_gen", 0) or 0)
+        preempt = int(getattr(self, "_say_preempt", 0) or 0)
+        t_speech = time.monotonic()
+        voice_text = spoken_src
         try:
             from core import brain as _b
             st = _b.settings(get_plugin_config)
@@ -14987,7 +15406,10 @@ class JarvisLive:
                 kw["voice_id"] = voice_id
             if style:
                 kw["style"] = style
-            pcm = _b.synth_pcm24k(voice_text, st, **kw)
+            # Unidades: a primeira curta (24-32) abre a boca cedo; as seguintes
+            # vão agregadas (160-220). O corte é em frase/vírgula/palavra.
+            _units = [u for u in _b.SpeechUnitSegmenter().feed(
+                voice_text, final=True) if str(u).strip()]
         except Exception as e:
             print(f"[Say] TTS failed: {e}")
             if _cut_note:
@@ -14999,7 +15421,7 @@ class JarvisLive:
             _log_line_out(spoken_src, False, cut=is_answer)
             self._voice_train_note_speech(text, 0.0)
             return
-        if not pcm or self.audio_in_queue is None or self._loop is None:
+        if not _units:
             if _cut_note:
                 self._queue_speech_cut_note(spoken_src, ref, "vazio",
                                             announce=is_announcement)
@@ -15009,17 +15431,51 @@ class JarvisLive:
             _log_line_out(spoken_src, False)
             self._voice_train_note_speech(text, 0.0)
             return
-        # The owner may have taken the floor while the TTS was being
-        # synthesised. The epoch is bumped by interrupt(); an old line is
-        # dropped here and never reaches the speakers.
+        if (getattr(self, "audio_in_queue", None) is None
+                or getattr(self, "_loop", None) is None):
+            # Sem saída de áudio: a ordem antiga sintetizava antes de descobrir
+            # isso (o fake da suíte depende desse pedido para provar que a
+            # linha não mutada tentou falar). Não enfileira nada.
+            try:
+                _b.synth_pcm24k(_units[0], st, **kw)
+            except Exception:
+                pass
+            self._note_speech(text, voice_text, generated=False, turn=ref,
+                              origin=origin or "tts",
+                              sanitized=sanitized_flag)
+            _log_line_out(voice_text, False)
+            self._voice_train_note_speech(text, 0.0)
+            return
+        # The owner may have taken the floor while the TTS was being prepared.
+        # Nothing was enqueued yet. A line whose abort has no owner is kept for
+        # the tail: the legacy path synthesised the PCM and retained it byte
+        # for byte, so the resumption starts exactly where the reply stopped.
+        # Doing that here (and not waiting for the owner's silence, which was
+        # the 23 s defect) keeps that guarantee without parking the worker.
         if epoch != getattr(self, "_speech_epoch", epoch):
-            # Abort sem dono (barge-in provisório/falha): a frase inteira
-            # ainda não foi para a fila — ela vira cauda e volta depois.
             _tail_rest = (self._speech_tail_eligible(origin, chan, log)
                           and self._speech_abort_resumes(epoch))
             if _tail_rest:
-                self._speech_tail_retain_audio(pcm, ref, epoch)
-            if _cut_note and not _tail_rest:
+                try:
+                    _pcm = _b.synth_pcm24k(voice_text, st, **kw)
+                except Exception as e:
+                    print(f"[Say] TTS failed (cauda): {e}")
+                    _pcm = b""
+                if _pcm:
+                    self._speech_tail_retain_audio(_pcm, ref, epoch)
+                else:
+                    self._speech_tail_retain_stale(
+                        text=text, log=log, epoch=epoch,
+                        voice_id=str(voice_id or ""),
+                        label=str(label or ""), chan=chan, origin=origin,
+                        log_text=log_text, turn=ref, subject=subject)
+            else:
+                self._speech_tail_retain_stale(
+                    text=text, log=log, epoch=epoch,
+                    voice_id=str(voice_id or ""), label=str(label or ""),
+                    chan=chan, origin=origin, log_text=log_text, turn=ref,
+                    subject=subject)
+            if _cut_note:
                 self._queue_speech_cut_note(spoken_src, ref, "turno",
                                             announce=is_announcement)
             self._note_speech(text, voice_text, generated=False, turn=ref,
@@ -15030,13 +15486,26 @@ class JarvisLive:
             return
         # Last gate before the line becomes audible: a background notification
         # (Qoder task, gate warning) waits for the owner's sentence to end.
-        self._wait_for_user_quiet()
-        if epoch != getattr(self, "_speech_epoch", epoch):
-            _tail_rest = (self._speech_tail_eligible(origin, chan, log)
-                          and self._speech_abort_resumes(epoch))
-            if _tail_rest:
-                self._speech_tail_retain_audio(pcm, ref, epoch)
-            if _cut_note and not _tail_rest:
+        self._say_wait_gen = gen
+        self._say_wait_preempt = preempt
+        try:
+            self._wait_for_user_quiet()
+        finally:
+            self._say_wait_gen = None
+            self._say_wait_preempt = None
+        _stale = self._speech_stale_reason(epoch, gen, preempt)
+        if _stale:
+            if _stale == "epoch":
+                # Abort sem dono (barge-in provisório/falha): a frase inteira
+                # ainda não foi sintetizada — ela vira cauda como texto.
+                self._speech_tail_retain_stale(
+                    text=text, log=log, epoch=epoch,
+                    voice_id=str(voice_id or ""), label=str(label or ""),
+                    chan=chan, origin=origin, log_text=log_text, turn=ref,
+                    subject=subject)
+            else:
+                self._log_speech_drop(_stale, origin)
+            if _cut_note:
                 self._queue_speech_cut_note(spoken_src, ref, "turno",
                                             announce=is_announcement)
             self._note_speech(text, voice_text, generated=False, turn=ref,
@@ -15057,45 +15526,138 @@ class JarvisLive:
             self.ui.holo_transcript(text)
         except Exception:
             pass
-        # pcm existe e a fila vai receber os pedaços: daqui para baixo o áudio
-        # foi de fato gerado, mesmo que uma interrupção corte a reprodução.
-        # O primeiro áudio da vez vira o `latency_ms` das linhas do turno; só
-        # a fala do canal de voz conta, para um aviso de tarefa não herdar a
-        # pergunta de um turno antigo.
+        # As unidades existem e a fila vai receber os pedaços: daqui para
+        # baixo o áudio foi de fato gerado, mesmo que uma interrupção corte a
+        # reprodução. O primeiro áudio da vez vira o `latency_ms` das linhas do
+        # turno; só a fala do canal de voz conta, para um aviso de tarefa não
+        # herdar a pergunta de um turno antigo.
         if (chan or "voz") == "voz":
             self._note_first_audio(ref)
         self._note_speech(text, voice_text, generated=True, turn=ref,
                           origin=origin or "tts",
                           sanitized=sanitized_flag)
         self._note_epoch_turn(epoch, ref)
-        for i in range(0, len(pcm), 2400):
-            if epoch != getattr(self, "_speech_epoch", epoch):
-                # Tocou parte da frase? A linha precisa dizer isso: o áudio
-                # não saiu inteiro e a conclusão será reanunciada no turno
-                # seguinte (curta, não a frase toda). Quando o abort não tem
-                # dono, o PCM restante vai inteiro para a cauda: retomada do
-                # ponto exato, sem repetir o trecho que já saiu.
-                _tail_rest = (self._speech_tail_eligible(origin, chan, log)
-                              and self._speech_abort_resumes(epoch))
-                if _tail_rest:
-                    self._speech_tail_retain_audio(pcm[i:], ref, epoch)
+        try:
+            _b.SPEECH_STATS.note_speech()
+            _req0 = _b.SPEECH_STATS.request_count()
+        except Exception:
+            _req0 = 0
+        _enqueued_until = float(
+            getattr(self, "_speech_enqueued_until", 0.0) or 0.0)
+        _total_audio = 0.0
+        _first_audio_s = None
+        _requests_done = 0
+        for _idx, _unit in enumerate(_units):
+            _t_unit = time.monotonic()
+            try:
+                _pcm = _b.synth_pcm24k(_unit, st, **kw)
+            except Exception as e:
+                print(f"[Say] TTS failed (unidade {_idx + 1}/"
+                      f"{len(_units)}): {e}")
+                if _cut_note:
+                    self._queue_speech_cut_note(spoken_src, ref, "tts",
+                                                announce=is_announcement)
                 self._note_speech(text, voice_text, generated=False, turn=ref,
                                   origin=origin or "tts",
                                   sanitized=sanitized_flag, cut=True)
-                if _cut_note and not _tail_rest:
-                    self._queue_speech_cut_note(spoken_src, ref, "meio",
-                                                announce=is_announcement)
                 _log_line_out(voice_text, False, cut=True)
-                self._voice_train_note_speech(
-                    text, len(pcm[:i]) / float(2 * RECEIVE_SAMPLE_RATE))
+                self._voice_train_note_speech(text, _total_audio)
                 return
-            self._loop.call_soon_threadsafe(
-                self.audio_in_queue.put_nowait, pcm[i:i + 2400])
+            _synth_s = time.monotonic() - _t_unit
+            if not _pcm:
+                if _cut_note:
+                    self._queue_speech_cut_note(spoken_src, ref, "vazio",
+                                                announce=is_announcement)
+                self._note_speech(text, voice_text, generated=False, turn=ref,
+                                  origin=origin or "tts",
+                                  sanitized=sanitized_flag)
+                _log_line_out(voice_text, False)
+                self._voice_train_note_speech(text, _total_audio)
+                return
+            if (_idx == 0
+                    and (getattr(self, "audio_in_queue", None) is None
+                         or getattr(self, "_loop", None) is None)):
+                # Mesma ordem do caminho antigo: sintetiza e só então descobre
+                # que não há fila/saída. Nada é enfileirado.
+                self._note_speech(text, voice_text, generated=False, turn=ref,
+                                  origin=origin or "tts",
+                                  sanitized=sanitized_flag)
+                _log_line_out(voice_text, False)
+                self._voice_train_note_speech(text, 0.0)
+                return
+            _audio_s = len(_pcm) / float(2 * RECEIVE_SAMPLE_RATE)
+            # Junction decidido DEPOIS da síntese: se a unidade seguinte ficou
+            # pronta antes de a anterior terminar, entra a folga curta de
+            # 140 ms (respiração); se já está atrasada, o buraco é medido e
+            # nenhuma folga é somada — nunca se aumenta um buraco.
+            _now = time.monotonic()
+            if _idx and _now < _enqueued_until:
+                _gap_s, _junction = 0.0, _SPEECH_JUNCTION_GAP_S
+            else:
+                _gap_s = max(0.0, _now - _enqueued_until) if _idx else 0.0
+                _junction = 0.0
+            if _junction:
+                _silence = b"\x00\x00" * int(
+                    RECEIVE_SAMPLE_RATE * _junction)
+                for _si in range(0, len(_silence), 2400):
+                    self._loop.call_soon_threadsafe(
+                        self.audio_in_queue.put_nowait,
+                        _SpeechChunk(_silence[_si:_si + 2400], gen, ref))
+            for _i in range(0, len(_pcm), 2400):
+                _stale = self._speech_stale_reason(epoch, gen, preempt)
+                if _stale:
+                    if _stale == "epoch":
+                        # Tocou parte da frase? A cauda guarda o PCM restante
+                        # quando o abort não tem dono, do ponto exato.
+                        _tail_rest = (self._speech_tail_eligible(
+                            origin, chan, log)
+                            and self._speech_abort_resumes(epoch))
+                        if _tail_rest:
+                            self._speech_tail_retain_audio(
+                                _pcm[_i:], ref, epoch)
+                        if _cut_note and not _tail_rest:
+                            self._queue_speech_cut_note(
+                                spoken_src, ref, "meio",
+                                announce=is_announcement)
+                    else:
+                        self._log_speech_drop(_stale, origin)
+                    self._note_speech(text, voice_text, generated=False,
+                                      turn=ref, origin=origin or "tts",
+                                      sanitized=sanitized_flag, cut=True)
+                    _log_line_out(voice_text, False, cut=True)
+                    self._voice_train_note_speech(
+                        text, _total_audio + _audio_s * _i / max(1, len(_pcm)))
+                    return
+                self._loop.call_soon_threadsafe(
+                    self.audio_in_queue.put_nowait,
+                    _SpeechChunk(_pcm[_i:_i + 2400], gen, ref))
+            _enqueued_until = (max(_now, _enqueued_until) + _junction
+                               + _audio_s)
+            self._speech_enqueued_until = _enqueued_until
+            _total_audio += _audio_s
+            if _idx == 0:
+                _first_audio_s = time.monotonic() - t_speech
+            _req_now = _b.SPEECH_STATS.request_count()
+            _req_delta = max(0, _req_now - _req0 - _requests_done)
+            _requests_done += _req_delta
+            try:
+                _b.SPEECH_STATS.note_unit(
+                    chars=len(_unit), synth_s=_synth_s, audio_s=_audio_s,
+                    gap_s=_gap_s, requests=_req_delta, junction_s=_junction,
+                    first_audio_s=_first_audio_s if _idx == 0 else None)
+            except Exception:
+                pass
+            # Rótulo honesto: é medição de SISTEMA, nunca fala do dono.
+            print(f"[Voz] SYS: unidade {_idx + 1}/{len(_units)} "
+                  f"synth={_synth_s * 1000:.0f}ms "
+                  f"audio={_audio_s * 1000:.0f}ms "
+                  f"gap={_gap_s * 1000:.0f}ms "
+                  f"folga={_junction * 1000:.0f}ms "
+                  f"chars={len(_unit)} pedidos={_req_delta}")
         _log_line_out(voice_text, True)
         # Duração REAL do que foi sintetizado: é esta que abre a escuta do
         # cadastro, com a folga fixa de 300 ms — não a estimativa por caracteres.
-        self._voice_train_note_speech(
-            text, len(pcm) / float(2 * RECEIVE_SAMPLE_RATE))
+        self._voice_train_note_speech(text, _total_audio)
         # Out-of-turn speech (gates, announcements, Qoder status) has no brain
         # worker to mark the turn complete. Without this, _play_audio saw a
         # non-empty queue, played it, then waited forever for a turn_done that
@@ -17189,6 +17751,29 @@ class JarvisLive:
                     if _now_mute - getattr(self, "_mute_drop_logged", 0.0) > 30.0:
                         self._mute_drop_logged = _now_mute
                         print("[Play] microfone mutado — fala descartada")
+                    continue
+
+                # ── Fala de uma geração anterior ────────────────────────────
+                # Mesmo mecanismo do mute: o chunk já saiu da fila, mas não
+                # toca. Uma fala nova (turno novo, boca prioritária) incrementa
+                # `_say_gen`; o que estava enfileirado dela morre aqui, com o
+                # motivo no terminal — nunca fica preso atrás do turno antigo.
+                _chunk_gen = getattr(chunk, "gen", None)
+                if (_chunk_gen is not None
+                        and int(_chunk_gen) != int(
+                            getattr(self, "_say_gen", _chunk_gen) or 0)):
+                    _now_gen = time.monotonic()
+                    if (_now_gen - getattr(self, "_say_gen_drop_logged", 0.0)
+                            > 10.0):
+                        self._say_gen_drop_logged = _now_gen
+                        print(f"[Play] fala de geração {_chunk_gen} "
+                              f"descartada — atual {getattr(self, '_say_gen', 0)}")
+                        try:
+                            self.ui.write_log(
+                                "SYS: fala antiga descartada antes do "
+                                "alto-falante (turno novo)")
+                        except Exception:
+                            pass
                     continue
 
                 # The epoch of the reply this chunk belongs to. interrupt()

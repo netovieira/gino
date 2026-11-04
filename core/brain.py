@@ -28,6 +28,7 @@ import ipaddress
 import json
 import re
 import socket
+import threading
 import time
 from typing import Callable
 from urllib.parse import urlsplit
@@ -1415,15 +1416,19 @@ def tts_fish_pcm24k(text: str, st: dict, style: str | None = None) -> bytes:
         "Content-Type": "application/json",
         "model": st.get("fish_model") or FISH_MODELS[0],
     }
+    _http_t0 = time.monotonic()
     r = requests.post(f"{FISH_BASE}/v1/tts", headers=headers, json=body, timeout=TIMEOUT)
+    SPEECH_STATS.note_http(time.monotonic() - _http_t0)
     if r.status_code in (415, 422):
         # Server insisting on MessagePack (the SDK's encoding): retry that way
         # when the package is present.
         try:
             import ormsgpack
             headers["Content-Type"] = "application/msgpack"
+            _http_t0 = time.monotonic()
             r = requests.post(f"{FISH_BASE}/v1/tts", headers=headers,
                               data=ormsgpack.packb(body), timeout=TIMEOUT)
+            SPEECH_STATS.note_http(time.monotonic() - _http_t0)
         except ImportError:
             raise RuntimeError(f"Fish Audio refused the JSON request ({r.status_code}): "
                                f"{r.text[:120]} — run: py -m pip install ormsgpack")
@@ -1456,6 +1461,256 @@ def strip_style_tags(text: str) -> str:
     """Drop leading Fish style tags from ``text``. Edge voices read every
     character, so a tag must never survive on that path."""
     return _STYLE_TAG.sub("", str(text or ""), count=1).strip()
+
+
+# ── Unidades de fala: a boca abre cedo, o resto vai agregado ────────────────
+# O defeito medido pelo dono (04/11/2026): a boca esperava o pedido HTTP
+# inteiro de cada frase e a fila empilhava atrás dos turnos anteriores. A
+# correção é de pipeline de áudio, não de espera pelo cérebro:
+#   * a PRIMEIRA unidade é curta (24-32 caracteres) para o primeiro som sair
+#     no menor tempo possível;
+#   * as seguintes agregam frases (160-220 caracteres) para reduzir o número
+#     de pedidos ao sintetizador;
+#   * o corte é sempre em fim de frase, vírgula ou espaço — nunca no meio de
+#     uma palavra.
+SPEECH_FIRST_MIN_CHARS = 24
+SPEECH_FIRST_MAX_CHARS = 32
+SPEECH_UNIT_MIN_CHARS = 160
+SPEECH_UNIT_MAX_CHARS = 220
+# Folga de junção entre duas unidades quando a seguinte JÁ está pronta. É
+# respiração intencional, não buraco de síntese; abaixo do `_FISH_GAP` de
+# 220 ms usado dentro de uma frase antiga.
+SPEECH_JUNCTION_GAP_S = 0.14
+
+_SPEECH_SENTENCE_END = re.compile(r"[.!?…]+(?=\s|$)")
+_SPEECH_CLAUSE_END = re.compile(r"[,;:—–](?=\s)")
+
+
+class SpeechUnitSegmenter:
+    """Cut a stream of sentences into speakable units.
+
+    ``feed()`` receives every finished sentence the brain produces and returns
+    zero or more units that are safe to synthesise now. The first unit is the
+    short opening (24-32 chars when the text allows it); the following units
+    aggregate until 160-220 chars, always ending at a sentence, clause or word
+    boundary. ``flush()`` emits whatever is left at the end of a reply.
+
+    The segmenter never cuts inside a word: the only exception is a single token
+    longer than the maximum, where there is no safe boundary at all.
+    """
+
+    def __init__(self, first_min: int = SPEECH_FIRST_MIN_CHARS,
+                 first_max: int = SPEECH_FIRST_MAX_CHARS,
+                 unit_min: int = SPEECH_UNIT_MIN_CHARS,
+                 unit_max: int = SPEECH_UNIT_MAX_CHARS) -> None:
+        self.first_min = max(1, int(first_min))
+        self.first_max = max(self.first_min, int(first_max))
+        self.unit_min = max(self.first_min, int(unit_min))
+        self.unit_max = max(self.unit_min, int(unit_max))
+        self._buf = ""
+        self._first_done = False
+
+    @property
+    def pending(self) -> str:
+        """Text received but not emitted yet."""
+        return self._buf
+
+    @property
+    def first_done(self) -> bool:
+        return self._first_done
+
+    def feed(self, text: str, final: bool = False) -> list[str]:
+        text = " ".join(str(text or "").split())
+        if text:
+            self._buf = f"{self._buf} {text}".strip() if self._buf else text
+        return self._drain(final)
+
+    def flush(self) -> list[str]:
+        return self._drain(True)
+
+    # -- internals ---------------------------------------------------------
+    def _boundary(self, regex: re.Pattern, lo: int, hi: int,
+                  earliest: bool) -> int | None:
+        """Last (or first) regex ending inside ``[lo, hi]``, or None."""
+        found = None
+        for match in regex.finditer(self._buf):
+            end = match.end()
+            if end < lo or end > hi:
+                continue
+            if earliest:
+                return end
+            found = end
+        return found
+
+    def _cut_index(self, lo: int, hi: int, final: bool,
+                   first: bool) -> int | None:
+        buf, n = self._buf, len(self._buf)
+        if not buf:
+            return None
+        if n < lo and not final:
+            return None
+        window = min(hi, n)
+        # Sentence boundary first, then clause, then a word boundary.
+        cut = self._boundary(_SPEECH_SENTENCE_END, lo, window, earliest=first)
+        if cut is None:
+            cut = self._boundary(_SPEECH_CLAUSE_END, lo, window, earliest=first)
+        if cut is None:
+            space = buf.rfind(" ", lo, window)
+            if space > 0:
+                cut = space
+        if cut is not None:
+            return cut
+        if final:
+            if n <= hi:
+                return n
+            # No safe boundary before the cap: extend to the next space rather
+            # than split a word, and only fall back to the cap for one token.
+            space = buf.find(" ", hi)
+            return space if space > 0 else hi
+        if n > hi:
+            # Only reachable for a single token longer than the cap.
+            return hi
+        return None
+
+    def _drain(self, final: bool) -> list[str]:
+        out: list[str] = []
+        while self._buf:
+            first = not self._first_done
+            lo = self.first_min if first else self.unit_min
+            hi = self.first_max if first else self.unit_max
+            cut = self._cut_index(lo, hi, final, first)
+            if cut is None:
+                break
+            unit = self._buf[:cut].strip()
+            self._buf = self._buf[cut:].lstrip()
+            if unit:
+                out.append(unit)
+                self._first_done = True
+            elif not self._buf:
+                break
+        if final and self._buf.strip():
+            out.append(self._buf.strip())
+            self._buf = ""
+            self._first_done = True
+        return out
+
+
+# ── Medição do caminho real de fala ─────────────────────────────────────────
+class SpeechStats:
+    """Aggregated numbers of what the mouth actually did.
+
+    Every synthesis request and every spoken unit feeds this, so the answer to
+    "where did the time go?" is a measured number, not an estimate. Nothing
+    here stores the spoken text: only durations, character counts and drop
+    reasons. The public snapshot is what `speech_stats()` returns.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self.units = 0
+            self.speeches = 0
+            self.requests = 0
+            self.synth_s = 0.0
+            self.audio_s = 0.0
+            self.gap_s = 0.0
+            self.gap_n = 0
+            self.gap_max_s = 0.0
+            self.junction_s = 0.0
+            self.junction_n = 0
+            self.first_audio_s = 0.0
+            self.first_audio_n = 0
+            self.first_audio_max_s = 0.0
+            self.chars = 0
+            self.dropped: dict[str, int] = {}
+
+    def note_http(self, seconds: float = 0.0) -> None:
+        """One request to the voice engine (Fish or Edge)."""
+        with self._lock:
+            self.requests += 1
+
+    def note_speech(self) -> None:
+        with self._lock:
+            self.speeches += 1
+
+    def request_count(self) -> int:
+        with self._lock:
+            return self.requests
+
+    def note_unit(self, *, chars: int, synth_s: float, audio_s: float,
+                  gap_s: float = 0.0, requests: int = 0, junction_s: float = 0.0,
+                  first_audio_s: float | None = None) -> dict:
+        with self._lock:
+            self.units += 1
+            self.chars += max(0, int(chars))
+            self.synth_s += max(0.0, float(synth_s))
+            self.audio_s += max(0.0, float(audio_s))
+            if requests:
+                pass                    # already counted by note_http()
+            gap_s = max(0.0, float(gap_s))
+            if gap_s > 0.0:
+                self.gap_s += gap_s
+                self.gap_n += 1
+                self.gap_max_s = max(self.gap_max_s, gap_s)
+            junction_s = max(0.0, float(junction_s))
+            if junction_s > 0.0:
+                self.junction_s += junction_s
+                self.junction_n += 1
+            if first_audio_s is not None:
+                first_audio_s = max(0.0, float(first_audio_s))
+                self.first_audio_s += first_audio_s
+                self.first_audio_n += 1
+                self.first_audio_max_s = max(self.first_audio_max_s,
+                                             first_audio_s)
+            return dict(self)
+
+    def note_drop(self, reason: str) -> None:
+        key = " ".join(str(reason or "").split())[:80] or "?"
+        with self._lock:
+            self.dropped[key] = self.dropped.get(key, 0) + 1
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            units = self.units
+            speeches = self.speeches
+            requests = self.requests
+            first_n = self.first_audio_n
+            return {
+                "units": units,
+                "speeches": speeches,
+                "requests": requests,
+                "requests_per_speech": (requests / speeches) if speeches else 0.0,
+                "chars": self.chars,
+                "synth_s_total": round(self.synth_s, 3),
+                "synth_s_avg": round(self.synth_s / units, 3) if units else 0.0,
+                "audio_s_total": round(self.audio_s, 3),
+                "audio_s_avg": round(self.audio_s / units, 3) if units else 0.0,
+                "gap_s_total": round(self.gap_s, 3),
+                "gap_s_avg": round(self.gap_s / self.gap_n, 3) if self.gap_n else 0.0,
+                "gap_s_max": round(self.gap_max_s, 3),
+                "junction_s_total": round(self.junction_s, 3),
+                "junction_s_avg": round(self.junction_s / self.junction_n, 3)
+                if self.junction_n else 0.0,
+                "first_audio_s_avg": round(self.first_audio_s / first_n, 3)
+                if first_n else 0.0,
+                "first_audio_s_max": round(self.first_audio_max_s, 3),
+                "dropped": dict(self.dropped),
+            }
+
+
+SPEECH_STATS = SpeechStats()
+
+
+def speech_stats() -> dict:
+    """Measured speech numbers, for the inspector and for tests."""
+    return SPEECH_STATS.snapshot()
+
+
+def reset_speech_stats() -> None:
+    SPEECH_STATS.reset()
 
 
 def _fish_pieces(text: str) -> list[str]:
@@ -1544,6 +1799,7 @@ def synth_pcm24k(text: str, st: dict, voice_id: str | None = None,
             else:
                 out.extend(tts_fish_pcm24k(piece, state))
         return bytes(out)
+    SPEECH_STATS.note_http()
     return tts_pcm24k(strip_style_tags(text), st["tts_voice"])
 
 
