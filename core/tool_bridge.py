@@ -49,9 +49,9 @@ from pydantic import BaseModel, Field
 #          to a question for anything reversible).
 # medium — something leaves the machine or changes shared state: sending a
 #          message, uploading, purchases, controlling a phone/browser.
-# high   — restart/shutdown, destructive file operations, code execution,
-#          persona/secrets, and anything we do not recognise. A confirmation
-#          (and, at the voice layer, the owner) is mandatory.
+# high   — restart/shutdown, destructive file operations, a destructive shell
+#          command, persona/secrets, and anything we do not recognise. A
+#          confirmation (and, at the voice layer, the owner) is mandatory.
 TIER_SAFE = "safe"
 TIER_LOW = "low"
 TIER_MEDIUM = "medium"
@@ -76,7 +76,7 @@ ACTION_TIERS: dict[str, str] = {
     "system_monitor": TIER_SAFE,
     "background_monitor": TIER_SAFE,
     "screen_processor": TIER_SAFE,
-    # ── low: music / apps / reversible files ───────────────────────────────
+    # ── low: music / apps / reversible files / opening a visible terminal ───
     "open_app": TIER_LOW,
     "music_control": TIER_LOW,
     "video_player": TIER_LOW,
@@ -96,6 +96,11 @@ ACTION_TIERS: dict[str, str] = {
     "game_updater": TIER_LOW,
     "computer_settings": TIER_LOW,
     "proactive": TIER_LOW,
+    # Opening a terminal is an interface action, not execution: the owner
+    # asked that it never require permission. terminal_run is also direct for
+    # a plain command; risk_tier() escalates it when the command is destructive.
+    "terminal_open": TIER_LOW,
+    "terminal_run": TIER_LOW,
     # ── medium: sending / uploads / purchases / remote devices ─────────────
     "send_message": TIER_MEDIUM,
     "email_control": TIER_MEDIUM,
@@ -124,7 +129,6 @@ ACTION_TIERS: dict[str, str] = {
     "qoder_agent": TIER_HIGH,
     "qoder_job": TIER_HIGH,
     "personas": TIER_HIGH,
-    "terminal_run": TIER_HIGH,
     "phrase_blocklist": TIER_HIGH,
     # Parking a restart is not the restart: the owner's spoken phrase is the
     # only thing that executes it. The confirmation action is refused by the
@@ -148,6 +152,73 @@ _ESCALATING_ARGS: dict[str, frozenset[str]] = {
 }
 
 _ARG_SCAN_KEYS = ("action", "operation", "op", "command", "mode", "task")
+
+# ── terminal command risk ───────────────────────────────────────────────────
+#
+# The owner's rule: opening the terminal window must never ask permission.
+# What still needs the gate is the *command* the model wants to type inside it.
+# A plain command (ls, tail -f, npm test, git status) runs directly; anything
+# here is treated as irreversible and keeps the mandatory confirmation. The
+# list is deliberately conservative: a false positive costs one question, a
+# false negative could wipe a disk.
+_TERMINAL_DANGEROUS_RE = re.compile(
+    r"""
+    (?:
+        # privilege / root
+        (?<![\w-])(?:sudo|doas|pkexec)(?![\w-])
+      | (?<![\w-])su(?![\w-])
+        # deletion / disk writing
+      | (?<![\w-])(?:rm|rmdir|unlink|shred|wipe|wipefs|mkfs(?:\.\w+)?|dd
+                       |truncate|fdisk|parted|gdisk|sgdisk|mkswap|blkdiscard
+                       |cryptsetup)(?![\w-])
+      | (?<![\w-])find\b[^\n]*?(?:\s-delete\b|\s-exec(?:dir)?\s+(?:sudo\s+)?rm\b)
+      | (?<![\w-])rsync\b[^\n]*?\s--delete(?:-\w+)?(?:\s|$)
+      | (?<![\w-])chmod\s+-[a-zA-Z]*R
+      | (?<![\w-])chown\s+-[a-zA-Z]*R
+        # power / session
+      | (?<![\w-])(?:shutdown|reboot|poweroff|halt)(?![\w-])
+      | (?<![\w-])(?:systemctl|loginctl)\s+(?:poweroff|reboot|halt|suspend
+                                              |hibernate|kill-session)
+      | (?<![\w-])(?:init|telinit)\s+[06](?!\d)
+        # process / package / container mass destruction
+      | (?<![\w-])(?:killall|pkill)(?![\w-])
+      | (?<![\w-])(?:apt|apt-get)\s+(?:remove|purge|autoremove|autopurge)(?![\w-])
+      | (?<![\w-])(?:dnf|yum)\s+(?:remove|erase|autoremove)(?![\w-])
+      | (?<![\w-])pacman\s+-[a-zA-Z]*R
+      | (?<![\w-])zypper\s+(?:rm|remove)(?![\w-])
+      | (?<![\w-])(?:snap|flatpak)\s+(?:remove|uninstall)(?![\w-])
+      | (?<![\w-])(?:docker|podman)\s+(?:rm|rmi|prune)(?![\w-])
+      | (?<![\w-])(?:docker|podman)\s+(?:system|volume|image|container)\s+
+            (?:prune|rm)(?![\w-])
+      | (?<![\w-])kubectl\s+delete(?![\w-])
+      | (?<![\w-])helm\s+(?:uninstall|delete)(?![\w-])
+        # database / irreversible VCS history
+      | (?<![\w-])drop\s+(?:database|table|schema)(?![\w-])
+      | (?<![\w-])truncate\s+table(?![\w-])
+      | (?<![\w-])git\s+reset\s+--hard(?![\w-])
+      | (?<![\w-])git\s+clean\b[^\n]*?\s-[a-zA-Z]*f
+      | (?<![\w-])git\s+push\b[^\n]*?\s(?:--force|-f)(?![\w-])
+        # remote code piped straight into a shell
+      | (?<![\w-])(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z|k)?sh(?![\w-])
+        # opaque inline code: the payload can do anything, so it needs the gate
+      | (?<![\w-])(?:python[0-9.]*|node|perl|ruby|php|lua)\s+-[a-zA-Z]*[ce](?![\w-])
+      | (?<![\w-])(?:ba|z|k)?sh\s+-[a-zA-Z]*c(?![\w-])
+      | (?<![\w-])eval(?![\w-])
+        # raw write to a block device
+      | >\s*/dev/(?:sd|nvme|vd|hd|disk|mmcblk)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def terminal_command_is_dangerous(command: Any) -> bool:
+    """True when a shell command would be irreversible / privileged / mass.
+
+    Used only for the risk tier of ``terminal_run``. Opening the window
+    (``terminal_open``) never reaches this check.
+    """
+    return bool(_TERMINAL_DANGEROUS_RE.search(str(command or "")))
 
 _REDACT_RE = re.compile(r"(api[_-]?key|token|password|secret|authorization)", re.IGNORECASE)
 _REDACTED = "[REDACTED]"
@@ -415,6 +486,12 @@ class ToolBridge:
             if action in ("list", "show", "models", "for_project"):
                 return TIER_SAFE
             return TIER_HIGH
+        if action_name == "terminal_run" and isinstance(args, dict):
+            # Opening the window is direct; the command typed inside it is
+            # classified on its own. A destructive one still needs the gate.
+            if terminal_command_is_dangerous(args.get("command")):
+                return TIER_HIGH
+            return TIER_LOW
         tier = ACTION_TIERS.get(action_name, TIER_HIGH)
         tokens = _ESCALATING_ARGS.get(action_name)
         if tokens and isinstance(args, dict):

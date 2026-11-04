@@ -61,4 +61,5 @@ def test_new_action_tiers():
     assert obj.risk_tier("open_in", {"path": "x"}) == "low"
     assert obj.risk_tier("media_control", {"action": "pause"}) == "low"
     assert obj.risk_tier("memory_index", {"action": "tag"}) == "low"
-    assert obj.risk_tier("terminal_run", {"command": "ls"}) == "high"
+    assert obj.risk_tier("terminal_run", {"command": "ls"}) == "low"
+    assert obj.risk_tier("terminal_run", {"command": "rm -rf ~"}) == "high"

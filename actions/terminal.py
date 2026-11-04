@@ -1,10 +1,12 @@
-"""Abre um terminal visível na tela e roda um comando de shell.
+"""Abre um terminal visível na tela e, opcionalmente, roda um comando nele.
 
 O dono vê a janela e o comando acontecendo, em vez de um ``subprocess`` mudo.
-Preferência: ptyxis (GNOME), com ``--`` separando opções dos argumentos do
-comando e ``--working-directory`` ANTES do ``--``. Fallback:
-``x-terminal-emulator -e bash -lc``. Em ambos os casos ``hold=True`` (padrão)
-termina com ``exec bash`` para a janela não fechar quando o comando acaba.
+Sem ``command`` a janela nasce como um bash interativo vazio — abrir terminal
+não é executar comando. Preferência: ptyxis (GNOME), com ``--`` separando
+opções dos argumentos do comando e ``--working-directory`` ANTES do ``--``.
+Fallback: ``x-terminal-emulator -e bash -lc``. Em ambos os casos ``hold=True``
+(padrão) termina com ``exec bash`` para a janela não fechar quando o comando
+acaba.
 
 Nunca usa shell=True no Popen: o comando roda dentro do bash do terminal,
 que é justamente o shell pedido. O processo é destacado em uma sessão nova.
@@ -54,19 +56,36 @@ def _xterm_argv(binary: str, script: str,
     return argv + ["-e", "bash", "-lc", script]
 
 
+def _ptyxis_shell_argv(binary: str, cwd: str | None,
+                       title: str | None = None) -> list[str]:
+    """Um bash interativo vazio; nenhum comando do modelo entra aqui."""
+    argv = [binary]
+    if title:
+        argv += ["--title", title]
+    if cwd:
+        argv += ["--working-directory", cwd]
+    return argv + ["--", "bash", "-l"]
+
+
+def _xterm_shell_argv(binary: str, title: str | None = None) -> list[str]:
+    argv = [binary]
+    if title:
+        argv += ["-T", title]
+    return argv + ["-e", "bash", "-l"]
+
+
 def open_terminal(parameters) -> dict:
     """Abre a janela e devolve ``{"ok", "message", "pid"}``.
 
-    ``pid`` é o processo da janela que o app abriu (o cliente do ptyxis xterm).
-    Quem precisa fechar a janela depois — o espelho de execução — mata esse pid
-    em vez de adivinhar títulos de janela no gerenciador.
+    Sem ``command`` abre só a janela com um bash interativo. Com ``command``,
+    roda aquilo dentro dela. ``pid`` é o processo da janela que o app abriu
+    (o cliente do ptyxis xterm). Quem precisa fechar a janela depois — o
+    espelho de execução — mata esse pid em vez de adivinhar títulos de janela
+    no gerenciador.
     """
     p = parameters if isinstance(parameters, dict) else {}
 
     command = str(p.get("command") or "").strip()
-    if not command:
-        return {"ok": False, "pid": None,
-                "message": "Informe o comando para rodar no terminal."}
 
     raw_cwd = str(p.get("cwd") or "").strip()
     cwd = os.path.abspath(os.path.expanduser(raw_cwd)) if raw_cwd else None
@@ -74,19 +93,26 @@ def open_terminal(parameters) -> dict:
         return {"ok": False, "pid": None,
                 "message": f"Diretório não encontrado: {cwd}"}
 
-    script = command + ("; exec bash" if _hold_enabled(p.get("hold")) else "")
     title = str(p.get("title") or "").strip()[:80] or None
+    if command:
+        script = command + ("; exec bash" if _hold_enabled(p.get("hold")) else "")
+        message = f"Abri o terminal na tela e estou rodando: {command}."
+    else:
+        script = ""
+        message = "Abri o terminal na tela."
 
     ptyxis = _available(PTYXIS)
     if ptyxis:
-        argv = _ptyxis_argv(ptyxis, script, cwd, title=title)
+        argv = (_ptyxis_argv(ptyxis, script, cwd, title=title) if command
+                else _ptyxis_shell_argv(ptyxis, cwd, title=title))
     else:
         xterm = _available(X_TERMINAL)
         if not xterm:
             return {"ok": False, "pid": None,
                     "message": "Não achei ptyxis nem x-terminal-emulator "
                                "para abrir a tela."}
-        argv = _xterm_argv(xterm, script, title=title)
+        argv = (_xterm_argv(xterm, script, title=title) if command
+                else _xterm_shell_argv(xterm, title=title))
     try:
         proc = subprocess.Popen(
             argv,
@@ -103,12 +129,21 @@ def open_terminal(parameters) -> dict:
         pid = int(getattr(proc, "pid", 0) or 0) or None
     except Exception:
         pid = None
-    return {"ok": True, "pid": pid,
-            "message": f"Abri o terminal na tela e estou rodando: {command}."}
+    return {"ok": True, "pid": pid, "message": message}
 
 
 def terminal_run(parameters, player=None, speak=None, session_memory=None) -> str:
-    return str(open_terminal(parameters).get("message") or "")
+    p = parameters if isinstance(parameters, dict) else {}
+    if not str(p.get("command") or "").strip():
+        return "Informe o comando para rodar no terminal."
+    return str(open_terminal(p).get("message") or "")
+
+
+def terminal_open(parameters, player=None, speak=None, session_memory=None) -> str:
+    """Só abre a janela; ignora qualquer ``command`` que venha junto."""
+    p = parameters if isinstance(parameters, dict) else {}
+    return str(open_terminal({"cwd": p.get("cwd"),
+                              "title": p.get("title")}).get("message") or "")
 
 
 TOOL = {
@@ -119,8 +154,10 @@ TOOL = {
         "'abre um terminal e roda X', instalar algo, ver logs ou executar um "
         "comando demorado que precisa ficar visível. Passe cwd para rodar "
         "dentro de uma pasta e hold=false para a janela fechar ao terminar "
-        "(padrão: true, deixa o bash aberto). Não use para comandos que devem "
-        "ser silenciosos."
+        "(padrão: true, deixa o bash aberto). Abrir só a janela interativa é "
+        "terminal_open, sem comando. Comandos destrutivos continuam passando "
+        "pelo portão de confirmação. Não use para comandos que devem ser "
+        "silenciosos."
     ),
     "parameters": {
         "type": "OBJECT",

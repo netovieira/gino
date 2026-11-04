@@ -199,6 +199,64 @@ def test_popen_failure_is_reported(monkeypatch, only):
     assert "sem display" in result
 
 
+# ── abrir janela != executar comando ───────────────────────────────────────
+
+def test_open_terminal_without_command_opens_interactive_bash(popen, only, tmp_path):
+    only("ptyxis")
+
+    result = action.open_terminal({"cwd": str(tmp_path), "title": "JARVIS"})
+
+    assert result["ok"] is True
+    assert result["message"] == "Abri o terminal na tela."
+    argv, kwargs = popen[0]
+    assert argv == [
+        "ptyxis", "--title", "JARVIS", "--working-directory", str(tmp_path),
+        "--", "bash", "-l",
+    ]
+    assert kwargs["start_new_session"] is True
+
+
+def test_open_terminal_without_command_xterm_fallback(popen, only):
+    only("x-terminal-emulator")
+
+    result = action.open_terminal({})
+
+    assert result["message"] == "Abri o terminal na tela."
+    assert popen[0][0] == ["x-terminal-emulator", "-e", "bash", "-l"]
+
+
+def test_terminal_open_tool_never_runs_a_command(popen, only, tmp_path):
+    from actions import terminal_open as opener
+
+    only("ptyxis")
+
+    result = opener.terminal_open({"command": "rm -rf ~", "cwd": str(tmp_path)})
+
+    assert result == "Abri o terminal na tela."
+    argv = popen[0][0]
+    assert "rm -rf ~" not in argv
+    assert "rm" not in argv
+    assert argv[-3:] == ["--", "bash", "-l"]
+
+
+def test_terminal_open_tool_contract():
+    from actions import terminal_open as opener
+
+    assert opener.TOOL["name"] == "terminal_open"
+    assert opener.TOOL["handler"] is opener.terminal_open
+    assert opener.TOOL["parameters"]["required"] == []
+    assert opener.TOOL["scheduling"] == "SILENT"
+
+
+def test_terminal_open_does_not_contradict_the_mouth_guard():
+    from actions import terminal_open as opener
+    from core.flows.guard import announcement, template_for
+
+    assert opener.TOOL["scheduling"] == "SILENT"
+    assert announcement("Abrindo o Terminal.") == "abrindo"
+    assert template_for([], "Abrindo o Terminal.") == ""
+
+
 # ── contrato do TOOL ───────────────────────────────────────────────────────
 
 def test_tool_contract():
