@@ -118,7 +118,10 @@ class RestartVoiceTest(unittest.TestCase):
         self.assertEqual(obj._restart.cancelled, 0)   # kept for a retry
         self.assertIn("Não reconheci", obj.said[0])
 
-    def test_single_owner_fallback_accepts_the_exact_phrase(self):
+    def test_single_owner_fallback_is_gone_and_the_phrase_is_refused(self):
+        # Old rule: one enrolled owner forgave a failed voiceprint. It was
+        # removed with core.owner_decision; a restart confirmation must be the
+        # owner's voice even when he is the only person in the index.
         obj = self._obj(owner=False,
                         pending={"kind": "assistant",
                                  "phrase": "confirmo reiniciar"})
@@ -130,7 +133,9 @@ class RestartVoiceTest(unittest.TestCase):
         obj._speaker = SingleOwner(owner=False)
         self.assertTrue(main.JarvisLive._handle_restart_confirmation(
             obj, "confirmo reiniciar", b"\x01\x00" * 16000))
-        self.assertEqual(obj._restart.confirmed, ["confirmo reiniciar"])
+        self.assertEqual(obj._restart.confirmed, [])
+        self.assertEqual(obj._restart.cancelled, 0)   # kept for a retry
+        self.assertIn("Não reconheci", obj.said[0])
 
     def test_unrelated_speech_keeps_the_request_pending(self):
         obj = self._obj(pending={"kind": "assistant", "phrase": "confirmo reiniciar"})

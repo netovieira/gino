@@ -98,10 +98,10 @@ class FakeSpeaker:
     def embedding(self, _pcm):
         return [1.0, 0.0]
 
-    def identify(self, _emb):
+    def identify(self, _emb, device=None):
         return {"name": self._name, "score": 0.9, "sample_score": 0.9,
                 "effective_score": 0.9, "known": self._known,
-                "authorized": self._authorized}
+                "authorized": self._authorized, "device": device}
 
     def list(self):
         if self._records is not None:
@@ -299,11 +299,11 @@ class WhatsAppRestartConfirmGateTests(unittest.TestCase):
         self.assertEqual(obj.wa_replies[0][1], OWNER_CHAT)
         self.assertEqual(obj.said, [], "nada é falado na sala pelo chat")
 
-    def test_single_owner_indulgence_matches_the_microphone(self):
-        # The genuine note scored 0.37 against the enrolled centroid. The
-        # microphone's rule for an assistant restart accepts that when the
-        # owner is the only enrolled person; the remote note now gets the very
-        # same rule instead of being flattened into text.
+    def test_single_owner_has_no_indulgence_anymore(self):
+        # The genuine note scored 0.37 against the enrolled centroid. The old
+        # microphone rule accepted that when the owner was the only person
+        # enrolled; that ``allow_single`` escape was removed, so the same note
+        # is now refused here too. An unauthenticated speaker cannot restart.
         restart = FakeRestart(pending={"kind": "assistant",
                                        "phrase": "confirmo reiniciar"})
         speaker = FakeSpeaker(name=None, known=False, authorized=False,
@@ -316,8 +316,9 @@ class WhatsAppRestartConfirmGateTests(unittest.TestCase):
             speak=False, wa_account=ACCOUNT, wa_chat=OWNER_CHAT,
             confirm_direct=True)
 
-        self.assertEqual(restart.confirmed, [PHRASE])
-        self.assertEqual(restart.events[0][0], "reply")
+        self.assertEqual(restart.confirmed, [])
+        self.assertIsNotNone(restart.pending_value, "pedido continua parado")
+        self.assertIn("Não reconheci", obj.wa_replies[-1][2])
 
     def test_pc_restart_note_still_needs_the_positive_print(self):
         restart = FakeRestart(pending={"kind": "pc",

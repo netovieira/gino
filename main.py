@@ -84,6 +84,8 @@ from core import activity as _activity
 from core import speech_guard as _speech_guard
 from core import tool_bridge as _tool_bridge
 from core import speaker_id as _speaker_id
+from core import owner_decision as _owner_decision
+from core import voice_cohorts as _voice_cohorts
 from core import mic_route as _mic_route
 from core import voice_device_enroll as _device_enroll
 from core import series_gate as _series_gate_mod
@@ -2192,6 +2194,11 @@ class JarvisLive:
         self._device_attest        = None
         self._device_attest_timer  = None
         self._current_pcm          = None
+        # UMA decisão de dono por processo (core/owner_decision.py): a histerese
+        # entre frases e o limiar calibrado da coorte de hardware. Nada aqui é
+        # criado por frase — os portões reutilizam estas duas instâncias.
+        self._owner_speaker_state  = _owner_decision.SpeakerState()
+        self._voice_registry       = _voice_cohorts.default_registry()
         # Transcript-driven mouth shapes for the avatar. Fed from the receive
         # loop as words arrive, drained by the playback loop against the audio.
         self._visemes              = VisemeStream()
@@ -4992,6 +4999,9 @@ class JarvisLive:
                 except Exception as e:
                     print(f"[Audio] migração de perfis de voz falhou: {e}")
                 self._refresh_mic_route()
+                # The index may have just been migrated: regenerate the cohort
+                # limits and replace the cached registry before any gate runs.
+                self._refresh_voice_cohorts("startup")
                 _health.set_component("voice_id", True, f"dono: {owner}")
             except Exception as e:
                 self._speaker = None
@@ -7272,6 +7282,7 @@ class JarvisLive:
                     # primary segment embedding over a mixed utterance.
                     sample = analysis.get("primary_embedding") or pcm
                     self._speaker.enroll(owner_name, sample, authorized=True)
+                    self._refresh_voice_cohorts("primeiro cadastro")
                     speaker = owner_name
                     self.ui.write_log(f"SYS: voz do dono cadastrada ({owner_name}).")
                 else:
@@ -8003,6 +8014,7 @@ class JarvisLive:
                         device=device) or {}
                 stored = int(result.get("samples") or len(buffered))
                 backup = str(result.get("backup") or "")
+                self._refresh_voice_cohorts("cadastro guiado")
             except Exception as e:
                 try:
                     self.ui.write_log(
@@ -8883,6 +8895,7 @@ class JarvisLive:
             try:
                 owner = self._speaker.owner_name
                 self._speaker.enroll(owner, sample, authorized=True)
+                self._refresh_voice_cohorts("auto-cadastro")
                 self._last_unknown_emb = None
                 self._last_unknown_pcm = None
                 self._last_known_emb = None
@@ -8952,6 +8965,7 @@ class JarvisLive:
             return True
         try:
             self._speaker.enroll(name, sample, authorized=True)
+            self._refresh_voice_cohorts("cadastro de convidada")
             self._last_unknown_pcm = None
             self._last_unknown_emb = None
             self._say_now(f"Pronto: {name} cadastrada e autorizada. Vou responder ela também.")
@@ -9048,6 +9062,146 @@ class JarvisLive:
         print(f"[Power] {out}")
         return True
 
+    def _owner_state(self):
+        """The ONE SpeakerState of this process (hysteresis, never new/frase)."""
+        state = getattr(self, "_owner_speaker_state", None)
+        if state is None:
+            state = _owner_decision.SpeakerState()
+            self._owner_speaker_state = state
+        return state
+
+    def _voice_registry_instance(self):
+        """The ONE cohort registry, reloaded only when the index is regenerated."""
+        registry = getattr(self, "_voice_registry", None)
+        if registry is None:
+            try:
+                registry = _voice_cohorts.default_registry()
+            except Exception:
+                registry = None
+            self._voice_registry = registry
+        return registry
+
+    @staticmethod
+    def _voiced_seconds(pcm):
+        """Voiced duration the STT already measured, when the clip carries it.
+
+        ``0.0`` is the HeardClip default when no frame reached the speech
+        level; it means "not measured", not "zero seconds of voice". Passing it
+        to the decision would turn a positive owner match into
+        ``indecisive_short``, so only a positive measurement is forwarded.
+        """
+        try:
+            value = getattr(pcm, "speech_s", None)
+            if value is None:
+                return None
+            seconds = float(value)
+            return seconds if seconds > 0.0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def _mic_acoustic_verdict(self, device: str | None = None) -> str | None:
+        """mic_compare verdict for a LOCAL clip, from the running MultiMic.
+
+        A remote note (``device`` set) is not in this comparison, so it never
+        inherits the room's acoustic label.
+        """
+        if device is not None:
+            return None
+        multi = getattr(self, "_multi_mic", None)
+        decision = getattr(multi, "decision", None) if multi is not None else None
+        verdict = str(getattr(decision, "verdict", "") or "").strip().lower()
+        return verdict or None
+
+    def _owner_decision_for_match(self, match, *, device: str | None = None,
+                                  privileged: bool = False,
+                                  transcript: str | None = None,
+                                  voiced_seconds: float | None = None,
+                                  acoustic: str | None = None):
+        """Feed one SpeakerId.identify result to the single owner decision."""
+        speaker = getattr(self, "_speaker", None)
+        owner_name = (getattr(speaker, "owner_name", None)
+                      or _owner_decision.DEFAULT_OWNER_NAME)
+        verdict = _owner_decision.decide(
+            match=match,
+            device=device,
+            privileged=privileged,
+            acoustic=acoustic,
+            transcript=transcript,
+            voiced_seconds=voiced_seconds,
+            owner_name=owner_name,
+            state=self._owner_state(),
+            registry=self._voice_registry_instance(),
+        )
+        if verdict.profile_state == _owner_decision.ProfileState.NO_PROFILE.value:
+            # Clear, throttled guidance: the mic in use was never enrolled.
+            try:
+                self._no_profile_notice(verdict.device)
+            except Exception:
+                pass
+        return verdict
+
+    def _owner_verdict(self, pcm: bytes | None,
+                       device: str | None = None, *,
+                       privileged: bool,
+                       include_auto: bool = False,
+                       transcript: str | None = None,
+                       voiced_seconds: float | None = None,
+                       acoustic: str | None = None,
+                       ):
+        """(Verdict, error) for one clip; None means no comparable audio."""
+        speaker = getattr(self, "_speaker", None)
+        if not pcm:
+            return None, "sem áudio"
+        if speaker is None:
+            return None, "sem cadastro de voz"
+        try:
+            emb = speaker.embedding(pcm)
+            if include_auto:
+                match = _speaker_id.identify_conversational(
+                    speaker, emb, voiced_seconds=voiced_seconds,
+                    device=device)
+            else:
+                match = speaker.identify(emb, device=device)
+            verdict = self._owner_decision_for_match(
+                match, device=device, privileged=privileged,
+                transcript=transcript, voiced_seconds=voiced_seconds,
+                acoustic=acoustic)
+        except Exception as e:
+            return None, f"erro na voz: {e}"
+        return verdict, ""
+
+    @staticmethod
+    def _verdict_detail(verdict) -> str:
+        """Auditable detail: the decision's own reason plus the matched profile.
+
+        ``verdict.reason`` is a readable policy label (never a command the owner
+        did not give); the fields after it are the same ones the old audit lines
+        printed.
+        """
+        return (f"{verdict.reason} voz={verdict.speaker or 'desconhecida'} "
+                f"score={float(verdict.score or 0.0):.3f} "
+                f"perfil={verdict.device or '?'}")
+
+    def _refresh_voice_cohorts(self, reason: str = "") -> bool:
+        """Regenerate ``memory/voices/cohorts.json`` after the index changed."""
+        speaker = getattr(self, "_speaker", None)
+        store_dir = (getattr(speaker, "store_dir", None)
+                     or getattr(speaker, "_store_dir", None))
+        if store_dir is None:
+            # In-memory speaker double: there is no index on disk to regenerate.
+            return False
+        try:
+            _voice_cohorts.refresh(store_dir=store_dir)
+        except Exception as e:
+            print(f"[Voz] cohorts não regenerados"
+                  f"{f' ({reason})' if reason else ''}: {e!r}")
+            return False
+        try:
+            self._voice_registry = _voice_cohorts.default_registry()
+        except Exception as e:
+            print(f"[Voz] registry de coortes não recarregado: {e!r}")
+        return True
+
     def _owner_voice(self, pcm: bytes | None,
                      device: str | None = None) -> tuple[bool, str]:
         """(is_owner, detail) for the voiceprint in this utterance.
@@ -9057,22 +9211,16 @@ class JarvisLive:
         only the hand-enrolled trusted samples count here, never the ones the
         assistant auto-enrolled during conversation. ``device`` defaults to the
         active microphone; a remote note passes ``celular``.
+
+        The answer is ``core.owner_decision``: the calibrated cohort limit, the
+        acoustic veto and ``no_profile`` all apply. There is no single-owner
+        forgiveness here.
         """
-        if not pcm or self._speaker is None:
-            return False, "sem áudio"
-        try:
-            emb = self._speaker.embedding(pcm)
-            match = self._speaker.identify(emb, device=device)
-            owner = (self._speaker.owner_name or "").strip().lower()
-            name = (match.get("name") or "").strip()
-            ok = bool(match.get("known") and match.get("authorized")
-                      and name.lower() == owner)
-            device = str(match.get("device") or "?").strip() or "?"
-            return ok, (f"voz={name or 'desconhecida'} "
-                        f"score={float(match.get('effective_score') or match.get('score') or 0):.3f} "
-                        f"perfil={device}")
-        except Exception as e:
-            return False, f"erro na voz: {e}"
+        verdict, error = self._owner_verdict(
+            pcm, device=device, privileged=True)
+        if verdict is None:
+            return False, error
+        return bool(verdict.privileged), self._verdict_detail(verdict)
 
     def _is_owner_pcm(self, pcm: bytes | None,
                       device: str | None = None) -> bool:
@@ -9233,9 +9381,10 @@ class JarvisLive:
         speaker = getattr(self, "_speaker", None)
         owner = str(getattr(speaker, "owner_name", "") or "").strip().lower()
         if speaker is not None:
-            # The progressive gate may have already accepted this segment on a
-            # previous 1 s/2 s/3 s slice; that verdict is free and identical to
-            # what _owner_speaker_confirmed would use.
+            # O gate progressivo já avaliou este segmento; um "accept" dele
+            # serve de pista, não de autorização: a identificação + decisão
+            # única abaixo continua obrigatória. Recusas (unauthorized/
+            # playback) são fail-closed e podem parar aqui.
             try:
                 decision = self._series_decision_for(pcm)
             except Exception:
@@ -9245,12 +9394,12 @@ class JarvisLive:
                 score = float(decision.get("score") or 0.0)
                 who = str(decision.get("speaker") or "").strip().lower()
                 if verdict == "accept":
-                    if owner and who == owner:
-                        if strict and score < _WAKE_ECHO_MIN_SCORE:
-                            return False, score, detail + " score_baixo"
-                        return True, score, f"gate progressivo voz={who}"
-                    return False, score, detail + f" voz={who or 'autorizada'}"
-                if verdict in ("unauthorized", "playback"):
+                    if not (owner and who == owner):
+                        return False, score, detail + f" voz={who or 'autorizada'}"
+                    # Acordar também passa pela decisão única: o "accept" do
+                    # gate conversacional não vale como dono por si só; segue
+                    # para a identificação + decide abaixo.
+                elif verdict in ("unauthorized", "playback"):
                     return False, score, detail + f" voz={who or verdict}"
             try:
                 emb = speaker.embedding(pcm)
@@ -9259,18 +9408,52 @@ class JarvisLive:
                 match = None
                 detail += f" voz_erro={e.__class__.__name__}"
             if match:
-                score = float(match.get("effective_score")
-                              or match.get("score") or 0.0)
-                name = str(match.get("name") or "").strip().lower()
-                if match.get("verdict") == _speaker_id.VERDICT_NO_PROFILE:
+                verdict = None
+                try:
+                    # The conversation gate is NOT privileged, but it consumes
+                    # the calibrated cohort limit, the acoustic veto and the
+                    # shared hysteresis before accepting a bare address.
+                    verdict = self._owner_decision_for_match(
+                        match, device=None, privileged=False,
+                        voiced_seconds=self._voiced_seconds(pcm),
+                        acoustic=self._mic_acoustic_verdict())
+                except Exception as e:
+                    detail += f" decisao_erro={e.__class__.__name__}"
+                score = float(
+                    verdict.score if verdict is not None else
+                    (match.get("effective_score") or match.get("score") or 0.0))
+                name = str((verdict.speaker if verdict is not None
+                            else match.get("name")) or "").strip().lower()
+                if verdict is not None:
+                    if not verdict.can_answer:
+                        return False, score, detail + " acustica_sem_fala"
+                    if verdict.profile_state == (
+                            _owner_decision.ProfileState.NO_PROFILE.value):
+                        # _owner_decision_for_match already gave the throttled
+                        # "no enrolment on this microphone" notice.
+                        return False, 0.0, (f"sem cadastro neste microfone "
+                                            f"({verdict.device})")
+                elif match.get("verdict") == _speaker_id.VERDICT_NO_PROFILE:
                     device = str(match.get("device") or "?").strip() or "?"
                     self._no_profile_notice(device)
                     return False, 0.0, f"sem cadastro neste microfone ({device})"
-                if (match.get("known") and match.get("authorized")
-                        and owner and name == owner):
+                # A clip too short to compare is neutral, not an intruder: the
+                # voiceprint's positive owner answer still stands (this is a
+                # bare "Gino.", naturally short).
+                short = bool(verdict is not None and verdict.profile_state == (
+                    _owner_decision.ProfileState.SHORT.value))
+                confirmed = (
+                    (verdict is not None
+                     and verdict.who is _owner_decision.Who.OWNER)
+                    or (short and match.get("known") and match.get("authorized")
+                        and owner and name == owner)
+                    or (verdict is None and match.get("known")
+                        and match.get("authorized") and owner
+                        and name == owner))
+                if confirmed:
                     if strict and score < _WAKE_ECHO_MIN_SCORE:
                         return False, score, detail + " score_baixo"
-                    return True, score, f"voz={match.get('name')}"
+                    return True, score, f"voz={match.get('name') or name}"
                 if match.get("known"):
                     return False, score, detail + f" voz={name or 'outra'}"
                 # Below the identify threshold the name is not returned, but
@@ -9350,9 +9533,9 @@ class JarvisLive:
         if speaker is None:
             return False, 0.0, "sem cadastro de voz"
         owner = str(getattr(speaker, "owner_name", "") or "").strip().lower()
-        # The listener's progressive gate already evaluated this exact segment;
-        # consulting that cached verdict first is free and saves an embedding.
-        # It is microphone-only: remote audio (``device`` set) is not in it.
+        # O gate progressivo já avaliou este segmento. O "accept" dele é só
+        # pista: identificação + decisão única abaixo continuam obrigatórias.
+        # É microfone só: áudio remoto (``device`` setado) não está no cache.
         decision = None
         if device is None:
             try:
@@ -9363,41 +9546,74 @@ class JarvisLive:
             verdict = str(decision.get("verdict") or "")
             score = float(decision.get("score") or 0.0)
             who = str(decision.get("speaker") or "").strip().lower()
-            device = str(decision.get("device") or "?").strip() or "?"
+            cached_device = str(decision.get("device") or "?").strip() or "?"
             if verdict == "accept":
-                if owner and who == owner:
-                    return True, score, (f"gate progressivo voz={who} "
-                                         f"perfil={device}")
-                return False, score, (f"voz={who or 'autorizada'} (não o dono) "
-                                      f"perfil={device}")
-            if verdict in ("unauthorized", "playback"):
-                return False, score, f"voz={who or verdict} perfil={device}"
+                if not (owner and who == owner):
+                    return False, score, (
+                        f"voz={who or 'autorizada'} (não o dono) "
+                        f"perfil={cached_device}")
+                # O gate progressivo é conversacional; o "accept" dele NÃO é
+                # autorização sozinho. Segue para a identificação + decisão
+                # única abaixo (coorte calibrada, veto acústico, no_profile).
+            elif verdict in ("unauthorized", "playback"):
+                return False, score, (f"voz={who or verdict} "
+                                      f"perfil={cached_device}")
+        speech_s = self._voiced_seconds(pcm)
+        acoustic = self._mic_acoustic_verdict(device)
         try:
             emb = speaker.embedding(pcm)
-            match = _speaker_id.identify_conversational(speaker, emb,
-                                                        device=device)
+            match = _speaker_id.identify_conversational(
+                speaker, emb, voiced_seconds=speech_s, device=device)
         except Exception as e:
             return False, 0.0, f"erro na voz: {e}"
-        score = float(match.get("effective_score")
-                      or match.get("score") or 0.0)
-        verdict = str(match.get("verdict") or "")
-        name = str(match.get("name") or "").strip().lower()
-        device = str(match.get("device") or "?").strip() or "?"
-        if verdict == _speaker_id.VERDICT_NO_PROFILE:
+        decision, decision_error = None, ""
+        try:
+            decision = self._owner_decision_for_match(
+                match, device=device, privileged=False, transcript=text,
+                voiced_seconds=speech_s, acoustic=acoustic)
+        except Exception as e:
+            decision_error = f"decisão de dono indisponível: {e}"
+        score = float(
+            decision.score if decision is not None else
+            (match.get("effective_score") or match.get("score") or 0.0))
+        match_verdict = str(match.get("verdict") or "")
+        name = str((decision.speaker if decision is not None
+                    else match.get("name")) or "").strip().lower()
+        device = str((decision.device if decision is not None
+                      else match.get("device")) or "?").strip() or "?"
+        if decision is not None:
+            if decision.profile_state == (
+                    _owner_decision.ProfileState.NO_PROFILE.value):
+                # Notice was already given (once, throttled) by the decision.
+                return False, 0.0, (f"sem cadastro de voz neste microfone "
+                                    f"(perfil={device})")
+            if not decision.can_answer:
+                return False, score, (f"sem fala útil para comparar "
+                                      f"(perfil={device})")
+            if decision.who is _owner_decision.Who.OWNER:
+                return True, score, (f"{decision.reason} "
+                                     f"perfil={device}")
+        elif match_verdict == _speaker_id.VERDICT_NO_PROFILE:
             # The active microphone has no enrolment. Saying so is the whole
             # point: comparing with another mic's centroid returned 0.2–0.3 and
             # looked like an intruder.
             self._no_profile_notice(device)
             return False, 0.0, (f"sem cadastro de voz neste microfone "
                                 f"(perfil={device})")
-        if match.get("known") and match.get("authorized") and owner and name == owner:
+        if (decision is None and match.get("known") and match.get("authorized")
+                and owner and name == owner):
             return True, score, f"voz={match.get('name')} perfil={device}"
         if allow_indulgence and self._voice_indulgence_ok(
-                text, verdict, score, 0.0):
+                text, match_verdict, score, speech_s or 0.0):
             return True, score, (f"indulgência (faixa cinzenta, "
                                  f"perfil={device})")
-        return False, score, (f"voz={match.get('name') or 'desconhecida'} "
-                              f"perfil={device}")
+        detail = (f"voz={match.get('name') or 'desconhecida'} "
+                  f"perfil={device}")
+        if decision is not None:
+            detail = f"{decision.reason} {detail}"
+        elif decision_error:
+            detail = f"{decision_error} {detail}"
+        return False, score, detail
 
     def _no_profile_notice(self, device: str) -> None:
         """Say once (per device, with cooldown) that this mic was never enrolled."""
@@ -9667,8 +9883,7 @@ class JarvisLive:
         if pcm is None:
             return True
         try:
-            return bool(self._owner_voice_ok(pcm, allow_single=True,
-                                             device=device))
+            return bool(self._owner_voice_ok(pcm, device=device))
         except Exception:
             return False
 
@@ -10378,30 +10593,39 @@ class JarvisLive:
             pass
         return True
 
-    def _owner_voice_ok(self, pcm: bytes | None, *, allow_single: bool = True,
+    def _owner_voice_ok(self, pcm: bytes | None, *,
                         device: str | None = None) -> bool:
         """Voiceprint gate for the spoken confirmation. No audio, no answer.
 
-        ``allow_single`` only forgives a failed comparison when there IS audio
-        (a microphone/enrolment problem with the single enrolled owner). A
-        typed phrase reaches here with ``pcm is None`` and must never ride that
-        fallback: text never confirms an irreversible action.
+        There is no single-owner escape hatch anymore: typed text never
+        confirms an irreversible action and a microphone without the owner's
+        enrolment (``no_profile``) refuses the privilege instead of comparing
+        with another mic's centroid.
         """
         if not pcm:
             print("[Voice] sem áudio — texto nunca confirma uma ação")
             return False
-        ok, detail = self._owner_voice(pcm, device=device)
-        if ok:
+        verdict, error = self._owner_verdict(
+            pcm, device=device, privileged=True)
+        if verdict is None:
+            print(f"[Voice] {error}; ação recusada")
+            return False
+        detail = self._verdict_detail(verdict)
+        if verdict.privileged:
             self._voice_audit(
                 "portão de confirmação por voz aberto para o dono.", detail)
             return True
-        if allow_single and self._only_owner_enrolled():
+        if verdict.profile_state == (
+                _owner_decision.ProfileState.NO_PROFILE.value):
             self._voice_audit(
-                "portão aberto pela regra do único dono cadastrado — voz não "
-                "reconhecida nesta amostra.", detail)
-            print(f"[Voice] voz não reconhecida ({detail}); aceito por ser o "
-                  f"único cadastrado e dono")
-            return True
+                "portão privilegiado fechado — este microfone não tem "
+                "cadastro do dono.", detail, origin="voz-aparelho")
+            print(f"[Voice] sem perfil neste microfone ({detail}); "
+                  "ação privilegiada recusada")
+            return False
+        self._voice_audit(
+            "portão privilegiado fechado — voz não confirmada como dono.",
+            detail, origin="voz-aparelho")
         print(f"[Voice] voz não reconhecida ({detail}); ação recusada")
         return False
 
@@ -10476,7 +10700,7 @@ class JarvisLive:
             # let the conversation continue normally.
             return False
         if not self._owner_voice_ok(
-                pcm, allow_single=(pending.get("kind") == "assistant"),
+                pcm,
                 device=(_speaker_id.DEVICE_CELLPHONE if remote else None)):
             # Keep the request alive: a failed voiceprint is usually the
             # microphone, not an intruder, and the owner can simply repeat.
@@ -10556,13 +10780,11 @@ class JarvisLive:
                        "assistant" if _RESTART_ASSISTANT_RE.search(text or "")
                        else "")
         # What the owner named out loud wins; otherwise keep the dead request's
-        # kind. A bare "confirmo reiniciar" defaults to the assistant, the only
-        # kind whose single-owner fallback is allowed.
+        # kind. A bare "confirmo reiniciar" defaults to the assistant. No kind
+        # has a single-owner fallback anymore: it always needs the voiceprint.
         renew_kind = spoken_kind or kind or "assistant"
-        # A PC request always needs the voiceprint, whichever kind is renewed.
-        allow_single = kind != "pc" and renew_kind == "assistant"
         if not self._owner_voice_ok(
-                pcm, allow_single=allow_single,
+                pcm,
                 device=(_speaker_id.DEVICE_CELLPHONE if remote else None)):
             if not remote:
                 self._log_heard(text)
@@ -10695,7 +10917,7 @@ class JarvisLive:
             self._say_now("Já existe um reinício aguardando confirmação. "
                           "Diga 'confirmo reiniciar' ou 'cancela'.")
             return True
-        if not self._owner_voice_ok(pcm, allow_single=wants_assistant):
+        if not self._owner_voice_ok(pcm):
             self._say_now("Só o dono pode pedir um reinício.")
             return True
         if wants_assistant:
@@ -10720,9 +10942,11 @@ class JarvisLive:
         """(is_owner, known, detail) decided by the privileged voiceprint.
 
         Only the hand-enrolled samples count (no auto-enrolled material) and
-        there is no single-owner fallback: an irreversible direct order is
-        never executed on a guess. ``known`` is used only to decide whether a
-        non-owner request should be escalated to the owner.
+        the final answer is ``core.owner_decision.decide``: the calibrated
+        cohort limit, the acoustic veto and ``no_profile`` all apply. This
+        used to compare the raw match with the owner's name, a parallel route
+        that skipped the single decision. ``known`` is used only to decide
+        whether a non-owner request should be escalated to the owner.
 
         ``device`` names the capture chain of the audio: default (None) is the
         active microphone; a WhatsApp note must pass ``celular`` so it is not
@@ -10738,19 +10962,16 @@ class JarvisLive:
             match = speaker.identify(emb, device=device) or {}
         except Exception as e:
             return False, False, f"erro na voz: {e}"
-        name = str(match.get("name") or "").strip()
-        owner = str(getattr(speaker, "owner_name", "") or "").strip().lower()
-        try:
-            score = float(match.get("effective_score")
-                          or match.get("score") or 0.0)
-        except (TypeError, ValueError):
-            score = 0.0
         known = bool(match.get("known"))
-        is_owner = bool(known and match.get("authorized")
-                        and name and name.lower() == owner)
-        device = str(match.get("device") or "?").strip() or "?"
-        detail = (f"voz={name or 'desconhecida'} score={score:.2f} "
-                  f"perfil={device}")
+        try:
+            verdict = self._owner_decision_for_match(
+                match, device=device, privileged=True,
+                voiced_seconds=self._voiced_seconds(pcm),
+                acoustic=self._mic_acoustic_verdict(device))
+        except Exception as e:
+            return False, known, f"decisão de dono indisponível: {e}"
+        is_owner = bool(verdict.privileged)
+        detail = self._verdict_detail(verdict)
         if is_owner:
             # Todo portão de voz aberto deixa trilha com o perfil que casou.
             self._voice_audit("voz do dono confirmada no portão privilegiado.",
