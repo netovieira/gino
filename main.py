@@ -2584,16 +2584,25 @@ class JarvisLive:
     def _start_mail(self) -> None:
         """Sobe as contas de e-mail no molde do WhatsApp, sem travar o boot.
 
-        Cada conta habilitada tenta UMA vez (`core.email.connect_all`) e o
-        estado REAL de cada uma é falado: as que não conectaram pedem a mão do
-        dono. Zero contas = silêncio absoluto. Fora do caminho principal e com
-        espera limitada — o boot nunca fica refém daqui.
+        Cada conta habilitada tenta UMA vez (`core.email.connect_all`). Falha
+        transitória fica muda no boot (o hook de `core.email` fala na SEGUNDA
+        falha consecutiva); só `auth`, que não reconecta sozinho, pede a mão
+        do dono. Zero contas = silêncio absoluto. Fora do caminho principal e
+        com espera limitada — o boot nunca fica refém daqui.
         """
         try:
             from core import email as _mail
         except Exception as e:
             print(f"[E-mail] indisponível: {e}")
             return
+        # Aviso de queda/volta: o módulo só chama na SEGUNDA falha
+        # consecutiva e uma vez na recuperação. Registrar ANTES da primeira
+        # tentativa garante que o worker de reconexão já tenha para quem
+        # falar. A frase vem de `core.email`; aqui só agendamos a fala.
+        try:
+            _mail.set_retry_notice(self._mail_retry_notice)
+        except Exception as e:
+            print(f"[E-mail] aviso de reconexão indisponível: {e}")
         try:
             states = _mail.connect_all()
         except Exception as e:
@@ -2613,16 +2622,54 @@ class JarvisLive:
         except Exception as e:
             print(f"[E-mail] varredura de não lidos indisponível: {e}")
 
-    def _mail_startup_notice(self, states) -> list[str]:
-        """Fala uma vez cada conta que NÃO conectou no boot. Todas = silêncio.
+    def _mail_retry_notice(self, payload) -> None:
+        """Recebe o aviso de queda/volta do e-mail e agenda a fala na UI.
 
-        Uma frase curta por conta, só o nome e o pedido de conectar na mão:
-        nada de endereço, caminho, módulo, ferramenta ou log. Sai por
-        `_say_now`, então o guarda de fala e o modo silêncio seguem valendo.
+        Roda na thread de reconexão do `core.email`; falar daqui competiria
+        com o loop de áudio. A mensagem é montada no módulo — não inventamos
+        texto nem atribuímos fala ao dono. Sem loop (boot antes da UI), o
+        aviso vira linha `SYS:` no painel, sem sumir.
+        """
+        if not isinstance(payload, dict):
+            return
+        message = str(payload.get("message") or "").strip()
+        if not message:
+            return
+        kind = str(payload.get("kind") or "")
+
+        def _speak() -> None:
+            try:
+                self._say_now(message, log=True, origin="email")
+            except Exception as e:
+                print(f"[E-mail] aviso de reconexão não falado: {e}")
+
+        loop = getattr(self, "_loop", None)
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(_speak)
+                return
+            except Exception as e:
+                print(f"[E-mail] loop da UI indisponível: {e}")
+        try:
+            self.ui.write_log("SYS: " + message)
+        except Exception:
+            pass
+        print(f"[E-mail] aviso ({kind or '?'}): {message}")
+
+    def _mail_startup_notice(self, states) -> list[str]:
+        """Fala no boot só a conta que precisa de mão humana. Resto = silêncio.
+
+        Falha transitória (state == "error") tem reconexão automática: o boot
+        não faz barulho na PRIMEIRA tentativa — quem avisa é o hook de
+        `core.email` na segunda falha consecutiva. `auth` não reconecta
+        sozinho, então é a única que merece a frase de boot, com o nome e o
+        pedido de conectar na mão: nada de endereço, caminho ou módulo. Sai
+        por `_say_now`, então o guarda de fala e o modo silêncio valem.
         Devolve as frases (vazio = nada falado).
         """
         failures = [s for s in (states or [])
-                    if isinstance(s, dict) and not s.get("connected")]
+                    if isinstance(s, dict) and not s.get("connected")
+                    and str(s.get("state") or "") == "auth"]
         lines: list[str] = []
         for state in failures:
             name = " ".join(str(state.get("name") or "").split())[:40]

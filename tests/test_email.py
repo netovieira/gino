@@ -464,7 +464,7 @@ class Notice:
         self.obj = obj
 
 
-def test_startup_notice_one_line_per_failed_account():
+def test_startup_notice_only_for_auth_that_needs_a_hand():
     notice = Notice()
     states = [
         {"name": "trabalho", "connected": False, "state": "auth"},
@@ -472,11 +472,20 @@ def test_startup_notice_one_line_per_failed_account():
         {"name": "antiga", "connected": False, "state": "error"},
     ]
     lines = main.JarvisLive._mail_startup_notice(notice.obj, states)
-    assert len(lines) == 2
-    assert "trabalho" in lines[0] and "antiga" in lines[1]
+    assert len(lines) == 1, "falha transitória no boot não fala na 1ª tentativa"
+    assert "trabalho" in lines[0]
+    assert "antiga" not in lines[0]
     assert all("na mão" in line for line in lines)
     assert notice.obj.said == lines
     assert notice.obj.ui.mail_opened == 1
+
+
+def test_startup_notice_is_silent_for_transient_error():
+    notice = Notice()
+    states = [{"name": "trabalho", "connected": False, "state": "error"}]
+    assert main.JarvisLive._mail_startup_notice(notice.obj, states) == []
+    assert notice.obj.said == []
+    assert notice.obj.ui.mail_opened == 0
 
 
 def test_startup_notice_silent_when_all_connect():
@@ -494,6 +503,58 @@ def test_startup_notice_falls_back_to_panel_without_audio():
     assert len(lines) == 1
     assert notice.obj.said == []
     assert any("trabalho" in line for line in notice.obj.ui.lines)
+
+
+class FakeLoop:
+    def __init__(self):
+        self.calls = []
+
+    def call_soon_threadsafe(self, callback, *args):
+        self.calls.append((callback, args))
+
+
+def test_mail_retry_notice_schedules_module_message_on_ui_loop():
+    obj = object.__new__(main.JarvisLive)
+    obj.ui = FakeUI()
+    obj.said = []
+    obj._say_now = lambda text, **kwargs: obj.said.append((str(text), kwargs))
+    obj._loop = FakeLoop()
+    message = "Não consegui conectar o e-mail trabalho de novo; sigo tentando sozinho."
+    main.JarvisLive._mail_retry_notice(obj, {"kind": "down", "message": message})
+    assert obj.said == [], "a thread de reconexão não fala direto"
+    assert len(obj._loop.calls) == 1
+    callback, args = obj._loop.calls[0]
+    callback(*args)
+    assert obj.said == [(message, {"log": True, "origin": "email"})]
+
+
+def test_start_mail_registers_retry_notice_before_connect(monkeypatch):
+    obj = object.__new__(main.JarvisLive)
+    obj.ui = FakeUI()
+    obj._say_now = lambda *a, **k: None
+    obj._wait_boot_speech_ready = lambda timeout=25.0: True
+    order: list[str] = []
+    captured: dict = {}
+
+    def fake_set(handler=None):
+        order.append("set")
+        captured["handler"] = handler
+
+    def fake_connect(*a, **k):
+        order.append("connect")
+        return []
+
+    monkeypatch.setattr(mail, "set_retry_notice", fake_set)
+    monkeypatch.setattr(mail, "connect_all", fake_connect)
+    monkeypatch.setattr(mail, "start", lambda *a, **k: None)
+    main.JarvisLive._start_mail(obj)
+
+    assert order == ["set", "connect"], "hook registrado antes da 1ª tentativa"
+    handler = captured["handler"]
+    assert callable(handler)
+    assert getattr(handler, "__self__", None) is obj
+    assert (getattr(handler, "__func__", None)
+            is main.JarvisLive._mail_retry_notice)
 
 
 def test_start_mail_with_zero_accounts_never_raises(vault):

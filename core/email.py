@@ -60,9 +60,11 @@ import email
 import imaplib
 import json
 import os
+import random
 import re
 import shutil
 import smtplib
+import socket
 import ssl
 import tempfile
 import threading
@@ -92,6 +94,15 @@ INBOX_TRIM_EVERY  = 25         # regrava o arquivo a cada N itens
 CONNECT_TIMEOUT_S = 12.0       # teto de uma conexão IMAP/SMTP
 START_WAIT_S      = 10.0       # quanto o connect_all espera por conta
 BOOT_SETTLE_S     = 6.0        # janela curta para as contas mais lentas
+
+# Reconexão: falha de rede NUNCA vira conta desligada. A espera cresce de
+# verdade (5 s, 15 s, 45 s, 135 s, teto de 4 min) e ganha jitter para várias
+# contas não baterem no servidor no mesmo instante. O teto é de ESPERA, não de
+# tentativas: enquanto a conta estiver habilitada, o laço continua.
+BACKOFF_BASE_S    = 5.0
+BACKOFF_FACTOR    = 3.0
+BACKOFF_MAX_S     = 240.0
+BACKOFF_JITTER    = 0.2        # ±20% em cada espera
 POLL_S            = 180.0      # intervalo da varredura de não lidos
 OTP_POLL_S        = 60.0       # cadência do passo de códigos (a mesma de antes)
 SCAN              = 60         # quantos não lidos recentes uma varredura olha
@@ -147,6 +158,15 @@ _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 _lock   = threading.RLock()
 _logger = None
+
+# Reconexão automática: um worker por conta, parado de verdade em stop/reset.
+_retry_lock    = threading.Lock()
+_retry_threads: dict[str, threading.Thread] = {}
+_retry_stop    = threading.Event()
+
+# Aviso ao dono: só o SEGUNDO erro consecutivo e a recuperação chamam isto.
+_notice_lock   = threading.Lock()
+_notice_hook   = None
 
 
 def _log(message: str) -> None:
@@ -307,6 +327,12 @@ class MailAccount:
         self.last_check  = 0.0
         self.appended    = 0
         self.unread      = 0
+        # diagnóstico/reconexão (só em memória; nada de segredo aqui)
+        self.attempts       = 0      # tentativas de conexão desde o boot
+        self.fail_streak    = 0      # falhas CONSECUTIVAS (zera ao conectar)
+        self.down_notified  = False  # já avisamos o dono que caiu?
+        self.next_retry_s   = 0.0    # espera da próxima tentativa (só log)
+        self._stage         = ""     # etapa da tentativa em curso (dns/tcp/...)
 
     # -- caminhos ---------------------------------------------------------
     def ensure_dir(self) -> None:
@@ -837,22 +863,32 @@ def purge_legacy(backup: bool = True) -> list[str]:
 # ── conexão: estado REAL, nunca recibo de ferramenta ────────────────────────
 
 def _imap_open(acct: MailAccount):
-    """Abre e autentica a caixa. Levanta a exceção do imaplib/socket."""
+    """Abre e autentica a caixa. Levanta a exceção do imaplib/socket.
+
+    ``acct._stage`` marca a etapa em curso ANTES de cada passo que pode
+    falhar. É o que permite o diagnóstico dizer "travou no TLS" em vez de um
+    "erro de conexão" genérico — sem guardar senha nenhuma no caminho.
+    """
+    acct._stage = "preflight"
     password = app_password(acct.uuid)
     if not acct.address or not password:
         raise imaplib.IMAP4.error("faltam endereço e senha de app")
     host = acct.imap_host or str((PROVIDERS.get(acct.provider) or {}).get("imap", ("",))[0])
     if not host:
         raise imaplib.IMAP4.error("falta o host IMAP")
+    acct._stage = "connect"          # DNS + TCP + TLS acontecem aqui dentro
     if acct.imap_ssl:
         conn = imaplib.IMAP4_SSL(host, acct.imap_port, timeout=CONNECT_TIMEOUT_S)
     else:
         conn = imaplib.IMAP4(host, acct.imap_port, timeout=CONNECT_TIMEOUT_S)
+        acct._stage = "tls"
         try:
             conn.starttls(ssl_context=ssl.create_default_context())
         except Exception:
             pass
+    acct._stage = "login"
     conn.login(acct.address, password)
+    acct._stage = "ready"
     return conn
 
 
@@ -875,60 +911,271 @@ def _smtp_open(acct: MailAccount):
     return conn
 
 
-def _mark(acct: MailAccount, state: str, detail: str = "") -> dict:
-    """Grava o estado real na conta e devolve a entrada de boot."""
+def _imap_endpoint(acct: MailAccount) -> tuple[str, int]:
+    """Host/porta efetivos do IMAP (preset quando a conta não tem override)."""
+    host = acct.imap_host or str(
+        (PROVIDERS.get(acct.provider) or {}).get("imap", ("",))[0])
+    try:
+        port = int(acct.imap_port or 993)
+    except (TypeError, ValueError):
+        port = 993
+    return str(host or ""), port
+
+
+def _redact(acct: MailAccount, text: object) -> str:
+    """Mensagem curta de exceção SEM a senha de app, se ela aparecer.
+
+    Nunca chamamos isto com cabeçalho, corpo ou configuração inteira: só a
+    mensagem da exceção. A senha é lida do cofre apenas para ser removida do
+    texto — ela não é devolvida nem registrada.
+    """
+    out = _one_line(text, 160)
+    try:
+        secret = str(app_password(acct.uuid) or "")
+    except Exception:
+        secret = ""
+    if len(secret) >= 3 and secret in out:
+        out = out.replace(secret, "[senha omitida]")
+    return out
+
+
+def _stage_for(exc: Exception | None, fallback: str) -> str:
+    """Etapa real da falha: dns | tcp | tls | login | select | preflight."""
+    if exc is None:
+        return fallback or "unknown"
+    if isinstance(exc, socket.gaierror):
+        return "dns"
+    if isinstance(exc, ssl.SSLError):
+        return "tls"
+    if isinstance(exc, smtplib.SMTPAuthenticationError):
+        return "login"
+    if isinstance(exc, imaplib.IMAP4.error):
+        # Erro do protocolo/login: se o abridor já marcou select, confia nele.
+        if fallback == "preflight":
+            return "preflight"
+        return fallback if fallback in ("login", "select", "imap") else "login"
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return fallback if fallback in ("dns", "tcp", "tls", "login", "select") else "tcp"
+    if isinstance(exc, (ConnectionRefusedError, ConnectionResetError,
+                        ConnectionAbortedError, BrokenPipeError)):
+        return "tcp"
+    if isinstance(exc, OSError):
+        return fallback if fallback in ("dns", "tcp", "tls") else "tcp"
+    return fallback or "unknown"
+
+
+def _diag(acct: MailAccount, exc: Exception | None, stage: str,
+          started: float, attempt: int) -> dict:
+    """O que fica no log/estado de UMA tentativa. Só campos seguros.
+
+    Não entra aqui senha, token, credencial, cabeçalho nem conteúdo de
+    mensagem: tipo de exceção, mensagem curta (com a senha removida), host,
+    porta, etapa e duração.
+    """
+    host, port = _imap_endpoint(acct)
+    duration_ms = max(0, int(round((time.monotonic() - started) * 1000)))
+    return {
+        "attempt": int(attempt),
+        "stage": _stage_for(exc, stage),
+        "error_type": type(exc).__name__ if exc is not None else "",
+        "error_message": _redact(acct, exc) if exc is not None else "",
+        "host": host,
+        "port": port,
+        "duration_ms": duration_ms,
+    }
+
+
+def _write_state(acct: MailAccount, payload: dict) -> None:
+    """state.json atômico: temporário no MESMO diretório + os.replace.
+
+    Retry/reconnect pode rodar em paralelo com a varredura; escrita parcial
+    nunca deve deixar o JSON quebrado. Só metadado de diagnóstico, nunca
+    credencial.
+    """
+    try:
+        acct.ensure_dir()
+        fd, tmp = tempfile.mkstemp(prefix="state.", suffix=".tmp",
+                                   dir=str(acct.dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, acct.state_file)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        _log(f"não consegui gravar o estado de {acct.name}: {e}")
+
+
+def set_retry_notice(handler=None) -> None:
+    """Registra quem mostra ao dono o aviso de queda/recuperação do e-mail.
+
+    ``handler(payload)`` roda na thread de reconexão; quem for falar na
+    interface deve agendar no loop dela (``call_soon_threadsafe``). O aviso só
+    é chamado na SEGUNDA falha consecutiva e na recuperação — nunca por
+    tentativa. Sem gancho, só o log registra (nada é falado por conta própria).
+    """
+    global _notice_hook
+    _notice_hook = handler if callable(handler) else None
+
+
+def _emit_notice(kind: str, acct: MailAccount) -> None:
+    """Entrega o aviso de queda/recuperação a quem estiver registrado."""
+    name = " ".join(str(acct.name or "").split())[:40] or "principal"
+    if kind == "up":
+        message = f"O e-mail {name} voltou a conectar."
+    else:
+        message = (f"Não consegui conectar o e-mail {name} de novo; "
+                   "sigo tentando sozinho.")
+    payload = {"kind": kind, "account": acct.name, "uuid": acct.uuid,
+               "state": acct.state, "detail": acct.detail,
+               "fail_streak": acct.fail_streak, "message": message}
+    with _notice_lock:
+        hook = _notice_hook
+    _log(f"aviso de e-mail ({kind}) para {name}: {message}")
+    if hook is None:
+        return
+    try:
+        hook(dict(payload))
+    except Exception as e:
+        _log(f"o aviso de e-mail não foi entregue: {e}")
+
+
+def _mark(acct: MailAccount, state: str, detail: str = "",
+          diag: dict | None = None, track: bool = True) -> dict:
+    """Grava o estado real na conta e devolve a entrada de boot.
+
+    `diag` vem de `_diag()` e é persistido junto (tipo/etapa/duração), sem
+    segredo. A contagem de falhas consecutivas decide o aviso: primeira falha
+    é silêncio, segunda avisa uma vez, recuperação avisa uma vez. `track=False`
+    é para falha de ENVIO (SMTP): não conta para a reconexão da caixa IMAP.
+    """
     acct.state = state
     acct.connected = state == "connected"
     acct.detail = _one_line(detail, 200)
     acct.error = "" if acct.connected else acct.detail
     acct.last_check = time.time()
+    diag = dict(diag or {})
+    notice = ""
+    with _lock:
+        if track:
+            if acct.connected:
+                acct.fail_streak = 0
+                if acct.down_notified:
+                    acct.down_notified = False
+                    notice = "up"
+            else:
+                acct.fail_streak += 1
+                if acct.fail_streak == 2 and not acct.down_notified:
+                    acct.down_notified = True
+                    notice = "down"
+    payload = {
+        "state": state,
+        "detail": acct.detail,
+        "at": acct.last_check,
+        "attempt": int(diag.get("attempt") or acct.attempts or 0),
+        "stage": str(diag.get("stage") or acct._stage or ""),
+        "error_type": str(diag.get("error_type") or ""),
+        "error_message": str(diag.get("error_message") or ""),
+        "host": str(diag.get("host") or ""),
+        "port": int(diag.get("port") or 0),
+        "duration_ms": int(diag.get("duration_ms") or 0),
+        "consecutive_failures": int(acct.fail_streak),
+    }
+    _write_state(acct, payload)
     entry = {"name": acct.name, "uuid": acct.uuid, "address": acct.address,
              "connected": acct.connected, "state": state,
              "has_password": has_password(acct.uuid),
-             "detail": acct.detail}
-    try:
-        acct.ensure_dir()
-        acct.state_file.write_text(
-            json.dumps({"state": state, "detail": acct.detail,
-                        "at": acct.last_check}, ensure_ascii=False),
-            encoding="utf-8")
-    except Exception:
-        pass
+             "detail": acct.detail,
+             "attempts": int(acct.attempts),
+             "consecutive_failures": int(acct.fail_streak),
+             "stage": payload["stage"]}
+    if notice:
+        _emit_notice(notice, acct)
     return entry
 
 
-def test_account(name_or_uuid: str) -> dict:
-    """Tenta conectar de verdade. ``state``: connected | auth | error.
+def _begin_attempt(acct: MailAccount) -> int:
+    with _lock:
+        acct.attempts += 1
+        return acct.attempts
 
-    ``auth`` = o servidor recusou (senha de app errada/ausente, conta sem
-    permissão): precisa de mão humana. ``error`` = rede, TLS, host errado.
+
+def _attempt(acct: MailAccount) -> dict:
+    """UMA tentativa real de abrir a caixa; nunca levanta, sempre marca.
+
+    Loga etapa, tipo de exceção, host/porta e duração — inclusive quando dá
+    certo. A senha não entra no texto (nem se vier dentro da exceção).
     """
-    acct = _find(name_or_uuid)
-    if acct is None:
-        return {"name": str(name_or_uuid or ""), "uuid": "", "address": "",
-                "connected": False, "state": "error", "has_password": False,
-                "detail": "conta não encontrada"}
-    if not acct.address:
-        return _mark(acct, "auth", "sem endereço de e-mail")
-    if not has_password(acct.uuid):
-        return _mark(acct, "auth", "falta a senha de app")
+    started = time.monotonic()
+    n = _begin_attempt(acct)
+    stage = "preflight"
+    state, detail, exc = "error", "", None
     conn = None
     try:
-        conn = _imap_open(acct)
-        conn.select("INBOX", readonly=True)
+        if not acct.address:
+            state, detail = "auth", "sem endereço de e-mail"
+        elif not has_password(acct.uuid):
+            state, detail = "auth", "falta a senha de app"
+        else:
+            stage = "connect"
+            conn = _imap_open(acct)
+            stage = "select"
+            acct._stage = "select"
+            conn.select("INBOX", readonly=True)
+            stage = "ready"
+            state, detail = "connected", "caixa de entrada acessível"
     except imaplib.IMAP4.error as e:
-        return _mark(acct, "auth", f"o servidor recusou: {_reason(e)}")
+        exc = e
+        state = "auth"
+        detail = f"o servidor recusou: {_redact(acct, _reason(e))}"
     except (ssl.SSLError, OSError) as e:
-        return _mark(acct, "error", f"não consegui falar com o servidor: {_reason(e)}")
+        exc = e
+        state = "error"
+        detail = f"não consegui falar com o servidor: {_redact(acct, _reason(e))}"
     except Exception as e:
-        return _mark(acct, "error", _reason(e))
+        exc = e
+        state = "error"
+        detail = _redact(acct, _reason(e))
     finally:
         if conn is not None:
             try:
                 conn.logout()
             except Exception:
                 pass
-    return _mark(acct, "connected", "caixa de entrada acessível")
+    hinted = getattr(acct, "_stage", "") or stage
+    diag = _diag(acct, exc, hinted if exc is not None else stage, started, n)
+    host, port = diag["host"], diag["port"]
+    if state == "connected":
+        _log(f"{acct.name}: tentativa {n} conectou em {diag['duration_ms']} ms "
+             f"({host}:{port})")
+    else:
+        _log(f"{acct.name}: tentativa {n} falhou na etapa {diag['stage']} "
+             f"({diag['error_type'] or 'erro'}) após {diag['duration_ms']} ms "
+             f"em {host}:{port} — {diag['error_message'] or detail}")
+    return _mark(acct, state, detail, diag=diag)
+
+
+def test_account(name_or_uuid: str) -> dict:
+    """Tenta conectar de verdade. ``state``: connected | auth | error.
+
+    ``auth`` = o servidor recusou (senha de app errada/ausente, conta sem
+    permissão): precisa de mão humana. ``error`` = rede, TLS, host errado —
+    este é transitório e a reconexão automática continua.
+    """
+    acct = _find(name_or_uuid)
+    if acct is None:
+        return {"name": str(name_or_uuid or ""), "uuid": "", "address": "",
+                "connected": False, "state": "error", "has_password": False,
+                "detail": "conta não encontrada"}
+    return _attempt(acct)
+
 
 
 def _reason(exc: Exception) -> str:
@@ -946,16 +1193,101 @@ def _boot_entry(acct: MailAccount) -> dict:
     return {"name": acct.name, "uuid": acct.uuid, "address": acct.address,
             "connected": bool(acct.connected), "state": acct.state or "auth",
             "has_password": has_password(acct.uuid),
-            "detail": acct.detail or acct.error}
+            "detail": acct.detail or acct.error,
+            "auto_start": bool(acct.auto_start),
+            "attempts": int(acct.attempts),
+            "consecutive_failures": int(acct.fail_streak),
+            "stage": str(getattr(acct, "_stage", "") or "")}
+
+
+def _backoff_delay(fail_streak: int) -> float:
+    """Espera antes da próxima tentativa: 5, 15, 45, 135, 240 s (com jitter).
+
+    ``fail_streak`` é o número de falhas CONSECUTIVAS já ocorridas. O teto
+    limita a espera, não as tentativas: com a conta habilitada, o laço segue.
+    """
+    step = max(1, int(fail_streak or 1)) - 1
+    raw = min(BACKOFF_MAX_S, BACKOFF_BASE_S * (BACKOFF_FACTOR ** step))
+    jittered = raw * (1.0 + random.uniform(-BACKOFF_JITTER, BACKOFF_JITTER))
+    return max(1.0, min(BACKOFF_MAX_S, jittered))
+
+
+def _retry_wait(seconds: float) -> bool:
+    """Espera interrompível; True = pediram para parar. Testes trocam isto."""
+    return _retry_stop.wait(max(0.0, float(seconds or 0.0)))
+
+
+def _retry_active() -> bool:
+    with _retry_lock:
+        return any(t.is_alive() for t in _retry_threads.values())
+
+
+def _schedule_retry(acct: MailAccount) -> threading.Thread | None:
+    """Liga (uma vez por conta) o worker de reconexão em segundo plano."""
+    if acct.state != "error":
+        return None
+    if not acct.auto_start or not has_password(acct.uuid):
+        return None
+    with _retry_lock:
+        current = _retry_threads.get(acct.uuid)
+        if current is not None and current.is_alive():
+            return current
+        if not any(t.is_alive() for t in _retry_threads.values()):
+            _retry_stop.clear()       # um stop anterior não vale para esta conta
+        worker = threading.Thread(
+            target=_retry_worker, args=(acct,), daemon=True,
+            name=f"jarvis-mail-retry-{acct.uuid}")
+        _retry_threads[acct.uuid] = worker
+        worker.start()
+        _log(f"{acct.name}: falha transitória — reconexão automática ligada")
+        return worker
+
+
+def _retry_worker(acct: MailAccount, max_attempts: int | None = None) -> None:
+    """Reconecta com backoff exponencial até conseguir (ou ser parado).
+
+    Nunca mexe em ``auto_start``/configuração e nunca apaga credencial: se a
+    conta continua habilitada, o laço continua. Erro de autenticação não é
+    transitório e pausa aqui (insistir com senha errada pode travar a conta);
+    erro de rede/TLS/DNS segue tentando, com teto de espera de 4 minutos.
+    """
+    made = 0
+    while not _retry_stop.is_set():
+        current = _accounts.get(acct.uuid)
+        if current is not acct or not acct.auto_start:
+            return
+        delay = _backoff_delay(acct.fail_streak or 1)
+        acct.next_retry_s = delay
+        _log(f"{acct.name}: próxima tentativa em {delay:.0f} s "
+             f"(falhas consecutivas: {acct.fail_streak})")
+        if _retry_wait(delay):
+            return
+        if _retry_stop.is_set():
+            return
+        if acct.connected and acct.fail_streak == 0:
+            acct.next_retry_s = 0.0
+            return                    # a varredura recuperou antes do worker
+        entry = _attempt(acct)
+        made += 1
+        if entry.get("connected"):
+            acct.next_retry_s = 0.0
+            return
+        if entry.get("state") == "auth":
+            _log(f"{acct.name}: reconexão pausada — precisa de senha de app "
+                 "válida (a conta continua habilitada)")
+            return
+        if max_attempts is not None and made >= int(max_attempts):
+            return
 
 
 def connect_all(logger=None, settle_s: float = BOOT_SETTLE_S) -> list[dict]:
-    """Tenta cada conta HABILITADA uma vez, em paralelo, e diz o estado real.
+    """Tenta cada conta HABILITADA e devolve o estado REAL de cada uma.
 
-    É o que o boot chama. Cada conta roda numa thread com espera limitada; a
-    janela final (`settle_s`) é só para as mais lentas fecharem o handshake.
-    Não há laço de reconexão aqui — a varredura usa a conexão por conta quando
-    precisa e falha sem insistir. Devolve uma entrada por conta.
+    É o que o boot chama. A PRIMEIRA tentativa de cada conta roda em paralelo,
+    com a janela limitada de sempre — o boot nunca fica refém do e-mail. O que
+    falhar por rede/TLS/DNS ganha um worker de reconexão com backoff de 5 s a
+    4 min; a conta NÃO é desabilitada e nenhuma política de escuta muda.
+    Devolve uma entrada por conta (a primeira tentativa; o worker continua).
     """
     global _logger
     if logger is not None:
@@ -964,6 +1296,9 @@ def connect_all(logger=None, settle_s: float = BOOT_SETTLE_S) -> list[dict]:
     targets = [a for a in _accounts.values() if a.auto_start]
     if not targets:
         return []
+    with _retry_lock:
+        if not any(t.is_alive() for t in _retry_threads.values()):
+            _retry_stop.clear()
     workers = []
     for acct in targets:
         worker = threading.Thread(
@@ -978,14 +1313,21 @@ def connect_all(logger=None, settle_s: float = BOOT_SETTLE_S) -> list[dict]:
     while time.time() < settle_deadline and any(
             a.state == "unknown" for a in targets):
         time.sleep(0.1)
-    return [_boot_entry(a) for a in targets]
+    # Fotografa a primeira tentativa ANTES de ligar o worker: o retorno do
+    # boot diz o que aconteceu de fato, não o que o worker já conseguiu.
+    entries = [_boot_entry(a) for a in targets]
+    for acct in targets:
+        if acct.state == "error":
+            _schedule_retry(acct)
+    return entries
 
 
 def _safe_test(acct: MailAccount) -> None:
     try:
-        test_account(acct.uuid)
+        _attempt(acct)
     except Exception as e:
-        _mark(acct, "error", _reason(e))
+        _mark(acct, "error", _redact(acct, _reason(e)))
+
 
 
 def status(account: str | None = None) -> dict:
@@ -1161,9 +1503,10 @@ def refresh(name_or_uuid: str | None = None, limit: int = SCAN) -> list[dict]:
             conn.select("INBOX", readonly=True)
             fresh.extend(_collect_unseen(acct, conn, limit))
         except imaplib.IMAP4.error as e:
-            _mark(acct, "auth", f"o servidor recusou: {_reason(e)}")
+            _mark(acct, "auth",
+                  f"o servidor recusou: {_redact(acct, _reason(e))}")
         except Exception as e:
-            _mark(acct, "error", _reason(e))
+            _mark(acct, "error", _redact(acct, _reason(e)))
         finally:
             if conn is not None:
                 try:
@@ -1402,11 +1745,13 @@ def fetch_body(name_or_uuid: str, uid_or_key: str,
         _mark(acct, "connected", "caixa de entrada acessível")
         return True, subject, body
     except imaplib.IMAP4.error as e:
-        _mark(acct, "auth", f"o servidor recusou: {_reason(e)}")
-        return False, "", _reason(e)
+        why = _redact(acct, _reason(e))
+        _mark(acct, "auth", f"o servidor recusou: {why}")
+        return False, "", why
     except Exception as e:
-        _mark(acct, "error", _reason(e))
-        return False, "", _reason(e)
+        why = _redact(acct, _reason(e))
+        _mark(acct, "error", why)
+        return False, "", why
     finally:
         if conn is not None:
             try:
@@ -1466,8 +1811,12 @@ def poll_once(hook=None) -> list[dict]:
         if not acct.auto_start and not acct.notify and not acct.otp:
             continue
         conn = None
+        started = time.monotonic()
+        n = _begin_attempt(acct)
+        acct._stage = "connect"
         try:
             conn = _imap_open(acct)
+            acct._stage = "select"
             conn.select("INBOX", readonly=True)
             fresh = _collect_unseen(acct, conn)
             code_uids: set[str] = set()
@@ -1486,10 +1835,28 @@ def poll_once(hook=None) -> list[dict]:
                         _log(f"aviso de e-mail novo não entregue: {e}")
                     else:
                         delivered.append(item)
+            if not acct.connected or acct.fail_streak:
+                # A varredura voltou a abrir a caixa: registra a recuperação
+                # (e é isto que limpa a contagem de falhas consecutivas).
+                _mark(acct, "connected", "caixa de entrada acessível")
         except imaplib.IMAP4.error as e:
-            _mark(acct, "auth", f"o servidor recusou: {_reason(e)}")
+            diag = _diag(acct, e, getattr(acct, "_stage", "") or "login",
+                         started, n)
+            _log(f"{acct.name}: varredura tentativa {n} recusada no login "
+                 f"({_redact(acct, e)}) após {diag['duration_ms']} ms em "
+                 f"{diag['host']}:{diag['port']}")
+            _mark(acct, "auth",
+                  f"o servidor recusou: {_redact(acct, _reason(e))}", diag=diag)
         except Exception as e:
-            _mark(acct, "error", _reason(e))
+            diag = _diag(acct, e, getattr(acct, "_stage", "") or "connect",
+                         started, n)
+            _log(f"{acct.name}: varredura tentativa {n} falhou na etapa "
+                 f"{diag['stage']} ({diag['error_type'] or 'erro'}) após "
+                 f"{diag['duration_ms']} ms em {diag['host']}:{diag['port']} "
+                 f"— {diag['error_message'] or _redact(acct, e)}")
+            _mark(acct, "error",
+                  f"não consegui falar com o servidor: "
+                  f"{_redact(acct, _reason(e))}", diag=diag)
         finally:
             if conn is not None:
                 try:
@@ -1521,6 +1888,9 @@ def start(hook=None, logger=None, interval: float = POLL_S) -> None:
         tick = max(30.0, float(interval or POLL_S))
         if any(a.otp for a in _accounts.values()) or _otp_processor is not None:
             tick = min(tick, OTP_POLL_S)
+        with _retry_lock:
+            if not any(t.is_alive() for t in _retry_threads.values()):
+                _retry_stop.clear()
         _watch_stop.clear()
         _watch_thread = threading.Thread(
             target=_watch_loop, args=(tick,),
@@ -1529,17 +1899,42 @@ def start(hook=None, logger=None, interval: float = POLL_S) -> None:
 
 
 def _watch_loop(interval: float) -> None:
+    """Varredura periódica; quando uma caixa cai, a espera cresce.
+
+    O intervalo normal continua sendo o do dono (180 s, ou 60 s com OTP). Se
+    a varredura encontrar conta em erro transitório, a próxima tentativa usa o
+    MESMO backoff exponencial (5 s a 4 min, limitado pelo intervalo) em vez de
+    dormir o intervalo inteiro — rede que voltou não espera 3 minutos. Se já
+    existe worker de reconexão para a conta, não duplicamos a tentativa.
+    """
+    fail_streak = 0
     while not _watch_stop.is_set():
         try:
             poll_once()
+            down = any(a.auto_start and a.state == "error"
+                       for a in _accounts.values())
+            if down and not _retry_active():
+                fail_streak += 1
+                wait = min(float(interval), _backoff_delay(fail_streak))
+                _log(f"varredura com conta em erro: nova tentativa em "
+                     f"{wait:.0f} s")
+            else:
+                fail_streak = 0
+                wait = float(interval)
         except Exception as e:
-            _log(f"a varredura de e-mail falhou: {e}")
-        _watch_stop.wait(interval)
+            fail_streak += 1
+            wait = min(float(interval), _backoff_delay(fail_streak))
+            _log(f"a varredura de e-mail falhou ({type(e).__name__}): "
+                 f"{_one_line(e, 160)}; nova tentativa em {wait:.0f} s")
+        _watch_stop.wait(wait)
 
 
 def stop() -> None:
     global _watch_thread
     _watch_stop.set()
+    _retry_stop.set()
+    with _retry_lock:
+        _retry_threads.clear()
     with _watch_lock:
         thread, _watch_thread = _watch_thread, None
     if thread is not None and thread.is_alive() \
@@ -1551,13 +1946,18 @@ def reset() -> None:
     """Esquece o estado em memória (testes e troca de config na mão).
 
     O pedido de envio sai só da memória: quem tiver um arquivo em disco
-    continua sendo lido dali, pelo prazo normal.
+    continua sendo lido dali, pelo prazo normal. Reconexões em voo são
+    interrompidas — nenhuma thread antiga mexe em conta da próxima rodada.
     """
     global _watch_hook, _pending, _otp_processor
+    _retry_stop.set()
+    with _retry_lock:
+        _retry_threads.clear()
     with _lock:
         _accounts.clear()
     _watch_hook = None
     _otp_processor = None
+    set_retry_notice(None)
     with _pending_lock:
         _pending = None
 
@@ -1716,14 +2116,16 @@ def send_now(to: str, subject: str, body: str,
         conn = _smtp_open(acct)
         refused = conn.sendmail(acct.address, [recipient], msg.as_string())
     except smtplib.SMTPAuthenticationError as e:
-        _mark(acct, "auth", f"o servidor recusou: {_reason(e)}")
+        _mark(acct, "auth",
+              f"o servidor recusou: {_redact(acct, _reason(e))}", track=False)
         return False, (f"o servidor recusou o envio pela conta {acct.name}: "
                        "senha de app inválida?")
     except (smtplib.SMTPException, OSError, ssl.SSLError) as e:
-        _mark(acct, "error", _reason(e))
-        return False, f"não consegui enviar o e-mail: {_reason(e)}"
+        why = _redact(acct, _reason(e))
+        _mark(acct, "error", why, track=False)
+        return False, f"não consegui enviar o e-mail: {why}"
     except Exception as e:
-        return False, f"não consegui enviar o e-mail: {_reason(e)}"
+        return False, f"não consegui enviar o e-mail: {_redact(acct, _reason(e))}"
     finally:
         if conn is not None:
             try:
@@ -1733,5 +2135,5 @@ def send_now(to: str, subject: str, body: str,
     if refused:
         return False, f"o servidor recusou estes destinatários: {', '.join(refused)}"
     _store_pending(None)
-    _mark(acct, "connected", "caixa de entrada acessível")
+    _mark(acct, "connected", "caixa de entrada acessível", track=False)
     return True, f"E-mail enviado para {recipient} pela conta {acct.name}."
