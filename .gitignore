@@ -49,6 +49,22 @@ memory/whatsapp_media/
 # Screenshots captured from the Mac and voice samples of the owner:
 memory/mac/
 amostra-voz.mp3
+# Attachments received on WhatsApp, one media dir per account (the bare
+# memory/whatsapp_media/ above misses the per-account variants):
+memory/whatsapp_media*/
+
+# ── Backups locais que carregam segredos ou dados pessoais ────────────────────
+# Cópias datadas feitas à mão antes de editar credenciais. As de api_keys.json
+# contêm as chaves reais do Fish e do Groq: publicá-las entrega as contas.
+config/api_keys.json.backup-*
+config/api_keys.json.bak-*
+# Cópia da fila de tarefas antes de reescrevê-la:
+memory/tasks.json.bak-*
+# Estado de retomada de um restart, recriado a cada boot:
+memory/restart_last_pending.json
+# Estado por conta de e-mail (config/mail/ acima já cobre o diretório inteiro;
+# esta linha sobrevive a um eventual afrouxamento daquela regra):
+config/mail/*/state.json
 
 # ── Local tooling ─────────────────────────────────────────────────────────────
 # Qoder CLI session data and per-machine permission settings:
