@@ -69,8 +69,33 @@ def test_pending_confirmation_must_be_spoken_exactly():
 
 def test_template_is_deterministic():
     assert template_for([_fact("Spotify aberto")]) == "Spotify aberto."
-    assert template_for([], "Conferindo a hora.") == "Conferindo a hora."
+    assert template_for([], "Já te digo, criador.") == "Já te digo, criador."
     assert "Nada foi executado" in template_for([{"cancelled": True}])
+
+
+def test_template_never_speaks_an_action_announcement():
+    # O dono ouviu "Abrindo o Terminal." sem pedir (turno 22, origem boca).
+    assert template_for([], "Abrindo o Terminal.") == ""
+    assert template_for([], "Vou pôr Queen, criador.") == ""
+    assert template_for([], "Conferindo a hora.") == ""
+
+
+def test_guard_rejects_announcements_in_both_phases():
+    for line in ("Abrindo o Terminal.",
+                 "Vou abrir o WhatsApp, criador.",
+                 "Executando o pedido.",
+                 "Espera um instante, criador.",
+                 "Conferindo a hora."):
+        ok, why = guard(line, None, "brief")
+        assert not ok and "anúncio" in why, line
+        ok, why = guard(line, [], "complement")
+        assert not ok and "anúncio" in why, line
+
+
+def test_guard_accepts_an_authorized_fact_that_says_tocando():
+    facts = [_fact("Queen tocando no Spotify")]
+    ok, why = guard("Queen tocando no Spotify.", facts, "complement")
+    assert ok, why
 
 
 def test_ensure_facts_appends_omitted_fact():
@@ -80,7 +105,7 @@ def test_ensure_facts_appends_omitted_fact():
     assert "volume em 40%" in sentence
 
 
-def _decision(draft="Conferindo a hora.") -> Decision:
+def _decision(draft="Já te digo, criador.") -> Decision:
     return Decision(intent="lookup", rule="hora", draft=draft,
                     target="a hora", brief_label="consultar a hora")
 
@@ -92,19 +117,42 @@ def test_mouth_falls_back_when_model_asserts_in_brief():
 
     mouth = Mouth(FlowsConfig(enabled=True, mouth_enabled=True), caller=caller)
     result = mouth.brief("que horas são?", _decision())
-    assert result.sentence == "Conferindo a hora."
+    assert result.sentence == "Já te digo, criador."
     assert result.guard_tripped
     assert mouth.guard_trips == 1
 
 
+def test_mouth_brief_goes_silent_instead_of_announcing():
+    def caller(messages, max_tokens, **kwargs):
+        return {"text": "Abrindo o Terminal.", "ttft_ms": 1,
+                "first_sentence_ms": 2, "end_ms": 3, "error": None}
+
+    mouth = Mouth(FlowsConfig(enabled=True, mouth_enabled=True), caller=caller)
+    result = mouth.brief("abre o terminal", _decision("Abrindo o Terminal."))
+    assert result.sentence == ""
+    assert result.guard_tripped
+    assert mouth.guard_trips == 1
+
+
+def test_mouth_brief_rejects_the_model_and_keeps_a_safe_draft():
+    def caller(messages, max_tokens, **kwargs):
+        return {"text": "Abrindo o Terminal.", "ttft_ms": 1,
+                "first_sentence_ms": 2, "end_ms": 3, "error": None}
+
+    mouth = Mouth(FlowsConfig(enabled=True, mouth_enabled=True), caller=caller)
+    result = mouth.brief("abre o terminal", _decision("Deixa comigo, criador."))
+    assert result.sentence == "Deixa comigo, criador."
+    assert result.guard_tripped
+
+
 def test_mouth_uses_safe_model_sentence():
     def caller(messages, max_tokens, **kwargs):
-        return {"text": "Conferindo a hora.", "ttft_ms": 1,
+        return {"text": "Já te digo, criador.", "ttft_ms": 1,
                 "first_sentence_ms": 2, "end_ms": 3, "error": None}
 
     mouth = Mouth(FlowsConfig(enabled=True, mouth_enabled=True), caller=caller)
     result = mouth.brief("que horas são?", _decision())
-    assert result.sentence == "Conferindo a hora."
+    assert result.sentence == "Já te digo, criador."
     assert not result.guard_tripped
 
 
@@ -118,7 +166,7 @@ def test_mouth_disabled_never_calls_model():
     mouth = Mouth(FlowsConfig(enabled=True, mouth_enabled=False), caller=caller)
     result = mouth.brief("que horas são?", _decision())
     assert calls == []
-    assert result.sentence == "Conferindo a hora."
+    assert result.sentence == "Já te digo, criador."
 
 
 def test_complement_guard_rejects_invented_sentence():

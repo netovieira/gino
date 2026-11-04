@@ -27,6 +27,63 @@ ASSERT_WORDS = (
 LEAK_WORDS = ("media_control", "open_app", "reminder", "restart_assistant",
               "{", "}", "mcp__", "jarvis_call")
 
+# ── Anúncio de ação/ferramenta: PROIBIDO na boca ────────────────────────────
+#
+# O dono ouviu "Abrindo o Terminal." em voz alta sem ter pedido nada (turno 22,
+# origem "boca") e a regra é literal: a boca nunca descreve a ação, a
+# ferramenta ou o andamento. Ela pode dar conteúdo (um fato autorizado), pedir
+# uma confirmação ou ficar calada — nunca narrar o que "está fazendo".
+#
+# O detector é deliberadamente léxico e conservador: a lista de gerúndios é
+# explícita (não um regex de "-ndo", que pegaria "quando"/"entendendo"), e a
+# checagem de fato autorizado abaixo deixa a boca RELATAR "Queen tocando no
+# Spotify" quando esse é o fato que um trabalhador devolveu. Número, nome
+# próprio ou ferramenta continuam cobertos pelas outras regras.
+ACTION_GERUNDS = (
+    "abrindo", "fechando", "pondo", "colocando", "tocando", "pausando",
+    "ajustando", "aumentando", "diminuindo", "anotando", "lembrando",
+    "procurando", "pesquisando", "conferindo", "verificando", "olhando",
+    "checando", "executando", "rodando", "iniciando", "comecando",
+    "baixando", "salvando", "enviando", "mandando", "escrevendo",
+    "digitando", "ligando", "desligando", "reiniciando", "atualizando",
+    "instalando", "esperando", "aguardando", "preparando", "organizando",
+    "arrumando", "carregando", "processando", "sincronizando",
+)
+ACTION_INFINITIVES = (
+    "abrir", "fechar", "por", "colocar", "tocar", "pausar", "ajustar",
+    "aumentar", "diminuir", "anotar", "lembrar", "procurar", "pesquisar",
+    "conferir", "verificar", "olhar", "checar", "executar", "rodar",
+    "iniciar", "comecar", "baixar", "salvar", "enviar", "mandar",
+    "escrever", "digitar", "ligar", "desligar", "reiniciar", "atualizar",
+    "instalar", "esperar", "aguardar", "preparar", "organizar", "arrumar",
+    "carregar", "processar",
+)
+# "vou abrir", "vamos tocar", "irei reiniciar" — intenção, não conteúdo.
+_FUTURE_RE = re.compile(
+    r"\b(?:vou|vamos|irei|iremos)\s+(?:ja\s+)?(?:"
+    + "|".join(ACTION_INFINITIVES) + r")\b")
+# Andamento puro: nenhuma dessas palavras entrega conteúdo ao dono.
+_PROGRESS_RE = re.compile(
+    r"\b(?:aguarde|aguenta|espera|instante|"
+    r"ja volto|calma que ja|em andamento|processando)\b")
+_GERUND_RE = re.compile(r"\b(?:" + "|".join(ACTION_GERUNDS) + r")\b")
+
+
+def announcement(text: str) -> str:
+    """A palavra/expressão que faz da frase um anúncio de ação, ou ''.
+
+    "Abrindo o Terminal." -> 'abrindo'; "Vou pôr Queen" -> 'vou por';
+    "aguarde, criador" -> 'aguarde'. Conteúdo ("Volume em 40%.",
+    "Reiniciar é irreversível.") não casa.
+    """
+    n = norm(text)
+    for pattern in (_FUTURE_RE, _PROGRESS_RE, _GERUND_RE):
+        match = pattern.search(n)
+        if match:
+            return match.group(0)
+    return ""
+
+
 _STOP = {
     "para", "pelo", "pela", "com", "sem", "mais", "menos", "esta", "estava",
     "esse", "essa", "isso", "aqui", "agora", "muito", "pouco", "sobre",
@@ -59,6 +116,24 @@ def guard(text: str, facts: list[dict[str, Any]] | None,
     facts = list(facts or [])
     if not n:
         return False, "frase vazia"
+
+    # Lei do dono (04/11/2026): a boca NUNCA anuncia a ação/ferramenta nem o
+    # andamento ("Abrindo o Terminal.", "vou abrir", "executando", "espera").
+    # Vale nas duas fases. No complemento, um gerúndio que está no FATO
+    # autorizado é relato do trabalhador ("Queen tocando no Spotify") e passa.
+    hit_announce = announcement(text)
+    if hit_announce:
+        allowed_fact = False
+        if phase == "complement":
+            for fact in facts:
+                if not fact.get("assertion"):
+                    continue
+                spoken = norm(str(fact.get("spoken") or ""))
+                if hit_announce in spoken:
+                    allowed_fact = True
+                    break
+        if not allowed_fact:
+            return False, f"anúncio de ação/andamento: {hit_announce!r}"
 
     if phase == "brief":
         hit = has_assertion(text)
@@ -127,7 +202,13 @@ def ensure_facts(sentence: str, facts: list[dict[str, Any]]) -> tuple[str, list[
 
 def template_for(facts: list[dict[str, Any]] | None,
                  fallback: str = "") -> str:
-    """Frase determinística quando o modelo é rejeitado ou falha."""
+    """Frase determinística quando o modelo é rejeitado ou falha.
+
+    O fallback do roteador é um template e obedece à mesma lei: se ele narra a
+    ação ("Abrindo o WhatsApp.", "Vou pôr Queen", "Conferindo a hora."), a
+    boca fica CALADA — devolve string vazia. Silêncio é melhor que anunciar;
+    o cérebro responde logo em seguida e a boca nunca o espera.
+    """
     facts = list(facts or [])
     pending = [str(f.get("pending_confirm")) for f in facts
                if f.get("pending_confirm")]
@@ -139,4 +220,7 @@ def template_for(facts: list[dict[str, Any]] | None,
               if f.get("assertion") and str(f.get("spoken") or "").strip()]
     if spoken:
         return spoken[0][:1].upper() + spoken[0][1:].rstrip(".") + "."
-    return str(fallback or "").strip()
+    safe = str(fallback or "").strip()
+    if safe and announcement(safe):
+        return ""
+    return safe

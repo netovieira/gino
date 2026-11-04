@@ -121,7 +121,7 @@ def test_brief_survives_brain_text_after_mouth_started():
     def caller(*_a, **_kw):
         entered.set()
         release.wait(1.0)
-        return {"text": "Conferindo a hora.", "ttft_ms": 1.0,
+        return {"text": "Já te digo, criador.", "ttft_ms": 1.0,
                 "first_sentence_ms": 1.0, "end_ms": 2.0, "error": None}
 
     cfg = _config(mouth_enabled=True)
@@ -135,7 +135,7 @@ def test_brief_survives_brain_text_after_mouth_started():
     deadline = time.monotonic() + 1.0
     while not spoken and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert spoken == ["Conferindo a hora."]
+    assert spoken == ["Já te digo, criador."]
     runtime.finish("t1")
 
 
@@ -145,7 +145,7 @@ def test_brief_is_cancelled_when_brain_answered_before_mouth_started():
     logs = []
 
     def caller(*_a, **_kw):
-        return {"text": "Conferindo a hora.", "ttft_ms": 1.0,
+        return {"text": "Já te digo, criador.", "ttft_ms": 1.0,
                 "first_sentence_ms": 1.0, "end_ms": 2.0, "error": None}
 
     cfg = _config(mouth_enabled=True)
@@ -172,7 +172,7 @@ def test_disarmed_turn_speaks_pending_brief_when_voiceprint_accepts():
     logs = []
 
     def caller(*_a, **_kw):
-        return {"text": "Conferindo a hora.", "ttft_ms": 1.0,
+        return {"text": "Já te digo, criador.", "ttft_ms": 1.0,
                 "first_sentence_ms": 1.0, "end_ms": 2.0, "error": None}
 
     cfg = _config(mouth_enabled=True)
@@ -189,7 +189,7 @@ def test_disarmed_turn_speaks_pending_brief_when_voiceprint_accepts():
         time.sleep(0.01)
     assert spoken == []                       # desarmada até o voiceprint
     runtime.arm_speech("t1", True)
-    assert spoken == ["Conferindo a hora."]
+    assert spoken == ["Já te digo, criador."]
     runtime.finish("t1")
 
 
@@ -199,7 +199,7 @@ def test_disarmed_turn_drops_pending_brief_when_voiceprint_refuses():
     logs = []
 
     def caller(*_a, **_kw):
-        return {"text": "Conferindo a hora.", "ttft_ms": 1.0,
+        return {"text": "Já te digo, criador.", "ttft_ms": 1.0,
                 "first_sentence_ms": 1.0, "end_ms": 2.0, "error": None}
 
     cfg = _config(mouth_enabled=True)

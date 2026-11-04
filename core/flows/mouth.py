@@ -30,17 +30,19 @@ from .router import Decision
 SYS_BRIEF = (
     "Você é a BOCA do Gino, um assistente falado em português do Brasil. "
     "Recebe do orquestrador apenas a INTENÇÃO de um pedido do dono e diz UMA "
-    "frase curta, seca e ácida, de no máximo 12 palavras, anunciando o que vai "
-    "fazer. Comece com gerúndio (Conferindo, Abrindo, Pondo, Anotando, "
-    "Procurando) e NUNCA repita a pergunta do dono. "
+    "frase curta, seca e ácida, com no máximo 8 palavras, mostrando que ouviu. "
+    "PROIBIDO descrever a ação, a ferramenta ou o andamento: nunca use "
+    "gerúndio (Abrindo, Conferindo, Tocando, Ajustando, Pausando, Anotando, "
+    "Procurando), nunca diga 'vou abrir', 'vou tocar', 'executando', 'espera', "
+    "'instante' nem o nome de qualquer ferramenta. "
     "REGRAS INVIOLÁVEIS: você não sabe resultado nenhum; nunca diga feito, "
     "pronto, aberto, tocando, anotado, enviado ou qualquer fato; nunca invente "
     "número, hora, nome ou ferramenta; não use aspas, prefixo ou explicação; "
     "responda só a frase.\n"
     "Exemplos:\n"
-    "Intenção: tocar Queen. Alvo: Queen. -> Pondo Queen no Spotify, criador.\n"
-    "Intenção: abrir o WhatsApp. Alvo: WhatsApp. -> Abrindo o WhatsApp.\n"
-    "Intenção: conferir a hora. Alvo: a hora. -> Conferindo a hora.\n"
+    "Intenção: tocar Queen. Alvo: Queen. -> Deixa comigo, criador.\n"
+    "Intenção: abrir o WhatsApp. Alvo: WhatsApp. -> Certo, criador.\n"
+    "Intenção: conferir a hora. Alvo: a hora. -> Já te digo, criador.\n"
     "Intenção: conversa. Alvo: o dono. -> Tudo em ordem por aqui, criador."
 )
 SYS_FREE = (
@@ -204,8 +206,9 @@ class Mouth:
                 or not self.config.mouth_speaks_route(route)
                 or not self.config.mouth_enabled
                 or not allow_model):
-            return MouthResult(sentence=decision.draft, fixed=True,
-                               ms=0.0, ttft_ms=0.0, raw="[brief fixo]")
+            return MouthResult(
+                sentence=_guard.template_for(None, decision.draft),
+                fixed=True, ms=0.0, ttft_ms=0.0, raw="[brief fixo]")
         free = route == "livre" or decision.intent == "conversa"
         if free:
             # Rota livre: a boca local fala com as últimas falas e o contexto
@@ -240,7 +243,7 @@ class Mouth:
             self.failures += 1
             sentence = ""
         return MouthResult(
-            sentence=(sentence or decision.draft),
+            sentence=(sentence or _guard.template_for(None, decision.draft)),
             ms=float(result.get("first_sentence_ms") or 0.0),
             ttft_ms=float(result.get("ttft_ms") or 0.0),
             raw=str(result.get("text") or ""),

@@ -6965,6 +6965,26 @@ class JarvisLive:
             return rt
 
     def _flows_speak(self, text: str) -> None:
+        # Ponto de saída da boca: a lei do dono (04/11/2026) é aplicada AQUI
+        # também, não só no guard do modelo. Uma frase que anuncia a ação ou a
+        # ferramenta — "Abrindo o Terminal.", "vou abrir", "executando",
+        # "espera" — nunca vira som, venha ela do modelo local, do template ou
+        # de qualquer caminho que chegue à boca. O cérebro responde em seguida;
+        # a boca NUNCA espera por ele (nada de síntese síncrona).
+        try:
+            from core.flows import guard as _mouth_guard
+            hit = _mouth_guard.announcement(text)
+        except Exception:
+            hit = ""
+        if hit:
+            line = ("SYS: boca calada — anúncio de ação não é conteúdo "
+                    f"({hit!r}).")
+            print(f"[Fluxos] {line[5:]} texto={str(text)[:80]!r}")
+            try:
+                self.ui.write_log(line)
+            except Exception:
+                pass
+            return
         try:
             self._say_now(text, log=True, chan="voz", origin="boca")
         except Exception as e:
@@ -7321,8 +7341,13 @@ class JarvisLive:
                                 f"sample={float(primary.get('sample_score') or 0.0):.2f} "
                                 f"s={float(analysis.get('voiced_seconds') or 0.0):.1f} "
                                 f"seg={len(analysis.get('segments') or [])})")
-                            self._say_now("Não reconheço essa voz. Se for alguém autorizado, "
-                                          "peça ao dono para me apresentar.")
+                            # Mute means muted: the refusal notice is a spoken
+                            # line too, and it must not be the one thing that
+                            # crosses the mute.
+                            if not getattr(getattr(self, "ui", None),
+                                           "muted", False):
+                                self._say_now("Não reconheço essa voz. Se for alguém autorizado, "
+                                              "peça ao dono para me apresentar.")
                             self._flows_cancel(
                                 turn_id, "voiceprint: voz desconhecida")
                             _duck.up()
@@ -14485,6 +14510,30 @@ class JarvisLive:
         style = str(style or "").strip()
         if not style:
             style = self._resolve_say_style(origin, ref)
+        # ── Mute stops the MOUTH, not the ears ──────────────────────────────
+        # The owner's defect report: with `ui.muted` on the assistant still
+        # talked. Mute used to gate only the microphone; now a line handed to
+        # the TTS (answer, gate, persona, notice, boca) is not synthesised at
+        # all while muted. It is not retained for later either — an
+        # announcement spoken ten minutes after the fact is exactly what he
+        # does not want. The microphone keeps listening; only SPEECH stops.
+        # `force` is the silence-mode release worker, whose lines the owner
+        # already ordered to sound.
+        if not force and bool(getattr(getattr(self, "ui", None), "muted", False)):
+            try:
+                self._note_speech(text, "", generated=False, turn=ref,
+                                  origin="mute")
+            except Exception:
+                pass
+            if log:
+                speaker = str(label or self._asst_name)
+                try:
+                    self.ui.write_log(
+                        f"SYS: microfone mutado — {speaker} não falou: "
+                        f"{str(text)[:120]}")
+                except Exception:
+                    pass
+            return
         # O ÚNICO ponto de decisão de fala: se o assunto está cortado, a boca
         # não sintetiza. O texto vai para a tela/WhatsApp e a fala fica na
         # fila retida, para sair na liberação. Um `if` aqui cobre resposta,
@@ -16315,6 +16364,19 @@ class JarvisLive:
                     # Turn still open (background job speaking was done): the
                     # volumes come back with the SPEECH, not with the turn.
                     self._duck_check_drain()
+                    continue
+
+                # ── Mute closes the SPEAKERS, never the ears ─────────────────
+                # A chunk already in the playback queue (realtime answer,
+                # persona, anything synthesised before the mute) is dropped
+                # here, so turning mute on silences the assistant immediately.
+                # The microphone stream and every listener stay open: the
+                # owner wants the mic listening, only the speech stops.
+                if bool(getattr(getattr(self, "ui", None), "muted", False)):
+                    _now_mute = time.monotonic()
+                    if _now_mute - getattr(self, "_mute_drop_logged", 0.0) > 30.0:
+                        self._mute_drop_logged = _now_mute
+                        print("[Play] microfone mutado — fala descartada")
                     continue
 
                 # The epoch of the reply this chunk belongs to. interrupt()
