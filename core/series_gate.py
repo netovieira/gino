@@ -228,6 +228,7 @@ class SeriesGate:
             "verdict": "indecisive_short",
             "allowed": True,
             "speaker": None,
+            "device": "",
             "authorized": False,
             "score": 0.0,
             "seconds": 0.0,
@@ -271,6 +272,7 @@ class SeriesGate:
                     decision["attempts"].append({
                         "seconds": round(take_s, 2),
                         "name": match.get("name"),
+                        "device": str(match.get("device") or ""),
                         "score": round(effective, 4),
                     })
                     decision["score"] = round(effective, 4)
@@ -280,6 +282,7 @@ class SeriesGate:
                                 "verdict": "accept",
                                 "allowed": True,
                                 "speaker": match.get("name"),
+                                "device": str(match.get("device") or ""),
                                 "authorized": True,
                                 "reason": f"voz autorizada em {take_s:.1f}s",
                             })
@@ -293,6 +296,7 @@ class SeriesGate:
                             "verdict": verdict,
                             "allowed": (not enabled) and not playback_high,
                             "speaker": match.get("name"),
+                            "device": str(match.get("device") or ""),
                             "reason": (f"voz de {match.get('name')} não autorizada"
                                        if not playback_high else
                                        "reprodução com voz não autorizada"),

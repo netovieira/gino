@@ -83,7 +83,8 @@ class FakeSpeaker:
         samples = pcm.size if hasattr(pcm, "size") else len(pcm) // 2
         return [samples / SR, 1.0]
 
-    def identify(self, embedding) -> dict:
+    def identify(self, embedding, include_auto=False,
+                 voiced_seconds=None, device=None) -> dict:
         seconds = float(embedding[0])
         if seconds + 1e-9 >= self.known_after:
             return {"name": self.name, "score": self.score,
@@ -309,7 +310,7 @@ class MainIntegrationTest(GateTestCase):
         obj.said = []
         obj._say_now = lambda text, log=True: obj.said.append(text)
         obj._log_heard = lambda text: None
-        obj._owner_voice = lambda pcm: (True, "ok")
+        obj._owner_voice = lambda pcm, device=None: (True, "ok")
         return obj
 
     def test_spoken_toggle_on_and_off_persists(self):
@@ -713,7 +714,7 @@ class CinemaModeTest(unittest.TestCase):
         obj.said: list[str] = []
         obj._say_now = lambda text, log=True: obj.said.append(text)
         obj._log_heard = lambda text: obj.said.append(f"heard:{text}")
-        obj._owner_voice_ok = lambda pcm, allow_single=True: True
+        obj._owner_voice_ok = lambda pcm, allow_single=True, device=None: True
         obj._voice_indulgence_gray_floor = 0.38
         obj._cinema_mode_enabled = True
         obj._cinema_state_file = self.state
@@ -760,14 +761,14 @@ class CinemaModeTest(unittest.TestCase):
         obj = self._obj()
         obj._cinema_pending = True
         obj._cinema_prompted_at = time.monotonic()
-        obj._owner_voice_ok = lambda pcm, allow_single=True: False
+        obj._owner_voice_ok = lambda pcm, allow_single=True, device=None: False
 
         self.assertTrue(main.JarvisLive._cinema_mode_gate(
             obj, "Sim", b"tv-voice"))
         self.assertFalse(obj._cinema_active)
         self.assertIn("ativação recusada", "\n".join(obj.ui.lines))
 
-        obj._owner_voice_ok = lambda pcm, allow_single=True: True
+        obj._owner_voice_ok = lambda pcm, allow_single=True, device=None: True
         self.assertTrue(main.JarvisLive._cinema_mode_gate(
             obj, "Sim", b"owner-voice"))
         self.assertTrue(obj._cinema_active)
