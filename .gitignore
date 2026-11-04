@@ -33,6 +33,11 @@ memory/*.db
 memory/whatsapp_inbox.jsonl
 memory/whatsapp_inbox_*.jsonl
 memory/email_otp_seen.json
+# E-mail: headers of what arrived, the parked send (recipient + body) and the
+# per-account state dir — personal data, never in the repository:
+memory/mail_inbox_*.jsonl
+memory/mail_send_pending.json
+config/mail/
 # Personas criadas pelo dono, catálogo de modelos e vínculos projeto/persona:
 memory/personas.json
 memory/models.json

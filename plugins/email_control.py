@@ -1,5 +1,12 @@
 """Email por voz: não lidos, busca, ler um e enviar — IMAP/SMTP multi-conta.
 
+REGISTRO AUTORITATIVO: quem manda nas contas é core/email.py
+(`plugin_config.mail`, senha de app no cofre `mail_secrets`). Este plugin LÊ a
+lista de lá (`_accounts_from_registry`) e, se ainda existir, o formato antigo
+na raiz de `plugin_config.email` — que está sendo apagado. O painel do ⚙ desta
+casa é SOMENTE LEITURA: não grava senha em lugar nenhum; criar/editar conta é
+na tela 📧 E-MAIL (ui.MailOverlay), que fala com o registro novo e com o cofre.
+
 Uma senha de app resolve tudo (conta Google → Segurança → Verificação em duas
 etapas → Senhas de app); a senha normal da conta NÃO funciona aqui, porque o
 Gmail não aceita mais login simples em IMAP/SMTP. As credenciais ficam em
@@ -20,13 +27,11 @@ from __future__ import annotations
 import email
 import imaplib
 import re
-import smtplib
 import ssl
 from email.header import decode_header
-from email.mime.text import MIMEText
-from email.utils import formataddr, formatdate, make_msgid, parsedate_to_datetime
+from email.utils import parsedate_to_datetime
 
-from memory.config_manager import get_plugin_config, save_plugin_config
+from memory.config_manager import get_plugin_config
 
 NS = "email"
 
@@ -44,12 +49,55 @@ _ADDR_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
 
 # ── contas ───────────────────────────────────────────────────────────────────
 
+def _accounts_from_registry() -> list[dict]:
+    """As contas como elas vivem hoje: core/email.py + cofre.
+
+    A senha é pedida ao registro (que a lê do cofre) e fica só na memória
+    desta chamada: nada é gravado e nada aparece em log. É o que mantém as
+    ações antigas (unread/search/read/status) funcionando depois da limpeza
+    do namespace `email`.
+    """
+    try:
+        from core import email as registry
+        records = registry.list_accounts()
+    except Exception:
+        return []
+    out: list[dict] = []
+    for rec in records:
+        address = str(rec.get("address") or "").strip()
+        if not address:
+            continue
+        name = str(rec.get("name") or "principal").strip() or "principal"
+        try:
+            secret = registry.app_password(rec.get("uuid") or name)
+        except Exception:
+            secret = ""
+        out.append({
+            "name": name,
+            "address": address,
+            "app_password": secret,
+            "name_display": str(rec.get("display_name") or ""),
+            "imap_host": str(rec.get("imap_host") or IMAP_HOST),
+            "smtp_host": str(rec.get("smtp_host") or SMTP_HOST),
+            "default": bool(rec.get("default")),
+        })
+    return out
+
+
 def _load_accounts() -> list[dict]:
-    """A lista de contas; migra o formato antigo (uma conta, Gmail)."""
+    """A lista de contas; migra o formato antigo (uma conta, Gmail).
+
+    Ordem: a lista nova (`plugin_config.mail.accounts`, via core/email.py) manda;
+    o formato antigo da raiz de `plugin_config.email` é só o que sobrou de uma
+    configuração não migrada. Este módulo não grava em nenhum dos dois.
+    """
     cfg = get_plugin_config(NS) or {}
     accts = cfg.get("accounts")
     if isinstance(accts, list) and accts:
         return [a for a in accts if isinstance(a, dict) and a.get("address")]
+    modern = _accounts_from_registry()
+    if modern:
+        return modern
     # Formato antigo: address/app_password/name na raiz do namespace.
     if cfg.get("address"):
         return [{
@@ -61,10 +109,6 @@ def _load_accounts() -> list[dict]:
             "default": True,
         }]
     return []
-
-
-def _save_accounts(accounts: list[dict]) -> None:
-    save_plugin_config(NS, {"accounts": accounts})
 
 
 def _account_names() -> list[str]:
@@ -457,36 +501,21 @@ def read(query: str, values: dict | None = None, account: str = "") -> tuple[str
 
 def send(to: str, subject: str, body: str, values: dict | None = None,
          account: str = "") -> tuple[str, str]:
-    to = str(to or "").strip()
-    subject = str(subject or "").strip() or "(sem assunto)"
-    body = str(body or "").strip()
-    if not _ADDR_RE.match(to):
-        return (f"'{to}' não parece um endereço de email — preciso do email completo.",
-                "EMAIL — envio\n  (endereço inválido)")
-    if not body:
-        return "o email está sem texto — o que eu escrevo?", "EMAIL — envio\n  (corpo vazio)"
+    """Envio pela camada NOVA — e só com a voz do dono.
 
-    cfg = _resolve(values, account or None)
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = formataddr((str(cfg.get("name") or "").strip(), cfg["address"]))
-    msg["To"] = to
-    msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid()
+    Este plugin nasceu antes de core/email.py e mandava direto pelo SMTP. A
+    regra do dono é que e-mail é irreversível e exige a voz dele, então aqui só
+    estacionamos o pedido na mesma fila de core.email.request_send; o SMTP real
+    (send_now) só é alcançado pelo portão de voz do main.py. `values` não é
+    usado: a ferramenta nunca manda senha nenhuma, só o que o dono ditou.
+    """
+    from core import email as _mail
     try:
-        with smtplib.SMTP(cfg.get("smtp_host") or SMTP_HOST, SMTP_PORT,
-                          timeout=TIMEOUT) as smtp:
-            smtp.starttls(context=ssl.create_default_context())
-            smtp.login(cfg["address"], cfg["app_password"])
-            smtp.send_message(msg)
-    except smtplib.SMTPAuthenticationError:
-        return ("o servidor recusou o envio: a senha precisa ser uma SENHA DE APP.",
-                "EMAIL — envio\n  (autenticação recusada)")
+        _ok, message = _mail.request_send(to, subject, body,
+                                          account=account or None)
     except Exception as e:
-        return (f"o email não foi enviado: {e}",
-                f"EMAIL — envio\n  (falhou: {e})")
-    return (f"email enviado para {to}, assunto \"{subject}\".",
-            f"EMAIL — enviado\n  para: {to}\n  assunto: {subject}")
+        message = f"não consegui preparar o e-mail: {e}"
+    return message, "E-MAIL — envio\n  " + message
 
 
 def status(values: dict | None = None, account: str = "") -> tuple[str, str]:
@@ -507,39 +536,23 @@ def status(values: dict | None = None, account: str = "") -> tuple[str, str]:
 # ── o teste do botão da UI ───────────────────────────────────────────────────
 
 def _test(values: dict | None = None) -> tuple[bool, str]:
-    """Botão ⚙ → EMAIL. Adiciona/atualiza a conta nomeada e testa a conexão.
+    """Painel ⚙ → EMAIL: SOMENTE LEITURA; cadastro é na tela 📧 E-MAIL.
 
-    O formulário edita UMA conta (a de `account_name` — default 'principal').
-    Se o nome já existe na lista, atualiza; senão, adiciona. A primeira conta
-    criada vira default.
+    Este painel já gravou a senha de app em texto puro dentro de
+    `plugin_config.email` (a mesma senha que o cofre guarda), o que deixava
+    duas cópias em disco. Agora ele não grava NADA: mostra as contas como o
+    registro novo (core/email.py) as vê e manda editar na tela 📧 E-MAIL, que
+    escreve só no cofre. `values` é ignorado de propósito — nenhum campo desta
+    casa chega ao disco, então nem uma senha digitada aqui vira texto puro.
     """
-    vals = values or {}
-    name = str(vals.get("account_name") or "principal").strip() or "principal"
-    address = str(vals.get("address") or "").strip()
-    app_password = re.sub(r"\s+", "", str(vals.get("app_password") or ""))
-    if not address or not app_password:
-        return False, "preencha o endereço e a senha de app antes de testar"
-    accts = _load_accounts()
-    entry = {
-        "name": name, "address": address, "app_password": app_password,
-        "name_display": str(vals.get("name") or "").strip(),
-        "imap_host": str(vals.get("imap_host") or IMAP_HOST).strip(),
-        "smtp_host": str(vals.get("smtp_host") or SMTP_HOST).strip(),
-    }
-    idx = next((i for i, a in enumerate(accts)
-                if (a.get("name") or "").lower() == name.lower()), None)
-    if idx is not None:
-        entry["default"] = bool(accts[idx].get("default"))
-        accts[idx] = entry
-    else:
-        entry["default"] = not accts   # a primeira vira default
-        accts.append(entry)
-    _save_accounts(accts)
-    try:
-        spoken, _ = status(vals, name)
-        return True, f"{name}: {spoken}"
-    except Exception as e:
-        return False, _login_error(e)
+    rows = _load_accounts()
+    if not rows:
+        return False, ("nenhuma conta de e-mail configurada; use a tela "
+                       "📧 E-MAIL para cadastrar (a senha de app vai para o cofre)")
+    parts = [f"{str(r.get('name') or r.get('address') or '?')} "
+             f"({r.get('address')})" for r in rows]
+    return True, ("contas no registro novo: " + ", ".join(parts)
+                  + ". Editar ou testar conexão: 📧 E-MAIL — aqui é só leitura.")
 
 
 # ── entrada da ferramenta ────────────────────────────────────────────────────
@@ -593,21 +606,10 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
 
 PLUGIN_SETTINGS = {
     "namespace": NS,
-    "title": "EMAIL (IMAP + SMTP — Gmail, Outlook, iCloud…)",
-    "fields": [
-        {"key": "account_name", "label": "Nome desta conta (ex.: pessoal, trabalho)",
-         "type": "text", "placeholder": "principal", "default": "principal"},
-        {"key": "address", "label": "Endereço do email",
-         "type": "text", "placeholder": "seunome@gmail.com"},
-        {"key": "app_password", "label": "Senha de app",
-         "type": "password",
-         "placeholder": "Gmail: Conta Google → Segurança → Verificação em 2 etapas → Senhas de app"},
-        {"key": "name", "label": "Nome que aparece no remetente (opcional)",
-         "type": "text", "placeholder": "Seu nome"},
-        {"key": "imap_host", "label": "Servidor IMAP (vazio = Gmail)",
-         "type": "text", "placeholder": "imap.gmail.com"},
-        {"key": "smtp_host", "label": "Servidor SMTP (vazio = Gmail)",
-         "type": "text", "placeholder": "smtp.gmail.com"},
-    ],
-    "action": {"label": "ADICIONAR / ATUALIZAR E TESTAR", "run": _test},
+    "title": "EMAIL — cadastro agora fica na tela 📧 E-MAIL (aqui é só leitura)",
+    # Sem campos de propósito: este formulário gravava `app_password` no
+    # namespace antigo. Nada mais aqui escreve no disco (a tela 📧 E-MAIL
+    # edita as contas e guarda a senha de app no cofre).
+    "fields": [],
+    "action": {"label": "VER CONTAS (SOMENTE LEITURA)", "run": _test},
 }

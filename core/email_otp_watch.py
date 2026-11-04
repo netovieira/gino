@@ -1,27 +1,39 @@
 """Códigos de verificação que chegam por e-mail, anunciados em voz alta.
 
 A CONTA
-    Usa a MESMA credencial do plugin de e-mail (`plugin_config.email`): endereço
-    e senha de app, sem pedir nada novo. Sem ela, este módulo não inventa conta
-    nenhuma — só diz o que falta no log e fica quieto.
+    Vem do registro NOVO de e-mail (`core/email.py`, `plugin_config.mail`), a
+    mesma lista que a tela 📧 E-MAIL edita: só as contas marcadas com `otp`.
+    A senha de app sai do cofre (`mail_secrets.<uuid>`) pelas funções do
+    registro — este módulo nunca vê, imprime ou grava a senha. Sem conta
+    marcada, ele só registra o que falta no log e fica quieto.
 
 A VARREDURA
-    A cada POLL_S segundos abre a pasta de entrada em modo SOMENTE LEITURA
-    (BODY.PEEK: ler um código não marca o e-mail como lido) e olha as SCAN
-    mensagens mais recentes. Mensagem já vista pelo UID é pulada; mensagem
-    antiga demais (FRESH_S) é lembrada sem anúncio, porque um código vencido
-    não serve para nada. O histórico de UIDs fica em disco para um reinício do
-    assistente não anunciar o mesmo código duas vezes.
+    Não há laço próprio: o passo de código roda DENTRO da varredura única de
+    `core/email.py` (`poll_once`), na conexão que ela já abriu, caixa em modo
+    SOMENTE LEITURA (`BODY.PEEK`: ler um código não marca o e-mail como lido).
+    A cadência continua a mesma de antes — 60 s (`POLL_S`), garantida pelo
+    intervalo que `core.email.start()` usa quando existe conta com `otp`.
+    Mensagem já vista pelo UID é pulada; mensagem antiga demais (FRESH_S) é
+    lembrada sem anúncio, porque um código vencido não serve para nada. O
+    histórico de UIDs fica em disco (`memory/email_otp_seen.json`, chave
+    "endereço|uid") para um reinício do assistente não anunciar o mesmo código
+    duas vezes.
 
 O ANÚNCIO
     `handler(payload)` recebe o resultado de core/otp_detect.py com
     `origin="email"`. Se devolver False (sessão ainda não pronta, por exemplo),
     a mensagem NÃO é marcada como vista e o próximo ciclo tenta de novo; código
     já vencido é descartado na checagem de idade.
+
+SEM ANÚNCIO DUPLO
+    `scan_account` devolve também os UIDs que eram código, e a varredura não
+    fala "chegou um e-mail" para eles: o dono já ouviu o código. Ler um código
+    não marca a mensagem como lida em nenhum dos dois caminhos.
 """
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -34,20 +46,23 @@ SCAN_DAYS = 2           # o servidor só devolve UIDs recentes; código velho n�
 SCAN = 40
 MAX_SEEN = 2000
 
-_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
-           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-
 _BASE = Path(__file__).resolve().parent.parent
 _DEFAULT_STORE = _BASE / "memory" / "email_otp_seen.json"
 
 _lock = threading.Lock()
-_thread: threading.Thread | None = None
-_stop = threading.Event()
 _handler = None
 _logger = None
 _store_path = _DEFAULT_STORE
 _seen: dict[str, None] | None = None
 _last_warning = ""
+
+# Citação e assinatura fora: um código citado no histórico de uma resposta não
+# é um código novo. Mesmas regras de antes (o corpo vem do registro novo).
+_QUOTE_TAIL = re.compile(
+    r"(^\s*Em .{5,120}escreveu:\s*$)|(^\s*On .{5,120}wrote:\s*$)|"
+    r"(^\s*-{2,}\s*Mensagem original\s*-{2,})|(^\s*_{10,}\s*$)",
+    re.IGNORECASE | re.MULTILINE)
+_SIGNATURE = re.compile(r"^--\s?$", re.MULTILINE)
 
 
 def _default_log(message: str) -> None:
@@ -73,9 +88,10 @@ def _warn(message: str) -> None:
     _log(message)
 
 
-def _mail():
-    from plugins import email_control
-    return email_control
+def _registry():
+    """O registro autoritativo de e-mail (import tardio: evita ciclo)."""
+    from core import email as registry
+    return registry
 
 
 def _load_seen() -> dict[str, None]:
@@ -182,117 +198,136 @@ def process_messages(rows: list[dict], *, account: str = "", handler=None,
     return announced
 
 
-def _scan_criteria() -> str:
-    """`SINCE` em inglês (formato IMAP), independente do locale da máquina."""
-    t = time.gmtime(time.time() - SCAN_DAYS * 86400)
-    return f"SINCE {t.tm_mday:02d}-{_MONTHS[t.tm_mon - 1]}-{t.tm_year}"
+def _trim_quoted(text: str) -> str:
+    """Corpo sem citação/assinatura, como o leitor de e-mail já entregava."""
+    text = str(text or "").replace("\r\n", "\n")
+    cuts: list[int] = []
+    m = _QUOTE_TAIL.search(text)
+    if m and m.start() > 40:
+        cuts.append(m.start())
+    sig = _SIGNATURE.search(text)
+    if sig and sig.start() > 40:
+        cuts.append(sig.start())
+    if cuts:
+        text = text[:min(cuts)]
+    return "\n".join(ln for ln in text.splitlines()
+                     if not ln.lstrip().startswith(">"))
 
 
-def _messages_for_account(mail, cfg: dict) -> list[dict]:
-    conn = mail._imap(cfg)
-    try:
-        conn.select(mail.FOLDER, readonly=True)
-        rows = mail._recent(conn, _scan_criteria(), scan=SCAN)
-        now = time.time()
-        pending = []
-        seen = _load_seen()
-        for row in rows:
-            row = dict(row)
-            if _key(cfg["address"], row) in seen:
-                continue
-            if _fresh(row, now):
-                early = otp_detect.detect(
-                    "", subject=row.get("subject") or "",
-                    sender=row.get("from") or "")
-                if early is None:
-                    try:
-                        row["body"] = mail._body(conn, row.get("uid") or "")
-                    except Exception as e:
-                        _log(f"não consegui ler o corpo de um e-mail: {e}")
-                        row["body"] = ""
-            pending.append(row)
-        return pending
-    finally:
-        try:
-            conn.logout()
-        except Exception:
-            pass
+def scan_account(acct: dict, conn, *, handler=None,
+                 now: float | None = None) -> tuple[list[dict], set[str]]:
+    """Lê UMA caixa numa conexão já aberta e anuncia os códigos.
+
+    `acct` é o metadado público do registro novo (nome, endereço, uuid — nunca
+    a senha) e `conn` veio de `core.email.open_inbox` (somente leitura).
+    Devolve (anúncios, UIDs que eram código) — o segundo conjunto é o que
+    impede a varredura de avisar "chegou um e-mail" sobre um código já falado.
+    """
+    account = str(acct.get("address") or "")
+    registry = _registry()
+    rows = registry.recent_headers(conn, days=SCAN_DAYS, limit=SCAN)
+    now = time.time() if now is None else float(now)
+    seen = _load_seen()
+    pending: list[dict] = []
+    code_uids: set[str] = set()
+    for row in rows:
+        row = dict(row)
+        if _key(account, row) in seen:
+            continue
+        uid = str(row.get("uid") or "")
+        if not _fresh(row, now):
+            pending.append(row)          # process_messages lembra sem anunciar
+            continue
+        subject = row.get("subject") or ""
+        sender = row.get("from") or ""
+        body = ""
+        if otp_detect.detect("", subject=subject, sender=sender) is not None:
+            code_uids.add(uid)           # o assunto já diz: corpo não é preciso
+        else:
+            try:
+                body = _trim_quoted(registry.peek_body(conn, uid))
+            except Exception as e:
+                _log(f"não consegui ler o corpo de um e-mail: {e}")
+                body = ""
+            if otp_detect.detect(body, subject=subject, sender=sender) is not None:
+                code_uids.add(uid)
+        row["body"] = body
+        pending.append(row)
+    announced = process_messages(pending, account=account, handler=handler, now=now)
+    return announced, code_uids
+
+
+def _sweep_pass(acct: dict, conn) -> set[str]:
+    """O passo que roda DENTRO da varredura única de `core/email.py`."""
+    _announced, codes = scan_account(acct, conn, handler=_handler)
+    return codes
 
 
 def poll_once(handler=None, now: float | None = None) -> list[dict]:
-    """Uma varredura de todas as contas. Devolve os códigos anunciados."""
+    """Uma varredura manual (dry-run), caixa por caixa, pelo registro novo.
+
+    Não muda nada no servidor: abre somente leitura, lê cabeçalho e, quando
+    precisa, o corpo com BODY.PEEK. Devolve os códigos anunciados.
+    """
     global _last_warning
     try:
-        mail = _mail()
+        registry = _registry()
+        accounts = registry.otp_accounts()
     except Exception as e:
-        _warn(f"plugin de e-mail indisponível: {e}")
-        return []
-    try:
-        accounts = mail._load_accounts()
-    except Exception as e:
-        _warn(f"não consegui ler a configuração de e-mail: {e}")
+        _warn(f"o registro de e-mail está indisponível: {e}")
         return []
     if not accounts:
-        _warn("o e-mail não está configurado para leitura: falta endereço e "
-              "senha de app em ⚙ → PLUGIN SETTINGS → EMAIL. Nenhum código "
-              "será anunciado até isso existir.")
+        _warn("nenhuma conta de e-mail está marcada para anunciar códigos: "
+              "marque em 📧 E-MAIL. Nenhum código será anunciado até lá.")
         return []
 
     announced: list[dict] = []
     for acct in accounts:
-        name = str(acct.get("name") or acct.get("address") or "").strip()
+        label = str(acct.get("name") or acct.get("address") or "?")
+        conn = None
         try:
-            cfg = mail._resolve(None, name or None)
+            conn = registry.open_inbox(acct.get("name") or acct.get("uuid"))
+            got, _codes = scan_account(acct, conn, handler=handler, now=now)
         except Exception as e:
-            _warn(f"a conta de e-mail '{name}' não tem credencial de leitura "
-                  f"completa (endereço + senha de app): {e or 'faltando'}")
+            _warn(f"não consegui ler a caixa {label}: {e}")
             continue
-        try:
-            rows = _messages_for_account(mail, cfg)
-        except Exception as e:
-            _warn(f"não consegui ler a caixa {cfg['address']}: {e}")
-            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
         _last_warning = ""
-        announced.extend(process_messages(
-            rows, account=cfg["address"], handler=handler, now=now))
+        announced.extend(got)
     return announced
 
 
-def _loop(interval: float) -> None:
-    while not _stop.is_set():
-        try:
-            poll_once()
-        except Exception as e:
-            _log(f"a varredura de códigos falhou: {e}")
-        _stop.wait(interval)
-
-
 def start(handler=None, logger=None, interval: float = POLL_S) -> None:
-    """Liga a varredura em background; `handler(payload)` anuncia cada código."""
-    global _handler, _logger, _thread
+    """Liga o anúncio de códigos na varredura única de e-mail.
+
+    Não cria laço próprio: registra `handler(payload)` (o anúncio falado) e o
+    passo que `core/email.py` roda dentro do ciclo dela. É a MESMA conexão
+    somente leitura — um leitor por caixa, sem segundo IMAP.
+    """
+    global _handler, _logger
     if logger is not None:
         _logger = logger
-    with _lock:
-        if handler is not None:
-            _handler = handler
-        if _thread is not None and _thread.is_alive():
-            return
-        _stop.clear()
-        _thread = threading.Thread(
-            target=_loop, args=(max(1.0, float(interval)),), daemon=True,
-            name="jarvis-email-otp")
-        _thread.start()
+    if handler is not None:
+        _handler = handler
+    registry = _registry()
+    registry.set_otp_processor(_sweep_pass)
+    registry.start(interval=max(1.0, float(interval)))
 
 
 def stop() -> None:
-    global _thread, _handler
-    _stop.set()
+    """Desliga o passo de códigos (o laço de e-mail é de quem o criou)."""
+    global _handler
     with _lock:
-        thread, _thread = _thread, None
         _handler = None
-    if thread is not None and thread.is_alive() \
-            and thread is not threading.current_thread():
-        thread.join(timeout=5)
+    try:
+        _registry().set_otp_processor(None)
+    except Exception:
+        pass
 
 
 def reset(store_path: str | Path | None = None) -> None:
