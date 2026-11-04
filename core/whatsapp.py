@@ -827,20 +827,67 @@ def _trim_inbox(acct: _Account) -> None:
         pass
 
 
-def _prune_media(acct: _Account) -> None:
-    """Apaga mídia baixada mais velha que MEDIA_KEEP_DAYS."""
+def _prune_media(acct: _Account, *, older_than_days: float | None = None,
+                 now: float | None = None) -> int:
+    """Apaga mídia baixada mais velha que MEDIA_KEEP_DAYS; devolve o total.
+
+    Só arquivos regulares, só filhos diretos da pasta da conta. Symlink não é
+    seguido nem removido, e um arquivo tocado no último minuto fica para a
+    próxima passagem — mtime velho é a única prova aceita de que é descartável.
+    """
+    removed = 0
     try:
-        if not acct.media_dir.exists():
-            return
-        cutoff = time.time() - MEDIA_KEEP_DAYS * 86400
-        for p in acct.media_dir.iterdir():
+        media = acct.media_dir
+        if media == media.parent or not media.is_dir():
+            return 0
+        days = MEDIA_KEEP_DAYS if older_than_days is None else float(older_than_days)
+        moment = time.time() if now is None else float(now)
+        cutoff = moment - max(0.0, days) * 86400.0
+        for p in media.iterdir():
             try:
-                if p.is_file() and p.stat().st_mtime < cutoff:
+                if p.is_symlink() or not p.is_file():
+                    continue
+                mtime = p.stat().st_mtime
+                if mtime < cutoff and moment - mtime > 60.0:
                     p.unlink()
+                    removed += 1
             except Exception:
                 continue
     except Exception:
         pass
+    return removed
+
+
+def prune_media(account: str | None = None, *,
+                older_than_days: float | None = None,
+                now: float | None = None) -> int:
+    """Limpeza real da mídia do WhatsApp; idempotente.
+
+    Sem ``account`` passa por todas as contas configuradas. O ciclo de
+    manutenção do audio_ledger chama esta função de hora em hora, e cada
+    conexão bem-sucedida dispara uma passagem em segundo plano.
+    """
+    _ensure_accounts()
+    if account is not None:
+        try:
+            targets = [_A(account)]
+        except KeyError:
+            return 0
+    else:
+        targets = list(_accounts.values())
+    removed = 0
+    for acct in targets:
+        removed += _prune_media(acct, older_than_days=older_than_days,
+                                now=now)
+    if removed:
+        _log(f"mídia do WhatsApp: {removed} arquivo(s) antigo(s) removido(s)")
+    return removed
+
+
+def _prune_media_async(acct: _Account) -> None:
+    removed = _prune_media(acct)
+    if removed:
+        _log(f"[{acct.name}] mídia antiga: {removed} arquivo(s) removido(s)")
 
 
 def _load_inbox(acct: _Account) -> list[dict]:
@@ -1790,6 +1837,14 @@ def _on_connected(client, _evt, acct: _Account) -> None:
     _set_paired(acct)
     _log(f"[{acct.name}] conectado como {name or 'sem nome'} "
          f"({number or 'número desconhecido'})")
+    # Limpeza fora do handler: a pasta pode ter gigabytes de anexos velhos e o
+    # evento de conexão não deve esperar por I/O.
+    try:
+        threading.Thread(target=_prune_media_async, args=(acct,),
+                         name=f"jarvis-whatsapp-prune-{acct.uuid}",
+                         daemon=True).start()
+    except Exception:
+        pass
 
 
 def _on_disconnected(_client, _evt, acct: _Account) -> None:

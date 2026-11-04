@@ -33,6 +33,14 @@ AEC THAT FOLLOWS THE MIC
     (``systemctl --user restart filter-chain.service``), which does not touch
     the system's audio. Nothing auto-writes a filter chain for the owner's
     legacy node: that would mean two modules claiming one node name.
+
+    ONE MODULE PER MICROPHONE
+    The same managed file can declare several echo-cancel modules, one per
+    physical microphone — ``jarvis_aec_source``, ``_2``, ``_3``… — so every
+    microphone gets its own canceller and its own stream (core/mic_compare.py
+    compares the separate signals; nothing is ever summed). The first module
+    keeps the bare name so the saved ``input_device`` and the voice profile key
+    do not move.
 """
 
 from __future__ import annotations
@@ -51,10 +59,14 @@ DEFAULT_FILTER_DIR = Path.home() / ".config" / "pipewire" / "filter-chain.conf.d
 LEGACY_CONF_NAME = "50-echo-cancel.conf"
 MANAGED_CONF_NAME = "90-jarvis-aec-follow.conf"
 MANAGED_NODE = "jarvis_aec_source"
+MANAGED_CAPTURE = "jarvis_aec_capture"
 DEFAULT_RATE = 32000
 DEFAULT_CHANNELS = 2
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+# The first module keeps the bare name so the saved input_device and the voice
+# profile key never move; the extra microphones are _2, _3, … .
+_MANAGED_NODE_RE = re.compile(r"^" + re.escape(MANAGED_NODE) + r"(?:_\d+)?$")
 
 
 def slug(text: Any) -> str:
@@ -204,7 +216,7 @@ def read_filter_chains(directory: str | Path | None = None) -> list[dict[str, An
         for chain in parse_filter_chains(text):
             chain = dict(chain)
             chain["path"] = str(path)
-            chain["managed"] = chain.get("node_name") == MANAGED_NODE
+            chain["managed"] = is_managed_node(chain.get("node_name"))
             chains.append(chain)
     return chains
 
@@ -217,7 +229,29 @@ def is_aec_source(name: str) -> bool:
     low = str(name or "").strip().lower()
     return ("echo_cancel" in low or "echo-cancel" in low
             or "microfone aec" in low or low == "aec"
-            or low == MANAGED_NODE)
+            or is_managed_node(name))
+
+
+def is_managed_node(name: Any) -> bool:
+    """Is this node name one of JARVIS's own AEC sources?
+
+    ``jarvis_aec_source`` is the first (and for a single microphone, the only)
+    module. ``_2``, ``_3``… are the extra microphones rendered into the same
+    file — see render_managed_conf(). The legacy ``echo_cancel_source`` belongs
+    to the owner's file and never matches."""
+    return bool(_MANAGED_NODE_RE.match(str(name or "").strip()))
+
+
+def managed_node_names(count: int) -> list[str]:
+    """Virtual sources for N microphones: bare first, then _2, _3, …"""
+    count = max(1, int(count))
+    return [MANAGED_NODE] + [f"{MANAGED_NODE}_{i}" for i in range(2, count + 1)]
+
+
+def managed_capture_names(count: int) -> list[str]:
+    """Capture (hardware-facing) node names for N echo-cancel modules."""
+    count = max(1, int(count))
+    return [MANAGED_CAPTURE] + [f"{MANAGED_CAPTURE}_{i}" for i in range(2, count + 1)]
 
 
 def _match_source(name: str, sources: Iterable[Mapping[str, Any]]) -> str:
@@ -328,35 +362,54 @@ def managed_installed(directory: str | Path | None = None) -> bool:
     return managed_path(directory).is_file()
 
 
-def render_managed_conf(
+def _clean_targets(target: Any) -> list[str]:
+    """One or more physical microphone names, validated and de-duplicated.
+
+    N modules pointing at the same hardware would fight for the same node; a
+    stale config that lists the same microphone twice collapses to one module
+    instead of failing to load.
+    """
+    if isinstance(target, (str, bytes)):
+        raw = [target.decode("utf-8", "replace") if isinstance(target, bytes) else target]
+    else:
+        try:
+            raw = [item.decode("utf-8", "replace") if isinstance(item, bytes) else item
+                   for item in target]
+        except TypeError as exc:
+            raise ValueError("microfone alvo inválido") from exc
+    cleaned: list[str] = []
+    for item in raw:
+        name = str(item or "").strip()
+        if not name:
+            raise ValueError("microfone alvo vazio")
+        if name.lower().endswith(".monitor"):
+            raise ValueError("monitor do alto-falante não pode ser microfone de AEC")
+        if name not in cleaned:
+            cleaned.append(name)
+    if not cleaned:
+        raise ValueError("microfone alvo vazio")
+    return cleaned
+
+
+def _series(value: Any, count: int, default: Any) -> list[Any]:
+    """Per-module parameter: a scalar repeats, a sequence is padded."""
+    if isinstance(value, (str, bytes)) or not hasattr(value, "__iter__"):
+        return [value] * count
+    items = list(value)[:count]
+    return items + [default] * (count - len(items))
+
+
+def _module_block(
     target: str,
     *,
-    rate: int = DEFAULT_RATE,
-    channels: int = DEFAULT_CHANNELS,
-    node: str = MANAGED_NODE,
-    short: str = "",
+    rate: int,
+    channels: int,
+    node: str,
+    capture: str,
+    label: str,
 ) -> str:
-    """The filter-chain file JARVIS owns, retargeted at one physical mic."""
-    target = str(target or "").strip()
-    if not target:
-        raise ValueError("microfone alvo vazio")
-    rate = int(rate or DEFAULT_RATE)
-    channels = int(channels or DEFAULT_CHANNELS)
-    label = str(short or target)[:60]
     position = "[ FL FR ]" if channels >= 2 else "[ MONO ]"
-    return f"""# AEC gerenciado pelo JARVIS — gerado por core/mic_route.py.
-#
-# NAO EDITE A MAO: `python -m core.mic_route follow` reescreve este arquivo
-# quando o microfone ativo muda. O arquivo 50-echo-cancel.conf do dono nao e
-# tocado. O daemon do filtro e separado do audio do sistema
-# (systemctl --user restart filter-chain.service).
-#
-# Topologia:
-#   captura   : {target}
-#   referencia: monitor do sink DEFAULT
-#   fonte     : {node} (Audio/Source) -> escolha este nome em input_device
-context.modules = [
-    {{ name = libpipewire-module-echo-cancel
+    return f"""    {{ name = libpipewire-module-echo-cancel
         flags = [ nofail ]
         args = {{
             library.name   = aec/libspa-aec-webrtc
@@ -367,7 +420,7 @@ context.modules = [
             audio.position = {position}
 
             capture.props = {{
-                node.name     = "jarvis_aec_capture"
+                node.name     = "{capture}"
                 target.object = "{target}"
             }}
 
@@ -382,33 +435,122 @@ context.modules = [
                 webrtc.high_pass_filter  = true
             }}
         }}
-    }}
-]
+    }}"""
+
+
+_SINGLE_HEADER = """# AEC gerenciado pelo JARVIS — gerado por core/mic_route.py.
+#
+# NAO EDITE A MAO: `python -m core.mic_route follow` reescreve este arquivo
+# quando o microfone ativo muda. O arquivo 50-echo-cancel.conf do dono nao e
+# tocado. O daemon do filtro e separado do audio do sistema
+# (systemctl --user restart filter-chain.service).
+#
+# Topologia:
+#   captura   : {target}
+#   referencia: monitor do sink DEFAULT
+#   fonte     : {node} (Audio/Source) -> escolha este nome em input_device
+context.modules = [
 """
 
 
+def _multi_header(targets: list[str], nodes: list[str]) -> str:
+    lines = "\n".join(
+        f"#   [{index}] captura: {target} -> fonte {node}"
+        for index, (target, node) in enumerate(zip(targets, nodes), start=1))
+    return f"""# AEC gerenciado pelo JARVIS — gerado por core/mic_route.py.
+#
+# NAO EDITE A MAO: `python -m core.mic_route follow` reescreve este arquivo
+# quando o microfone ativo muda. O arquivo 50-echo-cancel.conf do dono nao e
+# tocado. O daemon do filtro e separado do audio do sistema
+# (systemctl --user restart filter-chain.service).
+#
+# Topologia: {len(targets)} microfones, um modulo e uma fonte POR microfone.
+#   O JARVIS abre um stream em cada fonte e COMPARA os sinais — nunca soma
+#   nem mixa os canais; somar dois microfones com atrasos diferentes
+#   comb-filtra a voz e dobra o ruido da sala.
+{lines}
+#   referencia: monitor do sink DEFAULT (por modulo)
+#
+# O primeiro modulo mantem o nome {MANAGED_NODE} para nao mudar a config
+# salva nem a chave do perfil de voz; os demais sao {MANAGED_NODE}_2, _3, ...
+context.modules = [
+"""
+
+
+def render_managed_conf(
+    target: Any,
+    *,
+    rate: Any = DEFAULT_RATE,
+    channels: Any = DEFAULT_CHANNELS,
+    node: str = MANAGED_NODE,
+    short: Any = "",
+) -> str:
+    """The filter-chain file JARVIS owns, one echo-cancel module per microphone.
+
+    ``target`` may be one name or a sequence; ``rate``, ``channels`` and
+    ``short`` take a scalar (applied to all) or one value per microphone. The
+    first module is rendered with the historic node names (``jarvis_aec_source``
+    / ``jarvis_aec_capture``) so an existing install, its saved ``input_device``
+    and its voice profile key keep working unchanged.
+
+    Pure text generation: nothing is written and no service is touched here.
+    """
+    targets = _clean_targets(target)
+    count = len(targets)
+    rates = [int(value or DEFAULT_RATE)
+             for value in _series(rate, count, DEFAULT_RATE)]
+    chans = [int(value or DEFAULT_CHANNELS)
+             for value in _series(channels, count, DEFAULT_CHANNELS)]
+    labels = [str(value or "") for value in _series(short, count, "")]
+    nodes = managed_node_names(count)
+    captures = managed_capture_names(count)
+    if count > 1 and node != MANAGED_NODE:
+        # A caller-supplied base name keeps its indexing, but the bare name is
+        # still the first module so nothing that points at it breaks.
+        nodes = [node] + [f"{node}_{i}" for i in range(2, count + 1)]
+
+    blocks = [
+        _module_block(
+            targets[index],
+            rate=rates[index],
+            channels=chans[index],
+            node=nodes[index],
+            capture=captures[index],
+            label=(labels[index] or targets[index])[:60],
+        )
+        for index in range(count)
+    ]
+    body = ",\n".join(blocks)
+    header = (_SINGLE_HEADER.format(target=targets[0], node=nodes[0])
+              if count == 1 else _multi_header(targets, nodes))
+    return header + body + "\n]\n"
+
+
 def write_managed_conf(
-    target: str,
+    target: Any,
     *,
     directory: str | Path | None = None,
-    rate: int = DEFAULT_RATE,
-    channels: int = DEFAULT_CHANNELS,
-    short: str = "",
+    rate: Any = DEFAULT_RATE,
+    channels: Any = DEFAULT_CHANNELS,
+    short: Any = "",
 ) -> dict[str, Any]:
     """Atomically write JARVIS's managed AEC file. No other file is touched.
 
-    Refuses a monitor source (that is the machine's own playback), a missing
-    target and — defensively — any path that is not the managed name.
+    ``target`` may be one microphone or several; each gets its own echo-cancel
+    module in this one file (see render_managed_conf). Refuses a monitor source
+    (that is the machine's own playback), a missing target and — defensively —
+    any path that is not the managed name.
+
+    This is the only side effect allowed here: generate text and write OUR
+    file. It does not restart the filter-chain daemon and does not touch
+    ``~/.config/pipewire`` unless the caller pointed `directory` there.
     """
-    target = str(target or "").strip()
-    if not target:
-        raise ValueError("microfone alvo vazio")
-    if target.lower().endswith(".monitor"):
-        raise ValueError("monitor do alto-falante não pode ser microfone de AEC")
+    targets = _clean_targets(target)
     path = managed_path(directory)
     if path.name != MANAGED_CONF_NAME:
         raise ValueError(f"arquivo gerenciado inesperado: {path.name}")
-    content = render_managed_conf(target, rate=rate, channels=channels, short=short)
+    content = render_managed_conf(targets, rate=rate, channels=channels,
+                                  short=short)
     previous = ""
     if path.is_file():
         try:
@@ -416,7 +558,8 @@ def write_managed_conf(
         except OSError:
             previous = ""
     if previous == content:
-        return {"path": str(path), "changed": False, "target": target}
+        return {"path": str(path), "changed": False, "target": targets[0],
+                "targets": targets}
     path.parent.mkdir(parents=True, exist_ok=True)
     if previous:
         # Our own previous generation, kept one step back for a manual undo.
@@ -440,7 +583,8 @@ def write_managed_conf(
         except OSError:
             pass
         raise
-    return {"path": str(path), "changed": True, "target": target}
+    return {"path": str(path), "changed": True, "target": targets[0],
+            "targets": targets}
 
 
 def restart_filter_chain(timeout: int = 15) -> dict[str, Any]:
@@ -458,6 +602,37 @@ def restart_filter_chain(timeout: int = 15) -> dict[str, Any]:
     return {"ok": out.returncode == 0, "detail": detail[:300]}
 
 
+def _description_label(chain: Mapping[str, Any]) -> str:
+    """The 'C920' part of ``Microfone AEC (JARVIS: C920)``."""
+    match = re.search(r"JARVIS:\s*([^)]+)\)", str(chain.get("description") or ""))
+    return match.group(1).strip() if match else ""
+
+
+def _managed_modules(directory: str | Path | None = None) -> list[dict[str, Any]]:
+    """Echo-cancel modules JARVIS declared in its own file, in file order.
+
+    Only ``render_managed_conf`` output is understood: the owner's legacy
+    ``50-echo-cancel.conf`` never participates here, even if it sits in the same
+    directory."""
+    path = managed_path(directory)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    modules: list[dict[str, Any]] = []
+    for chain in parse_filter_chains(text):
+        if not is_managed_node(chain.get("node_name")):
+            continue
+        modules.append({
+            "node": str(chain.get("node_name") or ""),
+            "target": str(chain.get("target") or ""),
+            "rate": int(chain.get("rate") or DEFAULT_RATE),
+            "channels": int(chain.get("channels") or DEFAULT_CHANNELS),
+            "short": _description_label(chain),
+        })
+    return modules
+
+
 def follow_managed(
     configured: str,
     *,
@@ -467,22 +642,24 @@ def follow_managed(
 ) -> dict[str, Any]:
     """Retarget JARVIS's AEC at the physical mic behind ``configured``.
 
-    Only acts when the configured chain IS the managed node. A legacy chain
-    (the owner's 50-echo-cancel.conf) is reported, never rewritten: replacing
-    it would require a backup decision that belongs to him.
+    Only acts when the configured chain IS one of the managed nodes — the bare
+    ``jarvis_aec_source`` or one of the indexed ``_2``, ``_3``… sources. A
+    legacy chain (the owner's 50-echo-cancel.conf) is reported, never
+    rewritten: replacing it would require a backup decision that belongs to him.
 
-    ``target`` is the NEW physical source (the one that just became the default
-    capture); without it the current chain target would be kept, which is the
-    microphone that was just abandoned.
+    With several modules in the file, only the module carrying the configured
+    chain is retargeted; the other microphones keep their hardware and their
+    node names. ``target`` is the NEW physical source (the one that just became
+    the default capture); without it the current chain target would be kept,
+    which is the microphone that was just abandoned.
     """
     route = physical_source(configured, chains=read_filter_chains(directory))
-    if route["chain"] != MANAGED_NODE:
+    if not is_managed_node(route["chain"]):
         return {"written": False, "restarted": False, "route": route,
                 "reason": "AEC não gerenciado pelo JARVIS "
                           f"(cadeia={route['chain'] or route['source'] or '?'})"}
     physical = str(target or route.get("physical") or "")
-    if (not physical or physical == MANAGED_NODE
-            or physical.lower().endswith(".monitor")
+    if (not physical or physical.lower().endswith(".monitor")
             or is_aec_source(physical)):
         return {"written": False, "restarted": False, "route": route,
                 "reason": "microfone físico não resolvido"}
@@ -490,14 +667,38 @@ def follow_managed(
     row = next((r for r in rows if r.get("name") == physical), None)
     rate = int((row or {}).get("rate") or DEFAULT_RATE)
     channels = _spec_channels((row or {}).get("spec") or "") or DEFAULT_CHANNELS
-    written = write_managed_conf(physical, directory=directory, rate=rate,
-                                 channels=channels, short=physical)
+
+    modules = _managed_modules(directory)
+    if not modules:
+        modules = [{"node": MANAGED_NODE, "target": physical, "rate": rate,
+                    "channels": channels, "short": physical}]
+    else:
+        hit = next((m for m in modules if m["node"] == route["chain"]), None)
+        if hit is None:
+            hit = modules[0]
+        hit["target"] = physical
+        hit["rate"] = rate
+        hit["channels"] = channels
+        hit["short"] = physical
+    kept: list[dict[str, Any]] = []
+    for module in modules:
+        if not any(other["target"] == module["target"] for other in kept):
+            kept.append(module)
+
+    written = write_managed_conf(
+        [module["target"] for module in kept],
+        directory=directory,
+        rate=[module["rate"] for module in kept],
+        channels=[module["channels"] for module in kept],
+        short=[module["short"] for module in kept],
+    )
     restarted: dict[str, Any] = {"ok": False, "detail": "sem alteração"}
     if written["changed"] and restart:
         restarted = restart_filter_chain()
     return {"written": bool(written["changed"]), "restarted": bool(restarted.get("ok")),
             "restart_detail": restarted.get("detail", ""), "route": route,
-            "path": written["path"], "target": physical, "rate": rate,
+            "path": written["path"], "target": physical,
+            "targets": [module["target"] for module in kept], "rate": rate,
             "channels": channels, "reason": ""}
 
 

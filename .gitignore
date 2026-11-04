@@ -52,6 +52,8 @@ amostra-voz.mp3
 # Attachments received on WhatsApp, one media dir per account (the bare
 # memory/whatsapp_media/ above misses the per-account variants):
 memory/whatsapp_media*/
+# Continuous classified microphone audio and its JSONL events (sensitive):
+memory/audio_ledger/
 
 # ── Backups locais que carregam segredos ou dados pessoais ────────────────────
 # Cópias datadas feitas à mão antes de editar credenciais. As de api_keys.json

@@ -25,6 +25,7 @@ WHY THIS IS CACHED
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 
@@ -48,6 +49,43 @@ _enum_lock = threading.RLock()
 # Which host API each direction settled on, so resolve() opens the same endpoint
 # the picker listed. Filled in by _query().
 _chosen_api: dict = {"input": None, "output": None}
+
+# Last device table handed out by PortAudio — (devices, host API names). Kept so
+# a name can be resolved to an index WHILE streams are running, when enumerating
+# again is exactly what trips the PulseAudio assertion described above. Written
+# only under `_enum_lock`.
+_table_cache: tuple[list, list] | None = None
+
+# How many audio streams the caller currently has open. The multi-microphone
+# path cannot ask PortAudio anything while a stream is live (opening a probe
+# stream next to a running one is the abort this module exists to avoid), so it
+# has to be told. `live_stream()` is that channel, and it is a counter because
+# the microphone and the speaker streams overlap.
+_live_streams = 0
+_live_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def live_stream():
+    """Declare that one or more audio streams are open inside this block.
+
+    Use it around any code that keeps an InputStream/OutputStream alive. While
+    it runs, resolve_many() serves indices from the cached device table and
+    skips the `_usable` probe — it never enumerates and never opens a stream.
+    """
+    global _live_streams
+    with _live_lock:
+        _live_streams += 1
+    try:
+        yield
+    finally:
+        with _live_lock:
+            _live_streams = max(0, _live_streams - 1)
+
+
+def streams_live() -> bool:
+    """True while any caller is inside a `live_stream()` block."""
+    return _live_streams > 0
 
 
 # ── Why the raw list is unusable, and what is filtered out ───────────────────
@@ -268,6 +306,29 @@ def _is_pseudo(name: str) -> bool:
     return any(tok in low for tok in _PSEUDO_DEVICES)
 
 
+def _enumerate() -> tuple[list, list]:
+    """(devices, host API names) straight from PortAudio, and cache the table.
+
+    Callers must already hold `_enum_lock` — see the note at the top of this
+    file. Never raises by itself: the import/queries are the caller's problem.
+    """
+    global _table_cache
+    import sounddevice as sd
+
+    devices = list(sd.query_devices())
+    try:
+        apis = [a.get("name", "") for a in sd.query_hostapis()]
+    except Exception:
+        apis = []
+    _table_cache = (devices, apis)
+    return devices, apis
+
+
+def _cached_table() -> tuple[list, list] | None:
+    """The last enumeration, or None. Never touches PortAudio."""
+    return _table_cache
+
+
 def _query() -> dict[str, list[str]]:
     with _enum_lock:
         return _query_serialized()
@@ -282,13 +343,8 @@ def _query_serialized() -> dict[str, list[str]]:
     out: dict[str, list[str]] = {"input": [], "output": []}
     try:
         import platform
-        import sounddevice as sd
 
-        devices = list(sd.query_devices())
-        try:
-            apis = [a.get("name", "") for a in sd.query_hostapis()]
-        except Exception:
-            apis = []
+        devices, apis = _enumerate()
 
         preferred = _PREFERRED_APIS.get(platform.system(), ())
 
@@ -379,7 +435,95 @@ def resolve(name: str, kind: str):
         return _resolve_serialized(name, kind)
 
 
-def _resolve_serialized(name: str, kind: str):
+def resolve_many(
+    names,
+    kind: str = "input",
+    *,
+    probe: bool | None = None,
+    refresh: bool = False,
+) -> list:
+    """Resolve SEVERAL saved device names under one enumeration lock.
+
+    One stream per microphone means the app resolves N names at the same
+    instant, at startup and again whenever the device set changes. Calling
+    resolve() in a loop would enumerate once per name and, worse, would let
+    another thread enumerate between them — the PortAudio/PulseAudio assertion
+    at the top of this file. So every name here is resolved against ONE device
+    table, taken once, under one acquisition of `_enum_lock`.
+
+    `probe` controls the `_usable` open-and-close check:
+      * None (default) — probe only when no stream is live;
+      * True/False — force it. A live stream still wins: probing is skipped,
+        because opening a probe stream next to a running one is the abort this
+        module exists to avoid.
+
+    `refresh` is honoured only when nothing is streaming: with a live stream
+    this NEVER enumerates again, whatever the caller asked for, because that
+    enumeration is the crash. In that case indices come from the device table
+    cached by the startup prefetch; if there is none, every name degrades to
+    the system default (None) instead of taking the process down.
+
+    Returns a list aligned with `names`: an index, or None for "system default"
+    (unknown, empty, or not resolvable right now).
+    """
+    wanted = [str(name or "") for name in names]
+    if not wanted:
+        return []
+
+    with _enum_lock:
+        live = streams_live()
+        do_probe = (not live) if probe is None else bool(probe)
+
+        if live:
+            if do_probe:
+                print("[Audio] resolve_many: probe ignorado com stream ativo "
+                      "(abrir um stream ao lado de outro derruba o processo)")
+            do_probe = False
+            table = _cached_table()
+            if table is None:
+                print("[Audio] resolve_many: sem tabela de dispositivos em "
+                      "cache e streams ativos — usando o padrão do sistema")
+                return [None] * len(wanted)
+            if refresh:
+                print("[Audio] resolve_many: refresh ignorado com streams "
+                      "ativos — usando a tabela em cache")
+            return [_resolve_serialized(name, kind, table=table, probe=False,
+                                        warm=False)
+                    for name in wanted]
+
+        # Nothing is streaming: one enumeration serves every name. list_devices
+        # warms the cache and picks the host API (a no-op once warm). A cold
+        # cache was just enumerated by that call, so its table is reused; a
+        # warm one is refreshed once, because the prefetch may be minutes old
+        # and a device plugged since would shift every index after it.
+        with _cache_lock:
+            warm = _cache is not None
+        try:
+            list_devices(kind)
+            table = _enumerate() if warm else _cached_table()
+            if table is None:
+                table = _enumerate()
+        except Exception as e:
+            print(f"[Audio] resolve_many: device table unavailable ({e}) — "
+                  "using system default")
+            return [None] * len(wanted)
+        return [_resolve_serialized(name, kind, table=table, probe=do_probe)
+                for name in wanted]
+
+
+def _accept_any(_idx: int, _kind: str) -> bool:
+    """Stand-in for _usable() when probing is not allowed (streams are live)."""
+    return True
+
+
+def _resolve_serialized(
+    name: str,
+    kind: str,
+    *,
+    table: tuple[list, list] | None = None,
+    probe: bool = True,
+    warm: bool = True,
+):
     """Turn a saved device name into something sounddevice accepts.
 
     Returns None for "system default" — which is also what we return when the
@@ -390,20 +534,21 @@ def _resolve_serialized(name: str, kind: str):
     the user chose from the WASAPI list resolves to the WASAPI endpoint. Without
     that ordering a full name would fall through to MME's truncated copy of the
     same device — which happens to work, but means the setting quietly refers to
-    a different endpoint than the one on screen."""
+    a different endpoint than the one on screen.
+
+    `table` is a pre-taken (devices, apis) pair so a batch can share one
+    enumeration; `probe=False` accepts a candidate without opening it, for the
+    case where a stream is already running; `warm=False` skips the host-API
+    lookup, which would enumerate on a cold cache."""
     wanted = (name or "").strip()
     if not wanted or wanted == DEFAULT_LABEL:
         return None
 
     try:
         import platform
-        import sounddevice as sd
 
-        devices = list(sd.query_devices())
-        try:
-            apis = [a.get("name", "") for a in sd.query_hostapis()]
-        except Exception:
-            apis = []
+        devices, apis = table if table is not None else _enumerate()
+        accept = _usable if probe else _accept_any
 
         want_in  = (kind == "input")
         chan_key = "max_input_channels" if want_in else "max_output_channels"
@@ -422,7 +567,8 @@ def _resolve_serialized(name: str, kind: str):
         # endpoint that was listed must be the endpoint that gets opened, or the
         # setting means something different from what it says. list_devices()
         # populates it; calling it here is a no-op once the cache is warm.
-        list_devices(kind)
+        if warm:
+            list_devices(kind)
         chosen = _chosen_api.get(kind)
         orders = ([chosen] if chosen is not None else []) \
             + [a for a in _PREFERRED_APIS.get(platform.system(), ()) if a != chosen] \
@@ -437,12 +583,12 @@ def _resolve_serialized(name: str, kind: str):
             partial = None
             for idx, dev_name in _candidates(api_filter):
                 if dev_name == wanted:
-                    if _usable(idx, kind):
+                    if accept(idx, kind):
                         return idx
                     continue
                 if partial is None and (dev_name.startswith(wanted[:24])
                                         or wanted.startswith(dev_name[:24])):
-                    if _usable(idx, kind):
+                    if accept(idx, kind):
                         partial = idx
             if partial is not None:
                 return partial

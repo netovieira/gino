@@ -6,9 +6,11 @@ tests never touch PulseAudio or the owner's configuration.
 """
 from __future__ import annotations
 
+import contextlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from core import mic_route
 
@@ -184,6 +186,189 @@ class MicRouteManagedTest(unittest.TestCase):
         text = (self.dir / mic_route.MANAGED_CONF_NAME).read_text(encoding="utf-8")
         self.assertIn(EDIFIER_NODE, text)
         self.assertNotIn(C920_NODE, text)
+
+
+class MicRouteMultiModuleTest(unittest.TestCase):
+    """Several echo-cancel modules in the ONE managed file.
+
+    The first module must keep the bare node name: ``input_device =
+    jarvis_aec_source`` and the voice profile key are saved in the owner's
+    config and must not move when a second microphone is added.
+    """
+
+    SECOND = "alsa_input.usb-046d_C925-00.analog-stereo"
+    THIRD = "alsa_input.pci-0000_00_1f.3.analog-stereo"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_names_are_bare_first_then_indexed(self):
+        self.assertEqual(mic_route.managed_node_names(1), ["jarvis_aec_source"])
+        self.assertEqual(mic_route.managed_node_names(3),
+                         ["jarvis_aec_source", "jarvis_aec_source_2",
+                          "jarvis_aec_source_3"])
+        self.assertEqual(mic_route.managed_capture_names(2),
+                         ["jarvis_aec_capture", "jarvis_aec_capture_2"])
+        self.assertEqual(mic_route.managed_node_names(0), ["jarvis_aec_source"])
+
+    def test_three_microphones_render_three_modules(self):
+        text = mic_route.render_managed_conf(
+            [C920_NODE, self.SECOND, self.THIRD],
+            rate=[32000, 48000, 16000],
+            channels=[2, 1, 1],
+            short=["C920", "C925", "Interno"],
+        )
+        self.assertEqual(text.count("libpipewire-module-echo-cancel"), 3)
+        self.assertEqual(text.count("context.modules"), 1)
+        self.assertIn(f'target.object = "{C920_NODE}"', text)
+        self.assertIn(f'target.object = "{self.SECOND}"', text)
+        self.assertIn(f'target.object = "{self.THIRD}"', text)
+        self.assertIn('node.name        = "jarvis_aec_source"', text)
+        self.assertIn('node.name        = "jarvis_aec_source_2"', text)
+        self.assertIn('node.name        = "jarvis_aec_source_3"', text)
+        self.assertIn('node.name     = "jarvis_aec_capture_2"', text)
+        self.assertIn("audio.rate     = 48000", text)
+        self.assertIn("audio.channels = 1", text)
+        self.assertIn("Microfone AEC (JARVIS: C925)", text)
+        # One module per microphone, never a shared channel list.
+        chains = mic_route.parse_filter_chains(text)
+        self.assertEqual([c["target"] for c in chains],
+                         [C920_NODE, self.SECOND, self.THIRD])
+        self.assertEqual([c["rate"] for c in chains], [32000, 48000, 16000])
+        self.assertEqual([c["channels"] for c in chains], [2, 1, 1])
+
+    def test_single_microphone_output_is_unchanged(self):
+        text = mic_route.render_managed_conf(C920_NODE, short="C920")
+        self.assertEqual(text.count("libpipewire-module-echo-cancel"), 1)
+        self.assertNotIn("jarvis_aec_source_2", text)
+        self.assertIn('node.name        = "jarvis_aec_source"', text)
+        self.assertIn('node.name     = "jarvis_aec_capture"', text)
+        self.assertIn("Microfone AEC (JARVIS: C920)", text)
+
+    def test_write_renders_all_modules_and_is_idempotent(self):
+        result = mic_route.write_managed_conf(
+            [C920_NODE, self.SECOND], directory=self.dir,
+            rate=[32000, 48000], channels=[2, 1], short=["C920", "C925"])
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["targets"], [C920_NODE, self.SECOND])
+        text = Path(result["path"]).read_text(encoding="utf-8")
+        self.assertEqual(text.count("libpipewire-module-echo-cancel"), 2)
+        again = mic_route.write_managed_conf(
+            [C920_NODE, self.SECOND], directory=self.dir,
+            rate=[32000, 48000], channels=[2, 1], short=["C920", "C925"])
+        self.assertFalse(again["changed"])
+
+    def test_duplicate_hardware_collapses_to_one_module(self):
+        text = mic_route.render_managed_conf(
+            [C920_NODE, C920_NODE, self.SECOND])
+        self.assertEqual(len(mic_route.parse_filter_chains(text)), 2)
+
+    def test_any_monitor_in_the_list_is_refused(self):
+        monitor = "alsa_output.usb-x.analog-stereo.monitor"
+        for targets in ([""], [C920_NODE, monitor], []):
+            with self.assertRaises(ValueError):
+                mic_route.write_managed_conf(targets, directory=self.dir)
+        self.assertFalse((self.dir / mic_route.MANAGED_CONF_NAME).exists())
+
+    def test_managed_flag_covers_indexed_nodes_and_not_the_legacy_file(self):
+        mic_route.write_managed_conf([C920_NODE, self.SECOND],
+                                     directory=self.dir)
+        (self.dir / mic_route.LEGACY_CONF_NAME).write_text(
+            LEGACY_CONF, encoding="utf-8")
+        chains = mic_route.read_filter_chains(self.dir)
+        managed = [c for c in chains if c["managed"]]
+        self.assertEqual(len(managed), 2)
+        self.assertEqual({c["node_name"] for c in managed},
+                         {"jarvis_aec_source", "jarvis_aec_source_2"})
+        legacy = [c for c in chains if not c["managed"]]
+        self.assertEqual([c["node_name"] for c in legacy], ["echo_cancel_source"])
+
+    def test_node_name_predicates(self):
+        self.assertTrue(mic_route.is_managed_node("jarvis_aec_source"))
+        self.assertTrue(mic_route.is_managed_node("jarvis_aec_source_2"))
+        self.assertFalse(mic_route.is_managed_node("jarvis_aec_source_x"))
+        self.assertFalse(mic_route.is_managed_node("echo_cancel_source"))
+        self.assertTrue(mic_route.is_aec_source("jarvis_aec_source_3"))
+        self.assertTrue(mic_route.is_aec_source("echo_cancel_source"))
+
+    def test_indexed_source_resolves_to_its_own_hardware(self):
+        text = mic_route.render_managed_conf([C920_NODE, self.SECOND])
+        chains = mic_route.parse_filter_chains(text)
+        route = mic_route.physical_source(
+            "jarvis_aec_source_2", sources=self._sources(), chains=chains,
+            default=self.SECOND)
+        self.assertEqual(route["source"], "jarvis_aec_source_2")
+        self.assertEqual(route["physical"], self.SECOND)
+        self.assertEqual(route["key"], mic_route.slug(self.SECOND))
+        self.assertTrue(route["aec"])
+
+    def _sources(self):
+        return mic_route.parse_sources(
+            "38\tjarvis_aec_source\tPipeWire\tfloat32le 2ch 32000Hz\tRUNNING\n"
+            "39\tjarvis_aec_source_2\tPipeWire\tfloat32le 2ch 48000Hz\tRUNNING\n"
+            f"64\t{C920_NODE}\tPipeWire\ts16le 2ch 32000Hz\tRUNNING\n"
+            f"65\t{self.SECOND}\tPipeWire\ts16le 1ch 48000Hz\tSUSPENDED\n"
+        )
+
+    @contextlib.contextmanager
+    def _no_pactl(self):
+        """follow_managed queries the live server; these tests never do."""
+        with mock.patch.object(mic_route, "list_sources", return_value=[]), \
+                mock.patch.object(mic_route, "default_source", return_value=""):
+            yield
+
+    def test_follow_retargets_only_the_matching_module(self):
+        mic_route.write_managed_conf([C920_NODE, self.SECOND],
+                                     directory=self.dir, short=["C920", "C925"])
+        with self._no_pactl():
+            result = mic_route.follow_managed(
+                mic_route.MANAGED_NODE, target=self.THIRD,
+                directory=self.dir, restart=False)
+        self.assertTrue(result["written"])
+        self.assertEqual(result["targets"], [self.THIRD, self.SECOND])
+        text = (self.dir / mic_route.MANAGED_CONF_NAME).read_text(encoding="utf-8")
+        self.assertIn(self.THIRD, text)
+        self.assertIn(self.SECOND, text)
+        self.assertNotIn(C920_NODE, text)
+        chains = mic_route.parse_filter_chains(text)
+        self.assertEqual(chains[0]["node_name"], mic_route.MANAGED_NODE)
+        self.assertEqual(chains[1]["node_name"], "jarvis_aec_source_2")
+
+    def test_follow_retargets_the_second_module_too(self):
+        mic_route.write_managed_conf([C920_NODE, self.SECOND],
+                                     directory=self.dir)
+        with self._no_pactl():
+            result = mic_route.follow_managed(
+                "jarvis_aec_source_2", target=self.THIRD,
+                directory=self.dir, restart=False)
+        self.assertTrue(result["written"])
+        self.assertEqual(result["targets"], [C920_NODE, self.THIRD])
+
+    def test_follow_refuses_a_monitor_and_an_aec_target(self):
+        mic_route.write_managed_conf([C920_NODE, self.SECOND],
+                                     directory=self.dir)
+        for bad in ("alsa_output.x.monitor", "jarvis_aec_source",
+                    "jarvis_aec_source_2"):
+            with self._no_pactl():
+                result = mic_route.follow_managed(
+                    mic_route.MANAGED_NODE, target=bad, directory=self.dir,
+                    restart=False)
+            self.assertFalse(result["written"])
+            self.assertIn("microfone físico", result["reason"])
+
+    def test_follow_collapses_a_duplicated_target(self):
+        mic_route.write_managed_conf([C920_NODE, self.SECOND],
+                                     directory=self.dir)
+        with self._no_pactl():
+            result = mic_route.follow_managed(
+                "jarvis_aec_source_2", target=C920_NODE,
+                directory=self.dir, restart=False)
+        # Both modules would capture the same hardware: one module survives.
+        self.assertEqual(result["targets"], [C920_NODE])
 
 
 if __name__ == "__main__":

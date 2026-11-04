@@ -134,6 +134,8 @@ from core                      import undo as undo_stack
 from core                      import welcome_promo as _welcome
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
+from core                      import multi_mic as _multi_mic
+from core                      import mic_compare as _mic_compare
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
 from core.echo_text            import EchoTextGuard, normalize as _echo_normalize
@@ -15706,6 +15708,315 @@ class JarvisLive:
             # 16 kHz int16 mono → 32 000 bytes per second of microphone.
             _usage.note("gemini", audio_in_s=len(msg["data"]) / 32000.0)
 
+    async def _ensure_multi_mic_conf(self) -> bool:
+        """One echo-cancel module per physical microphone, with a safety net.
+
+        Only runs when ``input_device`` is one of JARVIS's managed AEC sources
+        and the managed file is installed. The server's real capture sources
+        each get their own module (never one module feeding several mics); the
+        hardware currently in use stays FIRST, so ``jarvis_aec_source`` keeps
+        feeding the saved ``input_device`` and its voice-profile key. Writing,
+        restarting ONLY the filter-chain daemon, verifying the nodes and
+        restoring the previous file on any failure are delegated to
+        core.multi_mic.activate_filter_conf — the owner's 50-echo-cancel.conf
+        is never touched.
+
+        Returns True when at least two managed sources exist afterwards (the
+        caller then opens one stream per source). False means: behave exactly
+        as before, one stream and one chain.
+        """
+        try:
+            configured = get_input_device()
+            if (not _mic_route.is_managed_node(configured)
+                    or not _mic_route.managed_installed()):
+                return False
+            rows = await asyncio.to_thread(_mic_route.list_sources)
+            picked = _multi_mic.physical_sources(
+                rows, is_aec=_mic_route.is_aec_source)
+            # A source whose active port says "not available" (a line-in with
+            # nothing plugged) is suspended like a resting USB mic but would
+            # only add room hum to the comparison — drop just that one.
+            blocked = _multi_mic.unavailable_sources(
+                await asyncio.to_thread(_multi_mic.source_details))
+            if blocked:
+                picked = [row for row in picked
+                          if str(row.get("name") or "") not in blocked]
+            if not picked:
+                return False
+            try:
+                current = _mic_route.physical_source(
+                    configured, sources=rows)["physical"]
+            except Exception:
+                current = ""
+            picked.sort(key=lambda row: 0 if row.get("name") == current else 1)
+            names = [str(row.get("name") or "") for row in picked]
+            names = [name for name in names if name]
+            if not names:
+                return False
+            rates = [int(row.get("rate") or _mic_route.DEFAULT_RATE)
+                     for row in picked]
+            chans = [_multi_mic.channel_count(row.get("spec") or "")
+                     or _mic_route.DEFAULT_CHANNELS for row in picked]
+            # A source the server reports as suspended was not carrying audio
+            # before we opened it (a resting USB microphone, whose port is
+            # still usable). It still gets its own module, but its silence
+            # must not undo the whole file.
+            required = [str(row.get("name") or "") for row in picked
+                        if str(row.get("state") or "").upper() in ("RUNNING", "IDLE")]
+            result = await asyncio.to_thread(
+                _multi_mic.activate_filter_conf, names, rates=rates,
+                channels=chans, required=required or None)
+            if result.get("ok"):
+                line = ("SYS: AEC multi-microfone — "
+                        f"{len(names)} módulos ativos (um por microfone).")
+            else:
+                line = ("SYS: AEC multi-microfone indisponível — "
+                        f"etapa {result.get('failed')}: {result.get('detail')}")
+            print(f"[Mic] {line[5:]}")
+            try:
+                self.ui.write_log(line)
+            except Exception:
+                pass
+            if not result.get("ok"):
+                return False
+            return len(names) >= 2
+        except Exception as e:
+            print(f"[Mic] preparação multi-microfone falhou: {e!r} — um stream")
+            return False
+
+    def _multi_mic_plan_sync(self) -> list[dict]:
+        """Resolve every managed AEC source to a PortAudio device, at once.
+
+        Uses ``resolve_many`` so one enumeration serves all the names (the
+        PortAudio/PulseAudio assertion in core/audio_devices.py). Indices are
+        resolved BEFORE any of these streams is open; a name that cannot be
+        resolved degrades the whole plan to the single-stream path rather than
+        opening N streams on the system default.
+        """
+        names: list[str] = []
+        try:
+            configured = get_input_device()
+            if _mic_route.is_managed_node(configured):
+                names = [str(module.get("node") or "")
+                         for module in _mic_route._managed_modules()]
+        except Exception as e:
+            print(f"[Mic] fontes gerenciadas indisponíveis: {e}")
+            return []
+        names = [name for name in names if name]
+        if len(names) < 2:
+            return []
+        try:
+            devices = audio_devices.resolve_many(names, "input")
+        except Exception as e:
+            print(f"[Mic] resolve_many falhou: {e} — um stream")
+            return []
+        if len(devices) < 2 or any(device is None for device in devices):
+            print("[Mic] fontes AEC não resolvidas por nome — um stream")
+            return []
+        try:
+            chains = _mic_route.read_filter_chains()
+            rows = _mic_route.list_sources()
+        except Exception:
+            chains, rows = [], []
+        plan: list[dict] = []
+        for name, device in zip(names, devices):
+            try:
+                key = _mic_route.physical_source(
+                    name, sources=rows, chains=chains)["key"]
+            except Exception:
+                key = ""
+            plan.append({"name": name, "device": device, "key": key})
+        return plan
+
+    def _apply_multi_mic_key(self, name: str, key: str) -> None:
+        """Recognition follows the source the comparison selected (event loop).
+
+        Never called from the audio callback: the speaker's matcher takes a
+        lock that a 1–2 s diarization can hold, and blocking the callback there
+        would stall every microphone.
+        """
+        if not key:
+            return
+        speaker = getattr(self, "_speaker", None)
+        if speaker is not None:
+            try:
+                speaker.set_active_device(key)
+            except Exception:
+                pass
+        self._active_mic_key = key
+        self._active_mic_label = name
+        print(f"[Mic] fonte selecionada: {name} (perfil {key})")
+
+    def _multi_mic_callback(self, index: int, mic, base, loop, keys: dict,
+                            audit: list | None = None):
+        """One callback per stream: record, compare, route ONE source's block.
+
+        The blocks are never summed. The comparison (done when the last
+        microphone of a cycle arrives) picks the source; every block of THAT
+        source then goes to the pipeline, so the STT keeps receiving the whole
+        stream instead of one block per cycle:
+          * ``near``      -> the full pipeline (the owner may be speaking);
+          * ``diffuse`` / ``ambiguous`` -> only the transcription gate's
+            pre-roll, so a room/TV signal never opens a turn as owner speech.
+
+        While asleep the block of the chosen source goes to the full pipeline
+        too — it only feeds the local wake detector and never leaves the
+        machine, so there is no turn to protect.
+        """
+        def callback(indata, frames, time_info, status):
+            self._last_block_at = time.monotonic()
+            # O registro contínuo é por stream: a MESMA fonte do stream, nunca
+            # a soma de dois microfones. Não roda com o microfone mutado.
+            if not self._audio_audit_closed():
+                self._audio_audit_feed(
+                    audit[index] if audit else None, indata,
+                    getattr(mic.decision, "verdict", ""))
+            decision = mic.push(index, indata)
+            if decision is not None:
+                key = keys.get(decision.name) or ""
+                if key and key != getattr(self, "_multi_mic_key", ""):
+                    self._multi_mic_key = key
+                    try:
+                        loop.call_soon_threadsafe(
+                            self._apply_multi_mic_key, decision.name, key)
+                    except Exception:
+                        pass
+            chosen = getattr(mic.decision, "source", None)
+            if chosen != index:
+                return                  # esta fonte não é a escolhida agora
+            verdict = getattr(mic.decision, "verdict", "")
+            if self._wake_enabled and not self._awake:
+                base(indata, frames, time_info, status)
+                return
+            if verdict == _mic_compare.NEAR:
+                base(indata, frames, time_info, status)
+                return
+            gate = getattr(self, "_groq", None)
+            if gate is not None:
+                try:
+                    gate.feed(indata, preroll_only=True)
+                except Exception:
+                    pass
+        return callback
+
+    # ── Registro contínuo do que cada microfone ouve ───────────────────────
+    # Pedido do dono (04/11/2026): guardar o que a sala diz, classificado, para
+    # auditoria. Um classificador POR STREAM e UM ledger para todos; ambos são
+    # criados FORA do callback. No caminho quente só há numpy curto e um
+    # `put_nowait`: a codificação e o disco são de uma thread do ledger.
+    def _audio_audit_ledger(self):
+        ledger = getattr(self, "_audio_ledger", None)
+        if ledger is not None:
+            return ledger if ledger is not False else None
+        try:
+            from core import audio_ledger as _audio_ledger
+            ledger = _audio_ledger.AudioLedger()
+        except Exception as e:
+            print(f"[Audio] registro contínuo indisponível: {e!r}")
+            ledger = False              # sentinela: não tenta a cada bloco
+        self._audio_ledger = ledger
+        return ledger or None
+
+    def _audio_audit_closed(self) -> bool:
+        """Mutado (ou em chamada) não grava: o microfone está fechado."""
+        ui = getattr(self, "ui", None)
+        return bool(getattr(ui, "muted", False)
+                    or getattr(self, "_phone_active", False))
+
+    def _audio_audit_stream(self, name: str) -> dict:
+        """Estado de um stream: o classificador dele. Fora do callback."""
+        try:
+            from core.source_class import SourceClassifier
+            classifier = SourceClassifier(window_ms=500, interval_ms=100)
+        except Exception as e:
+            print(f"[Audio] classificador de fonte indisponível: {e!r}")
+            classifier = None
+        return {"name": str(name or ""), "classifier": classifier,
+                "blocks": 0, "peak_rms": 0.0}
+
+    def _audio_audit_feed(self, state: dict | None, raw, verdict="") -> None:
+        """Classifica o bloco REAL e o enfileira no ledger único.
+
+        ``raw`` é o bloco como o stream o entregou / antes do cancelador da
+        aplicação — o som da sala, não um buffer já processado. Nunca levanta:
+        um defeito aqui não pode custar a audição.
+        """
+        if state is None or raw is None:
+            return
+        try:
+            block = np.asarray(raw)
+            if block.size == 0:
+                return
+            floats = block.astype(np.float32, copy=False)
+            rms = float(np.sqrt(np.mean(floats * floats))) / 32768.0
+            state["blocks"] = int(state.get("blocks") or 0) + 1
+            if rms > float(state.get("peak_rms") or 0.0):
+                state["peak_rms"] = rms
+        except Exception:
+            return
+        label, confidence = "ruido", 0.0
+        classifier = state.get("classifier")
+        if classifier is not None:
+            try:
+                reading = classifier.push(block, SEND_SAMPLE_RATE)
+                label = str(getattr(reading, "label", "") or "ruido")
+                confidence = float(getattr(reading, "confidence", 0.0) or 0.0)
+            except Exception:
+                pass
+        ledger = self._audio_audit_ledger()
+        if ledger is None:
+            return
+        try:
+            ledger.push(block, label=label, confidence=confidence,
+                        sample_rate=SEND_SAMPLE_RATE,
+                        device_id=str(state.get("name") or "default"),
+                        verdict=verdict)
+        except Exception:
+            pass
+
+    def _audio_audit_callback(self, state: dict | None, base):
+        """Single-stream wrapper: record the RAW block, then run the pipeline.
+
+        Runs BEFORE the base callback, which is where the app-level playback
+        canceller rewrites the block — so the ledger keeps the room's sound,
+        not a buffer already processed. No disk work here.
+        """
+        def callback(indata, frames, time_info, status):
+            if not self._audio_audit_closed():
+                self._audio_audit_feed(state, indata)
+            base(indata, frames, time_info, status)
+        return callback
+
+    def _audio_audit_switch(self) -> None:
+        """Troca de microfone: zera as janelas e drena o que foi capturado."""
+        for state in getattr(self, "_audio_audit_states", None) or []:
+            classifier = (state or {}).get("classifier")
+            if classifier is None:
+                continue
+            try:
+                classifier.reset()
+            except Exception:
+                pass
+        ledger = getattr(self, "_audio_ledger", None)
+        if ledger is None or ledger is False:
+            return
+        try:
+            ledger.flush(timeout=2.0)
+        except Exception:
+            pass
+
+    async def _audio_audit_close(self) -> None:
+        """Shutdown: fecha o ledger (a thread dele termina depois do flush)."""
+        ledger = getattr(self, "_audio_ledger", None)
+        self._audio_ledger = None
+        self._audio_audit_states = []
+        if not ledger or ledger is False:
+            return
+        try:
+            await asyncio.to_thread(ledger.close)
+        except Exception as e:
+            print(f"[Audio] registro contínuo não fechou: {e!r}")
+
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
@@ -15922,15 +16233,21 @@ class JarvisLive:
                 print(f"[Audio] playback canceller unavailable: {e}")
 
         try:
-            def _open_mic(dev):
+            def _open_mic(dev, cb=None):
                 return sd.InputStream(
                     samplerate=SEND_SAMPLE_RATE,
                     channels=CHANNELS,
                     dtype="int16",
                     blocksize=CHUNK_SIZE,
                     device=dev,
-                    callback=callback,
+                    callback=cb or callback,
                 )
+
+            # One module per microphone, one source each: make sure the managed
+            # AEC file describes every real capture source before this loop
+            # resolves names. A failure here is reported and leaves the old
+            # file/behaviour in place (one stream, one chain).
+            await self._ensure_multi_mic_conf()
 
             # Open, listen, and REOPEN if the stream goes quiet or the active
             # microphone changes. The old code opened once and slept forever:
@@ -15939,6 +16256,7 @@ class JarvisLive:
             # old one until a restart.
             _mic_dev = None
             _mic_dev_name: str | None = None
+            _multi_plan: list[dict] = []
             while True:
                 _mic_name = get_input_device()
                 _route = self._refresh_mic_route()
@@ -15959,9 +16277,119 @@ class JarvisLive:
                 if _mic_dev_name != _mic_name:
                     _mic_dev = audio_devices.resolve(_mic_name, "input")
                     _mic_dev_name = _mic_name
+                    # Microfone trocado: o arquivo AEC gerenciado é reescrito
+                    # para as fontes físicas de AGORA (backup datado, restart
+                    # só do filter-chain, restauração se falhar) antes de o
+                    # plano ser resolvido por nome.
+                    try:
+                        await self._ensure_multi_mic_conf()
+                    except Exception as _e:
+                        print(f"[Mic] conf multi-microfone: {_e}")
+                    # As janelas do classificador são do microfone antigo.
+                    try:
+                        await asyncio.to_thread(self._audio_audit_switch)
+                    except Exception:
+                        pass
+                    # Several managed AEC sources -> one stream each. Resolved
+                    # together (one enumeration), BEFORE any of them opens.
+                    try:
+                        _multi_plan = self._multi_mic_plan_sync()
+                    except Exception as _e:
+                        print(f"[Mic] plano multi-microfone falhou: {_e}")
+                        _multi_plan = []
                 if _mic_dev is not None:
                     print(f"[JARVIS] 🎤 Input device: {_mic_name} "
                           f"(perfil de voz: {_route.get('key')})")
+
+                # ── Several microphones: one stream each, compared, never
+                # summed ────────────────────────────────────────────────────
+                # core/multi_mic compares each pair of separate signals and
+                # picks the source the person is in front of. No stream is a
+                # mix of another; `diffuse`/`ambiguous` never open a turn as
+                # owner speech.
+                if len(_multi_plan) >= 2:
+                    _mic_count = len(_multi_plan)
+                    _mm = _multi_mic.MultiMic(
+                        [(item["name"], item["device"]) for item in _multi_plan])
+                    _keys = {item["name"]: str(item.get("key") or "")
+                             for item in _multi_plan}
+                    self._multi_mic = _mm
+                    self._multi_mic_key = ""
+                    # Um classificador por stream, criados FORA do callback.
+                    _audit = [self._audio_audit_stream(item["name"])
+                              for item in _multi_plan]
+                    self._audio_audit_states = _audit
+                    # O ledger (thread, diretório, encoder) também nasce aqui,
+                    # nunca dentro do callback de áudio.
+                    self._audio_audit_ledger()
+                    print(f"[JARVIS] {_mic_count} microfones — um stream "
+                          "cada, comparados (nunca somados)")
+                    try:
+                        import contextlib as _ctx
+                        with _ctx.ExitStack() as _stack:
+                            with audio_devices.live_stream():
+                                for _index, _item in enumerate(_multi_plan):
+                                    _cb = self._multi_mic_callback(
+                                        _index, _mm, callback,
+                                        asyncio.get_running_loop(), _keys,
+                                        audit=_audit)
+                                    _stack.enter_context(
+                                        _open_mic(_item["device"], _cb))
+                            self._last_block_at = time.monotonic()
+                            print("[JARVIS] 🎤 Multi-mic streams open")
+                            # RMS REAL POR FONTE: uma fonte que não entregou
+                            # nenhum bloco é um stream morto — volta ao stream
+                            # único em vez de fingir que compara dois sinais.
+                            # Sala silenciosa NÃO é falha: o que se mede aqui é
+                            # se o nó entrega dados, não se há gente falando.
+                            # Microfone mutado não entrega nada por definição.
+                            if not self._audio_audit_closed():
+                                await asyncio.sleep(1.5)
+                                _dead = [state["name"] for state in _audit
+                                         if int(state.get("blocks") or 0) == 0]
+                                if _dead:
+                                    raise RuntimeError(
+                                        "fonte sem blocos: " + ", ".join(_dead))
+                                _audible = sum(
+                                    1 for state in _audit
+                                    if float(state.get("peak_rms") or 0.0) > 0.0)
+                                print(f"[Mic] captura por fonte: {_audible}/"
+                                      f"{len(_audit)} com áudio medido")
+                            while True:
+                                await asyncio.sleep(0.5)
+                                if getattr(self, "_mic_route_dirty", False):
+                                    self._mic_route_dirty = False
+                                    print("[JARVIS] 🔀 Microfone ativo mudou — "
+                                          "reabrindo streams")
+                                    await asyncio.to_thread(
+                                        self._audio_audit_switch)
+                                    break
+                                idle = (time.monotonic()
+                                        - getattr(self, "_last_block_at", 0.0))
+                                if idle > _MIC_STALL_S:
+                                    print(f"[JARVIS] 🔁 Mic sem áudio há "
+                                          f"{idle:.0f}s — reabrindo")
+                                    self.ui.write_log(
+                                        "SYS: O microfone parou de entregar "
+                                        "áudio — reabrindo.")
+                                    break
+                    except Exception as _e:
+                        # Any one of the N streams failing must never cost the
+                        # hearing: fall back to the historic single stream.
+                        print(f"[JARVIS] ⚠️  Multi-mic falhou: {_e} — "
+                              "voltando ao stream único")
+                        try:
+                            self.ui.write_log(
+                                "SYS: multi-microfone indisponível — usando "
+                                "um microfone.")
+                        except Exception:
+                            pass
+                        self._multi_mic = None
+                        _multi_plan = []
+                        self._audio_audit_states = []
+                        continue
+                    self._multi_mic = None
+                    continue
 
                 # Opening two PulseAudio streams back-to-back trips a PortAudio
                 # mainloop assertion and aborts the process, so the monitor is
@@ -15969,8 +16397,15 @@ class JarvisLive:
                 _loop_h = asyncio.get_running_loop()
                 _loop_h.call_later(3.0, _start_canceller, _mic_name,
                                    bool(_route.get("aec")), _generation)
+                # Um microfone: o mesmo registro contínuo do caminho multi —
+                # só o stream, a comparação é que não existe. Classificador e
+                # ledger nascem AQUI, fora do callback.
+                _audit = [self._audio_audit_stream(_mic_name)]
+                self._audio_audit_states = _audit
+                self._audio_audit_ledger()
                 try:
-                    _mic_stream = _open_mic(_mic_dev)
+                    _mic_stream = _open_mic(
+                        _mic_dev, self._audio_audit_callback(_audit[0], callback))
                 except Exception as _e:
                     # A device the picker listed but the driver will not open
                     # right now — exclusive mode, a webcam already in use, a
@@ -15984,7 +16419,8 @@ class JarvisLive:
                     )
                     _mic_dev = None
                     _mic_dev_name = None
-                    _mic_stream = _open_mic(None)
+                    _mic_stream = _open_mic(
+                        None, self._audio_audit_callback(_audit[0], callback))
 
                 self._last_block_at = time.monotonic()
                 with _mic_stream:
@@ -15995,6 +16431,7 @@ class JarvisLive:
                             self._mic_route_dirty = False
                             print("[JARVIS] 🔀 Microfone ativo mudou — reabrindo "
                                   "stream e cancelador")
+                            await asyncio.to_thread(self._audio_audit_switch)
                             break          # closes the `with`, reopens above
                         idle = time.monotonic() - getattr(self, "_last_block_at", 0.0)
                         if idle > _MIC_STALL_S:
@@ -16005,6 +16442,14 @@ class JarvisLive:
         except Exception as e:
             print(f"[JARVIS] ❌ Mic: {e}")
             raise
+        finally:
+            # Fim da vida do microfone (reconexão, troca de voz, shutdown):
+            # o ledger é drenado e a thread dele termina. Um defeito aqui não
+            # pode mascarar o erro do stream — nem uma cancelagem.
+            try:
+                await self._audio_audit_close()
+            except BaseException:
+                pass
 
     async def _flush_pending_vision(self) -> bool:
         """Send a captured frame immediately after its tool response.
