@@ -23,6 +23,21 @@ STORAGE
     board (or whatever slices are still valid), and the first ``save()``
     repairs it. Nothing outside that file is ever written.
 
+MANDATORY SKILL
+    The owner's rule (02/11/2026): every persona carries ``caveman`` (terse
+    communication), except the main assistant. The main assistant prompt is
+    built elsewhere (qoder_live: RUNTIME_SKILLS); this store only enforces the
+    rule on persona records, never injects anything into the assistant.
+
+READ SCOPE
+    ``allowed_dirs`` holds absolute read roots for one persona. It is empty by
+    default at all times: empty means the persona reads everywhere, exactly
+    like every record written before this field existed. A filled list (the UI
+    and the voice tool accept a comma-separated string) restricts Read, Glob
+    and Grep to those roots and their subdirectories. The main assistant has
+    no such field and is never limited. The field never touches the gates for
+    writing, deleting, sending messages or power actions.
+
 PAID MODELS
     The live catalog (memory/models.json) carries Fish/Qoder price factors.
     A persona may use a paid model only with an explicit ``confirm_paid=True``
@@ -52,8 +67,18 @@ SKILLS_DIR = BASE_DIR / "skills"
 MAX_PERSONAS = 12
 MAX_PERSONALITY = 2000
 MAX_ALIASES = 20
+MAX_ALLOWED_DIRS = 32
 DEFAULT_MODEL = "Qwen3.8-Flash"
 REASONING_LEVELS = ("low", "medium", "high", "max")
+# The form shows these labels; the value is what the catalog and the store use.
+# ``xhigh`` is the qfmodel/qmodel ceiling and is shown as "Max", the name the
+# owner sees — never store the label itself.
+REASONING_LABELS = {
+    "low": "Baixo", "medium": "Médio", "high": "Alto",
+    "max": "Max", "xhigh": "Max",
+}
+# Owner rule: all personas (never the main assistant) speak caveman.
+PERSONA_REQUIRED_SKILLS = ("caveman",)
 RETIRED_STATUSES = ("left", "retired", "fired", "renamed")
 CONTEXT_MIN = 16_000
 CONTEXT_MAX = 1_000_000
@@ -215,6 +240,64 @@ def _normalize_skills(value) -> list[str]:
     return out
 
 
+def _normalize_allowed_dirs(value) -> list[str]:
+    """Read roots for one persona; an empty list means "reads everywhere".
+
+    The form and the voice tool send a comma-separated string (the UI may also
+    hand a list). ``~``/env vars are expanded and relative entries resolve
+    against the project root, so the stored roots never depend on the process
+    cwd. Only LEITURA uses this field: write/send/power gates are untouched.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = re.split(r"[,;\n]", value)
+    elif isinstance(value, (list, tuple, set)):
+        parts = list(value)
+    else:
+        raise ValueError("diretórios permitidos inválidos")
+
+    out: list[str] = []
+    for part in parts:
+        if part is None:
+            continue
+        text = str(part).strip()
+        if not text:
+            continue
+        expanded = os.path.expanduser(os.path.expandvars(text))
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(str(BASE_DIR), expanded)
+        normalized = os.path.normpath(expanded)
+        if normalized not in out:
+            out.append(normalized)
+    if len(out) > MAX_ALLOWED_DIRS:
+        raise ValueError(
+            f"diretórios permitidos acima de {MAX_ALLOWED_DIRS} entradas")
+    return out
+
+
+def _clean_allowed_dirs(value) -> list[str]:
+    """Non-raising variant for records loaded from disk (never breaks load)."""
+    try:
+        return _normalize_allowed_dirs(value)
+    except (TypeError, ValueError):
+        return []
+
+
+def _ensure_required_skills(skills: list[str]) -> list[str]:
+    """Append every PERSONA_REQUIRED_SKILLS entry, preserving the given order."""
+    out = list(skills)
+    known = {name.casefold(): name for name in _available_skills()}
+    for wanted in PERSONA_REQUIRED_SKILLS:
+        canonical = known.get(wanted.casefold())
+        if canonical is None:
+            raise ValueError(
+                f"skill obrigatória {wanted!r} ausente em skills/")
+        if canonical not in out:
+            out.append(canonical)
+    return out
+
+
 # ── model catalog ───────────────────────────────────────────────────────────
 
 def _fallback_catalog() -> list[dict]:
@@ -330,16 +413,22 @@ def find_model(value) -> dict | None:
 
 
 def _context_bounds(model: dict) -> tuple[int, int]:
-    windows = model.get("availableContextWindows") or []
-    lower, upper = CONTEXT_MIN, CONTEXT_MAX
+    """Accepted context range, derived from the model's published windows.
+
+    ``availableContextWindows`` is the catalog's own list of selectable context
+    sizes (e.g. ``[200000, 400000, 1000000]``): the biggest one is the ceiling.
+    ``maxInputTokens`` is only the per-request input cap and must never shrink
+    that list; it is used solely when a model publishes no window at all.
+    """
+    windows = [int(w) for w in (model.get("availableContextWindows") or [])
+               if int(w) > 0]
     if windows:
-        lower = max(1, min(windows))
-        upper = max(windows)
-    max_input = model.get("maxInputTokens")
-    if max_input:
-        upper = min(upper, int(max_input))
+        lower, upper = max(1, min(windows)), max(windows)
+    else:
+        lower = CONTEXT_MIN
+        upper = int(model.get("maxInputTokens") or CONTEXT_MAX)
     if upper < lower:
-        upper = lower
+        lower = upper
     return lower, upper
 
 
@@ -359,7 +448,7 @@ def _validate_context(value, model: dict) -> int:
     lower, upper = _context_bounds(model)
     if size < lower or size > upper:
         raise ValueError(
-            f"context_size {size} fora da janela de {model['value']} "
+            f"context_size {size} fora da janela de {model['displayName']} "
             f"({lower}..{upper})")
     return size
 
@@ -374,6 +463,86 @@ def _reasoning(model: dict, value=None) -> str:
             f"reasoning {wanted!r} não suportado por {model['value']} "
             f"(use: {', '.join(efforts)})")
     return wanted
+
+
+# ── form options (one source of truth for the UI) ────────────────────────────
+#
+# The persona form never keeps its own list of context sizes or effort names:
+# it asks these helpers, so a model that publishes 1M offers 1M and a model
+# whose efforts say ``xhigh`` offers "Max" with ``xhigh`` underneath.
+
+def _model_of(value) -> dict | None:
+    """Catalog entry from a dict, a model name/value, or None (default model)."""
+    if isinstance(value, dict):
+        return value or None
+    return find_model(_text(value) or DEFAULT_MODEL)
+
+
+def context_windows(model=None) -> list[int]:
+    """Selectable context sizes: the model's published windows, ascending."""
+    entry = _model_of(model)
+    windows = [int(w) for w in
+               ((entry or {}).get("availableContextWindows") or [])
+               if _as_int(w)]
+    if windows:
+        return sorted(dict.fromkeys(windows))
+    lower, upper = _context_bounds(entry) if entry else (CONTEXT_MIN, CONTEXT_MAX)
+    return [upper] if upper >= lower else [lower]
+
+
+def default_context(model=None) -> int:
+    entry = _model_of(model)
+    return _default_context(entry) if entry else DEFAULT_CONTEXT
+
+
+def reasoning_choices(model=None) -> list[tuple[str, str]]:
+    """(value, label) pairs the form offers, in the model's own order."""
+    entry = _model_of(model)
+    efforts = [str(effort) for effort in ((entry or {}).get("efforts") or [])]
+    if not efforts:
+        efforts = list(REASONING_LEVELS)
+    return [(effort, REASONING_LABELS.get(effort, effort)) for effort in efforts]
+
+
+def default_reasoning(model=None) -> str:
+    entry = _model_of(model)
+    if entry is None:
+        return "medium"
+    try:
+        return _reasoning(entry)
+    except ValueError:
+        efforts = entry.get("efforts") or []
+        return efforts[0] if efforts else "medium"
+
+
+def _whatsapp_accounts() -> list[dict]:
+    """Configured WhatsApp accounts as ``{name, uuid, ...}``; [] when absent."""
+    try:
+        from core import whatsapp as _wa
+        return [dict(account) for account in _wa.list_accounts()]
+    except Exception:
+        return []
+
+
+def whatsapp_account_choices() -> list[str]:
+    """Pairing names the persona form offers (empty string = main account)."""
+    return [_text(account.get("name")) for account in _whatsapp_accounts()
+            if _text(account.get("name"))]
+
+
+def _resolve_whatsapp_account(value: str) -> str:
+    """Canonical account name for ``value`` (a name or the account uuid)."""
+    wanted = _text(value).casefold()
+    accounts = _whatsapp_accounts()
+    for key in ("name", "uuid"):
+        for account in accounts:
+            if _text(account.get(key)).casefold() == wanted:
+                name = _text(account.get("name"))
+                if name:
+                    return name
+    available = ", ".join(whatsapp_account_choices()) or "nenhuma conta pareada"
+    raise ValueError(
+        f"WhatsApp {value!r} não está pareado (disponíveis: {available})")
 
 
 # ── store ───────────────────────────────────────────────────────────────────
@@ -443,6 +612,9 @@ def _clean_persona(raw) -> dict | None:
     persona["id"] = pid
     persona["aliases"] = _clean_aliases(raw.get("aliases"))
     persona["history"] = _clean_history(raw.get("history"))
+    # Old records have no field at all: [] keeps the previous behaviour
+    # (persona reads everywhere).
+    persona["allowed_dirs"] = _clean_allowed_dirs(raw.get("allowed_dirs"))
     return persona
 
 
@@ -675,7 +847,8 @@ def delete(id_or_name, retired_status: str = "left") -> bool:
 # ── upsert ──────────────────────────────────────────────────────────────────
 
 _FIELDS = ("name", "gender", "voice_id", "personality", "skills", "stacks",
-           "model", "reasoning", "context_size", "whatsapp_account")
+           "model", "reasoning", "context_size", "whatsapp_account",
+           "allowed_dirs")
 
 
 def _merge_fields(base: dict, fields: dict) -> dict:
@@ -721,8 +894,10 @@ def upsert(fields: dict, confirm_paid: bool = False,
             raise ValueError("voice_id inválido")
 
         personality = _validate_personality(merged.get("personality"))
-        skills = _normalize_skills(merged.get("skills"))
+        skills = _ensure_required_skills(
+            _normalize_skills(merged.get("skills")))
         stacks = _projects.normalize_stacks(merged.get("stacks") or [])
+        allowed_dirs = _normalize_allowed_dirs(merged.get("allowed_dirs"))
 
         model_value = _text(merged.get("model")) or DEFAULT_MODEL
         model = find_model(model_value)
@@ -749,19 +924,7 @@ def upsert(fields: dict, confirm_paid: bool = False,
 
         wa_account = _text(merged.get("whatsapp_account"))
         if wa_account:
-            try:
-                from core import whatsapp as _wa
-                names = [str(n) for n in _wa.account_names()]
-                match = next((n for n in names
-                              if n.casefold() == wa_account.casefold()), None)
-            except Exception:
-                names, match = [], None
-            if match is None:
-                available = ", ".join(names) or "nenhuma conta pareada"
-                raise ValueError(
-                    f"WhatsApp {wa_account!r} não está pareado "
-                    f"(disponíveis: {available})")
-            wa_account = match
+            wa_account = _resolve_whatsapp_account(wa_account)
 
         now = _now()
         old_name = _text((existing or {}).get("name"))
@@ -794,6 +957,7 @@ def upsert(fields: dict, confirm_paid: bool = False,
             "reasoning": reasoning,
             "context_size": context_size,
             "whatsapp_account": wa_account,
+            "allowed_dirs": allowed_dirs,
             "aliases": aliases,
             "history": entries,
             "created_at": _text((existing or {}).get("created_at")) or now,

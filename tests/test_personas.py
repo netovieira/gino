@@ -6,6 +6,10 @@ touched. The catalog is written by the test, so paid/free rules are explicit.
 from __future__ import annotations
 
 import json
+import os
+import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -53,13 +57,27 @@ EXPENSIVE_MODEL = {
     "defaultEffort": "high",
 }
 
+# Free model that publishes three windows while its per-request input cap is
+# smaller (the qfmodel shape: max_input_tokens 180000, windows up to 1M).
+WIDE_MODEL = {
+    "value": "Wide-Flash",
+    "displayName": "Wide Flash",
+    "isFree": True,
+    "priceFactor": 0.0,
+    "originalPriceFactor": 0.0,
+    "availableContextWindows": [200000, 400000, 1000000],
+    "maxInputTokens": 180000,
+    "efforts": ["high"],
+    "defaultEffort": "high",
+}
+
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     memory = tmp_path / "memory"
     memory.mkdir()
     skills = tmp_path / "skills"
-    for name in ("frontend-design", "ui-styling"):
+    for name in ("frontend-design", "ui-styling", "caveman"):
         folder = skills / name
         folder.mkdir(parents=True)
         (folder / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
@@ -110,7 +128,7 @@ def test_create_defaults_normalizes_and_snapshots(env):
     assert persona["name"] == "Fulana"
     assert persona["gender"] == "f"
     assert persona["stacks"] == ["react", "typescript", "nextjs"]
-    assert persona["skills"] == ["frontend-design", "ui-styling"]
+    assert persona["skills"] == ["frontend-design", "ui-styling", "caveman"]
     assert persona["model"] == "Qwen3.8-Flash"
     assert persona["model_price_factor"] == 0.0
     assert persona["reasoning"] == "medium"
@@ -118,6 +136,8 @@ def test_create_defaults_normalizes_and_snapshots(env):
     assert persona["created_at"] and persona["updated_at"]
     assert persona["aliases"] == []
     assert persona["history"] == []
+    # Empty field keeps the default: persona reads everywhere.
+    assert persona["allowed_dirs"] == []
 
     stored = json.loads(Path(personas.PERSONAS_PATH).read_text(encoding="utf-8"))
     assert stored["version"] == 1
@@ -389,6 +409,7 @@ def test_existing_records_normalize_aliases_and_history(env):
     loaded = personas.get("Fulana")
     assert loaded["aliases"] == []
     assert loaded["history"] == []
+    assert loaded["allowed_dirs"] == []
     assert personas.history("Fulana")["aliases"] == []
 
 
@@ -463,9 +484,230 @@ def test_reasoning_and_context_validation(env):
     assert paid["model_price_factor"] == 0.5
 
 
+def test_context_ceiling_comes_from_published_windows(env):
+    """The ceiling is the biggest announced window, not max_input_tokens."""
+    env["write_catalog"]([FREE_MODEL, WIDE_MODEL, PAID_MODEL, EXPENSIVE_MODEL])
+    wide = personas.find_model("Wide-Flash")
+    assert personas._context_bounds(wide) == (200000, 1000000)
+    # The per-request cap (180000) must not shrink the published windows.
+    for size in (200000, 400000, 1000000):
+        persona = personas.upsert(fields(
+            name=f"Contexto {size}", voice_id=f"v{size}",
+            model="Wide-Flash", reasoning="high", context_size=size))
+        assert persona["context_size"] == size
+
+    with pytest.raises(ValueError, match="janela"):
+        personas.upsert(fields(name="Contexto Demais", voice_id="v2m",
+                               model="Wide-Flash", reasoning="high",
+                               context_size=2000000))
+
+    # A model that announces only 200000 still refuses 1M.
+    with pytest.raises(ValueError, match="janela"):
+        personas.upsert(fields(name="Contexto Estreito", voice_id="v1m",
+                               context_size=1000000))
+
+
+def test_action_accepts_advertised_context_windows(env):
+    env["write_catalog"]([FREE_MODEL, WIDE_MODEL, PAID_MODEL, EXPENSIVE_MODEL])
+    created = _call(action="create", **fields(
+        name="Ampla", id="ampla", voice_id="v-wide", model="Wide-Flash",
+        reasoning="high", context_size=1000000))
+    assert created["status"] == "created"
+    assert created["persona"]["context_size"] == 1000000
+    assert _call(action="show", id="ampla")["persona"]["context_size"] == 1000000
+
+    refused = _call(action="create", **fields(
+        name="Apertada", id="apertada", voice_id="v-narrow", model="Wide-Flash",
+        reasoning="high", context_size=2000000))
+    assert refused["status"] == "error"
+    assert "janela" in refused["error"]
+
+
+# The qfmodel/qmodel shape: three published windows while the per-request input
+# cap is 180000 and the efforts say ``xhigh`` (never "max").
+FLASH_MODEL = {
+    "value": "Flash-X",
+    "displayName": "Flash X",
+    "isFree": True,
+    "priceFactor": 0.0,
+    "originalPriceFactor": 0.0,
+    "availableContextWindows": [200000, 400000, 1000000],
+    "maxInputTokens": 180000,
+    "efforts": ["xhigh", "low", "medium"],
+    "defaultEffort": "medium",
+}
+
+
+def test_form_context_offers_every_published_window(env):
+    """The form's options come from the model, not from a hardcoded ceiling."""
+    env["write_catalog"]([FREE_MODEL, WIDE_MODEL, FLASH_MODEL])
+    flash = personas.find_model("Flash-X")
+    assert personas.context_windows(flash) == [200000, 400000, 1000000]
+    assert personas.context_windows("Wide-Flash") == [200000, 400000, 1000000]
+    # A narrow model only offers what it publishes.
+    assert personas.context_windows("Qwen3.8-Flash") == [32768, 200000]
+    assert personas.default_context(flash) == 200000
+
+    persona = personas.upsert(fields(
+        name="Um Milhão", voice_id="v-flash", model="Flash-X",
+        reasoning="medium", context_size=personas.context_windows(flash)[-1]))
+    assert persona["context_size"] == 1000000
+
+    # A size no window publishes is still refused, in words the owner can read.
+    with pytest.raises(ValueError, match="fora da janela de Flash X"):
+        personas.upsert(fields(name="Fora", voice_id="v-out", model="Flash-X",
+                               reasoning="medium", context_size=1100000))
+
+
+def test_form_reasoning_max_maps_to_the_stored_effort(env):
+    """The "Max" label carries the value the backend accepts (``xhigh``)."""
+    env["write_catalog"]([FREE_MODEL, FLASH_MODEL])
+    flash = personas.find_model("Flash-X")
+    labels = {label: value for value, label in personas.reasoning_choices(flash)}
+    assert labels["Max"] == "xhigh"
+    assert [label for _, label in personas.reasoning_choices(flash)].count("Max") == 1
+    assert personas.default_reasoning(flash) == "medium"
+
+    persona = personas.upsert(fields(
+        name="Arnaldo", gender="m", voice_id="v-max", model="Flash-X",
+        reasoning=labels["Max"]))
+    assert persona["reasoning"] == "xhigh"
+    reloaded = personas.get("arnaldo")
+    assert reloaded["reasoning"] == "xhigh"
+    # Reopening the form finds the label again: xhigh is still in the model.
+    assert dict(personas.reasoning_choices(
+        personas.find_model(reloaded["model"]))).get("xhigh") == "Max"
+
+
+def test_form_reasoning_choices_follow_a_model_without_efforts(env):
+    """A model that publishes no efforts offers the store's own levels."""
+    env["write_catalog"]([FREE_MODEL])
+    choices = personas.reasoning_choices("Qwen3.8-Flash")
+    assert [value for value, _ in choices] == ["low", "medium", "high"]
+    assert personas.default_reasoning("Qwen3.8-Flash") == "medium"
+
+
+def test_whatsapp_account_persists_through_the_form_save_path(env, monkeypatch):
+    """Picking an account in the form stores it — by name or by account uuid."""
+    monkeypatch.setattr(personas, "_whatsapp_accounts", lambda: [
+        {"name": "principal", "uuid": "jarvis", "paired": True},
+        {"name": "trabalho", "uuid": "jarvis-trabalho", "paired": True},
+    ])
+    assert personas.whatsapp_account_choices() == ["principal", "trabalho"]
+
+    persona = personas.upsert(fields(name="Arnaldo", gender="m",
+                                     whatsapp_account="trabalho"))
+    assert persona["whatsapp_account"] == "trabalho"
+    stored = json.loads(Path(personas.PERSONAS_PATH).read_text(encoding="utf-8"))
+    assert stored["personas"]["arnaldo"]["whatsapp_account"] == "trabalho"
+
+    # The account uuid is the same account: it is canonicalized to the name.
+    again = personas.upsert({"id": "arnaldo", "voice_id": "fish-ref-abc123",
+                             "whatsapp_account": "jarvis-trabalho"})
+    assert again["whatsapp_account"] == "trabalho"
+
+    with pytest.raises(ValueError, match="não está pareado"):
+        personas.upsert({"id": "arnaldo", "voice_id": "fish-ref-abc123",
+                         "whatsapp_account": "pessoal"})
+
+
+class _FakeText:
+    def __init__(self, text=""):
+        self._text = text
+
+    def text(self):
+        return self._text
+
+    def toPlainText(self):
+        return self._text
+
+
+class _FakeCombo:
+    """Only the QComboBox surface ``PersonaOverlay._fields`` reads."""
+
+    def __init__(self, items, index=0):
+        self._items = list(items)
+        self._index = index
+
+    def currentIndex(self):
+        return self._index
+
+    def currentData(self):
+        if 0 <= self._index < len(self._items):
+            return self._items[self._index][0]
+        return None
+
+    def currentText(self):
+        if 0 <= self._index < len(self._items):
+            return self._items[self._index][1]
+        return ""
+
+    def itemText(self, index):
+        if 0 <= index < len(self._items):
+            return self._items[index][1]
+        return ""
+
+
+def test_persona_form_fields_carry_account_context_and_reasoning(env, monkeypatch):
+    """The real ``_fields``/``upsert`` path keeps every picker value."""
+    from types import SimpleNamespace
+    from ui import PersonaOverlay
+
+    env["write_catalog"]([FLASH_MODEL])
+    monkeypatch.setattr(personas, "_whatsapp_accounts", lambda: [
+        {"name": "principal", "uuid": "jarvis"},
+        {"name": "trabalho", "uuid": "jarvis-trabalho"},
+    ])
+    form = SimpleNamespace(
+        _name=_FakeText("Arnaldo"),
+        _gender=_FakeCombo([("m", "Masculino")]),
+        _voice=_FakeText("fish-ref-abc123"),
+        _personality=_FakeText("engenheiro direto"),
+        _skills=_FakeText(""),
+        _stacks=_FakeText("react, typescript"),
+        _allowed_dirs=_FakeText("/projects/therotv, ~/Jarvis"),
+        _model=_FakeCombo([("Flash X", "Flash X  ·  0.0x")]),
+        _reasoning=_FakeCombo([("xhigh", "Max")]),
+        _context=_FakeCombo([(1000000, "1000000  ·  1 milhão")]),
+        _whatsapp=_FakeCombo([("", "Conta principal (padrão)"),
+                              ("trabalho", "trabalho")], index=1),
+        _select=_FakeCombo([("arnaldo", "Arnaldo")]),
+    )
+    picked = PersonaOverlay._fields(form)
+    assert picked["whatsapp_account"] == "trabalho"
+    assert picked["context_size"] == 1000000
+    assert picked["reasoning"] == "xhigh"
+    assert picked["allowed_dirs"] == "/projects/therotv, ~/Jarvis"
+
+    persona = personas.upsert(picked)
+    assert persona["whatsapp_account"] == "trabalho"
+    assert persona["context_size"] == 1000000
+    assert persona["reasoning"] == "xhigh"
+    assert persona["allowed_dirs"] == [
+        "/projects/therotv",
+        os.path.join(os.path.expanduser("~"), "Jarvis"),
+    ]
+
+
+def test_persona_form_has_no_hardcoded_option_lists():
+    """The overlay asks core/personas for windows, efforts and accounts."""
+    source = (Path(__file__).resolve().parent.parent / "ui.py").read_text(
+        encoding="utf-8")
+    assert "store.context_windows(" in source
+    assert "store.reasoning_choices(" in source
+    assert "store.default_context(" in source
+    assert "store.whatsapp_account_choices()" in source
+    assert '("low", "medium", "high", "max"' not in source
+    assert 'self._context.setText("200000")' not in source
+    assert '"context_size": context' in source
+    assert '"whatsapp_account": self._whatsapp.currentData() or ""' in source
+    assert '"allowed_dirs": self._allowed_dirs.text().strip()' in source
+    assert "vazio = lê tudo" in source
+
+
 def test_skills_validation(env):
     persona = personas.upsert(fields(name="Skills Vazias", skills=[]))
-    assert persona["skills"] == []
+    assert persona["skills"] == ["caveman"]
 
     with pytest.raises(ValueError, match="não existe"):
         personas.upsert(fields(name="Skill Ruim", skills=["ghost-skill"]))
@@ -473,6 +715,286 @@ def test_skills_validation(env):
         personas.upsert(fields(name="Skill Path", skills=["../etc/passwd"]))
     with pytest.raises(ValueError, match="não existe"):
         personas.upsert(fields(name="Skill Sem Md", skills=["not-a-skill"]))
+
+
+def test_every_persona_gets_caveman_even_without_skills(env):
+    """Owner rule 02/11/2026: caveman on every persona, created later included."""
+    params = fields(name="Sem Skills", gender="m")
+    params.pop("skills")
+    persona = personas.upsert(params)
+    assert "caveman" in persona["skills"]
+
+    # Updating a record that predates the rule adds caveman, keeps the rest.
+    stored = json.loads(Path(personas.PERSONAS_PATH).read_text(encoding="utf-8"))
+    stored["personas"]["sem-skills"]["skills"] = ["ui-styling"]
+    Path(personas.PERSONAS_PATH).write_text(
+        json.dumps(stored), encoding="utf-8")
+    updated = personas.upsert({"id": "sem-skills",
+                               "voice_id": "fish-ref-abc123"})
+    assert updated["skills"] == ["ui-styling", "caveman"]
+
+    # Explicitly asking for caveman never duplicates it.
+    again = personas.upsert({"id": "sem-skills",
+                             "voice_id": "fish-ref-abc123",
+                             "skills": ["caveman"]})
+    assert again["skills"] == ["caveman"]
+
+
+def test_caveman_rule_never_reaches_the_main_assistant_prompt(env):
+    """The rule is persona-only: qoder_live loads the assistant prompt itself."""
+    source = (Path(__file__).resolve().parent.parent
+              / "qoder_live" / "index.mjs").read_text(encoding="utf-8")
+    runtime = re.search(r"const RUNTIME_SKILLS = \[(.*?)\];", source, re.S)
+    assert runtime is not None
+    assert "caveman" not in runtime.group(1)
+    # Persona skills come from the persona's own ``skills`` list, not RUNTIME_SKILLS.
+    assert "loadPersonaSkills(persona.skills)" in source
+
+
+def test_runtime_skills_have_no_caveman_variant(env):
+    """Owner rule 02/11/2026: caveman never enters the spoken assistant prompt.
+
+    The live prompt is built from RUNTIME_SKILLS only. Caveman and its variants
+    stay in the execution channel and in persona prompts, never in Gino's voice.
+    """
+    source = (Path(__file__).resolve().parent.parent
+              / "qoder_live" / "index.mjs").read_text(encoding="utf-8")
+    runtime = re.search(r"const RUNTIME_SKILLS = \[(.*?)\];", source, re.S)
+    assert runtime is not None
+    names = re.findall(r'"([^"]+)"', runtime.group(1))
+    assert names, "RUNTIME_SKILLS vazio"
+    assert [n for n in names if "caveman" in n.casefold()] == []
+    # The assistant prompt loads only loadSkills() (RUNTIME_SKILLS); persona
+    # skills come from loadPersonaSkills(), used by personaPrompt() alone.
+    assert "const SYSTEM_PROMPT = loadSystemPrompt();" in source
+    assert "append: SYSTEM_PROMPT" in source
+    assert "append: personaPrompt(persona)" in source
+
+
+def test_persona_prompt_protects_the_spoken_reply_from_caveman():
+    """Owner rule 02/11/2026: caveman governs artifacts, never the spoken reply."""
+    source = (Path(__file__).resolve().parent.parent
+              / "qoder_live" / "index.mjs").read_text(encoding="utf-8")
+    match = re.search(r"function personaPrompt\(persona\) \{(.*?)\n\}",
+                      source, re.S)
+    assert match is not None
+    body = match.group(1)
+    assert "Caveman/compressão nunca se aplica à fala da persona" in body
+    # The old spoken rule stays, now with the compression exemption inside it.
+    assert "Sua resposta será falada" in body
+    assert "sem blocos de código" in body
+    # [FALA] comes after [SKILLS], so skill text cannot override spoken style.
+    assert body.index("[FALA]") > body.index("[SKILLS]")
+
+
+def test_persona_prompt_forbids_internal_vocabulary_in_speech():
+    """Incidente 02/11 19:05: nome de projeto, stack e HLS ditos em áudio.
+
+    A lei é cláusula de prompt, não mecanismo novo: fica dentro do bloco
+    [FALA], que continua por último (depois de [SKILLS]).
+    """
+    root = Path(__file__).resolve().parent.parent
+    source = (root / "qoder_live" / "index.mjs").read_text(encoding="utf-8")
+    match = re.search(r"function personaPrompt\(persona\) \{(.*?)\n\}",
+                      source, re.S)
+    assert match is not None
+    body = match.group(1)
+    assert "Na fala, nunca verbalize nome de projeto" in body
+    assert "monorepo ou sub-app" in body
+    assert "provedor de IA" in body
+    assert "hash de commit ou número de teste" in body
+    assert "agentes rodando, latência, saúde" in body
+    assert "credencial ou valor de config" in body
+    assert "dado pessoal de terceiro" in body
+    assert "sem identificador cru" in body
+    # A ordem existente não regride: a lei mora no último bloco.
+    assert body.index("[FALA]") > body.index("[SKILLS]")
+    assert body.index("Na fala, nunca verbalize") > body.index("[SKILLS]")
+
+    # A mesma lei vale para o assistente principal, nas skills de runtime.
+    for skill in ("personas", "voice"):
+        text = (root / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")
+        assert "nunca verbalize nome de projeto" in text, skill
+        assert "sem identificador cru" in text, skill
+
+
+def test_personas_read_any_directory_and_keep_write_gates():
+    """Owner rule 02/11/2026: read is total, always, no confirmation.
+
+    The Qoder CLI only treats listed directories as workspace, so the sidecar
+    must add the filesystem root for personas and for the main assistant. The
+    write gates stay untouched: personas still have no Bash/Edit/Write/Agent,
+    and edits outside the project still ask the owner by voice.
+    """
+    root = Path(__file__).resolve().parent.parent
+    source = (root / "qoder_live" / "index.mjs").read_text(encoding="utf-8")
+
+    assert ("const READ_EVERYWHERE = path.parse(path.resolve(CWD)).root "
+            "|| path.sep;") in source
+
+    persona_options = re.search(
+        r"function personaOptions\(persona, resumeId\) \{(.*?)\n\}", source, re.S)
+    assert persona_options is not None
+    body = persona_options.group(1)
+    # Empty allowed_dirs keeps the filesystem root; a filled list replaces it.
+    assert "additionalDirectories: restricted ? dirs : [READ_EVERYWHERE]" in body
+    assert "cwd: personaWorkingDir(persona)" in body
+    # Listed tools are auto-approved, so restricted personas must remove the
+    # read tools from the allowlist and send them through the directory check.
+    assert "PERSONA_ALLOWED_TOOLS.filter((name) => !PERSONA_READ_TOOLS.has(name))" in body
+    assert "canUseTool: (toolName, input, options) => personaCanUseTool(" in body
+
+    main_options = re.search(
+        r"function optionsFor\(maxTurns\) \{(.*?)\n\}", source, re.S)
+    assert main_options is not None
+    assert "additionalDirectories: [READ_EVERYWHERE]" in main_options.group(1)
+
+    # Read tools remain allowed; every write/execution tool remains denied.
+    allowed = re.search(r"const PERSONA_ALLOWED_TOOLS = \[(.*?)\];", source, re.S)
+    assert allowed is not None
+    names = re.findall(r'"([^"]+)"', allowed.group(1))
+    for tool in ("Read", "Glob", "Grep"):
+        assert tool in names
+    for tool in ("Bash", "Edit", "Write", "Agent"):
+        assert tool not in names
+    assert "Persona só tem leitura e memória" in source
+
+    # The new read scope cannot become a write path outside the project.
+    assert "function isInsideCwd(target)" in source
+    assert "await ownerAllowsOutsideWrite(toolName, target)" in source
+
+
+def test_allowed_dirs_defaults_normalizes_and_clears(env, tmp_path, monkeypatch):
+    """Owner rule 02/11/2026: empty = reads everywhere; list = read roots."""
+    persona = personas.upsert(fields())
+    assert persona["allowed_dirs"] == []
+
+    home = str(tmp_path / "home")
+    monkeypatch.setenv("HOME", home)
+    updated = personas.upsert({
+        "id": "fulana",
+        "allowed_dirs": " ~/Jarvis , /projects/therotv, ~/Jarvis/ , projects ",
+    })
+    expected = [
+        os.path.join(home, "Jarvis"),
+        "/projects/therotv",
+        os.path.join(str(personas.BASE_DIR), "projects"),
+    ]
+    assert updated["allowed_dirs"] == expected
+    assert personas.get("fulana")["allowed_dirs"] == expected
+    assert personas.resolve_name("fulana")["persona"]["allowed_dirs"] == expected
+    assert personas.list_personas()[0]["allowed_dirs"] == expected
+
+    cleared = personas.upsert({"id": "fulana", "allowed_dirs": ""})
+    assert cleared["allowed_dirs"] == []
+
+    with pytest.raises(ValueError, match="acima de"):
+        personas.upsert({"id": "fulana", "allowed_dirs": [
+            f"/tmp/dir{index}"
+            for index in range(personas.MAX_ALLOWED_DIRS + 1)]})
+
+    with pytest.raises(ValueError, match="inválidos"):
+        personas.upsert({"id": "fulana", "allowed_dirs": {"nope": 1}})
+
+
+def test_action_allowed_dirs_round_trip(env):
+    created = _call(action="create", **fields(),
+                    allowed_dirs="/projects/therotv, ~/Jarvis")
+    assert created["status"] == "created"
+    expected = ["/projects/therotv",
+                os.path.join(os.path.expanduser("~"), "Jarvis")]
+    assert created["persona"]["allowed_dirs"] == expected
+    assert _call(action="list")["personas"][0]["allowed_dirs"] == expected
+
+    cleared = _call(action="update", id="fulana", allowed_dirs="")
+    assert cleared["status"] == "updated"
+    assert cleared["persona"]["allowed_dirs"] == []
+    # Clearing the read list never touches the other fields.
+    assert cleared["persona"]["name"] == "Fulana"
+    assert cleared["persona"]["skills"] == ["frontend-design", "caveman"]
+
+
+def test_sidecar_restricts_reads_to_allowed_dirs():
+    """The sidecar turns allowed_dirs into the session read scope."""
+    source = (Path(__file__).resolve().parent.parent
+              / "qoder_live" / "index.mjs").read_text(encoding="utf-8")
+
+    assert 'const PERSONA_READ_TOOLS = new Set(["Read", "Glob", "Grep"]);' in source
+    assert "allowed_dirs: dirStringList(raw.allowed_dirs)" in source
+    assert "function personaAllowedDirs(persona)" in source
+    assert "function personaReadAllowed(persona, baseDir, target)" in source
+    assert "function personaWorkingDir(persona)" in source
+    assert "function personaReadRule(persona)" in source
+    assert "Leitura restrita às pastas" in source
+    assert "`[FERRAMENTAS] ${personaReadRule(persona)}" in source
+    # Changing the field restarts the persona session (config hash).
+    assert "persona.allowed_dirs," in source
+    # Writes are still denied by name, independent of the read scope.
+    assert "Persona só tem leitura e memória" in source
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node não instalado")
+def test_sidecar_selftest_reports_read_scope():
+    root = Path(__file__).resolve().parent.parent
+    proc = subprocess.run(
+        [shutil.which("node"), str(root / "qoder_live" / "index.mjs"),
+         "--selftest"],
+        cwd=root, env={**os.environ, "JARVIS_CWD": str(root)},
+        capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert payload["ok"] is True
+    for check in ("read_everywhere", "read_scope", "read_gate", "dir_parse"):
+        assert payload["checks"][check] is True, check
+
+
+def test_persona_skill_states_total_read_rule():
+    """The policy file carries the owner's 02/11/2026 rule in plain words."""
+    text = (Path(__file__).resolve().parent.parent
+            / "skills" / "personas" / "SKILL.md").read_text(encoding="utf-8")
+    folded = text.casefold()
+    assert "02/11/2026" in text
+    assert "leitura total" in folded
+    assert "sem confirmação" in folded
+    assert "editar, excluir" in folded
+    # Read is not consent for writing.
+    assert "leitura liberada nunca vale como permissão de escrita" in folded
+    # The rule now lives in the per-persona field; Gino has no such limit.
+    assert "allowed_dirs" in text
+    assert "nunca é limitado" in folded
+
+
+def test_stored_personas_always_carry_caveman(env):
+    """Owner rule 02/11/2026: every persona persisted on disk has caveman."""
+    personas.upsert(fields(name="Arnaldo", gender="m", skills=["frontend-design"]))
+    personas.upsert(fields(name="Aline", gender="f"))
+    stored = json.loads(Path(personas.PERSONAS_PATH).read_text(encoding="utf-8"))
+    assert stored["personas"], "nenhuma persona gravada"
+    for slug, record in stored["personas"].items():
+        assert "caveman" in record["skills"], slug
+
+
+def test_live_arnaldo_and_aline_carry_caveman_exactly_once():
+    """The real fichas keep one caveman entry; upsert never duplicates it."""
+    path = Path(personas.PERSONAS_PATH)
+    if not path.exists():
+        pytest.skip("memory/personas.json ainda não existe")
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    records = stored.get("personas") or {}
+    for slug in ("arnaldo", "aline"):
+        assert slug in records, f"persona {slug} ausente na ficha"
+        skills = [str(skill).casefold() for skill in records[slug].get("skills") or []]
+        assert skills.count("caveman") == 1, (slug, skills)
+
+
+def test_execution_skill_compresses_channel_but_keeps_speech_clean(env):
+    """The policy is a file: skills/execution/SKILL.md carries the caveman rule."""
+    text = (Path(__file__).resolve().parent.parent
+            / "skills" / "execution" / "SKILL.md").read_text(encoding="utf-8")
+    assert "Caveman só no canal de execução, nunca na fala" in text
+    assert "comprime-se o verbo, nunca a informação" in text
+    assert "sem caveman" in text
+    assert "TTS pronuncia" in text
 
 
 # ── model catalog ───────────────────────────────────────────────────────────

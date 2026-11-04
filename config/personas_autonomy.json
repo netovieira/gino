@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "_comment": "Autonomia declarativa por persona. Editar este arquivo muda o que cada persona pode tocar, o orçamento de tokens e o prazo de sessão sem tocar em código. 'overrides' vence todas as regras, na ordem do arquivo; 'deny_tools' do dono nunca perde. O cadastro (memory/personas.json) continua sendo a fonte de allowed_dirs, voz, modelo e skills; esta tabela é a camada de permissão.",
+  "defaults": {
+    "flow": "persona",
+    "action": "consult",
+    "deadline_ms": 30000,
+    "autonomy": {
+      "tools": [
+        "Read",
+        "Glob",
+        "Grep",
+        "WebFetch",
+        "WebSearch",
+        "memory_read",
+        "memory_search",
+        "memory_note"
+      ],
+      "read_roots": [],
+      "requires_confirm": [],
+      "max_tokens": 12000,
+      "session_ttl_s": 900,
+      "note": "persona é consultora: lê e anota na própria memória; não escreve, não edita, não roda comando e não cria subagente."
+    }
+  },
+  "overrides": [
+    {
+      "id": "dono-veta-escrita-e-comando-em-persona",
+      "note": "regra do dono: escrita, edição, comando, terminal e subagente nunca são autonomia de persona, mesmo que uma regra posterior tente liberar.",
+      "flow": "persona",
+      "action": "deny",
+      "deadline_ms": 1000,
+      "priority": 1000,
+      "requires_confirm": false,
+      "match": {
+        "route": "*"
+      },
+      "autonomy": {
+        "deny_tools": [
+          "Edit",
+          "Write",
+          "NotebookEdit",
+          "Bash",
+          "Agent",
+          "Task",
+          "Terminal",
+          "jarvis_call"
+        ]
+      }
+    }
+  ],
+  "rules": [
+    {
+      "id": "persona-aline",
+      "note": "Aline: frontend/UI do TheroTV. Lê apenas a pasta do projeto; memória própria em memory/personas/aline.",
+      "flow": "persona",
+      "action": "consult",
+      "deadline_ms": 30000,
+      "priority": 10,
+      "match": {
+        "route": "aline",
+        "any": ["aline"]
+      },
+      "autonomy": {
+        "read_roots": ["/projects/therotv"],
+        "tools": [
+          "Read",
+          "Glob",
+          "Grep",
+          "WebFetch",
+          "WebSearch",
+          "memory_read",
+          "memory_search",
+          "memory_note"
+        ],
+        "requires_confirm": [],
+        "max_tokens": 12000,
+        "session_ttl_s": 900
+      }
+    },
+    {
+      "id": "persona-arnaldo",
+      "note": "Arnaldo: backend/API do TheroTV. Lê apenas a pasta do projeto; memória própria em memory/personas/arnaldo.",
+      "flow": "persona",
+      "action": "consult",
+      "deadline_ms": 30000,
+      "priority": 10,
+      "match": {
+        "route": "arnaldo",
+        "any": ["arnaldo"]
+      },
+      "autonomy": {
+        "read_roots": ["/projects/therotv"],
+        "tools": [
+          "Read",
+          "Glob",
+          "Grep",
+          "WebFetch",
+          "WebSearch",
+          "memory_read",
+          "memory_search",
+          "memory_note"
+        ],
+        "requires_confirm": [],
+        "max_tokens": 12000,
+        "session_ttl_s": 900
+      }
+    }
+  ]
+}

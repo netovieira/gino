@@ -26,7 +26,7 @@ _SECRET_RE = re.compile(
 
 _FIELD_KEYS = ("id", "name", "gender", "voice_id", "personality", "skills",
                "stacks", "model", "reasoning", "context_size",
-               "whatsapp_account")
+               "whatsapp_account", "allowed_dirs")
 
 _ACTION_ALIASES = {
     "criar": "create", "crie": "create", "nova": "create",
@@ -99,6 +99,7 @@ def _summary(persona: dict) -> dict:
         "reasoning": persona.get("reasoning"),
         "context_size": persona.get("context_size"),
         "whatsapp_account": persona.get("whatsapp_account") or "",
+        "allowed_dirs": list(persona.get("allowed_dirs") or []),
         "skills": list(persona.get("skills") or []),
         "stacks": list(persona.get("stacks") or []),
         "aliases": list(persona.get("aliases") or []),
@@ -120,7 +121,9 @@ def _fields_from(parameters: dict) -> dict:
             continue
         if isinstance(value, str):
             value = value.strip()
-            if not value:
+            # An explicit empty allowed_dirs means "read everywhere" and must
+            # clear a previous list; every other empty field is simply absent.
+            if not value and key != "allowed_dirs":
                 continue
         fields[key] = value
     return fields
@@ -440,7 +443,8 @@ TOOL = {
         "em personagem usando a personalidade e o status do registro, depois "
         "responde o pedido. Toda persona tem nome, gênero (f/m/n), voice_id do "
         "Fish Audio, personalidade, skills, stacks, modelo, reasoning e "
-        "contexto. Modelo pago só é salvo com confirmação explícita: mostre o "
+        "contexto, além dos diretórios de leitura permitidos (vazio = lê "
+        "tudo). Modelo pago só é salvo com confirmação explícita: mostre o "
         "multiplicador ao dono e chame de novo com confirm_paid=true depois do "
         "'pode'. Nunca grave segredos na personalidade."
     ),
@@ -492,17 +496,28 @@ TOOL = {
             },
             "reasoning": {
                 "type": "STRING",
-                "description": "'low', 'medium', 'high' ou 'max'.",
+                "description": "Um dos efforts do modelo (action=models); nos "
+                               "modelos Flash/Max o topo é 'xhigh' e eles não "
+                               "aceitam 'high' nem 'max'.",
             },
             "context_size": {
                 "type": "INTEGER",
-                "description": "Janela de contexto em tokens (ex.: 200000).",
+                "description": "Janela de contexto em tokens; use um dos "
+                               "context_windows publicados pelo modelo "
+                               "(action=models).",
             },
             "whatsapp_account": {
                 "type": "STRING",
                 "description": "Nome da conta WhatsApp pareada que esta persona "
                                "usa como dela (ex.: 'trabalho'); vazio = conta "
                                "principal.",
+            },
+            "allowed_dirs": {
+                "type": "STRING",
+                "description": "Diretórios que esta persona pode LER, separados "
+                               "por vírgula (ex.: '/projects/therotv, ~/Jarvis'); "
+                               "vazio = lê tudo. Só restringe leitura; escrita, "
+                               "exclusão, envio e energia mantêm a confirmação.",
             },
             "path": {
                 "type": "STRING",
