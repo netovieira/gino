@@ -74,6 +74,10 @@ except Exception as _e:          # noqa: BLE001 — a intro é cosmética
 try:
     from core import autostart as _autostart
 except Exception as _e:          # noqa: BLE001 — bandeja não pode derrubar a UI
+    # `_e` é apagado pelo Python ao fim do `except`: os métodos da classe usam
+    # este alias global, senão `enable()`/`disable()` levantariam NameError.
+    _autostart_err = _e
+
     class _autostart:            # type: ignore[no-redef]
         @staticmethod
         def supported() -> bool:
@@ -85,11 +89,11 @@ except Exception as _e:          # noqa: BLE001 — bandeja não pode derrubar a
 
         @staticmethod
         def enable():
-            return False, f"autostart indisponível ({_e})"
+            return False, f"autostart indisponível ({_autostart_err})"
 
         @staticmethod
         def disable():
-            return False, f"autostart indisponível ({_e})"
+            return False, f"autostart indisponível ({_autostart_err})"
     print(f"[Autostart] unavailable ({_e}).")
 
 
@@ -3388,6 +3392,431 @@ class WhatsAppOverlay(_HudOverlay):
         super().hideEvent(event)
 
 
+class MailOverlay(_HudOverlay):
+    """CRUD das contas de e-mail — o mesmo molde do WhatsAppOverlay.
+
+    Lista as contas, cria/edita/apaga, e testa a conexão DE VERDADE (IMAP
+    login de verdade, resultado real). O campo da senha de app é write-only:
+    nunca mostramos de volta a senha guardada; em branco = manter a atual.
+    A senha vai para o cofre (config/api_keys.json, 600), nunca para o jsonl.
+    """
+
+    _OW = 820
+    closed = pyqtSignal()
+    _test_sig = pyqtSignal(str, str)      # (conta, mensagem) — volta da thread
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            MailOverlay {{
+                background: rgba(0, 6, 10, 248);
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+        self._line_style = (
+            f"QLineEdit {{ background: #000d12; color: {C.TEXT}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px; }}"
+            f"QLineEdit:focus {{ border: 1px solid {C.PRI}; }}")
+        self._combo_style = (
+            f"QComboBox {{ background: #000d12; color: {C.TEXT}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px 8px; }}"
+            f"QComboBox QAbstractItemView {{ background: #000d12; color: {C.TEXT}; "
+            f"selection-background-color: {C.PRI_GHO}; }}")
+        self._btn_style = (
+            f"QPushButton {{ background: #00091a; color: {C.PRI}; "
+            f"border: 1px solid {C.PRI_DIM}; border-radius: 3px; padding: 4px 10px; }}"
+            f"QPushButton:hover {{ background: {C.PRI_GHO}; border-color: {C.PRI}; }}")
+        self._selected = ""
+        self._accounts = []
+        self._testing = ""
+        self._test_sig.connect(self._on_tested)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 14, 20, 14)
+        root.setSpacing(8)
+        header = QHBoxLayout()
+        header.addWidget(self._label("📧  E-MAIL", 12, True))
+        header.addStretch(1)
+        close_btn = QPushButton("✕  FECHAR")
+        close_btn.setStyleSheet(self._btn_style)
+        close_btn.setToolTip("Fechar (Esc)")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(self._close)
+        header.addWidget(close_btn)
+        root.addLayout(header)
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER};")
+        root.addWidget(sep)
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_list_page())
+        self._stack.addWidget(self._build_form_page())
+        root.addWidget(self._stack, 1)
+        self._esc = QShortcut(QKeySequence("Escape"), self)
+        self._esc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._esc.activated.connect(self._close)
+        self._reload()
+
+    # ── widgets ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _label(text, size=8, bold=False, color=None):
+        lbl = QLabel(text)
+        lbl.setFont(QFont("Courier New", size,
+                          QFont.Weight.Bold if bold else QFont.Weight.Normal))
+        lbl.setStyleSheet(f"color: {color or C.PRI}; background: transparent;")
+        return lbl
+
+    def _line(self, placeholder=""):
+        w = QLineEdit(); w.setStyleSheet(self._line_style); w.setFixedHeight(28)
+        w.setPlaceholderText(placeholder)
+        return w
+
+    def _combo(self, items):
+        w = QComboBox(); w.setStyleSheet(self._combo_style); w.setFixedHeight(28)
+        w.addItems([str(i) for i in items])
+        return w
+
+    def _build_list_page(self):
+        page = QWidget(); page.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(page); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(6)
+        self._table = QTableWidget(0, 6)
+        self._table.setHorizontalHeaderLabels(
+            ["CONTA", "ENDEREÇO", "PROVEDOR", "STATUS", "PADRÃO", "AUTO"])
+        self._table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.setFixedHeight(190)
+        self._table.setStyleSheet(
+            f"QTableWidget {{ background: #000d12; color: {C.TEXT}; "
+            f"border: 1px solid {C.BORDER}; gridline-color: {C.BORDER}; }}"
+            f"QHeaderView::section {{ background: #00091a; color: {C.PRI}; "
+            f"border: 0; padding: 3px; }}")
+        self._table.cellClicked.connect(self._select_row)
+        self._table.cellDoubleClicked.connect(lambda *_: self._edit_selected())
+        lay.addWidget(self._table)
+
+        row = QHBoxLayout()
+        for text, fn in (("NOVA CONTA", self._new),
+                         ("EDITAR", self._edit_selected),
+                         ("EXCLUIR", self._delete_selected),
+                         ("TESTAR / CONECTAR", self._test_selected),
+                         ("ATUALIZAR", self._reload)):
+            b = QPushButton(text); b.setStyleSheet(self._btn_style)
+            b.clicked.connect(fn); row.addWidget(b)
+        lay.addLayout(row)
+
+        self._status = self._label("", 8, color=C.TEXT_DIM)
+        self._status.setWordWrap(True)
+        lay.addWidget(self._status)
+        note = self._label(
+            "A senha de app fica no cofre do Jarvis (permissão 600) e nunca é "
+            "mostrada de volta. Gmail, iCloud e Yahoo exigem senha de app; "
+            "conta corporativa Microsoft 365 exige OAuth e não conecta por aqui.",
+            8, color=C.TEXT_DIM)
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        lay.addStretch(1)
+        return page
+
+    def _build_form_page(self):
+        page = QWidget(); page.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(page); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(5)
+        lay.addWidget(self._label("CONTA", 9, True))
+        self._form_name = self._line("nome da conta, ex.: trabalho")
+        lay.addWidget(self._form_name)
+        self._form_display = self._line("seu nome (vai no campo De: do e-mail)")
+        lay.addWidget(self._form_display)
+        self._form_address = self._line("endereço completo, ex.: eu@empresa.com")
+        lay.addWidget(self._form_address)
+        lay.addWidget(self._label("PROVEDOR", 9, True))
+        self._form_provider = self._combo(self._provider_options())
+        self._form_provider.currentTextChanged.connect(self._apply_preset)
+        lay.addWidget(self._form_provider)
+        hosts = QHBoxLayout()
+        self._form_imap_host = self._line("host IMAP")
+        self._form_imap_port = self._line("993")
+        self._form_imap_port.setFixedWidth(80)
+        hosts.addWidget(self._label("IMAP", 8, color=C.TEXT_DIM))
+        hosts.addWidget(self._form_imap_host, 1)
+        hosts.addWidget(self._form_imap_port)
+        lay.addLayout(hosts)
+        hosts2 = QHBoxLayout()
+        self._form_smtp_host = self._line("host SMTP")
+        self._form_smtp_port = self._line("587")
+        self._form_smtp_port.setFixedWidth(80)
+        self._form_smtp_sec = self._combo(["starttls", "ssl", "plain"])
+        self._form_smtp_sec.setFixedWidth(110)
+        hosts2.addWidget(self._label("SMTP", 8, color=C.TEXT_DIM))
+        hosts2.addWidget(self._form_smtp_host, 1)
+        hosts2.addWidget(self._form_smtp_port)
+        hosts2.addWidget(self._form_smtp_sec)
+        lay.addLayout(hosts2)
+        lay.addWidget(self._label("SENHA DE APP (write-only)", 9, True))
+        self._form_password = self._line(
+            "em branco = manter a senha já guardada")
+        self._form_password.setEchoMode(QLineEdit.EchoMode.Password)
+        lay.addWidget(self._form_password)
+        self._form_has_password = self._label("", 8, color=C.TEXT_DIM)
+        lay.addWidget(self._form_has_password)
+        self._form_auto = QCheckBox("Conectar junto com o Jarvis")
+        self._form_notify = QCheckBox("Avisar e-mail novo em voz")
+        self._form_default = QCheckBox("Usar como conta padrão")
+        for cb in (self._form_auto, self._form_notify, self._form_default):
+            cb.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+            lay.addWidget(cb)
+        row = QHBoxLayout()
+        save = QPushButton("SALVAR"); save.setStyleSheet(self._btn_style)
+        save.clicked.connect(self._save)
+        cancel = QPushButton("CANCELAR"); cancel.setStyleSheet(self._btn_style)
+        cancel.clicked.connect(self._back_to_list)
+        row.addWidget(save); row.addWidget(cancel); row.addStretch(1)
+        lay.addLayout(row)
+        lay.addStretch(1)
+        return page
+
+    # ── e-mail (core) ────────────────────────────────────────────────────────
+
+    def _mail(self):
+        from core import email
+        return email
+
+    @staticmethod
+    def _provider_options():
+        from core import email
+        return [f"{key} — {info['label']}" for key, info in email.PROVIDERS.items()]
+
+    def _provider_key(self, text=None):
+        raw = str(text if text is not None else self._form_provider.currentText())
+        return raw.split(" — ", 1)[0].strip() or "manual"
+
+    def _apply_preset(self, text):
+        """Trocar o preset preenche host/porta; o dono ainda pode editar."""
+        try:
+            mail = self._mail()
+            key = self._provider_key(text)
+            defaults = mail._provider_defaults(key)
+        except Exception:
+            return
+        self._form_imap_host.setText(str(defaults.get("imap_host") or ""))
+        self._form_imap_port.setText(str(defaults.get("imap_port") or 993))
+        self._form_smtp_host.setText(str(defaults.get("smtp_host") or ""))
+        self._form_smtp_port.setText(str(defaults.get("smtp_port") or 587))
+        self._form_smtp_sec.setCurrentText(
+            str(defaults.get("smtp_security") or "starttls"))
+
+    def _reload(self):
+        try:
+            self._accounts = self._mail().list_accounts()
+        except Exception as exc:
+            self._accounts = []
+            self._status.setText(f"Falha ao ler contas: {exc}")
+        self._table.setRowCount(0)
+        for acc in self._accounts:
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+            state = str(acc.get("state") or "unknown")
+            status = {"connected": "conectada",
+                      "auth": "precisa de senha",
+                      "error": "sem conexão"}.get(state, "não testada")
+            if not acc.get("has_password"):
+                status += " · falta senha"
+            values = [str(acc.get("name") or ""), str(acc.get("address") or ""),
+                      str(acc.get("provider_label") or acc.get("provider") or ""),
+                      status, "sim" if acc.get("default") else "não",
+                      "sim" if acc.get("auto_start") else "não"]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, acc.get("name"))
+                self._table.setItem(row, col, item)
+        self._stack.setCurrentIndex(0)
+
+    def _back_to_list(self):
+        self._form_password.clear()
+        self._stack.setCurrentIndex(0)
+
+    def _select_row(self, row, _col):
+        item = self._table.item(row, 0)
+        if item is not None:
+            self._selected = str(item.data(Qt.ItemDataRole.UserRole) or "")
+
+    def _edit_selected(self):
+        if not self._selected:
+            self._status.setText("Selecione uma conta na lista.")
+            return
+        acc = next((a for a in self._accounts
+                    if str(a.get("name")) == self._selected), None)
+        if acc is None:
+            self._status.setText("Conta não encontrada; atualize a lista.")
+            return
+        self._form_name.setText(str(acc.get("name") or ""))
+        self._form_display.setText(str(acc.get("display_name") or ""))
+        self._form_address.setText(str(acc.get("address") or ""))
+        label = f"{acc.get('provider')} — {acc.get('provider_label')}"
+        idx = self._form_provider.findText(label)
+        if idx >= 0:
+            self._form_provider.blockSignals(True)
+            self._form_provider.setCurrentIndex(idx)
+            self._form_provider.blockSignals(False)
+        self._form_imap_host.setText(str(acc.get("imap_host") or ""))
+        self._form_imap_port.setText(str(acc.get("imap_port") or ""))
+        self._form_smtp_host.setText(str(acc.get("smtp_host") or ""))
+        self._form_smtp_port.setText(str(acc.get("smtp_port") or ""))
+        self._form_smtp_sec.setCurrentText(
+            str(acc.get("smtp_security") or "starttls"))
+        # Write-only: o campo NUNCA recebe a senha guardada.
+        self._form_password.clear()
+        self._form_has_password.setText(
+            "senha de app guardada — em branco mantém" if acc.get("has_password")
+            else "sem senha de app guardada")
+        self._form_auto.setChecked(bool(acc.get("auto_start")))
+        self._form_notify.setChecked(bool(acc.get("notify")))
+        self._form_default.setChecked(bool(acc.get("default")))
+        self._stack.setCurrentIndex(1)
+
+    def _new(self):
+        self._selected = ""
+        self._form_name.clear()
+        self._form_display.clear()
+        self._form_address.clear()
+        self._form_password.clear()
+        self._form_has_password.setText("a senha de app é obrigatória para conectar")
+        self._form_provider.blockSignals(True)
+        self._form_provider.setCurrentIndex(0)
+        self._form_provider.blockSignals(False)
+        self._apply_preset(self._form_provider.currentText())
+        self._form_auto.setChecked(True)
+        self._form_notify.setChecked(False)
+        self._form_default.setChecked(False)
+        self._stack.setCurrentIndex(1)
+        self._form_name.setFocus()
+
+    def _save(self):
+        name = " ".join(self._form_name.text().split())
+        address = self._form_address.text().strip()
+        if not name:
+            self._status.setText("Dê um nome à conta.")
+            return
+        password = self._form_password.text()
+        mail = self._mail()
+        kwargs = dict(
+            address=address,
+            provider=self._provider_key(),
+            display_name=self._form_display.text().strip(),
+            imap_host=self._form_imap_host.text().strip(),
+            smtp_host=self._form_smtp_host.text().strip(),
+            smtp_security=self._form_smtp_sec.currentText().strip().lower(),
+            auto_start=self._form_auto.isChecked(),
+            notify=self._form_notify.isChecked(),
+            default=self._form_default.isChecked(),
+        )
+        try:
+            kwargs["imap_port"] = int(self._form_imap_port.text() or 993)
+            kwargs["smtp_port"] = int(self._form_smtp_port.text() or 587)
+        except ValueError:
+            self._status.setText("Porta inválida: use um número (993 / 587).")
+            return
+        try:
+            if self._selected:
+                ok = mail.update_account(self._selected, new_name=name, **kwargs)
+                if not ok:
+                    self._status.setText(
+                        "Não salvei: nome duplicado, endereço inválido ou conta "
+                        "não encontrada.")
+                    return
+                target = name
+            else:
+                created = mail.add_account(name, **kwargs)
+                target = created.name
+        except Exception as exc:
+            self._status.setText(f"Falha ao salvar: {exc}")
+            return
+        if password:
+            # Só agora, e só para o cofre. O campo é limpo logo abaixo.
+            if not mail.set_app_password(target, password):
+                self._status.setText("Conta salva, mas a senha de app não foi "
+                                     "gravada no cofre.")
+        self._form_password.clear()
+        self._selected = target
+        self._status.setText(f"Conta {target} salva. Clique em TESTAR / CONECTAR.")
+        self._reload()
+
+    def _delete_selected(self):
+        if not self._selected:
+            self._status.setText("Selecione uma conta para excluir.")
+            return
+        answer = QMessageBox.question(
+            self, "Excluir conta de e-mail",
+            f"Excluir a conta {self._selected}? A senha de app sai do cofre e "
+            "o inbox guardado dessa conta é apagado. Se for a conta padrão, "
+            "outra é promovida.")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            ok = self._mail().remove_account(self._selected)
+        except Exception as exc:
+            self._status.setText(f"Falha ao excluir: {exc}")
+            return
+        self._status.setText("Conta excluída." if ok else "Conta não encontrada.")
+        self._selected = ""
+        self._reload()
+
+    def _test_selected(self):
+        """Testa a conexão de verdade, fora da thread da UI."""
+        if not self._selected:
+            self._status.setText("Selecione uma conta para testar.")
+            return
+        target = self._selected
+        self._testing = target
+        self._status.setText(f"Testando {target}…")
+        mail = self._mail()
+
+        def worker():
+            try:
+                entry = mail.test_account(target)
+                state = str(entry.get("state") or "")
+                detail = str(entry.get("detail") or "")
+                message = {"connected": "conectou de verdade",
+                           "auth": "o servidor recusou (senha de app?)",
+                           "error": "sem conexão"}.get(state, state)
+                if detail:
+                    message += f" — {detail}"
+            except Exception as exc:
+                message = f"falha no teste: {exc}"
+            try:
+                self._test_sig.emit(target, message)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True,
+                         name="jarvis-mail-test").start()
+
+    def _on_tested(self, target: str, message: str):
+        if target != self._testing:
+            return
+        self._testing = ""
+        self._status.setText(f"{target}: {message}")
+        self._reload()
+
+    def _close(self):
+        self._form_password.clear()
+        self.hide()
+
+    def hideEvent(self, event):
+        try:
+            self._form_password.clear()
+        except Exception:
+            pass
+        self.closed.emit()
+        super().hideEvent(event)
+
+
 class PersonaOverlay(QWidget):
     """Cadastro de personas: voz, modelo, skills, stacks e WhatsApp próprio."""
 
@@ -3480,15 +3909,29 @@ class PersonaOverlay(QWidget):
         self._skills.setPlaceholderText("frontend-design, ui-styling")
         self._stacks = self._line()
         self._stacks.setPlaceholderText("react, nextjs, typescript")
+        # Owner rule (02/11/2026): vazio = a persona lê tudo; preenchido =
+        # leitura restrita a estas pastas (e subpastas). Gino nunca é limitado.
+        self._allowed_dirs = self._line()
+        self._allowed_dirs.setPlaceholderText(
+            "/projects/therotv, ~/Jarvis — vazio = lê tudo")
         self._model = QComboBox(); self._model.setStyleSheet(self._combo_style)
         self._model.setFixedHeight(30)
-        self._reasoning = self._combo([(x, x) for x in
-                                       ("low", "medium", "high", "max")])
-        self._context = self._line()
-        self._context.setPlaceholderText("200000")
+        # Raciocínio e contexto vêm do modelo escolhido (core/personas): "Max"
+        # é o rótulo de ``xhigh``/``max`` e a janela de 1M aparece porque o
+        # catálogo a publica — nada disso mora aqui.
+        self._reasoning = QComboBox()
+        self._reasoning.setStyleSheet(self._combo_style)
+        self._reasoning.setFixedHeight(28)
+        self._context = QComboBox()
+        self._context.setStyleSheet(self._combo_style)
+        self._context.setFixedHeight(28)
+        self._context.setEditable(True)
+        self._context.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self._whatsapp = QComboBox(); self._whatsapp.setStyleSheet(self._combo_style)
         self._whatsapp.setFixedHeight(30)
         self._refresh_choices()
+        self._model.currentIndexChanged.connect(self._refresh_model_options)
+        self._refresh_model_options()
 
         for label, widget in (
             ("NOME", self._name),
@@ -3497,6 +3940,8 @@ class PersonaOverlay(QWidget):
             ("PERSONALIDADE", self._personality),
             ("SKILLS (separadas por vírgula)", self._skills),
             ("STACKS (separadas por vírgula)", self._stacks),
+            ("DIRETÓRIOS PERMITIDOS (vírgula; vazio = lê tudo)",
+             self._allowed_dirs),
             ("MODELO / MULTIPLICADOR", self._model),
             ("RACIOCÍNIO", self._reasoning),
             ("CONTEXTO (tokens)", self._context),
@@ -3571,15 +4016,77 @@ class PersonaOverlay(QWidget):
         self._whatsapp.clear()
         self._whatsapp.addItem("Conta principal (padrão)", "")
         try:
-            from core import whatsapp
-            for name in whatsapp.account_names():
-                self._whatsapp.addItem(str(name), str(name))
+            names = store.whatsapp_account_choices()
         except Exception:
-            pass
+            names = []
+        for name in names:
+            self._whatsapp.addItem(str(name), str(name))
+        if not names:
+            self._whatsapp.addItem("Nenhuma conta WhatsApp pareada", "")
         if current_wa:
             idx = self._whatsapp.findData(current_wa)
             if idx >= 0:
                 self._whatsapp.setCurrentIndex(idx)
+
+    @staticmethod
+    def _context_label(size: int) -> str:
+        """Dropdown text for a token window: the number the owner types first."""
+        size = int(size)
+        if size >= 1_000_000 and size % 1_000_000 == 0:
+            return f"{size}  ·  {size // 1_000_000} milhão"
+        if size >= 1_000 and size % 1_000 == 0:
+            return f"{size}  ·  {size // 1_000} mil"
+        return str(size)
+
+    def _refresh_model_options(self, *_args):
+        """Reasoning + context offered by the selected model (single source)."""
+        store = self._persona_store()
+        model = None
+        try:
+            model = store.find_model(self._model.currentData() or "")
+        except Exception:
+            model = None
+
+        keep_reasoning = self._reasoning.currentData()
+        self._reasoning.blockSignals(True)
+        self._reasoning.clear()
+        try:
+            choices = store.reasoning_choices(model)
+        except Exception:
+            choices = []
+        for value, label in choices:
+            self._reasoning.addItem(label, value)
+        idx = self._reasoning.findData(str(keep_reasoning or ""))
+        if idx < 0:
+            try:
+                idx = self._reasoning.findData(store.default_reasoning(model))
+            except Exception:
+                idx = -1
+        self._reasoning.setCurrentIndex(max(0, idx))
+        self._reasoning.blockSignals(False)
+
+        keep_context = self._context.currentData()
+        typed = self._context.currentText().strip()
+        self._context.blockSignals(True)
+        self._context.clear()
+        try:
+            windows = store.context_windows(model)
+        except Exception:
+            windows = []
+        for size in windows:
+            self._context.addItem(self._context_label(size), int(size))
+        idx = self._context.findData(keep_context) if keep_context else -1
+        if idx < 0:
+            try:
+                idx = self._context.findData(store.default_context(model))
+            except Exception:
+                idx = -1
+        self._context.setCurrentIndex(max(0, idx))
+        if typed and keep_context is None:
+            # Valor digitado à mão (fora das janelas, por exemplo): fica à
+            # vista para o validador do store recusar com uma frase legível.
+            self._context.setEditText(typed)
+        self._context.blockSignals(False)
 
     def _reload(self):
         store = self._persona_store()
@@ -3631,12 +4138,13 @@ class PersonaOverlay(QWidget):
         if hasattr(self, "_table"):
             self._table.clearSelection()
         self._name.clear(); self._voice.clear(); self._personality.clear()
-        self._skills.clear(); self._stacks.clear(); self._context.setText("200000")
+        self._skills.clear(); self._stacks.clear(); self._allowed_dirs.clear()
         self._gender.setCurrentIndex(0)
-        self._reasoning.setCurrentIndex(1)
         if self._model.count():
             self._model.setCurrentIndex(0)
-        self._whatsapp.setCurrentIndex(0)
+        self._refresh_model_options()
+        if self._whatsapp.count():
+            self._whatsapp.setCurrentIndex(0)
         self._status.setText("Nova persona.")
 
     def _load_selected(self):
@@ -3656,20 +4164,40 @@ class PersonaOverlay(QWidget):
         self._personality.setPlainText(str(persona.get("personality") or ""))
         self._skills.setText(", ".join(persona.get("skills") or []))
         self._stacks.setText(", ".join(persona.get("stacks") or []))
+        self._allowed_dirs.setText(
+            ", ".join(persona.get("allowed_dirs") or []))
         idx = self._model.findData(str(persona.get("model") or ""))
         if idx >= 0:
             self._model.setCurrentIndex(idx)
-        idx = self._reasoning.findData(str(persona.get("reasoning") or "medium"))
+        self._refresh_model_options()
+        idx = self._reasoning.findData(str(persona.get("reasoning") or ""))
         if idx >= 0:
             self._reasoning.setCurrentIndex(idx)
-        self._context.setText(str(persona.get("context_size") or "200000"))
-        idx = self._whatsapp.findData(str(persona.get("whatsapp_account") or ""))
+        size = persona.get("context_size")
+        idx = self._context.findData(size) if size else -1
+        if idx >= 0:
+            self._context.setCurrentIndex(idx)
+        elif size:
+            self._context.setEditText(str(size))
+        wa_account = str(persona.get("whatsapp_account") or "")
+        idx = self._whatsapp.findData(wa_account)
+        if idx < 0 and wa_account:
+            # Conta fora da lista (renomeada ou gravada por uuid): mostra o que
+            # está gravado em vez de cair em "principal" e apagar no SALVAR.
+            self._whatsapp.addItem(wa_account, wa_account)
+            idx = self._whatsapp.count() - 1
         self._whatsapp.setCurrentIndex(max(0, idx))
         self._status.setText(f"Editando {persona.get('name')}.")
 
     def _fields(self):
         def split(value):
             return [p.strip() for p in str(value or "").split(",") if p.strip()]
+        context = self._context.currentData()
+        typed = self._context.currentText().strip()
+        if context is None or typed != self._context.itemText(
+                self._context.currentIndex()):
+            # Editado à mão: vale o texto digitado, não a opção antiga.
+            context = typed
         fields = {
             "name": self._name.text().strip(),
             "gender": self._gender.currentData(),
@@ -3679,8 +4207,9 @@ class PersonaOverlay(QWidget):
             "stacks": split(self._stacks.text()),
             "model": self._model.currentData(),
             "reasoning": self._reasoning.currentData(),
-            "context_size": self._context.text().strip(),
+            "context_size": context,
             "whatsapp_account": self._whatsapp.currentData() or "",
+            "allowed_dirs": self._allowed_dirs.text().strip(),
         }
         pid = self._select.currentData()
         if pid:
@@ -4257,6 +4786,8 @@ class MainWindow(QMainWindow):
     _holo_text_sig  = pyqtSignal(str)            # live transcript chunk → advance the cards
     _holo_speak_sig = pyqtSignal(bool)           # speaking on/off → auto-clear timing
     _holo_clear_sig = pyqtSignal()
+    _whatsapp_sig   = pyqtSignal()               # abrir o painel do WhatsApp (boot)
+    _mail_sig       = pyqtSignal()               # abrir o painel de e-mail (boot)
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -4583,6 +5114,8 @@ class MainWindow(QMainWindow):
         self._quiz_sig.connect(self._show_quiz)
         self._quiz_hide_sig.connect(self._hide_quiz)
         self._review_sig.connect(self._show_review)
+        self._whatsapp_sig.connect(self._open_whatsapp_from_boot)
+        self._mail_sig.connect(self._open_mail_from_boot)
         self._cam_stop = threading.Event()
 
         # Hologram cards: drawn over whatever the centre stack shows, mouse
@@ -5929,6 +6462,14 @@ class MainWindow(QMainWindow):
         whatsapp_btn.setStyleSheet(_BTN_STYLE_DIM)
         whatsapp_btn.clicked.connect(self._open_whatsapp_settings)
         lay.addWidget(whatsapp_btn)
+
+        mail_btn = QPushButton("📧  E-MAIL")
+        mail_btn.setFixedHeight(26)
+        mail_btn.setFont(QFont("Courier New", 7))
+        mail_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        mail_btn.setStyleSheet(_BTN_STYLE_DIM)
+        mail_btn.clicked.connect(self._open_mail_settings)
+        lay.addWidget(mail_btn)
 
         w.adjustSize()
         return w
@@ -7508,6 +8049,17 @@ class MainWindow(QMainWindow):
         ov.raise_()
         self._plugin_settings_overlay = ov   # keep a reference so it isn't GC'd
 
+    def _open_whatsapp_from_boot(self):
+        """Slot — traz o painel do WhatsApp à frente (conta sem conexão no boot)."""
+        try:
+            ov = getattr(self, "_whatsapp_overlay", None)
+            if ov is not None and ov.isVisible():
+                ov.raise_()
+                return
+        except Exception:
+            pass
+        self._open_whatsapp_settings()
+
     def _open_whatsapp_settings(self):
         cw = self.centralWidget()
         ov = WhatsAppOverlay(parent=cw)
@@ -7526,6 +8078,35 @@ class MainWindow(QMainWindow):
         ov.raise_()
         ov.setFocus(Qt.FocusReason.OtherFocusReason)
         self._whatsapp_overlay = ov
+
+    def _open_mail_from_boot(self):
+        """Slot — traz o painel de e-mail à frente (conta sem conexão no boot)."""
+        try:
+            ov = getattr(self, "_mail_overlay", None)
+            if ov is not None and ov.isVisible():
+                ov.raise_()
+                return
+        except Exception:
+            pass
+        self._open_mail_settings()
+
+    def _open_mail_settings(self):
+        cw = self.centralWidget()
+        ov = MailOverlay(parent=cw)
+        ow = MailOverlay._OW
+        oh = min(720, cw.height() - 16)
+        ov.setGeometry((cw.width() - ow) // 2,
+                       (cw.height() - oh) // 2, ow, oh)
+        # Mesmo acordo do WhatsApp: com o painel à vista o Esc fecha o painel
+        # em vez de interromper a fala.
+        esc = getattr(self, "_esc_shortcut", None)
+        if esc is not None:
+            esc.setEnabled(False)
+            ov.closed.connect(lambda: esc.setEnabled(True))
+        ov.show()
+        ov.raise_()
+        ov.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._mail_overlay = ov
 
     def _open_personas(self):
         cw = self.centralWidget()
@@ -7655,6 +8236,13 @@ class MainWindow(QMainWindow):
         txt = self._input.text().strip()
         if not txt: return
         self._input.clear()
+        from core.activity import is_system_text
+        if is_system_text(txt):
+            # Texto de supervisor/registro não é fala do dono: não vira "YOU"
+            # e não é enviado ao cérebro. Fica registrado como o que é.
+            self._log.append_log(
+                "SYS: entrada do Activity Log ignorada — não é fala do dono")
+            return
         self._log.append_log(f"YOU: {txt}")
         if self.on_text_command:
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
@@ -8260,6 +8848,16 @@ class JarvisUI:
         """Thread-safe: show the API key setup overlay (e.g. after an auth error)."""
         self._win._ready = False
         self._win._reconfig_sig.emit()
+
+    def open_whatsapp(self):
+        """Thread-safe: bring the WhatsApp panel up so the owner can scan the QR."""
+        if self._win_alive():
+            self._win._whatsapp_sig.emit()
+
+    def open_mail(self):
+        """Thread-safe: bring the e-mail accounts panel up (boot notice)."""
+        if self._win_alive():
+            self._win._mail_sig.emit()
 
     def show_camera_frame(self, img_bytes: bytes):
         """Thread-safe: show a webcam frame in the small overlay (screen captures)."""
