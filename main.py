@@ -2308,6 +2308,17 @@ class JarvisLive:
         self.ui.on_focus_mode     = self._focus_mode_hook
         self.ui.on_music_control  = self._music_control_hook
         self._groq                = None   # core.groq_stt.GroqListener while Groq listening is on
+        # Portão de transitório do VAD: descartes contados por motivo e
+        # logados AGREGADOS (nunca uma linha por bloco). Vocabulário honesto:
+        # SYS: — fato do sistema, nunca fala atribuída ao dono.
+        self._gate_drop_lock      = threading.Lock()
+        self._gate_drop_counts: dict[str, int] = {}
+        self._gate_drop_total     = 0
+        self._gate_drop_logged    = 0
+        self._gate_drop_at        = time.monotonic()
+        self._vprint_skip_total   = 0
+        self._vprint_skip_logged  = 0
+        self._vprint_skip_at      = time.monotonic()
         self.ui.ptt_hold          = self._on_ptt
         self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
@@ -7310,8 +7321,17 @@ class JarvisLive:
             {"source": str(source or "owner"), "speak": bool(speak),
              "reply_channel": str(reply_channel or "voice")},
             armed=False)
+        # Clipe SEM prova de voz (válvula de energia sustentada, ~1.28 s) não
+        # vai ao voiceprint: era por aí que um clique/impacto com energia
+        # suficiente virava "voz" aprendida. A fala em si segue no pipeline —
+        # o gate já tem a válvula justamente para não matar voz baixa real;
+        # só a identificação/aprendizado de voz recusa o clipe sem prova.
+        voice_proven = bool(getattr(pcm, "voice_proven", True))
+        if (pcm and not owner_voice and not voice_proven
+                and self._voice_id_enabled and self._speaker is not None):
+            self._note_unproven_voiceprint()
         if (self._voice_id_enabled and self._speaker is not None and pcm
-                and not owner_voice):
+                and not owner_voice and voice_proven):
             try:
                 records = self._speaker.list()
                 owner_name = self._speaker.owner_name
@@ -11820,6 +11840,7 @@ class JarvisLive:
                 fallback_transcribe=fallback,
                 precheck=self._series_precheck,
                 on_lost=self._stt_lost_audio,
+                on_gate_drop=self._stt_gate_drop,
                 preroll_s=lst["preroll_s"],
                 max_utterance_s=lst.get("max_utterance_s"))
             self._wire_stt_hooks(self._groq)
@@ -11853,6 +11874,7 @@ class JarvisLive:
             sample_rate=SEND_SAMPLE_RATE, prompt=hint,
             precheck=self._series_precheck,
             on_lost=self._stt_lost_audio,
+            on_gate_drop=self._stt_gate_drop,
             preroll_s=st["preroll_s"],
             max_utterance_s=st.get("max_utterance_s"))
         self._wire_stt_hooks(self._groq)
@@ -11892,6 +11914,83 @@ class JarvisLive:
         if extra:
             parts.append(extra)
         return (". ".join(parts) + ".")[:200]
+
+    # ── Portão de voz do STT: motivo do descarte, agregado ──────────────────
+
+    _GATE_LOG_EVERY = 5          # clipes
+    _GATE_LOG_PERIOD_S = 60.0    # segundos
+
+    def _gate_log_state(self) -> threading.Lock:
+        """Lock e contadores do log agregado, criados também em doubles."""
+        lock = getattr(self, "_gate_drop_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._gate_drop_lock = lock
+            self._gate_drop_counts = {}
+            self._gate_drop_total = 0
+            self._gate_drop_logged = 0
+            self._gate_drop_at = time.monotonic()
+            self._vprint_skip_total = 0
+            self._vprint_skip_logged = 0
+            self._vprint_skip_at = time.monotonic()
+        return lock
+
+    def _stt_gate_drop(self, reason: str, seconds: float) -> None:
+        """Conta um clipe recusado pelo portão de voz e loga o motivo.
+
+        Roda na thread de áudio do `GroqListener`; um `write_log` por bloco
+        seria spam. A cada `_GATE_LOG_EVERY` descartes (ou 60 s) sai UMA linha
+        `SYS:` com os motivos acumulados (`core.groq_stt.VOICE_GATE_REASONS`).
+        O clipe não foi transcrito nem chegou ao voiceprint. O rótulo é
+        honesto: é fato do sistema, nunca fala atribuída ao dono.
+        """
+        reason = str(reason or "sem_prova")
+        now = time.monotonic()
+        lock = self._gate_log_state()
+        with lock:
+            counts = self._gate_drop_counts
+            counts[reason] = counts.get(reason, 0) + 1
+            self._gate_drop_total += 1
+            total = self._gate_drop_total
+            due = ((total - self._gate_drop_logged) >= self._GATE_LOG_EVERY
+                   or (now - self._gate_drop_at) >= self._GATE_LOG_PERIOD_S)
+            if not due:
+                return
+            self._gate_drop_logged = total
+            self._gate_drop_at = now
+            summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+        try:
+            self.ui.write_log(
+                f"SYS: portão de voz: {total} clipe(s) sem prova descartado(s) "
+                f"({summary}); nada foi ao STT nem ao voiceprint.")
+        except Exception:
+            pass
+
+    def _note_unproven_voiceprint(self) -> None:
+        """Conta o clipe sem prova que foi ao STT mas NÃO ao voiceprint.
+
+        A válvula de energia sustentada entrega o áudio para não perder fala
+        baixa legítima; sem prova de voz, porém, ele não alimenta a
+        identificação (era a porta do clique de teclado virar "voz"). A fala
+        segue no pipeline; só o voiceprint recusa. Log agregado e `SYS:`.
+        """
+        now = time.monotonic()
+        lock = self._gate_log_state()
+        with lock:
+            self._vprint_skip_total += 1
+            total = self._vprint_skip_total
+            due = ((total - self._vprint_skip_logged) >= self._GATE_LOG_EVERY
+                   or (now - self._vprint_skip_at) >= self._GATE_LOG_PERIOD_S)
+            if not due:
+                return
+            self._vprint_skip_logged = total
+            self._vprint_skip_at = now
+        try:
+            self.ui.write_log(
+                f"SYS: {total} clipe(s) sem prova de voz não foram ao "
+                "voiceprint; a fala seguiu no pipeline.")
+        except Exception:
+            pass
 
 
     @staticmethod

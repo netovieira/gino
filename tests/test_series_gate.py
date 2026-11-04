@@ -603,6 +603,38 @@ class ConversationalGateTest(unittest.TestCase):
         self.assertEqual(obj._qoder_live.calls, [])
         self.assertIn("Não reconheço essa voz", obj.said[0])
 
+    def test_unproven_clip_skips_voiceprint_but_speech_still_runs(self):
+        """A válvula de energia sustentada preserva a fala, não a identidade.
+
+        `voice_proven=False` é o clipe de ~1.3 s que só abriu por energia
+        sustentada: pode ser voz baixa real (por isso segue no pipeline), mas
+        não tem prova de voz para alimentar o voiceprint — era a porta do
+        clique de teclado virar "voz" aprendida.
+        """
+        analysis = _analysis("unknown", _TV_SCORE, _TV_VOICED, _TV_TEXT)
+        obj = self._obj(analysis)
+        analyzed: list = []
+        original = obj._speaker.analyze_utterance
+
+        def _spy(*args, **kwargs):
+            analyzed.append(1)
+            return original(*args, **kwargs)
+
+        obj._speaker.analyze_utterance = _spy
+        clip = groq_stt.HeardClip(live_voice(1.30))
+        clip.voice_proven = False
+
+        main.JarvisLive._qoder_turn(obj, "Gino, que horas são?", clip)
+
+        self.assertEqual(analyzed, [],
+                         "clipe sem prova não pode alimentar o voiceprint")
+        self.assertEqual(len(obj._qoder_live.calls), 1,
+                         "a fala legítima tem de seguir no pipeline")
+        self.assertEqual(obj.said, [],
+                         "sem prova não vira recusa falada")
+        self.assertNotIn("Não reconheço essa voz",
+                         "\n".join(obj.ui.lines))
+
 
 class _DecisionGate:
     """SeriesGate stand-in for the listener precheck (no ONNX, no audio)."""

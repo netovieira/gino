@@ -346,6 +346,7 @@ class LocalWhisperListener(GroqListener):
                  on_utterance: Callable[[str, bytes], None] | None = None,
                  precheck: Callable[[bytes], bool] | None = None,
                  on_lost: Callable[[str, str, float], None] | None = None,
+                 on_gate_drop: Callable[[str, float], None] | None = None,
                  preroll_s: float | None = None,
                  max_utterance_s: float | None = None) -> None:
         whisper = _Whisper(model, language, device, compute_type,
@@ -360,6 +361,7 @@ class LocalWhisperListener(GroqListener):
             on_utterance=on_utterance,
             precheck=precheck,
             on_lost=on_lost,
+            on_gate_drop=on_gate_drop,
             preroll_s=preroll_s,
             max_utterance_s=max_utterance_s)
         # Read self.prompt at call time, not now: the assistant's name is only
