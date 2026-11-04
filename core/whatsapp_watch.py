@@ -2,14 +2,26 @@
 
 O QUE É UM GATILHO
     Uma mensagem NOVA (no máximo MAX_AGE_S de idade — o HistorySync reenvia
-    meses de conversa e nada disso é "nova"), em chat INDIVIDUAL (grupo nunca),
-    cujo texto contém o nome atual do assistente, sem diferenciar maiúsculas.
-    Duas exceções, ambas no chat DIRETO do dono (o número dele ou o número
-    pareado da própria conta): qualquer mensagem vale, sem exigir o nome — e
-    inclusive com `from_me=True`, porque o dono escrevendo do celular chega
-    como evento do próprio aparelho. Fora do chat direto, `from_me` continua
-    sendo resposta própria e é ignorado; o eco de um envio DESTE processo é
-    reconhecido pelo ID e descartado (anti-laço).
+    meses de conversa e nada disso é "nova") cujo texto contém o nome atual do
+    assistente, sem diferenciar maiúsculas, ou menciona (@) o número dele.
+    Só vale em chat INDIVIDUAL (terceiros e, no chat direto do dono, qualquer
+    mensagem sem exigir o nome). GRUPO NUNCA entra no fluxo — nem com o nome,
+    nem com menção, nem por ordem do dono: é decisão inegociável do dono
+    (01/11 e 02/11/2026), que cancelou a política de responder em grupo. Duas
+    exceções no chat DIRETO do dono (o número dele ou o número pareado da
+    própria conta): qualquer mensagem vale — e inclusive com `from_me=True`,
+    porque o dono escrevendo do celular chega como evento do próprio aparelho.
+
+ECO DO DONO COMO ORDEM
+    Num chat individual de terceiro, uma mensagem `from_me=True` (o dono
+    escreveu do celular no chat de alguém) só vira turno quando nomeia o
+    assistente — "Gino, fala pra Carol...". Sem o nome continua sendo eco e é
+    ignorado. O eco de um envio DESTE processo também é reconhecido pelo ID e
+    pela assinatura "Gino:" (segunda barreira quando o ID não está mais em
+    memória). ÁUDIO é a exceção: uma nota de voz gravada no chat de um terceiro
+    não tem como "nomear" ninguém antes de ser transcrita, então ela é
+    candidata sempre — quem decide é o voiceprint do dono em main.py, e a
+    resposta vai para o chat do DONO, nunca para o terceiro.
 
 DEDUPE E LIMITE
     Cada id de mensagem aceito é lembrado uma única vez: o mesmo evento pode
@@ -21,7 +33,13 @@ DEDUPE E LIMITE
 
 COMO A RESPOSTA ACONTECE
     `start(handler)` registra o observador em core/whatsapp.py, que entrega
-    mensagens de TODAS as contas pareadas (`callback(account_name, item)`).
+    mensagens de TODAS as contas pareadas na thread de dispatch do neonize
+    (`callback(account_name, item)`). Essa thread NÃO faz trabalho lento: o
+    observador só enfileira o item na fila da conta de origem. Um worker
+    dedicado (uma thread única por conta) drena a fila em ordem de chegada e
+    executa download/STT → resposta → envio; a thread do neonize volta na hora
+    e a fila não para de chegar. Duas contas = duas filas: uma nota de voz
+    lenta na principal não atrasa o trabalho.
     A resposta é enviada pelo próprio WhatsApp (texto→texto, áudio→áudio no
     chat direto do dono) e nunca pelo alto-falante da sala: o aviso falado de
     "mensagem nova" é suprimido nesse chat para o mesmo pedido não ganhar duas
@@ -29,7 +47,10 @@ COMO A RESPOSTA ACONTECE
     core/actiongate.py uma autorização presa àquela conta+contato: só o
     whatsapp_control action=send para a mesma conversa passa pelo gate de voz.
     Qualquer outra ação — e qualquer outro contato — continua esperando o
-    "pode" do dono.
+    "pode" do dono. Mudar de thread não muda uma vírgula desse gate: o áudio
+    remoto continua passando por `_decode_whatsapp_pcm` /
+    `_speaker_order_identity` / `_whatsapp_owner_voice` dentro de
+    `_whatsapp_autoreply`, que agora roda no worker da conta.
 
 CÓDIGOS DE VERIFICAÇÃO
     Em chat individual, uma mensagem que é claramente um OTP (ver
@@ -41,6 +62,7 @@ CÓDIGOS DE VERIFICAÇÃO
 """
 from __future__ import annotations
 
+import queue
 import re
 import threading
 import time
@@ -76,6 +98,24 @@ _otp_handler = None
 _logger = None
 _seen: OrderedDict = OrderedDict()
 _sent: dict[tuple[str, str], list[float]] = {}
+
+# ── fila de trabalho por conta (fora da thread de dispatch do neonize) ──────
+# A thread do neonize é UMA para todas as mensagens de todas as contas: se ela
+# ficar presa num download/ffmpeg/STT, todas as outras mensagens param de
+# chegar. Por isso o observador só enfileira; o worker da conta é que faz o
+# trabalho lento. Cada conta tem a sua fila FIFO e a sua thread única, então a
+# ordem de chegada é preservada e uma conta não atrasa a outra.
+#
+# `DISPATCH_WAIT_S` é o único tempo em que o observador espera: quando a fila
+# da conta está vazia, ele aguarda até este teto pelo fim do item, para que um
+# handler instantâneo (OTP, mensagem que não é candidata, teste) mantenha o
+# comportamento de sempre. Item lento devolve depois do teto e continua no
+# worker — o download de mídia e a transcrição nunca mais seguram a fila.
+DISPATCH_WAIT_S = 0.2
+
+_queue_lock = threading.Lock()
+_lanes: dict[str, "_Lane"] = {}
+_pending: dict[str, int] = {}
 
 
 def _fold(text: object) -> str:
@@ -126,6 +166,45 @@ def matches(text: object) -> bool:
         return False
     body = _norm_words(text)
     return f" {trigger} " in f" {body} "
+
+
+# Menção (@) que o WhatsApp entrega no texto extraído como "@<número>".
+_MENTION_RE = re.compile(r"@\s*(\d{8,})")
+
+# Extensões que o WhatsApp usa para nota de voz / áudio.
+_AUDIO_EXT = frozenset({".ogg", ".opus", ".oga", ".mp3", ".m4a", ".wav",
+                        ".aac", ".amr", ".flac"})
+
+
+def is_own_signature(text: object) -> bool:
+    """O texto começa com a assinatura que TODA resposta nossa leva ("Gino:")?
+
+    É a segunda barreira contra laço: mesmo que o id de um envio não esteja
+    mais em ``_deliveries`` (processo reiniciado, histórico reenviado), a
+    própria assinatura identifica a mensagem como resposta do assistente.
+    A assinatura real sai como ``*Gino:*`` (negrito do WhatsApp), então as
+    marcas de formatação em volta do nome não podem escondê-la.
+    """
+    trigger = _trigger_norm
+    if not trigger:
+        return False
+    first = _fold(str(text or "")).splitlines()
+    if not first:
+        return False
+    line = re.sub(r"^[\s*_~]+|[\s*_~]+$", "", first[0])
+    return line.startswith(f"{trigger}:")
+
+
+def calls_assistant(item: dict, account: str = "") -> bool:
+    """O texto nomeia o assistente OU menciona (@) o número desta conta."""
+    text = (item or {}).get("text")
+    if matches(text):
+        return True
+    own = _account_number(account)
+    if not own:
+        return False
+    return any(number == own
+               for number in _MENTION_RE.findall(str(text or "")))
 
 
 def _same_chat(a: object, b: object) -> bool:
@@ -192,11 +271,21 @@ def _is_own_account(chat: object) -> bool:
     if not digits:
         return False
     try:
-        numbers = {_digits(a.get("number")) for a in whatsapp.list_accounts()}
+        entries = list(whatsapp.list_accounts())
     except Exception:
         return False
-    numbers.discard("")
-    return digits in numbers
+    for entry in entries:
+        number = _digits((entry or {}).get("number"))
+        if not number:
+            # A conta pode ainda não ter conectado (config sem número); o
+            # `account_number` devolve o pareado dela quando existir.
+            try:
+                number = _digits(whatsapp.account_number(entry.get("name")))
+            except Exception:
+                number = ""
+        if number and digits == number:
+            return True
+    return False
 
 
 def _default_log(message: str) -> None:
@@ -247,6 +336,7 @@ def stop() -> None:
         _handler = None
         _otp_handler = None
     whatsapp.remove_watcher(_dispatch)
+    _close_lanes()
 
 
 def reset() -> None:
@@ -264,13 +354,47 @@ def _fresh(item: dict) -> bool:
     return abs(time.time() - stamp) <= MAX_AGE_S
 
 
-def is_candidate(item: dict, account: str = "") -> bool:
-    """Nova, individual, do dono no chat direto ou nomeando o assistente.
+def is_voice_item(item: dict) -> bool:
+    """A mensagem carrega um áudio/voz (nota de voz do WhatsApp)?"""
+    media = (item or {}).get("media") or {}
+    if not isinstance(media, dict) or not media:
+        return False
+    if str(media.get("kind") or "").strip().lower() in (
+            "áudio", "audio", "mensagem de voz"):
+        return True
+    return str(media.get("ext") or "").lower() in _AUDIO_EXT
 
-    Mensagem do dono vinda do celular chega com ``from_me=True`` (é um aparelho
-    pareado da MESMA conta). No chat direto ela é conversa com o assistente e
-    precisa contar como turno; fora dele ``from_me`` continua sendo resposta
-    própria e nunca vira gatilho.
+
+def owner_direct_chat(account: str) -> str:
+    """O chat que conta como o chat direto do dono nesta conta.
+
+    É o destino de uma resposta que NÃO pode ir para o chat de terceiro (a
+    ordem de voz do dono no chat de alguém): ``owner_chat`` quando configurado,
+    senão o número pareado da própria conta ("mensagem para você mesmo").
+    """
+    account = str(account or "").strip()
+    if not account:
+        return ""
+    try:
+        from memory.config_manager import get_plugin_setting
+        selected = str(whatsapp.default_account_name() or _direct_account)
+        owner_chat = str(get_plugin_setting("whatsapp", "owner_chat", "")
+                         or _direct_chat)
+    except Exception:
+        selected, owner_chat = _direct_account, _direct_chat
+    if owner_chat and (not selected or account.lower() == selected.lower()):
+        return owner_chat
+    return _account_number(account)
+
+
+def is_candidate(item: dict, account: str = "") -> bool:
+    """Nova e dirigida ao assistente: nome/menção, ordem do dono ou chat direto.
+
+    - Grupo: NUNCA. Nem com o nome, nem com menção, nem por ordem do dono —
+      a política de responder em grupo foi cancelada pelo dono.
+    - Chat direto do dono: qualquer mensagem (inclusive ``from_me=True``).
+    - Individual de terceiro: nome/menção. Eco com ``from_me=True`` só vale
+      como ORDEM quando nomeia o assistente; sem o nome é resposta própria.
     """
     if not isinstance(item, dict):
         return False
@@ -281,25 +405,41 @@ def is_candidate(item: dict, account: str = "") -> bool:
         return False
     if not _fresh(item):
         return False
+    from_me = bool(item.get("from_me"))
     direct = _is_direct(account, item)
-    if item.get("from_me"):
-        if not direct:
-            return False
-        # Anti-laço: o eco de um envio DESTE processo tem o mesmo ID que
-        # core.whatsapp guardou em _deliveries. A mensagem do dono, não.
+
+    if from_me:
+        # Anti-laço primeiro: o eco de um envio DESTE processo é reconhecido
+        # pelo ID e, na falta dele, pela assinatura "Gino:" que ele carrega.
         try:
             if whatsapp.sent_by_me(item.get("id")):
                 return False
         except Exception:
             return False
-        return True
+        if is_own_signature(item.get("text")):
+            return False
+        if direct:
+            return True
+        # Chat de outro número pareado do MESMO assistente: a mensagem aparece
+        # nas duas contas e só a que RECEBEU deve responder (uma ordem, uma
+        # resposta). O dono falando com o próprio assistente não é eco.
+        if _is_own_account(chat):
+            return False
+        # Eco de ÁUDIO do dono num chat individual de terceiro: ele gravou no
+        # chat do Renan, e a nota é uma ordem para o assistente — não conversa
+        # para o Renan. Só o voiceprint (main.py) decide se ela vale; sem o
+        # nome no texto, esta é a única forma de o áudio chegar lá.
+        if is_voice_item(item):
+            return True
+        return calls_assistant(item, account)
+
     if direct:
         return True
-    # Never let one of JARVIS's own paired numbers trigger the name scheme on
-    # another account (anti-loop between the two WhatsApp connections).
+    # Nunca deixe um dos números pareados do próprio assistente reativar o
+    # gatilho na outra conta.
     if _is_own_account(chat):
         return False
-    return matches(item.get("text"))
+    return calls_assistant(item, account)
 
 
 def is_direct(account: str, item: dict) -> bool:
@@ -344,6 +484,17 @@ def _rate_record(key: tuple[str, str]) -> None:
 
 
 def handle(account: str, item: dict) -> bool:
+    """Processa UMA mensagem de forma síncrona; True quando pediu resposta.
+
+    A thread de dispatch do neonize NÃO usa este caminho: ela chama
+    `_dispatch`, que só enfileira. Este é o processador unitário (usado pelo
+    worker da conta e pelos testes) — quem chama daqui aceita esperar o
+    download/STT até o fim.
+    """
+    return _process(account, item)
+
+
+def _process(account: str, item: dict) -> bool:
     """Processa uma mensagem; True quando a resposta autônoma foi pedida."""
     account = str(account or "").strip()
     if not is_candidate(item, account):
@@ -427,8 +578,109 @@ def handle_otp(account: str, item: dict) -> bool:
     return True
 
 
+class _Lane:
+    """A fila FIFO de UMA conta, drenada por uma única thread.
+
+    A thread é daemon: um processo que morre não fica preso nela. A ordem é a
+    da fila do `queue.Queue` (FIFO) e só existe um consumidor por conta, então
+    duas respostas nunca são montadas fora de ordem para o mesmo contato.
+    """
+
+    def __init__(self, account: str) -> None:
+        self.account = account
+        self.items: queue.Queue = queue.Queue()
+        self.thread = threading.Thread(
+            target=self._run, name=f"jarvis-wa-{account or 'sem-conta'}",
+            daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        while True:
+            job = self.items.get()
+            try:
+                if job is None:      # sentinela de `stop()`
+                    return
+                item, done = job
+                try:
+                    _process(self.account, item)
+                except Exception as e:
+                    _log(f"[{self.account}] worker do WhatsApp falhou: {e}")
+                finally:
+                    with _queue_lock:
+                        _pending[self.account] = max(
+                            0, _pending.get(self.account, 0) - 1)
+                    done.set()
+            finally:
+                self.items.task_done()
+
+
+def _lane_for(account: str) -> "_Lane":
+    """A fila viva desta conta; criada (com o worker) na primeira mensagem."""
+    with _queue_lock:
+        lane = _lanes.get(account)
+        if lane is None or not lane.thread.is_alive():
+            lane = _Lane(account)
+            _lanes[account] = lane
+        return lane
+
+
+def _enqueue(account: str, item: dict) -> None:
+    """Enfileira o item na conta de origem e devolve sem esperar o trabalho.
+
+    Só a PRIMEIRA mensagem de uma fila vazia espera até `DISPATCH_WAIT_S`;
+    com item já em andamento, o retorno é imediato. Assim um handler rápido
+    continua síncrono para quem observa, e um handler lento nunca segura a
+    thread de dispatch.
+    """
+    lane = _lane_for(account)
+    with _queue_lock:
+        idle = _pending.get(account, 0) == 0
+        _pending[account] = _pending.get(account, 0) + 1
+    done = threading.Event()
+    lane.items.put((item, done))
+    if idle:
+        done.wait(DISPATCH_WAIT_S)
+
+
+def _close_lanes() -> None:
+    """Descarta o que ainda não começou e aposenta os workers de cada conta."""
+    with _queue_lock:
+        lanes = list(_lanes.values())
+        _lanes.clear()
+        _pending.clear()
+    for lane in lanes:
+        while True:
+            try:
+                job = lane.items.get_nowait()
+            except queue.Empty:
+                break
+            if job is not None:
+                job[1].set()     # libera quem ainda espera no _enqueue
+            lane.items.task_done()
+        lane.items.put(None)
+
+
 def _dispatch(account: str, item: dict) -> None:
-    """Observador registrado em core/whatsapp.py (roda na thread do neonize)."""
+    """Observador registrado em core/whatsapp.py (roda na thread do neonize).
+
+    Trabalho lento FORA daqui: o código de verificação é reconhecido na hora
+    (regex, microssegundos) e todo o resto é enfileirado na fila da conta de
+    origem. A thread do neonize volta imediatamente e continua entregando as
+    mensagens seguintes, mesmo que o item anterior seja uma nota de voz de
+    minutos esperando download/ffmpeg/STT.
+    """
+    account = str(account or "").strip()
     if handle_otp(account, item):
         return
-    handle(account, item)
+    if not isinstance(item, dict):
+        return
+    # Recusa barata (só memória, sem I/O) antes de enfileirar: um HistorySync
+    # de meses não pode encher a fila atrás de uma nota lenta. São as mesmas
+    # recusas de `is_candidate` que não dependem de configuração; o resto da
+    # decisão (chat direto, eco, rate limit, dedupe) fica no worker.
+    if not _fresh(item):
+        return
+    chat = str(item.get("chat") or "")
+    if item.get("group") or not chat or chat.endswith("g.us"):
+        return
+    _enqueue(account, item)

@@ -149,7 +149,31 @@ def _desktop_send(app_name: str, receiver: str, message: str) -> str:
     time.sleep(0.3)
     return f"Message sent to {receiver} via {app_name}."
 
-def _send_whatsapp(receiver: str, message: str) -> str:
+def _flag(value) -> bool:
+    """Booleano de parâmetro de ferramenta: aceita True e as strings óbvias."""
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "sim", "yes", "on"}
+
+
+def _whatsapp_outgoing(message: str, dictated: bool) -> str:
+    """Texto do caminho CEGO do WhatsApp, com a mesma regra do core.
+
+    A assinatura tem um dono só (``core.whatsapp.signed_text``): aqui só
+    chamamos a mesma função para o caso em que o driver não roda e o texto é
+    digitado na janela. Texto ditado pelo dono não é assinado.
+    """
+    if dictated:
+        return message
+    try:
+        from core import whatsapp as _wa
+        return _wa.signed_text(message, _wa.current_speaker())
+    except Exception:
+        return message
+
+
+def _send_whatsapp(receiver: str, message: str,
+                   dictated: bool = False) -> str:
     """WhatsApp goes through the verified driver when there is one.
 
     _desktop_send below is a sequence of keystrokes with sleeps between them:
@@ -175,19 +199,23 @@ def _send_whatsapp(receiver: str, message: str) -> str:
         from plugins import _whatsapp_core as wa
     except Exception as e:
         print(f"[SendMessage] WhatsApp driver unavailable ({e}) — typing blind.")
-        return _desktop_send("WhatsApp", receiver, message)
+        return _desktop_send("WhatsApp", receiver,
+                             _whatsapp_outgoing(message, dictated))
 
     try:
         transport, why = wa.get()
     except Exception as e:
         print(f"[SendMessage] WhatsApp driver failed to start ({e}) — typing blind.")
-        return _desktop_send("WhatsApp", receiver, message)
+        return _desktop_send("WhatsApp", receiver,
+                             _whatsapp_outgoing(message, dictated))
 
     if transport is None:
         print(f"[SendMessage] {why} — typing blind.")
-        return _desktop_send("WhatsApp", receiver, message)
+        return _desktop_send("WhatsApp", receiver,
+                             _whatsapp_outgoing(message, dictated))
 
-    sent, failure = transport.send_message_to(receiver, message)
+    sent, failure = transport.send_message_to(receiver, message,
+                                              dictated=dictated)
     if sent:
         return f"Message sent to {receiver} via WhatsApp."
     return (f"The message to {receiver} was NOT sent on WhatsApp: {failure}. "
@@ -282,6 +310,7 @@ def send_message(
     receiver     = params.get("receiver", "").strip()
     message_text = params.get("message_text", "").strip()
     platform     = params.get("platform", "whatsapp").strip()
+    dictated     = _flag(params.get("dictated"))
 
     if not receiver:
         return "Please specify a recipient."
@@ -297,7 +326,12 @@ def send_message(
 
     try:
         handler = _resolve_platform(platform)
-        result  = handler(receiver, message_text)
+        # Só o WhatsApp tem assinatura (é onde a regra do dono vale); as outras
+        # plataformas são digitadas em janela e não têm esse conceito.
+        if handler is _send_whatsapp:
+            result = handler(receiver, message_text, dictated=dictated)
+        else:
+            result = handler(receiver, message_text)
     except Exception as e:
         result = f"Could not send message: {e}"
 
@@ -334,7 +368,19 @@ TOOL = {
             },
             "message_text": {
                 "type": "STRING",
-                "description": "The message to send"
+                "description": "The message to send. On WhatsApp it goes out "
+                               "SIGNED with the current speaker's name "
+                               "('*Gino:*' on the first line) unless the user "
+                               "dictated the exact words to be sent as "
+                               "themselves — in that case pass dictated=true."
+            },
+            "dictated": {
+                "type": "BOOLEAN",
+                "description": "WhatsApp only: true when the user dictated the "
+                               "exact personal words to send as the user "
+                               "themselves (e.g. a message to their partner). "
+                               "Then it is NOT signed with the assistant's "
+                               "name. Default false: your own text, signed."
             },
             "platform": {
                 "type": "STRING",

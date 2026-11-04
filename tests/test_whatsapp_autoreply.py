@@ -102,14 +102,47 @@ class TriggerGateTests(WatcherHarness):
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.calls[0][0], ACCOUNT)
 
-    def test_group_messages_never_trigger(self):
+    def test_group_message_naming_the_assistant_is_ignored(self):
         self.assertFalse(whatsapp_watch.handle(
-            ACCOUNT, wa_item(group=True, chat="120363000000000000")))
+            ACCOUNT, wa_item(group=True,
+                             chat="120363000000000000@g.us")))
         self.assertEqual(self.calls, [])
 
-    def test_group_chat_id_never_triggers(self):
+    def test_group_message_without_the_name_does_not_trigger(self):
         self.assertFalse(whatsapp_watch.handle(
-            ACCOUNT, wa_item(chat="120363000000000000@g.us")))
+            ACCOUNT, wa_item("olha isso", group=True,
+                             chat="120363000000000000@g.us")))
+        self.assertEqual(self.calls, [])
+
+    def test_group_is_detected_from_the_chat_jid_alone_and_ignored(self):
+        self.assertFalse(whatsapp_watch.handle(
+            ACCOUNT, wa_item("Gino, olha isso",
+                             chat="120363000000000000@g.us")))
+        self.assertEqual(self.calls, [])
+
+    def test_group_mention_of_the_account_number_is_ignored(self):
+        with mock.patch("core.whatsapp_watch.whatsapp.account_number",
+                        return_value="5517992101133"):
+            self.assertFalse(whatsapp_watch.handle(
+                ACCOUNT, wa_item("@5517992101133 olha isso", group=True,
+                                 chat="120363000000000000@g.us")))
+        self.assertEqual(self.calls, [])
+
+    def test_our_group_reply_with_the_signature_never_retriggers(self):
+        self.assertFalse(whatsapp_watch.handle(
+            ACCOUNT, wa_item("Gino: já respondi lá", group=True,
+                             from_me=True,
+                             chat="120363000000000000@g.us")))
+        self.assertEqual(self.calls, [])
+
+    def test_group_echo_from_another_paired_number_never_triggers(self):
+        with mock.patch("core.whatsapp_watch.whatsapp.list_accounts",
+                        return_value=[{"name": "trabalho",
+                                       "number": "5517992101133"}]):
+            self.assertFalse(whatsapp_watch.handle(
+                ACCOUNT, wa_item("Gino, tudo bem?", group=True,
+                                 sender="5517992101133",
+                                 chat="120363000000000000@g.us")))
         self.assertEqual(self.calls, [])
 
     def test_message_without_the_name_does_not_trigger(self):
@@ -117,14 +150,36 @@ class TriggerGateTests(WatcherHarness):
             ACCOUNT, wa_item("tudo bem? saudades")))
         self.assertEqual(self.calls, [])
 
-    def test_owner_message_never_triggers(self):
+    def test_owner_echo_without_the_name_never_triggers(self):
         self.assertFalse(whatsapp_watch.handle(
-            ACCOUNT, wa_item("Gino, manda o boleto", from_me=True)))
+            ACCOUNT, wa_item("manda o boleto", from_me=True)))
+        self.assertEqual(self.calls, [])
+
+    def test_owner_echo_naming_the_assistant_is_an_order(self):
+        self.assertTrue(whatsapp_watch.handle(
+            ACCOUNT, wa_item("Gino, fala pra Carol que ela é incrível",
+                             from_me=True)))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_owner_echo_to_another_paired_number_is_not_double_answered(self):
+        with mock.patch("core.whatsapp_watch.whatsapp.list_accounts",
+                        return_value=[{"name": "trabalho",
+                                       "number": "5517992101133"}]):
+            self.assertFalse(whatsapp_watch.handle(
+                ACCOUNT, wa_item("Gino, chegou o pedido?", from_me=True,
+                                 chat="5517992101133")))
         self.assertEqual(self.calls, [])
 
     def test_assistant_reply_never_triggers_itself(self):
         self.assertFalse(whatsapp_watch.handle(
             ACCOUNT, wa_item("Gino: já mandei, qualquer coisa me chama",
+                             from_me=True)))
+        self.assertEqual(self.calls, [])
+
+    def test_bold_signature_is_recognised_as_our_own_reply(self):
+        # A assinatura real do envio é `*Gino:*` (negrito do WhatsApp).
+        self.assertFalse(whatsapp_watch.handle(
+            ACCOUNT, wa_item("*Gino:*\njá mandei, qualquer coisa me chama",
                              from_me=True)))
         self.assertEqual(self.calls, [])
 
@@ -200,7 +255,7 @@ class DirectChatTests(WatcherHarness):
     def test_group_is_never_direct(self):
         self.assertFalse(whatsapp_watch.handle(
             ACCOUNT, wa_item("tudo bem?", group=True,
-                             chat="120363000000000000")))
+                             chat="120363000000000000@g.us")))
         self.assertEqual(self.calls, [])
 
     def test_direct_chat_has_no_hourly_limit(self):

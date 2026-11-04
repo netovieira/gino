@@ -37,7 +37,9 @@ número é o do usuário.
 
     from core import whatsapp
     whatsapp.start()                              # sobe todas as auto_start
-    whatsapp.send("João", "chego em 10min")       # conta default
+    whatsapp.send("João", "chego em 10min",       # texto ditado pelo dono:
+                  signed=False)                   # sai sem assinatura
+    whatsapp.send("João", "resposta do Gino")     # texto do assistente: *Gino:*
     whatsapp.send("João", "oi", account="trabalho")
     whatsapp.recent(5)                            # o que chegou na default
     whatsapp.list_accounts()                      # [{name, uuid, connected, …}]
@@ -96,6 +98,10 @@ INBOX_KEEP     = 300          # mensagens mantidas em disco por conta
 INBOX_TRIM_EVERY = 25         # regrava o arquivo a cada N mensagens
 RECONNECT_S    = 10.0         # espera entre tentativas depois de uma queda
 START_WAIT_S   = 8.0          # quanto start() espera por um sinal concreto
+# Boot: depois da última tentativa, uma janela curta para as contas mais lentas
+# fecharem o handshake. Sem ela uma conexão de 10 s viraria alarme falso; e não
+# é laço de reconexão — isso é trabalho do `_run`, uma vez por conta.
+BOOT_SETTLE_S  = 6.0
 FRESH_TS_S     = 24 * 3600    # só guarda o que chegou nas últimas 24h
 MEDIA_MAX_MB   = 20           # acima disso a mídia fica no servidor
 MEDIA_KEEP_DAYS = 7           # quanto tempo os arquivos baixados ficam aqui
@@ -105,6 +111,16 @@ MEDIA_KEEP_DAYS = 7           # quanto tempo os arquivos baixados ficam aqui
 # o padrão é curto e `wait_delivery` aceita outro valor por chamada.
 DELIVERY_WAIT_S  = 8.0        # espera padrão por recibo de entrega/leitura
 _DELIVERY_KEEP_S = 300.0      # por quanto tempo o estado de entrega fica na memória
+
+# O servidor aceita textos enormes, mas uma parede de texto não é mensagem.
+# Acima deste tamanho `send` divide em partes numeradas, sempre em fronteira
+# de frase/palavra — nunca corta nem acrescenta reticências. O limite é uma
+# escolha de legibilidade, não um teto do WhatsApp.
+MAX_TEXT_CHARS = 4000
+
+# Fim de frase de verdade: pontuação seguida de espaço (não `main.py`).
+_SENTENCE_CUT_RE = re.compile(r"[.!?…][\"')\]»’”]*(?=\s)")
+_URL_ANY_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 # Mensagem do dono entregue como turno: o id fica lembrado este tempo para o
 # mesmo evento (reconexão, duas rotinas lendo o mesmo store) não virar dois
@@ -128,6 +144,14 @@ _logger     = None
 # chega na mesma execução do app e não há o que recuperar depois de reiniciar.
 _delivery_lock = threading.Lock()
 _deliveries: dict[str, dict] = {}
+# Recibo que chegou ANTES de o envio ser registrado. O `send_*` só devolve o
+# ID depois do ack do servidor, e o destinatário pode confirmar no mesmo
+# instante (áudio para uma conversa que está com o celular online, por
+# exemplo). O ReceiptEv da outra thread invalidava um ID que ainda não estava
+# no mapa — e o envio ficava "aguardando confirmação de entrega" para sempre,
+# mesmo tendo sido entregue. Aqui o recibo espera o registro.
+_early_receipts: dict[str, dict] = {}
+_EARLY_RECEIPT_KEEP_S = 120.0
 
 # O neonize carrega um runtime Go (whatsmeow) que segura threads do processo.
 # Depois disso o Python nunca mais sai sozinho ao fim do mainloop, então quem
@@ -912,6 +936,17 @@ def resolve(recipient: str, account: str | None = None
     if not raw:
         return None, []
 
+    # JID explícito de grupo: o "nome" do chat já é o endereço (`<id>@g.us`).
+    # Sem isto o fallback de número mais abaixo montaria um JID de telefone com
+    # os dígitos do grupo e a resposta do gatilho iria para o lugar errado.
+    if raw.lower().endswith("@g.us"):
+        user = raw.split("@", 1)[0]
+        try:
+            from neonize.utils import build_jid
+            return build_jid(user, "g.us"), []
+        except Exception:
+            return raw, []
+
     digits = _digits(raw)
     letters = re.sub(r"[\d\s+().-]", "", raw)
     # Só dígitos (com ou sem +55, espaços, traços) → é um número, não um nome.
@@ -979,6 +1014,25 @@ def _prune_deliveries(now: float | None = None) -> None:
     for mid in [m for m, rec in _deliveries.items()
                 if now - rec["at"] > _DELIVERY_KEEP_S]:
         _deliveries.pop(mid, None)
+    for mid, rec in list(_early_receipts.items()):
+        if now - float(rec.get("at") or 0.0) > _EARLY_RECEIPT_KEEP_S:
+            _early_receipts.pop(mid, None)
+
+
+def _remember_early_receipt(msg_id: str, state: str) -> None:
+    """Guarda um recibo de um ID que ainda não foi registrado (corrida).
+
+    Chamado com `_delivery_lock` na mão. `_remember_send` consome esta entrada
+    e já nasce sabendo que a mensagem foi entregue/lida.
+    """
+    rec = _early_receipts.setdefault(msg_id, {"at": time.time(),
+                                              "delivered": False,
+                                              "read": False})
+    rec["at"] = time.time()
+    if state == "read":
+        rec["read"] = True
+    if state in ("read", "delivered"):
+        rec["delivered"] = True
 
 
 def _remember_send(resp, acct: "_Account | None" = None) -> str:
@@ -989,12 +1043,16 @@ def _remember_send(resp, acct: "_Account | None" = None) -> str:
     msg_id = msg_id.strip()
     with _delivery_lock:
         _prune_deliveries()
+        early = _early_receipts.pop(msg_id, None) or {}
+        event = threading.Event()
+        if early.get("delivered"):
+            event.set()
         _deliveries[msg_id] = {
             "at": time.time(),
             "account": getattr(acct, "name", "") or "",
-            "delivered": False,
-            "read": False,
-            "event": threading.Event(),
+            "delivered": bool(early.get("delivered")),
+            "read": bool(early.get("read")),
+            "event": event,
         }
     return msg_id
 
@@ -1024,6 +1082,9 @@ def _on_receipt(evt, acct: "_Account | None" = None) -> None:
         for mid in ids:
             rec = _deliveries.get(mid)
             if rec is None:
+                # O recibo pode chegar antes do send_* devolver o ID (a corrida
+                # que deixava áudio entregue com "aguardando confirmação").
+                _remember_early_receipt(mid, state)
                 continue
             if state == "read":
                 rec["read"] = True
@@ -1068,8 +1129,8 @@ def _delivery_outcome(msg_id: str, sent_phrase: str, label: str,
                       timeout: float | None = None) -> tuple[bool, str]:
     """Frase falada com o estado REAL do envio — nunca "mandei" sem ID."""
     if not msg_id:
-        return True, (f"o envio para {label} não foi confirmado pelo WhatsApp: "
-                      f"nenhum identificador de mensagem voltou")
+        return False, (f"o envio para {label} não foi confirmado pelo WhatsApp: "
+                       f"nenhum identificador de mensagem voltou")
     result = wait_delivery(msg_id, timeout)
     if result["state"] in ("delivered", "read"):
         return True, (f"{sent_phrase} e o WhatsApp confirmou a entrega "
@@ -1078,11 +1139,145 @@ def _delivery_outcome(msg_id: str, sent_phrase: str, label: str,
                   f"de entrega")
 
 
-def send(recipient: str, text: str, account: str | None = None) -> tuple[bool, str]:
-    """Envia texto. Devolve (ok, frase) — a frase é o que o assistente fala."""
+def current_speaker() -> str:
+    """O alto-falante atual: o `assistant_name` do config (Gino, Aurora…).
+
+    É o mesmo nome que o app usa em `_asst_name`, agora resolvido fora dele para
+    as ações de ferramenta (plugins/actions) assinarem sem hardcode. Uma persona
+    que responde informa o próprio nome em `speaker=`.
+    """
+    try:
+        from memory.config_manager import get_assistant_name
+        name = str(get_assistant_name() or "").strip()
+    except Exception:
+        name = ""
+    return name or "Gino"
+
+
+def signed_text(text: str, speaker: str = "Gino") -> str:
+    """Mensagem ESCRITA leva o nome de quem fala; áudio nunca leva.
+
+    Regra do dono (03/11/2026): no texto, a primeira linha é ``*Gino:*`` (ou o
+    nome da persona) sozinha; na voz o nome não é dito — a voz já identifica.
+    Se a assinatura já estiver lá, não duplica.
+    """
+    body = str(text or "").strip()
+    name = str(speaker or "").strip() or "Gino"
+    if not body:
+        return body
+    try:
+        from core import speech_guard as _guard
+        # O texto pode chegar já assinado por outro nome do mesmo app (a
+        # persona atual): reconhecer os dois evita ``*Aline:*\n*Gino:*``.
+        if _guard.strip_speaker(body, (name, current_speaker())) != body:
+            return body
+    except Exception:
+        pass
+    return f"*{name}:*\n{body}"
+
+
+def _avoid_url_cut(text: str, cut: int) -> int:
+    """Move um corte que caiu dentro de URL para antes/depois dela inteira."""
+    for m in _URL_ANY_RE.finditer(text):
+        if m.start() < cut < m.end():
+            # URL maior que o limite: mantê-la inteira vale mais que o limite.
+            return m.start() if m.start() > 0 else m.end()
+        if m.start() >= cut:
+            break
+    return cut
+
+
+def _split_cut(text: str, limit: int) -> int:
+    """Índice do melhor corte de `text` que não passe de `limit`.
+
+    Prioridade: fim de frase → espaço → palavra inteira (mesmo que a parte
+    fique maior que o limite). Nunca corta no meio de palavra nem de URL.
+    """
+    cut = 0
+    for m in _SENTENCE_CUT_RE.finditer(text):
+        end = m.end()
+        if end > limit:
+            break
+        if end >= max(1, limit // 4):
+            cut = end
+    if cut:
+        return _avoid_url_cut(text, cut)
+    window = text[:limit]
+    ws = max(window.rfind(" "), window.rfind("\n"), window.rfind("\t"))
+    if ws > 0:
+        return _avoid_url_cut(text, ws)
+    # Palavra/URL sozinha maior que o limite: vai inteira na parte.
+    nxt = min((i for i in (text.find(" ", limit), text.find("\n", limit),
+                           text.find("\t", limit)) if i >= 0), default=-1)
+    return _avoid_url_cut(text, nxt) if nxt > 0 else len(text)
+
+
+def split_text(text: str, limit: int = MAX_TEXT_CHARS) -> list[str]:
+    """Divide um texto longo em partes legíveis, sem perder um caractere.
+
+    A concatenação das partes (com um espaço entre elas) reconstrói o texto
+    original a menos de espaços nas bordas. Cada parte termina em pontuação
+    real quando existe uma fronteira de frase disponível; nenhuma parte ganha
+    "..." artificial.
+    """
+    body = str(text or "").strip()
+    if not body:
+        return []
+    if limit <= 0 or len(body) <= limit:
+        return [body]
+    parts: list[str] = []
+    rest = body
+    while len(rest) > limit:
+        cut = _split_cut(rest, limit)
+        if cut <= 0 or cut >= len(rest):
+            break
+        part = rest[:cut].strip()
+        rest = rest[cut:].strip()
+        if part:
+            parts.append(part)
+    if rest:
+        parts.append(rest)
+    return parts or [body]
+
+
+def _number_parts(parts: list[str]) -> list[str]:
+    """Numera as partes; a assinatura, se houver, fica sozinha na 1ª linha."""
+    total = len(parts)
+    first = parts[0]
+    m = re.match(r"^(\*[^*\n]+:\*)\n", first)
+    if m:
+        parts[0] = f"{m.group(1)}\n(1/{total}) {first[m.end():]}"
+    else:
+        parts[0] = f"(1/{total}) {first}"
+    for i in range(1, total):
+        parts[i] = f"({i + 1}/{total}) {parts[i]}"
+    return parts
+
+
+def send(recipient: str, text: str, account: str | None = None,
+         speaker: str | None = None,
+         signed: bool = True) -> tuple[bool, str]:
+    """Envia texto. Devolve (ok, frase) — a frase é o que o assistente fala.
+
+    PONTO ÚNICO da assinatura do TEXTO: nenhum chamador monta ``*Nome:*`` por
+    conta própria. ``signed=True`` (padrão) assina o que o assistente produziu;
+    ``speaker`` escolhe o nome (persona) e vazio usa o alto-falante atual.
+    ``signed=False`` é para o texto DITADO pelo dono para outra pessoa: ali a
+    mensagem é dele e sai sem assinatura nenhuma. Áudio/caption não passam por
+    aqui e nunca levam nome.
+
+    Texto maior que ``MAX_TEXT_CHARS`` sai em partes numeradas ``(1/N)``, cada
+    uma quebrada em fronteira de frase/palavra — o conteúdo inteiro chega, sem
+    corte e sem reticências inventadas.
+    """
     text = str(text or "").strip()
     if not text:
         return False, "a mensagem está vazia"
+    parts = split_text(text, MAX_TEXT_CHARS)
+    if signed:
+        parts[0] = signed_text(parts[0], speaker or current_speaker())
+    if len(parts) > 1:
+        parts = _number_parts(parts)
     try:
         a = _A(account)
     except KeyError as e:
@@ -1108,15 +1303,23 @@ def send(recipient: str, text: str, account: str | None = None) -> tuple[bool, s
     # O rótulo é o nome de verdade do contato; um número desconhecido cai no
     # que o usuário disse, que é o melhor nome disponível.
     label = _display(target, a) or recipient
-    try:
-        resp = client.send_message(target, text)
-    except Exception as e:
-        return False, f"o WhatsApp recusou o envio para {label}: {e}"
-    msg_id = _remember_send(resp, a)
-    _append_inbox({"ts": int(time.time()), "chat": _user_of(target),
-                   "name": str(label), "from_me": True, "group": False,
-                   "text": text[:600], "id": msg_id}, a)
-    return _delivery_outcome(msg_id, "enviei a mensagem", label)
+    ids: list[str] = []
+    for index, part in enumerate(parts, 1):
+        try:
+            resp = client.send_message(target, part)
+        except Exception as e:
+            if len(parts) > 1:
+                return False, (f"o WhatsApp recusou a parte {index}/{len(parts)} "
+                               f"do envio para {label}: {e}")
+            return False, f"o WhatsApp recusou o envio para {label}: {e}"
+        msg_id = _remember_send(resp, a)
+        ids.append(msg_id)
+        _append_inbox({"ts": int(time.time()), "chat": _user_of(target),
+                       "name": str(label), "from_me": True, "group": False,
+                       "text": part[:600], "id": msg_id}, a)
+    phrase = ("enviei a mensagem" if len(parts) == 1
+              else f"enviei a mensagem em {len(parts)} partes")
+    return _delivery_outcome(ids[-1], phrase, label)
 
 
 def _user_of(jid) -> str:
@@ -1236,17 +1439,27 @@ def _media_filename(item: dict) -> str:
             f"_{item.get('id') or 'semid'}{ext}")
 
 
-def media_path(item: dict, account: str | None = None) -> str:
-    """O arquivo local desta mensagem, se ele foi baixado."""
+def media_dest(item: dict, account: str | None = None) -> str:
+    """O caminho ONDE a mídia desta mensagem vai ficar — exista o arquivo ou não.
+
+    O download roda numa thread separada do aviso de mensagem nova: quem
+    precisa transcrever um áudio tem que esperar por este caminho, porque
+    ``media_path`` devolve "" enquanto o arquivo ainda não apareceu.
+    """
     try:
         a = _A(account)
     except KeyError:
         return ""
-    p = a.media_dir / _media_filename(item)
-    return str(p) if p.exists() else ""
+    return str(a.media_dir / _media_filename(item))
 
 
-def _download_wanted() -> bool:
+def media_path(item: dict, account: str | None = None) -> str:
+    """O arquivo local desta mensagem, se ele foi baixado."""
+    p = media_dest(item, account)
+    return p if p and Path(p).exists() else ""
+
+
+def download_wanted() -> bool:
     try:
         from memory.config_manager import get_plugin_setting
         return bool(get_plugin_setting(NS, "media_download", True))
@@ -1257,7 +1470,7 @@ def _download_wanted() -> bool:
 def _download_media(client, message, item: dict, acct: _Account) -> None:
     """Baixa o anexo para a pasta de mídia da conta (link do WhatsApp expira)."""
     media = item.get("media") or {}
-    if not item.get("id") or not _download_wanted():
+    if not item.get("id") or not download_wanted():
         return
     size = int(media.get("size") or 0)
     if size and size > MEDIA_MAX_MB * 1024 * 1024:
@@ -1314,6 +1527,68 @@ def _resolve_file(path: str, acct: _Account) -> Path | None:
     return _find_local(raw, acct)
 
 
+# O WhatsApp só reconhece como mensagem de voz (PTT) um áudio OGG/Opus cujo
+# mimetype traz o codec EXPLÍCITO. O neonize monta o AudioMessage com
+# `magic.from_buffer(...)`, que devolve "audio/ogg" puro — o celular do
+# destinatário então não exibe/entrega o áudio (o dispositivo pareado, que não
+# valida o mimetype, baixa normalmente, o que já enganou uma autópsia antes).
+_AUDIO_MIME_PTT = "audio/ogg; codecs=opus"
+
+
+def _audio_waveform(file: Path) -> bytes:
+    """64 amostras (0..100) do PCM, como o WhatsApp grava no PTT.
+
+    O campo é opcional, mas o cliente do celular usa a forma de onda para
+    desenhar a mensagem de voz; mandar a barra vazia é mais um desvio do
+    formato canônico. Falha aqui nunca impede o envio: devolve b"".
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return b""
+    try:
+        r = subprocess.run(
+            [ffmpeg, "-v", "error", "-i", str(file), "-t", "120",
+             "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1",
+             "-ar", "8000", "pipe:1"],
+            capture_output=True, timeout=30)
+        pcm = r.stdout or b""
+        if len(pcm) < 128:
+            return b""
+        import array
+        samples = array.array("h")
+        samples.frombytes(pcm[:len(pcm) // 2 * 2])
+        step = max(1, len(samples) // 64)
+        peaks = []
+        for i in range(64):
+            chunk = samples[i * step:(i + 1) * step]
+            peak = max((abs(v) for v in chunk), default=0)
+            peaks.append(min(100, int(peak * 100 / 32768)))
+        return bytes(peaks)
+    except Exception:
+        return b""
+
+
+def _build_audio_message(client, file: Path, ptt: bool):
+    """AudioMessage do neonize com mimetype/waveform canônicos de PTT.
+
+    Devolve None quando o cliente não expõe `build_audio_message` (versões
+    antigas/testes) — quem chamou cai no `send_audio` normal.
+    """
+    build = getattr(client, "build_audio_message", None)
+    if not callable(build):
+        return None
+    msg = build(str(file), ptt=ptt)
+    audio = getattr(msg, "audioMessage", None)
+    if audio is None:
+        return None
+    if ptt:
+        audio.mimetype = _AUDIO_MIME_PTT
+        waveform = _audio_waveform(file)
+        if waveform:
+            audio.waveform = waveform
+    return msg
+
+
 def _send_any(client, target, file: Path, caption) -> tuple[str, object]:
     """Manda o arquivo pelo tipo certo. Devolve (tipo falado, SendResponse)."""
     ext = file.suffix.lower()
@@ -1325,7 +1600,22 @@ def _send_any(client, target, file: Path, caption) -> tuple[str, object]:
         return "vídeo", resp
     if ext in _AUDIO_EXT:
         # PTT é o "segurar e falar": só faz sentido em ogg/opus.
-        resp = client.send_audio(target, str(file), ptt=ext in (".ogg", ".opus"))
+        ptt = ext in (".ogg", ".opus")
+        msg = None
+        try:
+            msg = _build_audio_message(client, file, ptt)
+        except Exception as e:
+            _log(f"não consegui preparar o áudio como PTT ({e}); "
+                 f"tentando o caminho padrão do neonize")
+        if msg is not None:
+            _log(f"áudio {file.name}: "
+                 f"mime={getattr(msg.audioMessage, 'mimetype', '')!r} "
+                 f"ptt={ptt}")
+            resp = client.send_message(target, msg)
+        else:
+            _log(f"áudio {file.name}: caminho padrão do neonize "
+                 f"(sem mimetype PTT corrigido)")
+            resp = client.send_audio(target, str(file), ptt=ptt)
         return "áudio", resp
     if ext == ".webp":
         resp = client.send_sticker(target, str(file))
@@ -1411,6 +1701,11 @@ def send_media(recipient: str, path: str, caption: str = "",
             return False, f"o WhatsApp recusou o envio para {label}: {e2}"
 
     msg_id = _remember_send(resp, a)
+    if kind == "áudio":
+        # Sem o ID no log, "áudio enviado" era indistinguível de um envio sem
+        # resposta; o mimetype efetivo é registrado em _send_any.
+        _log(f"áudio enviado id={msg_id or '(sem id)'} "
+             f"arquivo={file.name}")
     item = {"ts": int(time.time()), "chat": _user_of(target), "name": str(label),
             "from_me": True, "group": False,
             "text": f"[{kind}{(': ' + caption) if caption else ''}]",
@@ -1585,6 +1880,31 @@ def _is_owner_turn(acct: _Account, item: dict) -> bool:
         return False
 
 
+def _calls_assistant(acct: _Account, item: dict) -> bool:
+    """O texto nomeia o assistente (ou menciona o número desta conta)?"""
+    try:
+        from core import whatsapp_watch
+        return bool(whatsapp_watch.armed()
+                    and whatsapp_watch.calls_assistant(item, acct.name))
+    except Exception:
+        return False
+
+
+def _is_owner_order(acct: _Account, item: dict, direct: bool) -> bool:
+    """A mensagem abre UM turno do dono (e por isso é deduplicada por id).
+
+    Duas formas: o chat direto (qualquer mensagem dele) e o eco do próprio
+    aparelho num chat individual de terceiro quando o texto chama o
+    assistente pelo nome — o dono escrevendo "Gino, fala pra Carol..." no chat
+    da Carol. Grupo nunca entra no fluxo, então também nunca abre turno.
+    """
+    if direct:
+        return True
+    if not item.get("from_me") or item.get("group"):
+        return False
+    return _calls_assistant(acct, item)
+
+
 def _on_message(client, ev, acct: _Account) -> None:
     try:
         from neonize.utils import extract_text
@@ -1620,24 +1940,29 @@ def _on_message(client, ev, acct: _Account) -> None:
             "name": _chat_name(chat, ev.Info.Pushname or "", group, acct),
             "from_me": from_me,
             "group": group,
-            "text": text[:600],
+            # Inteiro: uma mensagem longa do dono não pode perder o fim antes
+            # de virar turno. O inbox em disco guarda só as últimas mensagens,
+            # então o tamanho continua contido.
+            "text": text,
             "id": ev.Info.ID or "",
             "media": media,
         }
         # Rastro mínimo de que o evento chegou ao Python. Sem esta linha um
         # MessageEv perdido era indistinguível de uma conexão muda; só chat
-        # individual (grupo é volume alto e nunca vira gatilho). O LID vai
-        # junto porque é ele que aparece no celular do dono.
+        # individual (grupo NUNCA é lido nem vira turno). O LID vai junto
+        # porque é ele que aparece no celular do dono.
         if not group:
             _log(f"[{acct.name}] evento {item['id'] or '(sem id)'} de {chat}"
                  + (f"/{lid}" if lid else "")
                  + f" ({'do dono/outro aparelho' if from_me else 'recebida'})")
 
-        # Chat direto do dono: a mensagem dele é UM turno, uma vez só. O mesmo
-        # evento pode voltar numa reconexão (ou ser lido por duas rotinas), e
-        # responder duas vezes é o erro que ele percebe na hora.
+        # Turno do dono: a mensagem é UM turno, uma vez só. O mesmo evento pode
+        # voltar numa reconexão (ou ser lido por duas rotinas), e responder
+        # duas vezes é o erro que ele percebe na hora. Vale para o chat direto
+        # e para o eco com o nome escrito num chat individual de terceiro.
         owner_direct = _is_direct_chat(acct, item)
-        if owner_direct and not _first_owner_sighting(acct.name, item["id"]):
+        if _is_owner_order(acct, item, owner_direct) \
+                and not _first_owner_sighting(acct.name, item["id"]):
             _log(f"[{acct.name}] mensagem {item['id']} do dono repetida — "
                  f"já virou turno, ignorando esta cópia")
             return
@@ -1653,8 +1978,16 @@ def _on_message(client, ev, acct: _Account) -> None:
         # O dono mandando do celular também conta — no chat direto dele
         # (próprio número pareado ou owner_chat) o áudio precisa ser baixado
         # para ser transcrito e respondido em áudio.
+        #
+        # ÁUDIO `from_me` em chat individual de terceiro também desce: o dono
+        # gravando uma nota no chat do Renan é uma ordem para o assistente
+        # ("Gino, avisa ele que..."), e o arquivo é a única prova de quem
+        # falou (voiceprint). Imagem/vídeo dele no chat alheio continua sem
+        # download — só o áudio é uma ordem.
         if media and abs(time.time() - stamp) < FRESH_TS_S:
             want_media = not from_me
+            _audio = str(media.get("kind") or "").lower() in (
+                "áudio", "audio", "mensagem de voz")
             if not want_media:
                 chat_digits = _digits(chat)
                 with _lock:
@@ -1667,6 +2000,8 @@ def _on_message(client, ev, acct: _Account) -> None:
                     except Exception:
                         owner = ""
                     want_media = bool(chat_digits and owner and chat_digits == owner)
+            if not want_media and _audio and not group:
+                want_media = True
             if want_media:
                 threading.Thread(target=_download_media,
                                  args=(client, ev.Message, item, acct),
@@ -1827,6 +2162,77 @@ def _start_account(acct: _Account, on_message=None) -> tuple[bool, str]:
         if acct.error:
             return False, acct.error
     return True, "conectando…"
+
+
+def _boot_entry(acct: _Account, error: str = "") -> dict:
+    """Estado REAL de uma conta para o aviso de boot (nunca "pedido aceito")."""
+    with _lock:
+        connected = bool(acct.connected)
+        detail = str(acct.error or error or "")
+        number = _digits(acct.me.get("number") or "")
+        qr = bool(acct.qr_path)
+    try:
+        is_paired = bool(acct.paired_mark.exists() and acct.session_db.exists())
+    except Exception:
+        is_paired = False
+    if connected:
+        state = "connected"
+    elif qr:
+        state = "auth"          # QR na tela / sessão vencida: mão humana
+    elif detail:
+        state = "error"         # neonize ausente, falha de conexão, etc.
+    else:
+        state = "auth"          # handshake não fechou na janela: mão humana
+    return {"name": acct.name, "uuid": acct.uuid, "connected": connected,
+            "state": state, "paired": is_paired, "number": number,
+            "qr": qr, "detail": detail}
+
+
+def connect_all(on_message=None, logger=None,
+                settle_s: float = BOOT_SETTLE_S) -> list[dict]:
+    """Sobe cada conta habilitada uma vez e devolve o estado REAL de cada uma.
+
+    É o que o boot chama. As contas sobem em paralelo (cada `_start_account`
+    espera no máximo `START_WAIT_S`), e depois há uma janela curta para as mais
+    lentas fecharem o handshake. Uma tentativa só: não há laço aqui — o `_run`
+    já reconecta uma queda, com o intervalo de sempre.
+
+    Cada item: ``{"name", "uuid", "connected", "state", "paired", "number",
+    "qr", "detail"}``, com ``state`` em ``"connected"``, ``"auth"`` (QR
+    pendente, sessão vencida ou handshake incompleto: precisa de mão humana)
+    ou ``"error"``.
+    """
+    global _logger
+    if logger is not None:
+        _logger = logger
+    _ensure_accounts()
+    targets = ([a for a in _accounts.values() if a.auto_start]
+               or list(_accounts.values()))
+    if not targets:
+        return []
+    if not available():
+        return [_boot_entry(a, error="o WhatsApp precisa do neonize")
+                for a in targets]
+
+    workers = []
+    for acct in targets:
+        worker = threading.Thread(
+            target=_start_account, args=(acct, on_message), daemon=True,
+            name=f"jarvis-whatsapp-connect-{acct.uuid}")
+        worker.start()
+        workers.append(worker)
+
+    deadline = time.time() + START_WAIT_S
+    for worker in workers:
+        worker.join(timeout=max(0.0, deadline - time.time()))
+    # Janela de tolerância só para quem ainda não deu sinal nenhum. Conta com
+    # QR na tela ou erro já está decidida: esperar mais só atrasa o aviso.
+    settle_deadline = time.time() + max(0.0, float(settle_s or 0.0))
+    while time.time() < settle_deadline and any(
+            not a.connected and not a.qr_path and not a.error
+            for a in targets):
+        time.sleep(0.1)
+    return [_boot_entry(a) for a in targets]
 
 
 def _stop_account(acct: _Account) -> None:

@@ -229,8 +229,24 @@ PLUGIN = {
             },
             "text": {
                 "type": "STRING",
-                "description": "send: exactly what the user wants said, in their "
-                               "own language. Never invent or embellish it.",
+                "description": "send: the text to send in the user's own "
+                               "language. It goes out SIGNED with the speaker's "
+                               "name ('*Gino:*' on the first line), because it "
+                               "is your message. Never invent an emotional or "
+                               "personal message on the user's behalf — if the "
+                               "user is dictating words to send AS THEMSELVES "
+                               "(e.g. a love message to their partner), pass "
+                               "dictated=true so it goes out without any "
+                               "signature.",
+            },
+            "dictated": {
+                "type": "BOOLEAN",
+                "description": "send: true ONLY when the user dictated the "
+                               "exact words to be sent as the user themselves "
+                               "(personal/family message). Then the text is NOT "
+                               "signed with the assistant's name — it is the "
+                               "user's voice. Default false: your own text, "
+                               "signed with the current speaker name.",
             },
             "path": {
                 "type": "STRING",
@@ -341,7 +357,15 @@ def _do_pair(account: str = "") -> tuple[str, str]:
     return f"não consegui conectar o WhatsApp: {msg}", f"não consegui conectar: {msg}"
 
 
-def _do_send(to: str, text: str, account: str = "") -> tuple[str, str]:
+def _flag(value: object) -> bool:
+    """Booleano de parâmetro de ferramenta: aceita True e as strings óbvias."""
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "sim", "yes", "on"}
+
+
+def _do_send(to: str, text: str, account: str = "",
+             dictated: bool = False) -> tuple[str, str]:
     if not to:
         return _missing_destination(), "falta o destinatário"
     if not text:
@@ -352,7 +376,11 @@ def _do_send(to: str, text: str, account: str = "") -> tuple[str, str]:
     amb = _ambiguous(account)
     if amb:
         return amb, "conta ambígua"
-    ok, msg = whatsapp.send(target, text, account=account or None)
+    # `signed=` do core é o ponto único: texto que EU produzi leva o nome do
+    # alto-falante atual; texto ditado pelo dono para outra pessoa é dele e sai
+    # sem assinatura (assinar seria forjar a fala dele).
+    ok, msg = whatsapp.send(target, text, account=account or None,
+                            signed=not dictated)
     if not ok:
         return f"falhou: {msg}", msg
     return msg, msg
@@ -531,6 +559,7 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
     query   = str(parameters.get("query") or "").strip()
     path    = str(parameters.get("path") or "").strip()
     caption = str(parameters.get("caption") or "").strip()
+    dictated = _flag(parameters.get("dictated"))
     try:
         limit = int(parameters.get("limit") or 8)
     except Exception:
@@ -557,7 +586,7 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             spoken, body = _do_open_window()
             title = "WHATSAPP — abrir aplicativo"
         elif action in ("send", "enviar", "manda", "mandar"):
-            spoken, body = _do_send(to, text, account)
+            spoken, body = _do_send(to, text, account, dictated)
             title = "WHATSAPP — envio"
         elif action in ("search", "buscar", "procurar", "procurar_mensagem"):
             spoken, body = _do_search(query, limit, account)

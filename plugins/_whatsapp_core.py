@@ -18,9 +18,15 @@ from __future__ import annotations
 
 
 class _Transport:
-    def send_message_to(self, receiver: str, message: str) -> tuple[bool, str]:
+    def send_message_to(self, receiver: str, message: str,
+                        dictated: bool = False) -> tuple[bool, str]:
+        """`dictated`: texto do dono (sem assinatura) × texto do assistente.
+
+        A assinatura é decidida no único ponto do core (`whatsapp.send`), não
+        aqui: por padrão o texto é do assistente e sai com o nome de quem fala.
+        """
         from core import whatsapp
-        ok, why = whatsapp.send(receiver, message)
+        ok, why = whatsapp.send(receiver, message, signed=not dictated)
         return ok, "" if ok else why
 
 

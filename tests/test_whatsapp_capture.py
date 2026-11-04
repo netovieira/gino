@@ -28,11 +28,13 @@ from core import whatsapp, whatsapp_watch  # noqa: E402
 OWNER = "5517981792464"       # número do dono = conta pareada "principal"
 ASSISTANT = "5517992101133"   # número de saída = conta "trabalho"
 THIRD = "5511888888888"
+GROUP = "120363000000000000@g.us"
 
 
 def make_event(chat: str, text: str, from_me: bool = False,
                message_id: str = "", ts: float | None = None,
-               group: bool = False, lid: str = "") -> Message:
+               group: bool = False, lid: str = "",
+               sender: str = "") -> Message:
     ev = Message()
     ev.Info.ID = message_id or f"3EB0{time.time_ns():016X}"
     # O neonize entrega MILISSEGUNDOS: é o mesmo número que o pedido de
@@ -51,7 +53,8 @@ def make_event(chat: str, text: str, from_me: bool = False,
             ev.Info.MessageSource.SenderAlt.CopyFrom(build_jid(chat))
     else:
         ev.Info.MessageSource.Chat.CopyFrom(build_jid(chat))
-    ev.Info.MessageSource.Sender.CopyFrom(build_jid(OWNER if from_me else chat))
+    ev.Info.MessageSource.Sender.CopyFrom(
+        build_jid(sender or (OWNER if from_me else chat)))
     ev.Info.MessageSource.IsFromMe = from_me
     ev.Info.MessageSource.IsGroup = group
     ev.Message.conversation = text
@@ -107,6 +110,30 @@ def wire(tmp_path, monkeypatch):
         whatsapp_watch.reset()
 
 
+def test_media_dest_knows_the_path_before_the_download_finishes(tmp_path,
+                                                               monkeypatch):
+    """media_path="" não pode encerrar a espera: o destino é previsível.
+
+    Foi exatamente o caso do áudio de 02/11: o watcher chegou antes de a
+    thread de download criar o arquivo e devolveu "não consegui transcrever".
+    """
+    acct = whatsapp._Account("espera", "capture-espera")
+    acct.media_dir = tmp_path
+    monkeypatch.setattr(whatsapp, "_accounts", {"capture-espera": acct})
+    monkeypatch.setattr(whatsapp, "_ensure_accounts", lambda: None)
+    item = {"ts": 1793626189, "name": "Anthero Vieira Neto",
+            "id": "3AB54B686F02A8160839",
+            "media": {"kind": "mensagem de voz", "ext": ".ogg"}}
+
+    dest = whatsapp.media_dest(item, "espera")
+    assert dest == str(
+        tmp_path / "1793626189_anthero_vieira_neto_3AB54B686F02A8160839.ogg")
+    assert whatsapp.media_path(item, "espera") == ""
+
+    Path(dest).write_bytes(b"OggS")
+    assert whatsapp.media_path(item, "espera") == dest
+
+
 def test_owner_message_from_phone_lands_in_inbox_and_triggers(wire, tmp_path):
     """O caso de 18:05: dono -> número do assistente, pelo celular dele."""
     case = CaptureCase(tmp_path, "trabalho", ASSISTANT)
@@ -118,6 +145,27 @@ def test_owner_message_from_phone_lands_in_inbox_and_triggers(wire, tmp_path):
     assert items[0]["from_me"] is False
     assert [c[0] for c in wire] == ["trabalho"], (
         "mensagem do dono no chat direto tem que pedir resposta mesmo sem o nome")
+
+
+def test_long_owner_message_reaches_the_watcher_whole(wire, tmp_path):
+    """Mensagem longa do dono: o item do inbox não pode parar em 600.
+
+    O teto antigo ``text[:600]`` cortava o texto ANTES do turno, então o
+    modelo recebia só o começo de uma mensagem escrita longa do dono.
+    """
+    case = CaptureCase(tmp_path, "trabalho", ASSISTANT)
+    long_text = " ".join(
+        f"Ponto {i}: conferir o relatório e registrar a decisão final."
+        for i in range(1, 121)) + " FIM DA MENSAGEM DO DONO: última instrução."
+    assert len(long_text) > 4000
+
+    items = case.deliver(make_event(OWNER, long_text, from_me=False))
+
+    assert len(items) == 1
+    assert items[0]["text"] == long_text
+    assert len(wire) == 1
+    assert wire[0][1]["text"] == long_text
+    assert wire[0][1]["text"].endswith("última instrução.")
 
 
 def test_owner_own_number_self_chat_is_captured_and_triggers(wire, tmp_path):
@@ -132,12 +180,34 @@ def test_owner_own_number_self_chat_is_captured_and_triggers(wire, tmp_path):
         "chat direto do dono não exige a palavra Gino, nem com from_me")
 
 
-def test_from_me_outside_direct_chat_never_triggers(wire, tmp_path):
+def test_from_me_outside_direct_chat_without_the_name_never_triggers(
+        wire, tmp_path):
     """Dono mandando para um terceiro pelo celular: inbox sim, resposta não."""
     case = CaptureCase(tmp_path, "trabalho", ASSISTANT)
     items = case.deliver(make_event(THIRD, "oi, tudo bem?", from_me=True))
     assert len(items) == 1
     assert wire == []
+
+
+def test_from_me_outside_direct_chat_naming_the_assistant_is_an_order(
+        wire, tmp_path):
+    """O caso real da Carol: ordem escrita do celular no chat de terceiro."""
+    case = CaptureCase(tmp_path, "trabalho", ASSISTANT)
+    items = case.deliver(make_event(
+        THIRD, "Gino, fala pra Carol como você se sente", from_me=True,
+        message_id="3EB02F87F80819AA795C2A"))
+    assert len(items) == 1
+    assert [c[0] for c in wire] == ["trabalho"]
+
+
+def test_owner_echo_order_is_one_turn_per_message_id(wire, tmp_path):
+    """O mesmo evento reentregue não pode gerar uma segunda resposta."""
+    case = CaptureCase(tmp_path, "trabalho", ASSISTANT)
+    ev = make_event(THIRD, "Gino, fala pra Carol", from_me=True,
+                    message_id="3EB0ORDERDEDUP01")
+    case.deliver(ev)
+    case.deliver(ev)
+    assert [c[0] for c in wire] == ["trabalho"]
 
 
 def test_direct_owner_message_is_not_announced_in_the_room(wire, tmp_path):
@@ -191,10 +261,47 @@ def test_third_party_naming_the_assistant_still_triggers(wire, tmp_path):
     assert [c[0] for c in wire] == ["trabalho"]
 
 
-def test_group_message_never_triggers(wire, tmp_path):
+def test_group_message_naming_the_assistant_is_ignored(wire, tmp_path):
+    """Grupo NUNCA vira turno — nem com o nome (decisão do dono)."""
     case = CaptureCase(tmp_path, "trabalho", ASSISTANT)
-    case.deliver(make_event("120363000000000000@g.us", "Gino, olha isso",
-                            from_me=False, group=True))
+    case.deliver(make_event(GROUP, "Gino, olha isso", from_me=False,
+                            group=True, sender=OWNER))
+    assert wire == []
+
+
+def test_group_event_is_not_logged(wire, tmp_path, monkeypatch):
+    """Sem rastro de conversa de grupo no log: grupo não é monitorado."""
+    logs: list[str] = []
+    monkeypatch.setattr(whatsapp, "_logger", logs.append)
+    case = CaptureCase(tmp_path, "trabalho", ASSISTANT)
+    case.deliver(make_event(GROUP, "Gino, olha isso", from_me=False,
+                            group=True, sender=OWNER))
+    assert logs == []
+    assert wire == []
+
+
+def test_group_message_without_the_name_is_ignored(wire, tmp_path):
+    case = CaptureCase(tmp_path, "trabalho", ASSISTANT)
+    case.deliver(make_event(GROUP, "olha isso", from_me=False,
+                            group=True, sender=OWNER))
+    assert wire == []
+
+
+def test_our_own_group_answer_never_retriggers(wire, tmp_path):
+    """from_me=True em grupo (nossa resposta com "Gino:") nunca dispara."""
+    case = CaptureCase(tmp_path, "trabalho", ASSISTANT)
+    case.deliver(make_event(GROUP, "Gino: já respondi", from_me=True,
+                            group=True))
+    assert wire == []
+
+
+def test_group_answer_from_the_other_paired_account_never_retriggers(
+        wire, tmp_path):
+    """A resposta da conta "trabalho" no grupo chega na "principal" como
+    mensagem de membro; o remetente pareado é o que barra o laço."""
+    case = CaptureCase(tmp_path, "principal", OWNER)
+    case.deliver(make_event(GROUP, "Gino, tudo bem?", from_me=False,
+                            group=True, sender=ASSISTANT))
     assert wire == []
 
 
