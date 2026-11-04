@@ -402,6 +402,13 @@ class TTSPlayer:
         on_done:  Optional[Callable] = None,
     ) -> None:
         """Synthesise and play text. BLOCKING – call from a dedicated thread."""
+        # A fala passa pelo filtro puro antes do motor: telefone, caminho,
+        # ferramenta e JSON nunca chegam ao ouvido (core/speech_guard.py).
+        try:
+            from core.speech_guard import sanitize as _sanitize_speech
+            text = _sanitize_speech(str(text or "")).text or str(text or "")
+        except Exception:
+            text = str(text or "")
         try:
             with self._lock:
                 self._playing = True

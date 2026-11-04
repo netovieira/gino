@@ -9,28 +9,48 @@ from core import groq_stt
 
 
 class FakeSpeaker:
+    """Store double: counts samples, so the flow can be observed end to end."""
+
     owner_name = "Anthero"
     sample_rate = 16000
 
-    def __init__(self):
+    def __init__(self, samples: int = 3):
         self.enrolled = []
-        self.records = [{"name": "Anthero", "owner": True, "authorized": True,
-                         "samples": 3}]
+        self.replaced = []
+        self.samples = samples
+        self.records = ([{"name": "Anthero", "owner": True, "authorized": True,
+                          "samples": samples}] if samples else [])
 
     def list(self):
-        return list(self.records)
+        return [dict(rec) for rec in self.records]
 
     def embedding(self, _pcm):
         return [1.0, 0.0]
 
-    def enroll(self, name, sample, authorized=False):
+    def enroll(self, name, sample, authorized=False, device="pc"):
         self.enrolled.append((name, sample, authorized))
         if not self.records:
             self.records.append({"name": name, "owner": True,
-                                 "authorized": True, "samples": 1})
-        else:
-            self.records[0]["samples"] += 1
-        return self.records[0]
+                                 "authorized": True, "samples": 0})
+        self.records[0]["samples"] += _batch_size(sample)
+        self.samples = self.records[0]["samples"]
+        return dict(self.records[0])
+
+    def replace_samples(self, name, sample, authorized=False, device="pc"):
+        if not self.records:
+            raise KeyError(f"voz não cadastrada: {name}")
+        self.replaced.append((name, list(sample), authorized))
+        self.records[0]["samples"] = len(sample)
+        self.samples = len(sample)
+        return dict(self.records[0],
+                    backup="/tmp/voices/index.json.prev-20260101-000000",
+                    device=device)
+
+
+def _batch_size(sample) -> int:
+    if isinstance(sample, list) and sample and isinstance(sample[0], list):
+        return len(sample)
+    return 1
 
 
 class FakeUI:
@@ -109,29 +129,36 @@ class VoiceTrainingTest(unittest.TestCase):
         self.assertTrue(any("não confirmada como dono" in line
                             for line in obj.ui.lines))
 
-    def test_five_samples_finish_and_enroll_the_owner(self):
+    def test_five_samples_finish_and_replace_the_owner_samples(self):
         obj = self._obj()
         self._start(obj)
         for prompt in main._VOICE_TRAIN_PROMPTS:
             self.assertTrue(main.JarvisLive._voice_train_gate(
                 obj, prompt, self._sample()))
         self.assertIsNone(obj._voice_train)
-        self.assertEqual(len(obj._speaker.enrolled),
-                         len(main._VOICE_TRAIN_PROMPTS))
-        self.assertTrue(all(name == "Anthero" and auth
-                            for name, _sample, auth in obj._speaker.enrolled))
-        self.assertIn("Pronto", obj.said[-1])
+        # 5/5 substitutes the old set: nothing is appended to the store.
+        self.assertEqual(obj._speaker.enrolled, [])
+        self.assertEqual(len(obj._speaker.replaced), 1)
+        name, vectors, auth = obj._speaker.replaced[0]
+        self.assertEqual(name, "Anthero")
+        self.assertTrue(auth)
+        self.assertEqual(len(vectors), len(main._VOICE_TRAIN_PROMPTS))
+        self.assertEqual(obj._speaker.records[0]["samples"], 5)
+        self.assertIn("Substituí", obj.said[-1])
+        self.assertTrue(any("substituída" in line for line in obj.ui.lines))
 
     def test_first_enrollment_needs_no_owner_profile(self):
         obj = self._obj()
-        obj._speaker.records = []
+        obj._speaker = FakeSpeaker(samples=0)
         self._start(obj)
         for prompt in main._VOICE_TRAIN_PROMPTS:
             self.assertTrue(main.JarvisLive._voice_train_gate(
                 obj, prompt, self._sample()))
         self.assertIsNone(obj._voice_train)
-        self.assertEqual(len(obj._speaker.enrolled),
-                         len(main._VOICE_TRAIN_PROMPTS))
+        # Nothing to replace on the first run: one enroll with the 5 vectors.
+        self.assertEqual(len(obj._speaker.enrolled), 1)
+        self.assertEqual(len(obj._speaker.enrolled[0][1]), 5)
+        self.assertEqual(obj._speaker.records[0]["samples"], 5)
 
     def test_mismatched_phrase_is_rejected_without_progress(self):
         obj = self._obj()
@@ -139,45 +166,204 @@ class VoiceTrainingTest(unittest.TestCase):
         self.assertTrue(main.JarvisLive._voice_train_gate(
             obj, "Vai tomar no cú.", self._sample()))
         self.assertEqual(obj._speaker.enrolled, [])
+        self.assertEqual(obj._speaker.replaced, [])
         self.assertEqual(obj._voice_train["done"], 0)
-        self.assertEqual(obj._voice_train["fails"], 1)
+        # The first rejected clip is a free retry: same phrase again, and no
+        # strike is spent just because a word came out wrong.
+        self.assertEqual(obj._voice_train["fails"], 0)
         self.assertIn(main._VOICE_TRAIN_PROMPTS[0], obj.said[-1])
-        self.assertLess(main._voice_phrase_score(
-            "Vai tomar no cú.", main._VOICE_TRAIN_PROMPTS[0]),
-            main._VOICE_TRAIN_MATCH_MIN)
-        # The SAME phrase is accepted on the next try and only then progresses.
+        self.assertTrue(any("sem contar falha" in line for line in obj.ui.lines))
+        # The same phrase is accepted on the next try and only then progresses.
         self.assertTrue(main.JarvisLive._voice_train_gate(
             obj, main._VOICE_TRAIN_PROMPTS[0], self._sample()))
-        self.assertEqual(len(obj._speaker.enrolled), 1)
         self.assertEqual(obj._voice_train["done"], 1)
+        self.assertEqual(len(obj._voice_train["samples"]), 1)
 
-    def test_non_owner_voice_is_rejected_without_progress(self):
+    def test_second_rejection_of_the_same_prompt_counts_a_strike(self):
+        obj = self._obj()
+        self._start(obj)
+        for _ in range(2):
+            self.assertTrue(main.JarvisLive._voice_train_gate(
+                obj, "frase completamente diferente", self._sample()))
+        self.assertEqual(obj._voice_train["done"], 0)
+        self.assertEqual(obj._voice_train["fails"], 1)
+
+    def test_phrase_is_not_rechecked_against_the_old_centroid(self):
+        """The old profile is what gets replaced — it cannot veto the new
+        sample. Identity is confirmed once, at the trigger."""
         obj = self._obj()
         self._start(obj)
         obj._owner_speaker_confirmed = lambda _text, _pcm: (
             False, 0.21, "voz=TV")
         self.assertTrue(main.JarvisLive._voice_train_gate(
             obj, main._VOICE_TRAIN_PROMPTS[0], self._sample()))
-        self.assertEqual(obj._speaker.enrolled, [])
-        self.assertEqual(obj._voice_train["done"], 0)
-        self.assertEqual(obj._voice_train["fails"], 1)
+        self.assertEqual(obj._voice_train["done"], 1)
+        self.assertEqual(obj._voice_train["fails"], 0)
+        self.assertEqual(len(obj._voice_train["samples"]), 1)
+        self.assertEqual(obj._speaker.replaced, [])
 
-    def test_three_failures_cancel_the_flow(self):
+    def test_intensity_instruction_is_not_required_in_the_transcript(self):
+        """Prompt 3 says "Agora fale um pouco mais baixo: ..." but the owner
+        repeats only the content. That was the deterministic 02/11 failure."""
+        content = "Gino, essa voz é minha."
+        prompt = main._VOICE_TRAIN_PROMPTS[2]
+        self.assertIn(":", prompt)
+        self.assertEqual(main._voice_phrase_content(prompt),
+                         "Gino, essa voz é minha.")
+        self.assertGreaterEqual(main._voice_phrase_score(content, prompt),
+                                main._VOICE_TRAIN_MATCH_MIN)
+        self.assertGreaterEqual(
+            main._voice_phrase_score("Gino, pode me ouvir?",
+                                     main._VOICE_TRAIN_PROMPTS[3]),
+            main._VOICE_TRAIN_MATCH_MIN)
+        # Prompts without a colon keep the old behaviour.
+        self.assertEqual(main._voice_phrase_content(main._VOICE_TRAIN_PROMPTS[0]),
+                         main._VOICE_TRAIN_PROMPTS[0])
+        self.assertGreaterEqual(main._voice_phrase_score(
+            main._VOICE_TRAIN_PROMPTS[0], main._VOICE_TRAIN_PROMPTS[0]), 1.0)
+
+    def test_content_only_repetition_reaches_five_of_five(self):
         obj = self._obj()
         self._start(obj)
-        for _ in range(3):
+        for prompt in main._VOICE_TRAIN_PROMPTS:
+            heard = main._voice_phrase_content(prompt)
+            self.assertTrue(main.JarvisLive._voice_train_gate(
+                obj, heard, self._sample()), heard)
+        self.assertIsNone(obj._voice_train)
+        self.assertEqual(len(obj._speaker.replaced), 1)
+        self.assertEqual(obj._speaker.records[0]["samples"], 5)
+
+    def test_three_counted_failures_cancel_the_flow(self):
+        obj = self._obj()
+        self._start(obj)
+        # First rejection is a free retry; the next three count and cancel.
+        for _ in range(4):
             self.assertTrue(main.JarvisLive._voice_train_gate(
                 obj, "frase completamente diferente", self._sample()))
         self.assertIsNone(obj._voice_train)
         self.assertEqual(obj._speaker.enrolled, [])
+        self.assertEqual(obj._speaker.replaced, [])
+        self.assertEqual(obj._speaker.records[0]["samples"], 3)
         self.assertIn("Cadastro de voz cancelado", obj.said[-1])
+
+    def test_prompt_opens_listening_after_real_audio_not_the_estimate(self):
+        """The race from the audit: Fish takes ~5 s, the estimate expires
+        first, and the owner's answer was spent as a wrong attempt.
+
+        The prompt must stay closed for the whole REAL duration (reported by
+        the say pipeline) plus the 300 ms slack, even when the character
+        estimate has already expired.
+        """
+        obj = self._obj()
+        obj._is_speaking = False          # real object, playback clock exists
+        obj._tail_until = 0.0
+        obj._out_latency = 0.2
+        obj._voice_train_watch_enabled = False   # no daemon thread in tests
+        queued = []
+
+        def _say(text, log=True):
+            queued.append(text)
+            return "queued"              # non-None: the async worker is in play
+
+        obj._say_now = _say
+        self._start(obj)
+        session = obj._voice_train
+        prompt_text = session["prompt_text"]
+        obj.heard.clear()
+        # The prompt is still being synthesised: nothing is an attempt yet.
+        self.assertTrue(session["prompt_pending"])
+        session["prompt_guard_until"] = time.monotonic() - 1.0
+        self.assertTrue(main.JarvisLive._voice_train_gate(
+            obj, main._VOICE_TRAIN_PROMPTS[0], self._sample()))
+        self.assertIs(obj._voice_train, session)
+        self.assertEqual(session["done"], 0)
+        self.assertEqual(session["fails"], 0)
+        self.assertEqual(obj.heard, [])
+        # The real PCM duration arrives (5 s): audio is still in the room even
+        # though the estimate already expired.
+        obj._voice_train_note_speech(prompt_text, 5.0)
+        self.assertFalse(session["prompt_pending"])
+        self.assertGreater(session["prompt_audio_until"], time.monotonic())
+        self.assertTrue(main.JarvisLive._voice_train_gate(
+            obj, main._VOICE_TRAIN_PROMPTS[0], self._sample()))
+        self.assertEqual(session["done"], 0)
+        self.assertEqual(session["fails"], 0)
+        self.assertEqual(obj.heard, [])
+        # Playback (real end + 300 ms) is over: the same answer now counts.
+        session["prompt_audio_until"] = time.monotonic() - 0.01
+        self.assertTrue(main.JarvisLive._voice_train_gate(
+            obj, main._VOICE_TRAIN_PROMPTS[0], self._sample()))
+        self.assertEqual(obj._voice_train["done"], 1)
+
+    def test_idle_session_times_out_with_an_audible_warning(self):
+        obj = self._obj()
+        self._start(obj)
+        session = obj._voice_train
+        session["prompt_pending"] = False
+        session["prompt_guard_until"] = 0.0
+        session["prompt_audio_until"] = 0.0
+        session["last_activity"] = (
+            time.monotonic() - main._VOICE_TRAIN_IDLE_TIMEOUT_S - 1.0)
+        self.assertTrue(main.JarvisLive._voice_train_gate(
+            obj, main._VOICE_TRAIN_PROMPTS[0], self._sample()))
+        self.assertIsNone(obj._voice_train)
+        self.assertEqual(obj._speaker.enrolled, [])
+        self.assertEqual(obj._speaker.replaced, [])
+        self.assertTrue(any("inatividade" in line for line in obj.ui.lines))
+        self.assertTrue(any("inatividade" in said for said in obj.said))
+
+    def test_failures_only_count_inside_the_time_window(self):
+        obj = self._obj()
+        self._start(obj)
+        # Free retry, then one counted strike.
+        main.JarvisLive._voice_train_gate(
+            obj, "frase completamente diferente", self._sample())
+        main.JarvisLive._voice_train_gate(
+            obj, "frase completamente diferente", self._sample())
+        session = obj._voice_train
+        self.assertEqual(session["fails"], 1)
+        # That strike ages out of the window: the next rejection cannot be
+        # added to it, so a failure from minutes ago does not stack.
+        session["fail_times"] = [
+            time.monotonic() - main._VOICE_TRAIN_FAILURE_WINDOW_S - 5.0]
+        main.JarvisLive._voice_train_gate(
+            obj, "frase completamente diferente", self._sample())
+        self.assertIsNotNone(obj._voice_train)
+        self.assertEqual(obj._voice_train["fails"], 1)
+
+    def test_enrollment_blocks_sleep(self):
+        obj = self._obj()
+        self._start(obj)
+        obj._awake = True
+        main.JarvisLive.sleep(obj, reason="teste")
+        self.assertTrue(obj._awake)
+        self.assertTrue(any("sono adiado" in line for line in obj.ui.lines))
+
+    def test_active_enrollment_always_wakes_on_a_transcript(self):
+        obj = self._obj()
+        self._start(obj)
+        self.assertTrue(main.JarvisLive._asleep_utterance_wakes(
+            obj, "qualquer coisa", self._sample()))
 
     def test_short_sample_is_asked_again(self):
         obj = self._obj()
         self._start(obj)
         main.JarvisLive._voice_train_gate(obj, "Gino", self._sample(0.3))
         self.assertEqual(obj._speaker.enrolled, [])
+        self.assertEqual(obj._speaker.replaced, [])
         self.assertIn("curta", obj.said[-1])
+
+    def test_cancel_mid_flow_leaves_the_store_untouched(self):
+        obj = self._obj()
+        self._start(obj)
+        self.assertTrue(main.JarvisLive._voice_train_gate(
+            obj, main._VOICE_TRAIN_PROMPTS[0], self._sample()))
+        self.assertEqual(obj._voice_train["done"], 1)
+        main.JarvisLive._voice_train_gate(obj, "cancela", self._sample())
+        self.assertIsNone(obj._voice_train)
+        self.assertEqual(obj._speaker.enrolled, [])
+        self.assertEqual(obj._speaker.replaced, [])
+        self.assertEqual(obj._speaker.records[0]["samples"], 3)
 
     def test_cancel_stops_the_flow(self):
         obj = self._obj()
@@ -207,6 +393,51 @@ class VoiceTrainingTest(unittest.TestCase):
         self.assertFalse(main.JarvisLive._voice_train_gate(
             obj, "cadastra minha voz", self._sample()))
         self.assertIsNone(obj._voice_train)
+
+    def test_ghost_wake_during_prompt_does_not_reset_the_phrase(self):
+        """04/11: prompts echoed back as "Gino."/"Sou eu." and each ghost was
+        counted as an attempt, cancelling the whole flow in two seconds."""
+        obj = self._obj()
+        self._start(obj)
+        session = obj._voice_train
+        said = len(obj.said)
+        obj.heard.clear()                 # the trigger itself is already logged
+        obj._is_speaking = True           # the prompt is still in the room
+        self.assertTrue(main.JarvisLive._voice_train_gate(
+            obj, "Gino", self._sample()))
+        self.assertIs(obj._voice_train, session)
+        self.assertEqual(session["done"], 0)
+        self.assertEqual(session["fails"], 0)
+        self.assertEqual(len(obj.said), said)   # no new prompt, no restart
+        self.assertEqual(obj.heard, [])         # no fake "YOU: Gino." line
+        # The same first phrase is still the one expected once the TTS ends.
+        obj._is_speaking = False
+        session["prompt_guard_until"] = 0.0
+        self.assertTrue(main.JarvisLive._voice_train_gate(
+            obj, main._VOICE_TRAIN_PROMPTS[0], self._sample()))
+        self.assertEqual(obj._voice_train["done"], 1)
+
+    def test_partial_phrase_waits_for_the_end_of_speech(self):
+        """"Gino, sou eu" is the beginning of phrase 1, not a wrong phrase:
+        it must not advance, must not spend a strike and must not re-prompt."""
+        obj = self._obj()
+        self._start(obj)
+        session = obj._voice_train
+        said = len(obj.said)
+        obj.heard.clear()
+        self.assertTrue(main.JarvisLive._voice_train_gate(
+            obj, "Gino", self._sample()))
+        self.assertTrue(main.JarvisLive._voice_train_gate(
+            obj, "Gino, sou eu", self._sample()))
+        self.assertIs(obj._voice_train, session)
+        self.assertEqual(session["done"], 0)
+        self.assertEqual(session["fails"], 0)
+        self.assertEqual(len(obj.said), said)
+        self.assertEqual(obj.heard, [])   # fragments are not the owner's turn
+        # Only the complete phrase (end of speech) advances to 1/5.
+        self.assertTrue(main.JarvisLive._voice_train_gate(
+            obj, main._VOICE_TRAIN_PROMPTS[0], self._sample()))
+        self.assertEqual(obj._voice_train["done"], 1)
 
 
 class _FakeGate:

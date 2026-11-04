@@ -14,7 +14,10 @@ limpa passa byte a byte, sem reformatação.
 Tipos detectados (nomes usados na flag ``sanitized=`` do Activity Log):
 
     tool     nome de ferramenta (Bash, Grep, Read, qoder_job, mcp__…)
-    path     caminho de arquivo (/home/…, ./repo/…) ou arquivo com extensão
+    path     caminho de arquivo ou pasta (/home/…, /projects/…, ./repo/…,
+             ``pasta/arquivo``) ou arquivo com extensão
+    phone    telefone/identificador com DDI/DDD (+55 17 9…, 5517…,
+             ``5517…@s.whatsapp.net``) — nunca vira número falado
     command  linha de comando ($ …, grep …, pytest …)
     json     JSON/XML/etiqueta solta ({…}, […], <…>)
     lang     frase em outro idioma quando a fala é português
@@ -27,10 +30,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-__all__ = ["Sanitized", "sanitize", "KINDS"]
+__all__ = ["Sanitized", "sanitize", "strip_speaker", "KINDS"]
 
 # Ordem fixa na flag `sanitized=`: deixa o log comparável entre linhas.
-KINDS = ("tool", "path", "command", "json", "lang")
+KINDS = ("tool", "path", "phone", "command", "json", "lang")
 
 # ── ferramentas ────────────────────────────────────────────────────────────
 
@@ -75,14 +78,70 @@ _TOOL_WORDS = {
 _EXT = (r"py|pyc|js|mjs|ts|tsx|jsx|json|jsonl|md|txt|log|yml|yaml|toml|ini|"
         r"cfg|conf|sh|bat|html|css|sql|db|csv|env")
 
+# Preposição que vinha antes do caminho entra na troca: "em /projects/x" →
+# "na pasta", "de /projects/x" → "da pasta". Só uma palavra, como no original.
+_PATH_PREPS = r"em|no|na|de|do|da|para|pelo|pela"
+
+# Pastas de projeto que aparecem sem barra inicial ("projects/therotv").
+# A lista é curta de propósito: "e/ou", "24/7" e "km/h" não são caminho.
+_REL_DIRS = (r"projects|repos|workspace|src|core|tests|skills|logs|memory|"
+             r"docs|actions|plugins|tools|scripts|dashboard|config")
+
 _PATH_RE = re.compile(
-    r"(?<![\w/])(?:(?:em|no|na|de|do|da|para|pelo|pela)\s+)?("
-    r"(?:~|\.{1,2})?/(?:home|root|usr|etc|var|tmp|opt|mnt|media|srv|proc|sys)"
-    r"/[^\s,;:!?\"')\]}]*"
+    r"(?<![\w/])(?:(?:" + _PATH_PREPS + r")\s+)?(?:"
+    # Qualquer caminho absoluto comum: /projects/therotv, /home/…, /opt/…
+    r"(?:~|\.{1,2})?/(?:[\w.@%+~-]+/)+[\w.@%+~-]*"
+    r"|~/(?:[\w.@%+~-]+)(?:/[\w.@%+~-]*)*"
     r"|(?:\.{1,2}/)[\w.@%+~/-]{2,}"
+    # Caminho relativo de projeto: projects/therotv, core/narration
+    r"|(?:" + _REL_DIRS + r")/[\w.@%+~-]+(?:/[\w.@%+~-]+)*"
     r"|(?:[\w.-]+/)+[\w.-]+\.(?:" + _EXT + r")\b"
     r"|[\w-]+\.(?:" + _EXT + r")\b"
     r")")
+
+# ── telefone / identificador ───────────────────────────────────────────────
+
+# Telefone com DDI/DDD, JID do WhatsApp e sequência longa de dígitos (número
+# colado no log/argumento). Valor monetário com pontos ("380.789,00"), data
+# ("02/11/2026"), hora ("16:04") e linha de log ("3190") NÃO casam: exigimos
+# +DDI, ou formato (DDD) 9…-…, ou ao menos 11 dígitos seguidos.
+_PHONE_RE = re.compile(
+    r"(?<![\w/])(?:(?P<prep>em|no|na|para|pra|pro|ao|à|a|de|do|da|com)\s+)?"
+    r"(?P<num>(?:"
+    r"\+\s*\d{1,3}(?:[\s.\-()]*[\d*]){8,16}"
+    r"|\d{11,}"
+    r"|\(?\d{2}\)?[\s.\-]+(?:9[\s.\-]?)?\d{4}[\s.\-]?\d{4}"
+    r")(?:@(?:s\.whatsapp\.net|c\.us|g\.us))?)(?![\w])")
+
+# A fala nomeia o contato quando ele já está na frase; o número vira sempre
+# "destinatário". A preposição capturada evita "chega em o destinatário".
+_PHONE_PREPS = {
+    "em": "ao destinatário",
+    "no": "no destinatário",
+    "na": "no destinatário",
+    "para": "para o destinatário",
+    "pra": "para o destinatário",
+    "pro": "para o destinatário",
+    "ao": "ao destinatário",
+    "à": "ao destinatário",
+    "a": "ao destinatário",
+    "de": "do destinatário",
+    "do": "do destinatário",
+    "da": "do destinatário",
+    "com": "com o destinatário",
+}
+
+# Troca com a preposição já consumida: mantém a frase em português natural.
+_PATH_DIR_WORDS = {
+    "em": "na pasta", "no": "na pasta", "na": "na pasta",
+    "de": "da pasta", "do": "da pasta", "da": "da pasta",
+    "para": "para a pasta", "pelo": "pela pasta", "pela": "pela pasta",
+}
+_PATH_FILE_WORDS = {
+    "em": "no arquivo", "no": "no arquivo", "na": "no arquivo",
+    "de": "do arquivo", "do": "do arquivo", "da": "do arquivo",
+    "para": "para o arquivo", "pelo": "pelo arquivo", "pela": "pelo arquivo",
+}
 
 # ── comandos ───────────────────────────────────────────────────────────────
 
@@ -159,11 +218,46 @@ _LABEL_RE = re.compile(
     r"^\s*(?:ferramenta|tool|comando|command|saída|output|log)\s*[—–:-]\s*",
     re.I)
 
+# ── nome do falante ────────────────────────────────────────────────────────
+
+# A assinatura (`*Gino:*`, `Gino:`, `Gino —`, `[Gino]`) é coisa de mensagem
+# ESCRITA. Na fala ela nunca entra: a voz já diz quem está falando.
+_MARK = r"[*_~`\s]*"
+
+
+def strip_speaker(text: str, names=()) -> str:
+    """Tira o nome do falante do começo da fala; o resto volta intacto.
+
+    ``names`` são os nomes que assinam mensagem escrita (Gino, Aline,
+    Arnaldo...). Sem nome conhecido na frente, o texto volta byte a byte —
+    a função nunca reformata fala limpa.
+    """
+    raw = str(text or "")
+    body = raw.strip()
+    known = [str(n or "").strip() for n in (names or ())]
+    known = [n for n in known if n]
+    if not body or not known:
+        return raw
+    alts = "|".join(re.escape(n) for n in sorted(known, key=len, reverse=True))
+    pattern = re.compile(
+        r"^(?:"
+        r"\[" + _MARK + r"(?:" + alts + r")" + _MARK + r"\]"
+        r"|" + _MARK + r"(?:" + alts + r")" + _MARK + r"(?::|[-–—])"
+        r")" + _MARK,
+        re.IGNORECASE)
+    match = pattern.match(body)
+    if not match:
+        return raw
+    rest = body[match.end():].lstrip(" \t\r\n")
+    return rest or raw      # só o nome sozinho não é assinatura de nada
+
+
 # ── frase de intenção por tipo dominante ───────────────────────────────────
 
 _PHRASES = {
     "command": "Vou testar isso.",
     "path": "Deixa eu ver no log.",
+    "phone": "Aviso o destinatário.",
     "tool": "Deixa eu verificar isso.",
     "json": "Pronto.",
     "lang": "Deixa eu verificar isso.",
@@ -261,6 +355,7 @@ def _sanitize_sentence(sentence: str, lang: str) -> tuple[str, list[str], list[t
 
     _swap("command", _DOLLAR_RE, _dollar_repl)
     _swap("command", _CMD_TOKEN_RE, lambda m: _CMD_WORDS.get(m.group(0), "o comando"))
+    _swap("phone", _PHONE_RE, _phone_repl)
     _swap("path", _PATH_RE, _path_repl)
     _swap("tool", _TOOL_LABEL_RE, lambda m: "")
     _swap("tool", _TOOL_RE, _tool_repl)
@@ -300,6 +395,7 @@ def _without_leaks(sentence: str) -> str:
     work = _TAG_RE.sub(" ", work)
     work = _DOLLAR_RE.sub(" ", work)
     work = _CMD_TOKEN_RE.sub(" ", work)
+    work = _PHONE_RE.sub(" ", work)
     work = _PATH_RE.sub(" ", work)
     work = _TOOL_LABEL_RE.sub(" ", work)
     work = _TOOL_RE.sub(" ", work)
@@ -321,7 +417,31 @@ def _path_repl(m: re.Match) -> str:
         # Nome de arquivo solto ("o arquivo main.py"): o substantivo já está
         # na frase, então o nome some em vez de virar "o arquivo" duas vezes.
         return ""
-    return "no log" if "log" in raw.lower() else "no arquivo"
+    low = raw.lower()
+    if "log" in low:
+        return "no log"
+    # A preposição pode ter entrado no casamento ("em /projects/x"): a troca
+    # já sai com a contração certa. Sem preposição, devolve o substantivo.
+    parts = low.split()
+    lead = parts[0] if len(parts) > 1 else ""
+    if re.search(r"\.(?:" + _EXT + r")\b", low):
+        return _PATH_FILE_WORDS.get(lead, "o arquivo")
+    return _PATH_DIR_WORDS.get(lead, "a pasta")
+
+
+def _phone_repl(m: re.Match) -> str:
+    prep = (m.groupdict().get("prep") or "").lower()
+    # "o contato 5517…" já tem o substantivo: repetir "o destinatário" soaria
+    # "o contato o destinatário". Nesse caso o número simplesmente some.
+    if not prep and re.search(
+            r"(?:contato|número|numero|conta|identificador)\s+$",
+            m.string[:m.start()], re.IGNORECASE):
+        return ""
+    change = _PHONE_PREPS.get(prep, "o destinatário")
+    # No começo da frase, "o destinatário" precisa de maiúscula.
+    if m.start() == 0 and not m.string[:m.start()].strip():
+        change = change[:1].upper() + change[1:]
+    return change
 
 
 def _tool_repl(m: re.Match) -> str:

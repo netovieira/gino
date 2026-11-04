@@ -42,7 +42,7 @@ import threading
 import time
 import unicodedata
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -60,6 +60,25 @@ SAMPLE_RATE = 16000
 # Enough samples to survive a change of tone or microphone without letting the
 # index grow forever.
 MAX_SAMPLES = 20
+
+# ── per-device voice profiles ───────────────────────────────────────────────
+# One speaker may hold one trusted profile per capture chain. ``pc`` is the
+# microphone of this machine (the historical single set); ``celular`` is built
+# only from voice notes the owner sends to his own direct WhatsApp chat while an
+# enrolment window is armed by his verified microphone voice. The profiles are
+# grouped by SPEAKER, never by device: a match against either one authorises
+# the same person, and a device label can never promote a different speaker.
+DEFAULT_DEVICE = "pc"
+DEVICE_CELLPHONE = "celular"
+
+# ── canonical device keys (physical microphone, not the filter in front) ─────
+# A profile key must name the HARDWARE. ``pc``/``celular`` remain valid labels
+# because they already exist in every index; a new enrolment records the slug
+# of the physical capture node (``core/mic_route.py``), e.g. the webcam behind
+# ``echo_cancel_source``. Old keys are migrated by an EXPLICIT mapping — see
+# ``SpeakerId.migrate_device_profiles`` — because the index does not record
+# which hardware produced the historical ``pc`` set; guessing it is exactly the
+# bug this replaces.
 
 # ── continuous (adaptive) enrollment ────────────────────────────────────────
 # A matched, authorized utterance above this similarity may be appended to the
@@ -94,6 +113,10 @@ _MIN_VOICED_SECONDS = 0.8
 VERDICT_KNOWN = "known"
 VERDICT_UNKNOWN = "unknown"
 VERDICT_INDECISIVE = "indecisive_short"
+# The active microphone has no enrolment at all. This is NOT "unknown voice":
+# comparing that clip with another microphone's centroid is what produced the
+# low scores, so the answer must be "there is no profile here" instead.
+VERDICT_NO_PROFILE = "no_profile"
 
 # Robust centroid: a sample joins the coherent cluster when it is at least this
 # close to the cluster mean. Singletons never leave the index — they just stop
@@ -230,6 +253,16 @@ def _audio_quality(pcm16: Any, sample_rate: int = SAMPLE_RATE,
     return result
 
 
+def audio_quality(pcm16: Any, sample_rate: int = SAMPLE_RATE,
+                  min_seconds: float = DEFAULT_AUTO_ENROLL_MIN_SECONDS) -> dict:
+    """Public wrapper for the enrollment quality gate.
+
+    The device-enrolment flow (phone notes) checks duration, silence and
+    clipping before an embedding is accepted. Pure DSP, no model.
+    """
+    return _audio_quality(pcm16, sample_rate, min_seconds)
+
+
 def _trim_to_voiced(
     samples: np.ndarray, sample_rate: int
 ) -> tuple[np.ndarray, float]:
@@ -346,20 +379,27 @@ def _verdict_result(verdict: str, score: float = 0.0,
 
 
 def identify_conversational(speaker: Any, embedding: Any,
-                            voiced_seconds: float | None = None) -> dict:
+                            voiced_seconds: float | None = None,
+                            device: str | None = None) -> dict:
     """Identify for the conversational gate, using the EXPANDED set.
 
     Kept out of the security path on purpose: callers that decide a privileged
     action must call ``speaker.identify(embedding)`` directly. Tolerates a
-    stand-in speaker whose ``identify`` takes a single argument.
+    stand-in speaker whose ``identify`` takes a single argument. ``device``
+    is forwarded so a filtered (per-microphone) match is possible.
     """
     kwargs: dict[str, Any] = {"include_auto": True}
     if voiced_seconds is not None:
         kwargs["voiced_seconds"] = float(voiced_seconds)
+    if device is not None:
+        kwargs["device"] = device
     try:
         return speaker.identify(embedding, **kwargs)
     except TypeError:
-        return speaker.identify(embedding)
+        try:
+            return speaker.identify(embedding, include_auto=True)
+        except TypeError:
+            return speaker.identify(embedding)
 
 
 class SpeakerId:
@@ -402,6 +442,14 @@ class SpeakerId:
         self._lock = threading.RLock()
         self._speakers: dict[str, dict[str, Any]] = {}
         self._owner_name = str(owner_name or DEFAULT_OWNER).strip() or DEFAULT_OWNER
+        # The capture chain the microphone is feeding RIGHT NOW (a physical
+        # hardware key from core/mic_route.py). None keeps the historical
+        # behaviour — compare against every profile — which is what tests and
+        # offline tools expect until main.py reports the active device.
+        self._active_device: str | None = None
+        # Explicit legacy -> canonical profile mapping (see migrate below). The
+        # index keeps it so a migration is never re-guessed on the next start.
+        self._device_aliases: dict[str, str] = {}
 
         # Adaptive enrollment. ``auto_enroll_enabled`` is a master switch; a
         # zero cap disables growth the same way.
@@ -457,6 +505,48 @@ class SpeakerId:
     def sample_rate(self) -> int:
         return self._sample_rate
 
+    # ── active capture chain ────────────────────────────────────────────────
+
+    @property
+    def active_device(self) -> str | None:
+        """Canonical key of the microphone recognition currently consults."""
+        with self._lock:
+            return self._active_device
+
+    def set_active_device(self, device: str | None) -> str | None:
+        """Tell the matcher which physical microphone is feeding the app.
+
+        ``None``/``""`` restores the old pool-of-all-profiles behaviour. A key
+        is a physical-hardware slug (``core/mic_route.profile_key``); callers
+        must pass the hardware, never the AEC filter's name.
+        """
+        label = _slugify(device) if str(device or "").strip() else None
+        with self._lock:
+            self._active_device = label
+            return label
+
+    @property
+    def device_aliases(self) -> dict[str, str]:
+        """Recorded legacy -> canonical profile mapping (read-only copy)."""
+        with self._lock:
+            return dict(self._device_aliases)
+
+    def has_profile_for(self, device: str, name: str | None = None) -> bool:
+        """Does anybody (or ``name``) have a profile for this physical mic?"""
+        label = _slugify(device)
+        if not label:
+            return False
+        with self._lock:
+            if name is not None:
+                slugs = [_slugify(name)]
+            else:
+                slugs = list(self._speakers)
+            for slug in slugs:
+                rec = self._speakers.get(slug)
+                if rec is not None and label in self._profiles_of(rec):
+                    return True
+            return False
+
     def set_owner(self, name: str) -> str:
         """Set the owner. The owner is always authorized when identified."""
         name = str(name or "").strip()
@@ -478,12 +568,17 @@ class SpeakerId:
         name: str,
         pcm16_or_embeddings: Any,
         authorized: bool = False,
+        device: str = DEFAULT_DEVICE,
     ) -> dict:
         """Add one voice sample (audio) or several embeddings under ``name``.
 
         Re-enrolling an existing person merges samples and never silently
         removes an authorization already granted. Raw audio is converted to an
         embedding and discarded; only normalized vectors are persisted.
+
+        ``device`` is the capture chain the sample came from (audit label:
+        ``pc``, the microphone name, ``celular``). It selects which profile
+        grows; matching never filters by it.
 
         ``authorized`` is an identity hint, not authentication — see the module
         docstring.
@@ -492,6 +587,7 @@ class SpeakerId:
         if not display:
             raise ValueError("nome vazio")
         slug = _slugify(display)
+        label = _slugify(device) or DEFAULT_DEVICE
 
         if _is_pcm(pcm16_or_embeddings):
             vectors = [_normalize(self.embedding(pcm16_or_embeddings))]
@@ -521,6 +617,8 @@ class SpeakerId:
                     "name": display,
                     "authorized": bool(authorized) or is_owner,
                     "samples": [],
+                    "centroid": [],
+                    "profiles": {},
                     "created": now,
                     "updated": now,
                 }
@@ -529,16 +627,303 @@ class SpeakerId:
                 # Never deauthorize by re-enrolling with the default flag.
                 rec["authorized"] = bool(rec.get("authorized")) or bool(authorized) or is_owner
 
-            samples = list(rec.get("samples") or [])
+            # The profile of the capture chain that produced this sample. The
+            # historical single set (pure microphone enrollment) is ``pc``.
+            profiles = rec.setdefault("profiles", {})
+            profile = profiles.get(label) or {
+                "samples": [],
+                "centroid": list(rec.get("centroid") or []),
+                "created": rec.get("created") or now,
+            }
+            samples = list(profile.get("samples") or [])
             samples.extend(v.tolist() for v in vectors)
             if len(samples) > MAX_SAMPLES:
                 samples = samples[-MAX_SAMPLES:]
-            rec["samples"] = samples
             centroid, _ = _centroid_from_samples(samples)
-            rec["centroid"] = centroid.tolist()
+            profile["samples"] = samples
+            profile["centroid"] = centroid.tolist()
+            profile["created"] = profile.get("created") or now
+            profile["updated"] = now
+            profiles[label] = profile
+            rec["profiles"] = profiles
+            # The top-level legacy fields mirror the chain just written, so a
+            # reader that ignores ``profiles`` still sees the current samples.
+            self._sync_primary_locked(rec, label)
             rec["updated"] = now
             self._save_locked()
             return self._public(slug, rec)
+
+    def replace_samples(
+        self,
+        name: str,
+        pcm16_or_embeddings: Any,
+        authorized: bool = True,
+        device: str = DEFAULT_DEVICE,
+    ) -> dict:
+        """Swap ONE device profile of an enrolled person for a new set.
+
+        The guided five-phrase recadastro uses this with the CURRENT
+        microphone label: the new session is that mic's current tone, so the
+        old samples of that chain must stop dragging it instead of piling up
+        next to them. Nothing is appended — that device profile keeps exactly
+        the vectors passed. Other profiles (another microphone, ``celular``)
+        are preserved; a recadastro never erases another capture chain.
+
+        The previous ``index.json`` is copied to ``index.json.prev-<stamp>``
+        (atomic, mode 0600) before the new one lands, so a bad run can be
+        undone by hand. The EXPANDED (auto-enrolled) set is left untouched.
+
+        Raises ``KeyError`` for an unknown person and ``ValueError`` for an
+        invalid set, so the caller keeps the old samples on a bad run.
+        """
+        display = str(name or "").strip()
+        if not display:
+            raise ValueError("nome vazio")
+        slug = _slugify(display)
+        label = _slugify(device) or DEFAULT_DEVICE
+
+        if _is_pcm(pcm16_or_embeddings):
+            vectors = [_normalize(self.embedding(pcm16_or_embeddings))]
+        else:
+            vectors = _embedding_rows(pcm16_or_embeddings)
+        dim = len(vectors[0])
+        if any(len(v) != dim for v in vectors):
+            raise ValueError("embeddings com dimensões diferentes")
+
+        with self._lock:
+            rec = self._speakers.get(slug)
+            if rec is None:
+                raise KeyError(f"voz não cadastrada: {display}")
+            expected = len(rec["centroid"])
+            if dim != expected:
+                raise ValueError(
+                    f"embedding com {dim} dimensões; o índice usa {expected}"
+                )
+            samples = [v.tolist() for v in vectors][-MAX_SAMPLES:]
+            centroid, _ = _centroid_from_samples(samples)
+            # Backup first: the file on disk still holds the old set here.
+            backup = self._backup_index_locked()
+            now = time.time()
+            profiles = rec.setdefault("profiles", {})
+            previous = profiles.get(label) or {}
+            profiles[label] = {
+                "samples": samples,
+                "centroid": centroid.tolist(),
+                "created": previous.get("created") or rec.get("created") or now,
+                "updated": now,
+            }
+            rec["profiles"] = profiles
+            # Never deauthorize the owner by re-running the stock flow.
+            rec["authorized"] = (
+                bool(rec.get("authorized"))
+                or bool(authorized)
+                or slug == _slugify(self._owner_name)
+            )
+            self._sync_primary_locked(rec, label)
+            rec["updated"] = now
+            self._save_locked()
+            result = self._public(slug, rec)
+            result["backup"] = backup
+            result["device"] = label
+            return result
+
+    def enroll_device(
+        self,
+        name: str,
+        pcm16_or_embeddings: Any,
+        device: str = DEFAULT_DEVICE,
+        authorized: bool = True,
+        append: bool = False,
+    ) -> dict:
+        """Write ONE device profile of an already enrolled speaker.
+
+        This is the only door for a capture chain that was not the microphone
+        of this machine (``celular``, a new headset). It never creates a new
+        speaker: the remote notes must attach to somebody the machine has
+        already enrolled, and the caller is responsible for having confirmed
+        the owner's identity on a KNOWN device. The ``celular`` label is
+        reserved for the owner — a third party can never receive it, so a
+        device label can never promote another person.
+
+        ``append=True`` adds the samples to that device's existing set (the
+        per-person pool is the union of every profile's samples); the default
+        replaces it, as the guided phone window always sends the full set.
+
+        The previous ``index.json`` is copied to ``index.json.prev-<stamp>``
+        before the write. Other device profiles are preserved; the legacy
+        top-level ``samples``/``centroid`` mirror the ``pc`` profile.
+
+        Raises ``KeyError`` for an unknown speaker, ``ValueError`` for an
+        invalid set and ``PermissionError`` for a non-owner ``celular`` call.
+        """
+        display = str(name or "").strip()
+        if not display:
+            raise ValueError("nome vazio")
+        slug = _slugify(display)
+        label = _slugify(device) or DEFAULT_DEVICE
+
+        if _is_pcm(pcm16_or_embeddings):
+            vectors = [_normalize(self.embedding(pcm16_or_embeddings))]
+        else:
+            vectors = _embedding_rows(pcm16_or_embeddings)
+        if not vectors:
+            raise ValueError("nenhuma amostra")
+        dim = len(vectors[0])
+        if any(len(v) != dim for v in vectors):
+            raise ValueError("embeddings com dimensões diferentes")
+        if label == DEVICE_CELLPHONE and slug != _slugify(self._owner_name):
+            raise PermissionError("o perfil celular é exclusivo do dono")
+
+        with self._lock:
+            rec = self._speakers.get(slug)
+            if rec is None:
+                raise KeyError(f"voz não cadastrada: {display}")
+            expected = len(rec["centroid"])
+            if dim != expected:
+                raise ValueError(
+                    f"embedding com {dim} dimensões; o índice usa {expected}"
+                )
+            samples = [v.tolist() for v in vectors][-MAX_SAMPLES:]
+            if append:
+                previous_samples = list((rec.get("profiles", {}).get(label)
+                                         or {}).get("samples") or [])
+                samples = (previous_samples + samples)[-MAX_SAMPLES:]
+            centroid, _ = _centroid_from_samples(samples)
+            backup = self._backup_index_locked()
+            now = time.time()
+            profiles = rec.setdefault("profiles", {})
+            previous = profiles.get(label) or {}
+            profiles[label] = {
+                "samples": samples,
+                "centroid": centroid.tolist(),
+                "created": previous.get("created") or now,
+                "updated": now,
+            }
+            rec["profiles"] = profiles
+            rec["authorized"] = (
+                bool(rec.get("authorized"))
+                or bool(authorized)
+                or slug == _slugify(self._owner_name)
+            )
+            rec["updated"] = now
+            self._sync_primary_locked(rec, DEFAULT_DEVICE)
+            self._save_locked()
+            result = self._public(slug, rec)
+            result["device"] = label
+            result["backup"] = backup
+            result.update(self._profile_stats(samples))
+            return result
+
+    def known_devices(self, name: str | None = None) -> list[str]:
+        """Capture chains already enrolled (audit labels, owner by default)."""
+        with self._lock:
+            if name is None:
+                slugs = list(self._speakers)
+            else:
+                slugs = [_slugify(name)]
+            found: set[str] = set()
+            for slug in slugs:
+                rec = self._speakers.get(slug)
+                if rec is None:
+                    continue
+                found.update(str(label) for label in self._profiles_of(rec))
+            return sorted(found)
+
+    def device_known(self, name: str, device: str) -> bool:
+        """True when ``name`` already has a profile for that capture chain."""
+        label = _slugify(device)
+        return bool(label) and label in self.known_devices(name)
+
+    def migrate_device_profiles(self, mapping: Mapping[str, str],
+                                persist: bool = True) -> dict:
+        """Copy legacy profiles onto EXPLICIT canonical hardware keys.
+
+        ``mapping`` is ``{"pc": "<physical-mic-slug>", ...}`` and is supplied
+        by the caller because the index never recorded which hardware produced
+        the historical ``pc`` set — inferring it from whatever mic is plugged
+        today would recreate the very miscomparison this feature fixes. The
+        caller is main.py, which derives the mapping from the AEC chain the app
+        was actually reading (documented there).
+
+        The copy is additive: the old profile is never moved or deleted, so an
+        undo is possible and an existing reader keeps working. Each pair is
+        recorded in ``device_aliases`` (persisted in index.json); once recorded
+        it is never re-applied, so deleting the copied profile on purpose is
+        not undone by the next start. The previous index is backed up before
+        the first write.
+        """
+        pairs: dict[str, str] = {}
+        for old, new in (mapping or {}).items():
+            source = _slugify(old)
+            target = _slugify(new)
+            if source and target and source != target:
+                pairs[source] = target
+
+        with self._lock:
+            pending = {old: new for old, new in pairs.items()
+                       if self._device_aliases.get(old) != new}
+            report: dict[str, Any] = {
+                "copied": 0, "skipped": 0, "aliases": {}, "backup": ""}
+            if not pending:
+                return report
+            for _slug, rec in self._speakers.items():
+                profiles = dict(self._profiles_of(rec))
+                for old, new in pending.items():
+                    legacy = profiles.get(old)
+                    if not isinstance(legacy, dict) or not (legacy.get("samples") or []):
+                        report["skipped"] += 1
+                        continue
+                    if new in profiles:
+                        # Already canonical (maybe re-enrolled later): never
+                        # overwrite the newer set with the legacy copy.
+                        report["skipped"] += 1
+                        continue
+                    samples = [list(sample) for sample in legacy.get("samples") or []]
+                    centroid, _cluster = _centroid_from_samples(samples)
+                    profiles[new] = {
+                        "samples": samples,
+                        "centroid": centroid.tolist(),
+                        "created": legacy.get("created") or rec.get("created"),
+                        "updated": legacy.get("updated"),
+                        "migrated_from": old,
+                    }
+                    report["copied"] += 1
+                if profiles:
+                    rec["profiles"] = profiles
+            if report["copied"]:
+                self._device_aliases.update(pending)
+                report["aliases"] = dict(pending)
+                if persist:
+                    report["backup"] = self._backup_index_locked()
+                    self._save_locked()
+            return report
+
+    def pool(self, name: str | None = None) -> list[dict]:
+        """Every trusted sample, per person, with the device it came from.
+
+        The pool is a UNION: samples from all capture chains of one speaker
+        are available for any match, and the device is kept only as an audit
+        label. It is never used to filter who may match.
+        """
+        with self._lock:
+            if name is None:
+                slugs = list(self._speakers)
+            else:
+                slugs = [_slugify(name)]
+            out: list[dict] = []
+            for slug in slugs:
+                rec = self._speakers.get(slug)
+                if rec is None:
+                    continue
+                for label, profile in self._profiles_of(rec).items():
+                    for sample in profile.get("samples") or []:
+                        out.append({
+                            "name": rec.get("name") or slug,
+                            "owner": slug == _slugify(self._owner_name),
+                            "device": str(label),
+                            "sample": list(sample),
+                        })
+            return out
 
     def auto_enroll(self, pcm16: Any = None, *,
                     embedding: Any = None) -> dict:
@@ -684,47 +1069,52 @@ class SpeakerId:
             rec = self._speakers.get(slug)
             if rec is None:
                 raise KeyError(f"voz não cadastrada: {name}")
-            centroid = _normalize(rec["centroid"])
+            profile = self._profiles_of(rec).get(DEFAULT_DEVICE) or {}
+            centroid = _normalize(profile.get("centroid"))
             return [
                 round(float(np.dot(_normalize(sample), centroid)), 6)
-                for sample in rec.get("samples") or []
+                for sample in profile.get("samples") or []
             ]
 
     def recompute_centroids(self, persist: bool = True) -> list[dict]:
-        """Rebuild every centroid from its coherent sample cluster.
+        """Rebuild every profile centroid from its coherent sample cluster.
 
         Maintenance entry point: samples are never deleted, only ignored by
         the centroid. ``persist`` writes the new centroids to ``index.json``;
         without it the change lives only in memory. Returns one report dict
-        per person with the cluster indices, per-sample trust and how far the
-        centroid moved.
+        per speaker PROFILE (``device`` says which one) with the cluster
+        indices, per-sample trust and how far the centroid moved.
         """
         report: list[dict] = []
         with self._lock:
-            for slug, rec in self._speakers.items():
-                samples = list(rec.get("samples") or [])
-                if not samples:
-                    continue
-                centroid, cluster = _centroid_from_samples(samples)
-                previous = np.asarray(rec["centroid"], dtype=np.float64)
-                trust = [
-                    round(float(np.dot(_normalize(sample), centroid)), 6)
-                    for sample in samples
-                ]
-                report.append({
-                    "name": rec.get("name"),
-                    "samples": len(samples),
-                    "cluster": cluster,
-                    "trust": trust,
-                    "centroid_shift": round(float(np.dot(previous, centroid)), 6),
-                })
-                rec["centroid"] = centroid.tolist()
+            for _slug, rec in self._speakers.items():
+                for device, profile in self._profiles_of(rec).items():
+                    samples = list(profile.get("samples") or [])
+                    if not samples:
+                        continue
+                    centroid, cluster = _centroid_from_samples(samples)
+                    previous = np.asarray(profile["centroid"], dtype=np.float64)
+                    trust = [
+                        round(float(np.dot(_normalize(sample), centroid)), 6)
+                        for sample in samples
+                    ]
+                    report.append({
+                        "name": rec.get("name"),
+                        "device": str(device),
+                        "samples": len(samples),
+                        "cluster": cluster,
+                        "trust": trust,
+                        "centroid_shift": round(float(np.dot(previous, centroid)), 6),
+                    })
+                    profile["centroid"] = centroid.tolist()
+                self._sync_primary_locked(rec, DEFAULT_DEVICE)
             if persist and report:
                 self._save_locked()
         return report
 
     def identify(self, embedding: Any, include_auto: bool = False,
-                 voiced_seconds: float | None = None) -> dict:
+                 voiced_seconds: float | None = None,
+                 device: str | None = None) -> dict:
         """Compare one embedding with the enrolled centroids (cosine).
 
         Returns ``{"name", "score", "sample_score", "effective_score",
@@ -732,9 +1122,20 @@ class SpeakerId:
         voice; ``score`` is the cosine against the (robust) centroid,
         ``sample_score`` the best single stored sample and ``effective_score``
         the better of the two — the number the threshold actually uses.
-        ``verdict`` is ``"known"``, ``"unknown"`` or ``"indecisive_short"``;
-        the last one means the clip is too short in voiced audio to judge
-        (``voiced_seconds``), so it must not be treated as a rejection.
+        ``verdict`` is ``"known"``, ``"unknown"``, ``"indecisive_short"`` or
+        ``"no_profile"``; the last two mean the clip must not be treated as a
+        rejection — too little voiced audio, or the active microphone has no
+        enrolment at all.
+
+        ``device`` selects the hardware profile to compare against. ``None``
+        uses the active device reported by ``set_active_device``; an explicit
+        empty string keeps the legacy behaviour of pooling every profile. When
+        a device is selected and NOBODY has a profile for it, the result is
+        ``verdict="no_profile"`` with score 0 — the clip is never compared with
+        another microphone's centroid, which is what dragged the owner's score
+        down when the app heard the webcam but held the headset's profile.
+        The expanded (auto) set is not consulted in that filtered mode: it has
+        no device label, so it cannot prove identity on THIS hardware.
 
         ``include_auto`` is the conversational switch: it also consults the
         EXPANDED (auto-enrolled) set. It defaults to False deliberately — the
@@ -743,35 +1144,78 @@ class SpeakerId:
         never widen it.
         """
         vec = _normalize(embedding)
+        # ``None`` -> whatever the app reported as the active microphone;
+        # ``""`` -> explicit "no filter" (the historical pool of all profiles).
+        if device is None:
+            wanted = self._active_device
+        else:
+            wanted = _slugify(device) if str(device or "").strip() else None
         with self._lock:
+            if wanted:
+                enrolled = any(wanted in self._profiles_of(rec)
+                               for rec in self._speakers.values())
+                if not enrolled:
+                    result = _verdict_result(VERDICT_NO_PROFILE)
+                    result["device"] = wanted
+                    result["profile"] = wanted
+                    result["reason"] = "sem cadastro de voz neste microfone"
+                    return result
             best_slug = None
             best_score = -1.0
             best_sample = -1.0
             best_effective = -1.0
+            best_device = ""
             for slug, rec in self._speakers.items():
-                centroid = np.asarray(rec["centroid"], dtype=np.float64)
-                if centroid.shape != vec.shape:
-                    # Enrolled with another embedding model: incomparable.
-                    continue
-                # A single sample can match a new recording better than the
-                # average does — the microphone, a cold or a different tone
-                # moves one sample, not the whole centroid.
-                score = float(np.dot(vec, centroid))
+                # One speaker may hold several capture chains. With an active
+                # device only THAT profile may speak for the person; without
+                # one, any profile of the same person authorises that person
+                # (the historical behaviour).
+                profiles = self._profiles_of(rec)
+                if wanted:
+                    profiles = {wanted: profiles[wanted]} if wanted in profiles else {}
+                device = ""
+                score = -1.0
                 sample_score = -1.0
-                for sample in rec.get("samples") or []:
-                    sv = np.asarray(sample, dtype=np.float64)
-                    if sv.shape == vec.shape:
-                        sample_score = max(sample_score,
-                                           float(np.dot(vec, _normalize(sv))))
-                effective = max(score, sample_score)
-                if include_auto and effective >= self._auto_anchor:
+                effective = -1.0
+                for label, profile in profiles.items():
+                    centroid = np.asarray(profile.get("centroid") or [],
+                                          dtype=np.float64)
+                    if centroid.shape != vec.shape:
+                        # Enrolled with another embedding model: incomparable.
+                        continue
+                    # A single sample can match a new recording better than the
+                    # average does — the microphone, a cold or a different tone
+                    # moves one sample, not the whole centroid.
+                    profile_score = float(np.dot(vec, centroid))
+                    profile_sample = -1.0
+                    for sample in profile.get("samples") or []:
+                        sv = np.asarray(sample, dtype=np.float64)
+                        if sv.shape == vec.shape:
+                            profile_sample = max(
+                                profile_sample,
+                                float(np.dot(vec, _normalize(sv))))
+                    profile_effective = max(profile_score, profile_sample)
+                    if profile_effective > effective:
+                        device = str(label)
+                        score = profile_score
+                        sample_score = profile_sample
+                        effective = profile_effective
+                if not device and effective < 0:
+                    continue
+                # The auto set carries no device label; in the filtered mode it
+                # could vouch for a voice recorded through another microphone,
+                # which is precisely what must not happen here.
+                if include_auto and not wanted and effective >= self._auto_anchor:
                     auto_score, auto_sample = self._auto_scores(vec, rec)
+                    if max(auto_score, auto_sample) > effective:
+                        device = "auto"
                     score = max(score, auto_score)
                     sample_score = max(sample_score, auto_sample)
                     effective = max(score, sample_score)
                 if effective > best_effective:
                     best_slug, best_score, best_sample = slug, score, sample_score
                     best_effective = effective
+                    best_device = device
             effective = best_effective
             if best_slug is None:
                 best_score = 0.0
@@ -799,8 +1243,8 @@ class SpeakerId:
                       f"centroid={max(best_score, 0.0):.3f} "
                       f"amostra={max(best_sample, 0.0):.3f} "
                       f"limiar={self._threshold:.2f} voz={name or '?'} "
-                      f"veredito={verdict}")
-            return {
+                      f"perfil={best_device or '?'} veredito={verdict}")
+            result = {
                 "name": name,
                 "score": float(round(best_score, 6)),
                 "sample_score": float(round(max(best_sample, 0.0), 6)),
@@ -809,6 +1253,13 @@ class SpeakerId:
                 "authorized": bool(authorized),
                 "verdict": verdict,
             }
+            if best_slug is not None:
+                # Which capture chain matched (pc, celular, auto). Read by the
+                # audit lines; never used to decide identity.
+                result["device"] = best_device
+            if wanted:
+                result["profile"] = wanted
+            return result
 
     def _best_trusted(self, vec: np.ndarray) -> tuple[str | None, float, float]:
         """Closest trusted voice for ``vec``: (slug, centroid score, best sample).
@@ -822,20 +1273,25 @@ class SpeakerId:
         best_sample = -1.0
         best_effective = -1.0
         for slug, rec in self._speakers.items():
-            centroid = np.asarray(rec["centroid"], dtype=np.float64)
-            if centroid.shape != vec.shape:
-                continue
-            score = float(np.dot(vec, centroid))
-            sample_score = -1.0
-            for sample in rec.get("samples") or []:
-                sv = np.asarray(sample, dtype=np.float64)
-                if sv.shape == vec.shape:
-                    sample_score = max(sample_score,
-                                       float(np.dot(vec, _normalize(sv))))
-            effective = max(score, sample_score)
-            if effective > best_effective:
-                best_slug, best_score, best_sample = slug, score, sample_score
-                best_effective = effective
+            # Trusted material of every device profile counts here: a phone
+            # note that confidently matches the owner's ``celular`` profile is
+            # still the owner when the conversational set grows.
+            for profile in self._profiles_of(rec).values():
+                centroid = np.asarray(profile.get("centroid") or [],
+                                      dtype=np.float64)
+                if centroid.shape != vec.shape:
+                    continue
+                score = float(np.dot(vec, centroid))
+                sample_score = -1.0
+                for sample in profile.get("samples") or []:
+                    sv = np.asarray(sample, dtype=np.float64)
+                    if sv.shape == vec.shape:
+                        sample_score = max(sample_score,
+                                           float(np.dot(vec, _normalize(sv))))
+                effective = max(score, sample_score)
+                if effective > best_effective:
+                    best_slug, best_score, best_sample = slug, score, sample_score
+                    best_effective = effective
         return best_slug, best_score, best_sample
 
     def _auto_scores(self, vec: np.ndarray, rec: dict) -> tuple[float, float]:
@@ -1162,13 +1618,69 @@ class SpeakerId:
 
     # ── persistence (call with the lock held) ───────────────────────────────
 
+    @staticmethod
+    def _profiles_of(rec: dict) -> dict[str, dict[str, Any]]:
+        """Device profiles of one record, with a legacy fallback.
+
+        An index written before this feature has only the top-level
+        ``samples``/``centroid``; that set is the ``pc`` profile.
+        """
+        profiles = rec.get("profiles")
+        if isinstance(profiles, dict) and profiles:
+            return profiles
+        return {
+            DEFAULT_DEVICE: {
+                "samples": rec.get("samples") or [],
+                "centroid": rec.get("centroid") or [],
+            }
+        }
+
+    @staticmethod
+    def _sync_primary_locked(rec: dict, want: str = DEFAULT_DEVICE) -> None:
+        """Keep the legacy top-level fields mirroring the primary profile.
+
+        Old readers of ``index.json`` and of ``SpeakerId.list()`` expect
+        ``samples``/``centroid`` at the top level. They always describe the
+        ``pc`` profile when it exists, so a single-profile speaker is byte
+        compatible with the previous behaviour.
+        """
+        profiles = rec.get("profiles") or {}
+        if not profiles:
+            return
+        key = want if want in profiles else None
+        if key is None:
+            key = (DEFAULT_DEVICE if DEFAULT_DEVICE in profiles
+                   else next(iter(profiles)))
+        primary = profiles[key]
+        rec["samples"] = list(primary.get("samples") or [])
+        rec["centroid"] = list(primary.get("centroid") or [])
+        rec["primary"] = str(key)
+
+    @staticmethod
+    def _profile_stats(samples: list[Any]) -> dict:
+        """Mean/min cosine of a profile's samples to their own centroid."""
+        try:
+            arr = np.asarray([_normalize(s) for s in samples], dtype=np.float64)
+        except (ValueError, TypeError):
+            return {"coherence_mean": 0.0, "coherence_min": 0.0}
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            return {"coherence_mean": 0.0, "coherence_min": 0.0}
+        mean = _normalize(arr.mean(axis=0))
+        sims = arr @ mean
+        return {
+            "coherence_mean": round(float(np.mean(sims)), 6),
+            "coherence_min": round(float(np.min(sims)), 6),
+        }
+
     def _public(self, slug: str, rec: dict) -> dict:
+        profiles = rec.get("profiles") or {}
         return {
             "name": rec["name"],
             "authorized": bool(rec.get("authorized")),
             "owner": slug == _slugify(self._owner_name),
             "samples": len(rec.get("samples") or []),
             "auto_samples": len(rec.get("auto_samples") or []),
+            "devices": sorted(str(label) for label in profiles),
             "created": rec.get("created"),
             "updated": rec.get("updated"),
         }
@@ -1176,6 +1688,7 @@ class SpeakerId:
     def _load(self) -> None:
         with self._lock:
             self._speakers = {}
+            self._device_aliases = {}
             try:
                 text = self._index_path.read_text(encoding="utf-8")
             except (FileNotFoundError, NotADirectoryError):
@@ -1189,6 +1702,12 @@ class SpeakerId:
                 return
             if not isinstance(data, dict):
                 return
+            raw_aliases = data.get("device_aliases")
+            if isinstance(raw_aliases, dict):
+                for old, new in raw_aliases.items():
+                    source, target = _slugify(old), _slugify(new)
+                    if source and target and source != target:
+                        self._device_aliases[source] = target
             speakers = data.get("speakers")
             if not isinstance(speakers, dict):
                 return
@@ -1196,24 +1715,82 @@ class SpeakerId:
             for slug, rec in speakers.items():
                 if not isinstance(rec, dict):
                     continue
-                try:
-                    samples = [
-                        _normalize(sample).tolist()
-                        for sample in (rec.get("samples") or [])
-                    ][-MAX_SAMPLES:]
+                profiles: dict[str, dict[str, Any]] = {}
+                raw_profiles = rec.get("profiles")
+                if isinstance(raw_profiles, dict):
+                    for device, profile in raw_profiles.items():
+                        if not isinstance(profile, dict):
+                            continue
+                        label = _slugify(device) or DEFAULT_DEVICE
+                        if label in profiles:
+                            continue
+                        try:
+                            samples = [
+                                _normalize(sample).tolist()
+                                for sample in (profile.get("samples") or [])
+                            ][-MAX_SAMPLES:]
+                            if samples:
+                                centroid, _ = _centroid_from_samples(samples)
+                                centroid = centroid.tolist()
+                            else:
+                                centroid = _normalize(
+                                    profile.get("centroid")).tolist()
+                                samples = [centroid]
+                        except (ValueError, TypeError):
+                            continue
+                        profiles[label] = {
+                            "samples": samples[-MAX_SAMPLES:],
+                            "centroid": centroid,
+                            "created": profile.get("created"),
+                            "updated": profile.get("updated"),
+                        }
+                        migrated = str(profile.get("migrated_from") or "")
+                        if migrated:
+                            profiles[label]["migrated_from"] = _slugify(migrated)
+                # Backward compatibility: an index written before the
+                # per-device profiles has only the top-level samples/centroid.
+                # That set is the ``pc`` profile, exactly as before.
+                if DEFAULT_DEVICE not in profiles:
+                    try:
+                        samples = [
+                            _normalize(sample).tolist()
+                            for sample in (rec.get("samples") or [])
+                        ][-MAX_SAMPLES:]
+                        if samples:
+                            # Rebuild the centroid from the coherent cluster on
+                            # load. Singletons stay in ``samples`` (owner data is
+                            # sacred) but no longer drag the average; the stored
+                            # centroid is only a fallback for an index without
+                            # samples. Nothing is written to disk here.
+                            centroid, _ = _centroid_from_samples(samples)
+                            centroid = centroid.tolist()
+                        else:
+                            centroid = _normalize(rec.get("centroid")).tolist()
+                            samples = [centroid]
+                    except (ValueError, TypeError):
+                        samples = []
                     if samples:
-                        # Rebuild the centroid from the coherent cluster on
-                        # load. Singletons stay in ``samples`` (owner data is
-                        # sacred) but no longer drag the average; the stored
-                        # centroid is only a fallback for an index without
-                        # samples. Nothing is written to disk here.
-                        centroid, _ = _centroid_from_samples(samples)
-                        centroid = centroid.tolist()
-                    else:
-                        centroid = _normalize(rec.get("centroid")).tolist()
-                        samples = [centroid]
-                except (ValueError, TypeError):
+                        profiles[DEFAULT_DEVICE] = {
+                            "samples": samples[-MAX_SAMPLES:],
+                            "centroid": centroid,
+                            "created": rec.get("created"),
+                            "updated": rec.get("updated"),
+                        }
+                if not profiles:
                     continue
+                # ``primary`` records which chain the legacy top-level fields
+                # mirror (written by _sync_primary_locked). An old index has
+                # none and falls back to the historical pc profile.
+                wanted = str(rec.get("primary") or "")
+                primary = (profiles.get(wanted) if wanted in profiles else None)
+                if primary is None:
+                    primary = (profiles.get(DEFAULT_DEVICE)
+                               or next(iter(profiles.values())))
+                primary_label = next(
+                    (label for label, prof in profiles.items()
+                     if prof is primary), DEFAULT_DEVICE)
+                centroid = list(primary["centroid"])
+                samples = list(primary["samples"])
                 # The expanded set is additive and optional: an older index or
                 # a corrupt entry must never take the person's trusted samples
                 # down with it.
@@ -1234,6 +1811,8 @@ class SpeakerId:
                     "authorized": bool(rec.get("authorized")),
                     "centroid": centroid,
                     "samples": samples[-MAX_SAMPLES:],
+                    "profiles": profiles,
+                    "primary": str(primary_label),
                     "auto_samples": auto_samples,
                     "created": rec.get("created"),
                     "updated": rec.get("updated"),
@@ -1256,6 +1835,50 @@ class SpeakerId:
         except OSError:
             pass
 
+    def _backup_index_locked(self) -> str:
+        """Atomic copy of the current index before a destructive replace.
+
+        Returns the backup path, or "" when there is nothing to copy or the
+        copy fails. A missing backup is logged and tolerated: losing the undo
+        file must never block a recadastro that already passed its gates.
+        """
+        try:
+            if not self._index_path.is_file():
+                return ""
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+            target = self._index_path.with_name(
+                f"{self._index_path.name}.prev-{stamp}")
+            suffix = 1
+            while target.exists():
+                target = self._index_path.with_name(
+                    f"{self._index_path.name}.prev-{stamp}-{suffix}")
+                suffix += 1
+            payload = self._index_path.read_bytes()
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(self._store_dir), prefix=".index-prev-",
+                suffix=".json.tmp"
+            )
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.chmod(tmp_name, 0o600)
+                except OSError:
+                    pass
+                os.replace(tmp_name, target)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+            return str(target)
+        except OSError as e:
+            print(f"[SpeakerId] backup do índice falhou: {e}")
+            return ""
+
     def _save_locked(self) -> None:
         self._store_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -1266,6 +1889,7 @@ class SpeakerId:
             "version": 1,
             "threshold": self._threshold,
             "owner": self._owner_name,
+            "device_aliases": dict(self._device_aliases),
             "updated": time.time(),
             "speakers": self._speakers,
         }

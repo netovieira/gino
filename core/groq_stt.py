@@ -46,6 +46,16 @@ NAMESPACE = "groq"
 # Segmenter, in 64 ms blocks at 16 kHz (CHUNK_SIZE 1024 in main.py).
 _START_BLOCKS = 3        # ~190 ms above threshold opens an utterance
 _END_BLOCKS = 11         # ~700 ms below closes it
+# Guided voice enrollment: the owner repeats a short phrase and the flow must
+# never advance on a breath/pause between words. 28 blocks = ~1.8 s of silence,
+# the "só depois de 1,5–2 s de fim de fala" rule (04/11/2026).
+_ENROLL_END_BLOCKS = 28
+# An utterance only closes on BLOCKS, and silence is a block. When the
+# microphone stops being heard at all (muted, a phone call, the device gone)
+# no block arrives and the segment stays open forever: `speaking` stuck at
+# True held every out-of-turn line for the full 30 s cap. Past this long with
+# no block, an open segment is an orphan — provably unfinishable.
+_STALE_SPEAKING_S = 5.0
 # Pre-roll: audio kept from BEFORE the first phoneme. ONE place sizes the ring
 # (override: plugin_config.groq.preroll_s in config/api_keys.json).
 _PREROLL_S = 1.5
@@ -98,6 +108,24 @@ _ENDPOINT_MIN_S = 0.6      # very short commands close immediately
 _CONTINUE_WINDOW_S = 3.0   # how long to wait for the rest of the sentence
 _MAX_PENDING_S = 18.0      # never hold a fragment forever
 
+# ── Fala retida quando o microfone fecha no meio da frase ───────────────────
+# Owner's rule (02/11/2026): he is NEVER ignored nor cut — a registered
+# utterance always ends in an answer or in an explicit item. When the mute
+# window (or a phone call) closes the microphone while a segment is open, the
+# audio he was saying at that instant used to be thrown away (`discard_open`).
+# Now it is RETAINED (`hold_open`): the next microphone block after the reopen
+# hands it to the worker, where the endpointing window decides whether it is
+# the head of the next sentence (merged, one transcript, one answer) or a
+# fragment old enough to be a turn of its own.
+_HELD_MIN_VOICED = _MIN_SPEECH   # fewer voiced blocks than an utterance has
+_HELD_MIN_SECONDS = 0.32         # ...or too little audio to transcribe
+_HELD_WAIT_S = 10.0              # how long a retained head waits for its tail
+# What counts as "there was a voice here" when a clip transcribes to nothing:
+# the segmenter already required voiced blocks to emit it, so one of these is
+# the second piece of evidence before the owner is asked to repeat.
+_LOST_MIN_SPEECH_S = 0.35
+_LOST_MIN_SECONDS = 0.8
+
 # Whisper hallucinates on silence, and does so with a short list of
 # favourites. Anything that is only one of these is dropped.
 _NOISE = {
@@ -108,38 +136,117 @@ _NOISE = {
 }
 
 
-def _boost_quiet(pcm16: bytes) -> bytes:
+# Speech evidence inside one clip: 64 ms frames whose RMS reaches a level only
+# a nearby voice produces. Rain, a fan and a table thump stay far below it (the
+# 02/11 ghost clips peaked at 0.06–0.07 on the mic; the owner at the desk hits
+# 0.27–0.55), and a spoken "Gino" covers several frames. Used by the wake gate
+# so a lone name decoded from noise is not mistaken for a call.
+_SPEECH_FRAME_SAMPLES = 1024          # 64 ms at 16 kHz
+_SPEECH_FRAME_RMS = 0.05
+
+
+def _speech_seconds(f: np.ndarray) -> float:
+    """Seconds of 64 ms frames loud enough to be a voice in the room."""
+    n = f.size // _SPEECH_FRAME_SAMPLES
+    if n <= 0:
+        return 0.0
+    frames = f[:n * _SPEECH_FRAME_SAMPLES].reshape(n, _SPEECH_FRAME_SAMPLES)
+    levels = np.sqrt(np.mean(frames * frames, axis=1))
+    return float(np.count_nonzero(levels >= _SPEECH_FRAME_RMS)
+                 * _SPEECH_FRAME_SAMPLES) / 16000.0
+
+
+class HeardClip(bytes):
+    """int16 PCM carrying how it was pre-processed for transcription.
+
+    ``pre_rms`` is the level of the ORIGINAL clip (before any gain) and
+    ``boost_gain`` the amplification ``_boost_quiet`` applied. The wake gate
+    needs both: a name invented out of a quiet clip that had to be multiplied
+    by 7x is not the same evidence as a full-level voice saying it.
+    ``speech_s`` is how long the original clip stayed above the frame level a
+    nearby voice reaches — the length half of the same proof, so one loud
+    thump is not a call. Bytes subclasses compare and behave exactly like
+    ``bytes`` everywhere else.
+    """
+
+    boost_gain: float = 1.0
+    pre_rms: float | None = None
+    speech_s: float | None = None
+
+    def __new__(cls, pcm: bytes, *, boost_gain: float = 1.0,
+                pre_rms: float | None = None,
+                speech_s: float | None = None):
+        obj = super().__new__(cls, pcm)
+        obj.boost_gain = float(boost_gain)
+        obj.pre_rms = None if pre_rms is None else float(pre_rms)
+        obj.speech_s = None if speech_s is None else float(speech_s)
+        return obj
+
+
+def _boost_quiet(pcm16: bytes) -> HeardClip:
     """Raise a quiet, distant utterance to a level Whisper can decode.
 
     Applied only to the clip sent to transcription; the segmenter keeps seeing
     the real room level, so a loud room does not become a loud false positive.
+    The returned clip records the original RMS, the gain applied and how many
+    seconds of it were loud enough to be a voice, so the wake gate can tell a
+    real call from amplified room noise.
     """
     x = np.frombuffer(pcm16, dtype=np.int16)
     if x.size == 0:
-        return pcm16
+        return HeardClip(pcm16, pre_rms=0.0, speech_s=0.0)
     f = x.astype(np.float32) / 32768.0
     rms = float(np.sqrt(np.mean(f * f)))
+    speech_s = _speech_seconds(f)
     if rms >= 0.03 or rms < 0.004:
-        return pcm16
+        return HeardClip(pcm16, pre_rms=rms, speech_s=speech_s)
     gain = min(_MAX_GAIN, _TARGET_RMS / rms)
     if gain <= 1.2:
-        return pcm16
+        return HeardClip(pcm16, pre_rms=rms, speech_s=speech_s)
     y = f * gain
     # Soft ceiling instead of hard clipping: a loud consonant on top of the
     # boost is scaled down, so the extra input gain never turns into distortion.
     peak = float(np.max(np.abs(y)))
     if peak > 0.95:
         y *= 0.95 / peak
-    return (y * 32767.0).astype(np.int16).tobytes()
+    return HeardClip((y * 32767.0).astype(np.int16).tobytes(),
+                     boost_gain=gain, pre_rms=rms, speech_s=speech_s)
 
 
-class _ForcedChunk(bytes):
+def _sum_speech_s(*clips) -> float | None:
+    """Total loud seconds among merged pieces (the clip Whisper sees)."""
+    values = [getattr(c, "speech_s", None) for c in clips]
+    values = [float(v) for v in values if v is not None]
+    return sum(values) if values else None
+
+
+def _min_pre_rms(*clips) -> float | None:
+    """Lowest original RMS among the merged pieces (conservative evidence)."""
+    values = [getattr(c, "pre_rms", None) for c in clips]
+    values = [float(v) for v in values if v is not None]
+    return min(values) if values else None
+
+
+class _ForcedChunk(HeardClip):
     """A chunk closed by the time boundary instead of by a pause.
 
     Same bytes, one extra fact for the worker: Smart Turn must not merge it
     with the continuation — two 15 s pieces glued back together are the same
     untranscribable blob this boundary exists to prevent.
     """
+
+
+class _HeldChunk(HeardClip):
+    """Speech retained when the microphone was closed mid-sentence.
+
+    It goes to the worker as a *pending* fragment, never straight to the
+    brain: the endpointing window waits `_HELD_WAIT_S` for the continuation
+    that completes the same phrase, and only then is one transcript produced.
+    ``held_head`` survives the merge, so an untranscribable result can be
+    announced as "perdi o começo" instead of a generic failure.
+    """
+
+    held_head: bool = True
 
 
 def preroll_from_config(cfg: dict | None) -> float:
@@ -264,6 +371,7 @@ class GroqListener:
                  fallback_transcribe: Callable[[bytes], str] | None = None,
                  on_utterance: Callable[[str, bytes], None] | None = None,
                  precheck: Callable[[bytes], bool] | None = None,
+                 on_lost: Callable[[str, str, float], None] | None = None,
                  preroll_s: float | None = None,
                  max_utterance_s: float | None = None) -> None:
         self._key, self._model, self._lang = api_key, model, language
@@ -290,6 +398,12 @@ class GroqListener:
         # drop it silently (the "modo série" gate: a TV line must cost no paid
         # transcription and must never reach the brain).
         self._precheck = precheck
+        # Called when a captured utterance yielded no text at all: the owner's
+        # rule is that speech never disappears in silence, so main.py answers
+        # it with an activity.log item ("fala não aproveitada") and a short
+        # "repete". Signature: (kind, reason, seconds), kind in
+        # {"inicio", "audio"} — "inicio" means the retained head of a sentence.
+        self._on_lost = on_lost
         self._on_status = on_status or (lambda m: None)
         self._sr = sample_rate
         self._q: queue.Queue = queue.Queue()
@@ -334,8 +448,21 @@ class GroqListener:
         # name can wake it — but nothing leaves the machine, nothing reaches
         # the panel and the speakers are not ducked for room noise.
         self.sleeping = False
+        # Silence (in blocks) that closes an utterance. Guided enrollment
+        # raises it so a phrase is only delivered after ~1.8 s of real
+        # end-of-speech, not on the first pause between words.
+        self._end_blocks = _END_BLOCKS
         self._peak = 0.0
         self._peak_t = time.monotonic()
+        # When the last microphone block arrived. A segment can only be closed
+        # BY a block (700 ms of quiet), so "no block for a while" is the one
+        # proof that an open segment will never close on its own.
+        self._last_feed_at = time.monotonic()
+        # Speech kept from a segment the closed microphone could not finish
+        # (see hold_open). Emptied exactly once, on the first block after the
+        # reopen, so the same audio can never reach the STT twice.
+        self._held_pcm: bytes = b""
+        self._held_voiced = 0
 
     @property
     def local(self) -> bool:
@@ -362,6 +489,16 @@ class GroqListener:
         """Voiced seconds allowed in one live segment before a forced cut."""
         return self._utterance_s
 
+    def set_enrollment(self, enabled: bool) -> None:
+        """Guided enrollment: wait ~1.8 s of silence before closing a phrase.
+
+        The normal 700 ms closes on the pause between words; during the five
+        prompted phrases that turned half a sentence into an "attempt" and a
+        ghost into a failure. Only the segmenter's end-of-speech window
+        changes — VAD, thresholds and devices stay untouched.
+        """
+        self._end_blocks = _ENROLL_END_BLOCKS if enabled else _END_BLOCKS
+
     def set_assistant_speaking(self, value: bool) -> None:
         """Called by the playback path: a reply is (not) coming out now."""
         value = bool(value)
@@ -379,12 +516,152 @@ class GroqListener:
             # after a turn, but no mixed-voice segment may survive into it.
             self._drop_segment = True
 
+    def mic_idle_seconds(self) -> float:
+        """Seconds since the last microphone block reached `feed()`."""
+        return max(0.0, time.monotonic() - self._last_feed_at)
+
+    def speaking_is_stale(self,
+                          max_idle_s: float = _STALE_SPEAKING_S) -> bool:
+        """An open segment that has received no audio for `max_idle_s`.
+
+        This is the proof that it can never close by itself: only `feed()`
+        can close an utterance, and nothing is being fed.
+        """
+        if not self.speaking:
+            return False
+        return self.mic_idle_seconds() > float(max_idle_s)
+
+    def discard_open(self) -> bool:
+        """Throw away a half-open segment WITHOUT transcribing it.
+
+        The no-retention variant: used when nothing may become a turn even
+        later — the owner himself silenced the microphone while asleep (there
+        the ears are the wake word's, and a stale fragment must not wake her).
+        Everything the owner says with the mic OPEN goes through `hold_open`
+        instead. Nothing is emitted here: no ghost transcription, no barge-in,
+        no status line. The room volumes come back the same way an ordinary
+        end of utterance releases them.
+
+        Runs on the microphone thread (same as `feed()`), which is what makes
+        it race-free; the only other caller is `main.py`'s stale check, which
+        fires after `_STALE_SPEAKING_S` with no block at all — the one moment
+        `feed()` is not running — and a lost race there costs one restarted
+        utterance, never mixed audio.
+        """
+        if not (self._active or self.speaking or self._seg):
+            return False
+        self._seg, self._active, self.speaking = [], False, False
+        self._above = self._below = self._voiced = 0
+        # The ring holds audio from before this instant. After a mute it is
+        # stale, and prepending it to the next sentence would paste words said
+        # with the microphone closed onto the front of it.
+        self._pre.clear()
+        if not self.assistant_speaking:
+            _duck.up()
+        return True
+
+    def hold_open(self) -> dict:
+        """Keep the audio of a segment the closed microphone cannot finish.
+
+        Returns ``{"held": bool, "seconds": float, "voiced": int,
+        "lost": bool}``. The audio becomes the pending HEAD of the next
+        utterance: it is handed to the worker on the first block after the
+        reopen (see `feed`) and merged with the continuation by the same
+        endpointing window every pause already uses. Nothing is transcribed
+        here, nothing reaches the brain now, and no barge-in is raised — the
+        owner may still be in the middle of the sentence.
+
+        A segment with too little voice to ever be transcribed is not kept:
+        it becomes an explicit "fala não aproveitada" through ``on_lost``, so
+        the owner is asked to repeat instead of being met with silence.
+        """
+        if not (self._active or self.speaking or self._seg):
+            return {"held": False, "seconds": 0.0, "voiced": 0, "lost": False}
+        seg, voiced = list(self._seg), self._voiced
+        self._seg, self._active, self.speaking = [], False, False
+        self._above = self._below = self._voiced = 0
+        self._pre.clear()
+        if not self.assistant_speaking:
+            _duck.up()
+        if not seg:
+            return {"held": False, "seconds": 0.0, "voiced": 0, "lost": False}
+        pcm = b"".join(seg)
+        secs = len(pcm) / (2 * self._sr)
+        if voiced < _HELD_MIN_VOICED or secs < _HELD_MIN_SECONDS:
+            print(f"[{self.label}] segmento aberto irrecuperável "
+                  f"({voiced} quadros de voz, {secs:.2f}s) — nada transcrevível")
+            self._lost("inicio", "curto demais para transcrever", secs)
+            return {"held": False, "seconds": secs, "voiced": voiced,
+                    "lost": True}
+        self._held_pcm = pcm
+        self._held_voiced = voiced
+        return {"held": True, "seconds": secs, "voiced": voiced, "lost": False}
+
+    @property
+    def held_seconds(self) -> float:
+        """Seconds of speech retained for the next microphone opening."""
+        return len(self._held_pcm) / (2 * self._sr) if self._held_pcm else 0.0
+
+    def has_held_speech(self) -> bool:
+        """True while a retained segment waits for the microphone to reopen."""
+        return bool(self._held_pcm)
+
+    def _lost(self, kind: str, reason: str, seconds: float) -> None:
+        """Report a captured-but-untranscribable utterance (never silence)."""
+        if self._on_lost is None:
+            return
+        try:
+            self._on_lost(str(kind), str(reason), float(seconds))
+        except Exception as e:
+            print(f"[{self.label}] aviso de fala perdida falhou ({e!r})")
+
+    def _audible_voice(self, pcm) -> bool:
+        """Was there enough voice here for "nothing heard" to be a loss?
+
+        The segmenter already required voiced blocks to emit the clip, so this
+        is the second piece of evidence — a clip that only held a door, a fan
+        or a blip is not the owner's speech and must not become a "repete".
+        A quiet, distant microphone (the 02/11 captures) still qualifies: its
+        original RMS clears `_THRESH_MIN` even when no frame reaches the loud
+        voice level.
+        """
+        secs = len(pcm) / (2 * self._sr)
+        if secs < _LOST_MIN_SECONDS:
+            return False
+        speech_s = getattr(pcm, "speech_s", None)
+        if speech_s is not None and float(speech_s) >= _LOST_MIN_SPEECH_S:
+            return True
+        pre_rms = getattr(pcm, "pre_rms", None)
+        return pre_rms is not None and float(pre_rms) >= _THRESH_MIN
+
+    def _release_held(self) -> None:
+        """Hand the retained head to the worker as pending, exactly once."""
+        pcm, voiced = self._held_pcm, self._held_voiced
+        self._held_pcm, self._held_voiced = b"", 0
+        if not pcm:
+            return
+        secs = len(pcm) / (2 * self._sr)
+        if voiced < _HELD_MIN_VOICED or secs < _HELD_MIN_SECONDS:
+            print(f"[{self.label}] fala retida irrecuperável "
+                  f"({voiced} quadros de voz, {secs:.2f}s)")
+            self._lost("inicio", "curto demais para transcrever", secs)
+            return
+        payload = _boost_quiet(pcm)
+        self._q.put(_HeldChunk(
+            payload,
+            boost_gain=getattr(payload, "boost_gain", 1.0),
+            pre_rms=getattr(payload, "pre_rms", None),
+            speech_s=getattr(payload, "speech_s", None)))
+        print(f"[{self.label}] fala retida durante o mute devolvida ao STT "
+              f"({secs:.1f}s) — o agregador decide se junta com a continuação")
+
     # ── audio thread ────────────────────────────────────────────────────────
 
     def feed(self, block, preroll_only: bool = False) -> None:
         x = np.asarray(block, dtype=np.float32).ravel()
         if x.size == 0:
             return
+        self._last_feed_at = time.monotonic()
         raw = np.asarray(block, dtype=np.int16).tobytes()
         # Record FIRST, before any gate below can return: the ring is the only
         # copy of the audio that precedes a detection, and it must keep running
@@ -393,8 +670,15 @@ class GroqListener:
         if preroll_only:
             # Only the ring — used while the assistant's own voice is in the
             # monitor, so the segmenter does not open on our echo, but the
-            # owner's first phoneme still survives for a barge-in.
+            # owner's first phoneme still survives for a barge-in. A retained
+            # head is NOT released here: our own echo must never be what wakes
+            # the owner's words up.
             return
+        if self._held_pcm:
+            # The microphone is open again with real (non-echo) audio: that is
+            # the reopen, and the retained speech goes back into the worker
+            # where the endpointing window joins it with this same phrase.
+            self._release_held()
         level = float(np.sqrt(np.mean(x * x))) / 32768.0
 
         if self._drop_segment:
@@ -464,7 +748,7 @@ class GroqListener:
             cap = _SPEAK_CAP_BLOCKS
         else:
             cap = _SLEEP_CAP_BLOCKS if self.sleeping else _MAX_BLOCKS
-        if self._below >= _END_BLOCKS or len(self._seg) >= cap:
+        if self._below >= self._end_blocks or len(self._seg) >= cap:
             self._close(capped=len(self._seg) >= cap)
             return
         if not self.assistant_speaking and not self.sleeping:
@@ -559,7 +843,13 @@ class GroqListener:
                 if not self.sleeping:
                     self._on_status(f"Ouvi {secs:.1f}s — transcrevendo no {self.label}…")
                 payload = _boost_quiet(pcm)
-                self._q.put(_ForcedChunk(payload) if forced else payload)
+                if forced:
+                    payload = _ForcedChunk(
+                        payload,
+                        boost_gain=getattr(payload, "boost_gain", 1.0),
+                        pre_rms=getattr(payload, "pre_rms", None),
+                        speech_s=getattr(payload, "speech_s", None))
+                self._q.put(payload)
         else:
             print(f"[Groq] dropped a {voiced}-block blip as noise")
             _duck.up()          # it opened an utterance (and ducked) for nothing
@@ -570,17 +860,15 @@ class GroqListener:
         Compared fragment by fragment: the hint is a paragraph, so a whole-text
         ratio would dilute a single regurgitated sentence below any threshold.
 
-        ASLEEP THIS FILTER IS OFF, on purpose. The hint is built from the phrases
-        people use to call ("<name>, tá aí?") — so an honest wake call is
-        character-for-character a fragment of the prompt and was dropped as an
-        echo. She could not answer to her own name. While asleep the worst case
-        of letting an echo through is one unnecessary "estou aqui"; while awake
-        it is a whole invented turn, which is what this filter exists to stop.
+        This runs asleep too. It used to be disabled there because the hint
+        was built from wake phrases ("<name>, tá aí?") — an honest call was
+        character-for-character a fragment of the prompt and got dropped. The
+        hint now carries the name ONCE (main._stt_name_hint), so a short
+        fragment cannot match it; what still matches is a long sentence
+        regurgitated from the hint, which is exactly the false wake.
         """
         import difflib
         import re as _re
-        if self.sleeping:
-            return False
         hint = (self.prompt or "").lower()
         if not hint or len(text) < 8:
             return False
@@ -644,19 +932,34 @@ class GroqListener:
     def _run(self) -> None:
         pending = b""
         pending_at = 0.0
+        pending_held = False
         while not self._stop.is_set():
             try:
                 pcm = self._q.get(timeout=0.25)
             except queue.Empty:
-                if pending and time.monotonic() - pending_at >= _CONTINUE_WINDOW_S:
+                wait = _HELD_WAIT_S if pending_held else _CONTINUE_WINDOW_S
+                if pending and time.monotonic() - pending_at >= wait:
                     print(f"[{self.label}] continuação não veio — transcrevendo o trecho")
                     self._process_utterance(pending)
                     pending, pending_at = b"", 0.0
+                    pending_held = False
                 continue
             if self._stop.is_set():
                 break
             if self.sleeping:
                 self._process_utterance(pcm)
+                continue
+            if isinstance(pcm, _HeldChunk):
+                # Speech retained when the microphone closed mid-sentence. It
+                # is never a turn by itself: it waits longer for the tail that
+                # completes the same phrase, and the merge below hands ONE
+                # transcript to the brain (no double answer, no double echo).
+                if pending:
+                    self._process_utterance(pending)
+                    pending, pending_at = b"", 0.0
+                    pending_held = False
+                pending, pending_at = pcm, time.monotonic()
+                pending_held = True
                 continue
             if isinstance(pcm, _ForcedChunk):
                 # Closed by the time boundary, not by a pause: it is already a
@@ -665,15 +968,28 @@ class GroqListener:
                 if pending:
                     self._process_utterance(pending)
                     pending, pending_at = b"", 0.0
+                    pending_held = False
                 self._process_utterance(pcm)
                 continue
 
             now = time.monotonic()
             if pending:
                 age = now - pending_at
-                if age <= _CONTINUE_WINDOW_S:
-                    merged = (pending + (b"\x00\x00" * int(0.20 * self._sr)) + pcm)
+                if age <= (_HELD_WAIT_S if pending_held else _CONTINUE_WINDOW_S):
+                    gap = b"\x00\x00" * int(0.20 * self._sr)
+                    merged = HeardClip(
+                        pending + gap + pcm,
+                        boost_gain=max(getattr(pending, "boost_gain", 1.0),
+                                       getattr(pcm, "boost_gain", 1.0)),
+                        pre_rms=_min_pre_rms(pending, pcm),
+                        speech_s=_sum_speech_s(pending, pcm))
+                    if getattr(pending, "held_head", False):
+                        # The retained head survives the merge, so a clip that
+                        # still transcribes to nothing is announced as "perdi
+                        # o começo" and not as a generic failure.
+                        merged.held_head = True
                     pending = b""
+                    pending_held = False
                     if (len(merged) < int(_MAX_PENDING_S * 2 * self._sr)
                             and not self._endpoint_complete(merged)):
                         pending, pending_at = merged, now
@@ -684,6 +1000,7 @@ class GroqListener:
                 # real turn. Send it before evaluating the new one.
                 self._process_utterance(pending)
                 pending, pending_at = b"", 0.0
+                pending_held = False
 
             if (len(pcm) < int(_MAX_PENDING_S * 2 * self._sr)
                     and not self._endpoint_complete(pcm)):
@@ -774,6 +1091,15 @@ class GroqListener:
         if len(clean) < 2 or clean.lower() in _NOISE:
             if not self.sleeping:
                 self._on_status(f"{self.label} não reconheceu nada nisso.")
+                if len(clean) < 2 and self._audible_voice(pcm):
+                    # The owner's rule (02/11/2026): eight captures vanished
+                    # here with nothing but this status line. A clip with
+                    # audible voice that Whisper could not read is an item,
+                    # not a discard — main.py logs "fala não aproveitada" and
+                    # asks him to repeat.
+                    self._lost("inicio" if getattr(pcm, "held_head", False)
+                               else "audio",
+                               "o STT não reconheceu nada", secs)
                 _duck.up()  # no text reaches main: close the exchange here
             return
         print(f"[{self.label}] {secs:.1f}s of speech → {len(clean)} chars in "
@@ -806,4 +1132,11 @@ class GroqListener:
 
     def stop(self) -> None:
         self._stop.set()
+        # A retained fragment belongs to a session that is ending: nothing can
+        # reopen its microphone, so it must not survive into the next listener.
+        # Say it on the console instead of letting it disappear unseen.
+        if self._held_pcm:
+            print(f"[{self.label}] fala retida descartada no desligamento "
+                  f"({self.held_seconds:.1f}s) — microfone desta sessão fechou")
+        self._held_pcm, self._held_voiced = b"", 0
         _duck.up()

@@ -64,6 +64,90 @@ class LeakTypesTest(unittest.TestCase):
         self.assertTrue(result.text)
 
 
+class PhoneAndDirectoryLeakTest(unittest.TestCase):
+    """Casos reais da tarde de 02/11: número e /projects/therotv na fala."""
+
+    def test_narration_phone_number_is_never_spoken(self):
+        result = _sanitize(
+            "deixa comigo: a mensagem chega em 5517997248315 já")
+        self.assertEqual(result.kinds, ("phone",))
+        self.assertFalse(any(ch.isdigit() for ch in result.text), result.text)
+        self.assertIn("destinatário", result.text)
+        self.assertIn("a mensagem", result.text)
+
+    def test_formatted_and_masked_phone_numbers_are_caught(self):
+        for text in (
+            "já estou mandando a mensagem pra +5517997111056",
+            "deixa comigo: a mensagem chega em +55 17 9****-**15 já",
+            "manda pra (17) 99711-1056 agora",
+        ):
+            with self.subTest(text=text):
+                result = _sanitize(text)
+                self.assertIn("phone", result.kinds)
+                self.assertIn("destinatário", result.text)
+                self.assertFalse(any(ch.isdigit() for ch in result.text),
+                                 result.text)
+                self.assertNotIn("*", result.text)
+
+    def test_whatsapp_jid_is_not_spoken(self):
+        result = _sanitize(
+            "o contato 5517997111056@s.whatsapp.net está online.")
+        self.assertEqual(result.kinds, ("phone",))
+        self.assertNotIn("5517", result.text)
+        self.assertNotIn("@s.whatsapp.net", result.text)
+        self.assertIn("o contato", result.text)
+
+    def test_project_directory_is_not_spoken(self):
+        for text in (
+            "Achei — Therotv está em /projects/therotv.",
+            "Vou ler /projects/therotv",
+            "Leitura direta de /projects/therotv foi bloqueada pelo "
+            "permissímetro.",
+            "o mapa está em projects/therotv agora",
+        ):
+            with self.subTest(text=text):
+                result = _sanitize(text)
+                self.assertIn("path", result.kinds)
+                self.assertNotIn("/projects", result.text)
+                self.assertNotIn("projects/therotv", result.text)
+                self.assertTrue(result.text)
+
+    def test_dates_money_and_common_slashes_are_not_leaks(self):
+        phrases = [
+            "A reunião é em 02/11/2026 às 16:04.",
+            "Custou R$ 380.789,00.",
+            "Vale para e/ou casos.",
+            "Trabalho 24/7 e ando a 60 km/h.",
+            "Mandei 2 mensagens e recebi 3 respostas.",
+        ]
+        for phrase in phrases:
+            with self.subTest(phrase=phrase):
+                result = _sanitize(phrase)
+                self.assertEqual(result.text, phrase)
+                self.assertEqual(result.kinds, ())
+
+
+class TTSPlayerEntryTest(unittest.TestCase):
+    """O ponto de entrada de core/tts.py também filtra antes do motor."""
+
+    def test_player_sanitizes_before_the_engine(self):
+        from core.tts import TTSPlayer
+
+        class _Engine:
+            def __init__(self):
+                self.seen = []
+
+            def speak(self, text):
+                self.seen.append(text)
+
+        engine = _Engine()
+        TTSPlayer(engine).speak("já estou mandando pra +5517997111056")
+        self.assertEqual(len(engine.seen), 1)
+        self.assertFalse(any(ch.isdigit() for ch in engine.seen[0]),
+                         engine.seen[0])
+        self.assertIn("destinatário", engine.seen[0])
+
+
 class LanguageTest(unittest.TestCase):
     def test_english_sentence_is_caught_when_the_owner_speaks_portuguese(self):
         result = _sanitize("The tool failed")
@@ -184,7 +268,62 @@ class SayPipelineTest(unittest.TestCase):
         # O texto exibido continua sendo o original; a troca está no tts.
         self.assertIn("Bash", activity.strip(obj.ui.logs[-1]))
 
-    def test_cut_speech_is_honest_and_conclusion_is_reannounced(self):
+    def test_persona_voice_phone_and_path_never_reach_the_tts(self):
+        """A fala da persona usa a mesma esteira guardada de `_say_blocking`."""
+        obj = self._obj()
+        seen = []
+        with mock.patch("core.brain.settings", return_value={}), \
+                mock.patch("core.numwords.speakable",
+                           side_effect=lambda text, style="words": text), \
+                mock.patch("core.brain.synth_pcm24k",
+                           side_effect=lambda text, st, **_kw:
+                               seen.append(text) or b"\x00" * 2400):
+            obj._say_blocking(
+                "já estou mandando a mensagem pra +5517997111056",
+                label="Arnaldo", voice_id="v-arnaldo",
+                chan="persona", origin="persona")
+            obj._say_blocking(
+                "Vou ler /projects/therotv", label="Arnaldo",
+                voice_id="v-arnaldo", chan="persona", origin="persona")
+        self.assertEqual(len(seen), 2)
+        self.assertFalse(any(ch.isdigit() for ch in seen[0]), seen[0])
+        self.assertIn("destinatário", seen[0])
+        self.assertNotIn("/projects", seen[1])
+        persona_phone = activity.parse(obj.ui.logs[-2])
+        persona_path = activity.parse(obj.ui.logs[-1])
+        self.assertEqual(persona_phone["origin"], "persona")
+        self.assertIn("phone", persona_phone["sanitized"])
+        self.assertIn("path", persona_path["sanitized"])
+
+    def test_narration_phone_and_path_never_reach_the_tts(self):
+        obj = self._obj()
+        seen = []
+        with mock.patch("core.brain.settings", return_value={}), \
+                mock.patch("core.numwords.speakable",
+                           side_effect=lambda text, style="words": text), \
+                mock.patch("core.brain.synth_pcm24k",
+                           side_effect=lambda text, st: seen.append(text) or b"\x00" * 2400):
+            obj._say_blocking(
+                "deixa comigo: a mensagem chega em 5517997248315 já",
+                label="Gino", chan="voz", origin="narração",
+                log_text="SYS: Gino — deixa comigo: a mensagem chega em "
+                         "5517997248315 já")
+            obj._say_blocking(
+                "Vou ler /projects/therotv", label="Gino", chan="voz",
+                origin="narração", log_text="SYS: Gino — Vou ler /projects/therotv")
+        self.assertEqual(len(seen), 2)
+        self.assertFalse(any(ch.isdigit() for ch in seen[0]), seen[0])
+        self.assertIn("destinatário", seen[0])
+        self.assertNotIn("/projects", seen[1])
+        phone = activity.parse(obj.ui.logs[-2])
+        path = activity.parse(obj.ui.logs[-1])
+        self.assertEqual(phone["origin"], "narração")
+        self.assertIn("phone", phone["sanitized"])
+        self.assertIn("path", path["sanitized"])
+        self.assertNotIn("5517", phone["tts"])
+        self.assertNotIn("/projects", path["tts"])
+
+    def test_cut_speech_is_honest_and_conclusion_is_not_dumped_later(self):
         obj = self._obj()
         obj._turn_ref = 7
         with mock.patch("core.brain.settings", return_value={}), \
@@ -201,15 +340,15 @@ class SayPipelineTest(unittest.TestCase):
         self.assertEqual(len(notes), 1)
         self.assertEqual(notes[0]["text"], "O resultado está bom.")
 
-        # Turno seguinte: só a conclusão, não a frase inteira.
+        # 02/11/2026: o resto de uma resposta cortada não é despejado no
+        # turno seguinte por cima do assunto novo. O turno fecha a nota sem
+        # falar nada (a pergunta original não é conhecida nesta vez, então
+        # não há citação possível).
         spoken = []
-        obj._turn_ref = 8
         obj._say_now = lambda text, **kw: spoken.append(text)
+        obj._turn_ref = 8
         obj._flush_speech_cut_note()
-        self.assertEqual(len(spoken), 1)
-        self.assertIn("Só para fechar o assunto anterior", spoken[0])
-        self.assertIn("O resultado está bom", spoken[0])
-        self.assertNotIn("Terminei a análise", spoken[0])
+        self.assertEqual(spoken, [])
         self.assertEqual(getattr(obj, "_speech_cut_notes"), [])
 
 
@@ -287,7 +426,7 @@ class BackgroundAvisoCutNoteTest(unittest.TestCase):
         obj._flush_speech_cut_note_quiet()
         self.assertEqual(len(calls), 1)
         line, kw = calls[0]
-        self.assertIn("Só para fechar o assunto anterior", line)
+        self.assertIn("Sobre o trabalho que estava rodando", line)
         self.assertIn("Terminei em segundo plano: build.", line)
         self.assertTrue(kw.get("log"))
         self.assertEqual(kw.get("origin"), "conclusão")
@@ -302,7 +441,7 @@ class BackgroundAvisoCutNoteTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(getattr(obj, "_speech_cut_notes"), [])
 
-    def test_quiet_flush_leaves_answer_notes_for_the_turn_flush(self):
+    def test_quiet_flush_leaves_answer_notes_from_a_replaced_turn_for_discard(self):
         obj = self._obj()
         obj._queue_speech_cut_note("O resultado está bom.", turn=7,
                                    reason="meio")
@@ -313,11 +452,11 @@ class BackgroundAvisoCutNoteTest(unittest.TestCase):
         obj._say_now = lambda text, **kw: spoken.append(text)
         obj._turn_ref = 8
         obj._flush_speech_cut_note()
-        self.assertEqual(len(spoken), 1)
-        self.assertIn("O resultado está bom", spoken[0])
+        # Fala que o dono interrompeu não volta depois: o turno novo manda.
+        self.assertEqual(spoken, [])
         self.assertEqual(getattr(obj, "_speech_cut_notes"), [])
 
-    def test_turn_flush_does_not_repeat_a_queued_aviso(self):
+    def test_turn_flush_keeps_queued_aviso_for_the_quiet_moment(self):
         obj = self._obj()
         obj._queue_speech_cut_note("Terminei em segundo plano: build.",
                                    turn=7, reason="tts", announce=True)
@@ -327,6 +466,11 @@ class BackgroundAvisoCutNoteTest(unittest.TestCase):
         obj._say_now = lambda text, **kw: spoken.append(text)
         obj._turn_ref = 9
         obj._flush_speech_cut_note()
+        # Aviso de segundo plano não entra no fecho do turno; sai no silêncio.
+        self.assertEqual(spoken, [])
+        self.assertEqual(len(obj._speech_cut_notes), 2)
+        self._age()(obj)
+        obj._flush_speech_cut_note_quiet()
         self.assertEqual(len(spoken), 1)
         self.assertEqual(getattr(obj, "_speech_cut_notes"), [])
 

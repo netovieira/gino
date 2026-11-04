@@ -8,6 +8,7 @@ Whisper.
 from __future__ import annotations
 
 import json
+import stat
 import tempfile
 import time
 import unittest
@@ -152,6 +153,49 @@ class SpeakerIdStoreTest(unittest.TestCase):
 
         reopened = speaker_id.SpeakerId(store_dir=self.store)
         self.assertTrue(reopened.identify(_vec(8))["known"])
+
+    def test_replace_samples_swaps_the_trusted_set_and_keeps_a_backup(self):
+        old = [_vec(30 + i) for i in range(7)]
+        self.sid.enroll("Anthero", old)
+        self.assertEqual(self.sid.list()[0]["samples"], 7)
+        before = (self.store / "index.json").read_text(encoding="utf-8")
+
+        fresh = [_near(_vec(40), seed=50 + i, mix=0.02) for i in range(5)]
+        result = self.sid.replace_samples("Anthero", fresh)
+        self.assertTrue(result["owner"])
+        self.assertTrue(result["authorized"])
+        self.assertEqual(result["samples"], 5)
+
+        # The previous index survives untouched, atomic and private.
+        backup = Path(result["backup"])
+        self.assertTrue(backup.is_file())
+        self.assertEqual(backup.read_text(encoding="utf-8"), before)
+        self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
+        index_file = self.store / "index.json"
+        self.assertEqual(stat.S_IMODE(index_file.stat().st_mode), 0o600)
+        self.assertEqual(list(self.store.glob(".index-*.tmp")), [])
+
+        stored = json.loads(index_file.read_text(encoding="utf-8"))
+        person = stored["speakers"]["anthero"]
+        # Exactly the new five — the old seven are gone, not appended.
+        self.assertEqual(len(person["samples"]), 5)
+        for kept, wanted in zip(person["samples"], fresh):
+            self.assertTrue(np.allclose(kept, wanted, atol=1e-9))
+        self.assertGreaterEqual(
+            float(np.dot(np.mean(fresh, axis=0) /
+                         np.linalg.norm(np.mean(fresh, axis=0)),
+                         np.asarray(person["centroid"]))), 0.999)
+        self.assertTrue(self.sid.identify(_near(_vec(40), mix=0.01))["known"])
+
+        reopened = speaker_id.SpeakerId(store_dir=self.store)
+        self.assertEqual(reopened.list()[0]["samples"], 5)
+
+        with self.assertRaises(KeyError):
+            self.sid.replace_samples("Ninguém", fresh)
+        with self.assertRaises(ValueError):
+            self.sid.replace_samples("Anthero", [_vec(1, dim=4)])
+        # A rejected call must not touch the store.
+        self.assertEqual(self.sid.list()[0]["samples"], 5)
 
     def test_bad_embeddings_and_missing_names_raise(self):
         with self.assertRaises(ValueError):

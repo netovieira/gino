@@ -37,6 +37,14 @@ DEFAULT_VALUE = ""
 _cache: dict[str, list[str]] | None = None
 _cache_lock = threading.Lock()
 
+# PortAudio's PulseAudio backend aborts the process
+# ("Assertion 'm->n_waiting > 0' failed ... pa_threaded_mainloop_wait") when two
+# threads enumerate/open streams at the same time. That is exactly what happens
+# at startup: prefetch() enumerates on its own thread while _listen_audio()
+# resolves the saved microphone on the event-loop thread. Every sounddevice
+# call that enumerates or opens a probe stream goes through this lock.
+_enum_lock = threading.RLock()
+
 # Which host API each direction settled on, so resolve() opens the same endpoint
 # the picker listed. Filled in by _query().
 _chosen_api: dict = {"input": None, "output": None}
@@ -208,6 +216,11 @@ def configure(input_rate: int, output_rate: int) -> None:
 
 
 def _usable(idx: int, kind: str) -> bool:
+    with _enum_lock:
+        return _usable_serialized(idx, kind)
+
+
+def _usable_serialized(idx: int, kind: str) -> bool:
     """Can this device actually be opened at the rate we need?
 
     Deliberately opens a real stream rather than asking
@@ -256,9 +269,16 @@ def _is_pseudo(name: str) -> bool:
 
 
 def _query() -> dict[str, list[str]]:
+    with _enum_lock:
+        return _query_serialized()
+
+
+def _query_serialized() -> dict[str, list[str]]:
     """Return {'input': [names...], 'output': [names...]}. Never raises.
 
-    Only real, selectable devices — see the note above."""
+    Only real, selectable devices — see the note above. Callers must already
+    hold `_enum_lock` (sounddevice/PulseAudio are not safe to enumerate from
+    two threads at once)."""
     out: dict[str, list[str]] = {"input": [], "output": []}
     try:
         import platform
@@ -324,9 +344,13 @@ def prefetch() -> None:
     settings drawer never pays for enumeration on the Qt thread."""
     def _work():
         global _cache
-        result = _query()
-        with _cache_lock:
-            _cache = result
+        # Hold the lock through the cache write: a thread that waits for the
+        # enumeration to finish must find the result already published, not
+        # start a second enumeration right after the first one releases.
+        with _enum_lock:
+            result = _query()
+            with _cache_lock:
+                _cache = result
         print(f"[Audio] {len(result['input'])} input / "
               f"{len(result['output'])} output devices found")
     threading.Thread(target=_work, daemon=True, name="audio-devices").start()
@@ -339,13 +363,23 @@ def list_devices(kind: str, refresh: bool = False) -> list[str]:
     with _cache_lock:
         cached = None if refresh else _cache
     if cached is None:
-        cached = _query()
-        with _cache_lock:
-            _cache = cached
+        with _enum_lock:
+            # The prefetch may have published the cache while we waited.
+            with _cache_lock:
+                cached = None if refresh else _cache
+            if cached is None:
+                cached = _query()
+                with _cache_lock:
+                    _cache = cached
     return list(cached.get(kind, []))
 
 
 def resolve(name: str, kind: str):
+    with _enum_lock:
+        return _resolve_serialized(name, kind)
+
+
+def _resolve_serialized(name: str, kind: str):
     """Turn a saved device name into something sounddevice accepts.
 
     Returns None for "system default" — which is also what we return when the
