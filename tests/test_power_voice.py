@@ -46,7 +46,7 @@ class FakeSpeaker:
     def embedding(self, _pcm):
         return [1.0, 0.0] if self.owner else [0.0, 1.0]
 
-    def identify(self, _emb):
+    def identify(self, _emb, device=None):
         if self.owner:
             return {"name": "Anthero", "score": 1.0, "known": True,
                     "authorized": True}

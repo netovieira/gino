@@ -138,6 +138,37 @@ class PowerManager:
         self._log(f"{p.kind} executed")
         return out
 
+    def execute_owner(self, kind: str, reason: str = "") -> str:
+        """Run a power action the OWNER just ordered out loud.
+
+        Same owner rule as ``RestartManager.confirm_owner``: the direct order
+        is the authorisation, and the identity proof is the audio layer's
+        privileged voiceprint (this method is never reached by a model tool
+        call). Rate limit and platform support still apply; a parked request
+        of another kind is dropped so it cannot fire later.
+        """
+        kind = str(kind or "").strip().lower()
+        if kind not in PHRASES:
+            return f"Ação de energia desconhecida: {kind}."
+        with self._lock:
+            self._pending = None
+        if kind == "lock":
+            return self.lock()
+        if self._rate_limited(kind):
+            self._log(f"{kind} refused by rate limit (direct owner order)")
+            return (f"Ação de {LABELS[kind]} está limitada a uma vez a cada "
+                    f"{int(RATE_LIMIT_SECONDS/60)} minutos. Nada foi feito.")
+        try:
+            out = self.execute(kind)
+        except Exception as e:
+            self._log(f"{kind} failed: {e}")
+            return f"Não consegui {LABELS[kind]}: {str(e)[:160]}. Nada foi feito."
+        with self._lock:
+            self._last_at[kind] = time.monotonic()
+        self._log(f"{kind} executed (direct owner order)"
+                  + (f" — {str(reason)[:80]}" if reason else ""))
+        return out
+
     def cancel(self) -> str:
         with self._lock:
             had = self._pending is not None

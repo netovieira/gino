@@ -30,11 +30,13 @@ WHY THE HELPER IS DETACHED
 WHY THE PENDING REQUEST IS ON DISK
     The manager used to keep the parked request only in memory. The model's
     tool call and the owner's spoken phrase are handled in the same process,
-    but a request that outlived the five-minute timer silently disappeared —
-    and ``status`` then said "no restart awaiting" instead of admitting the
-    request had expired. Now the request is written to
-    ``memory/restart_pending.json`` (it survives a process restart too), and the
-    status answer distinguishes "nothing was asked" from "it expired".
+    but a request that outlived its timer silently disappeared — and ``status``
+    then said "no restart awaiting" instead of admitting the request had
+    expired. Now the request is written to ``memory/restart_pending.json`` (it
+    survives a process restart too), and the status answer distinguishes
+    "nothing was asked" from "it expired". When it expires, the file is *moved*
+    to ``memory/restart_last_pending.json`` instead of being deleted, so a late
+    "confirmo reiniciar" can renew the request with the reason it always had.
 
 RATE LIMIT
     One assistant restart per five minutes. A restart loop is the worst failure
@@ -63,6 +65,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Local, git-ignored state next to the other memory/*.json files.
 STATE_PATH = BASE_DIR / "memory" / "restart_pending.json"
 LAST_PATH = BASE_DIR / "memory" / "restart_last.json"
+# The last request that timed out. Kept so a late confirmation can be renewed
+# with the original kind/reason instead of being re-parked as a blank request.
+ARCHIVE_PATH = BASE_DIR / "memory" / "restart_last_pending.json"
 
 # Wall clock of this process. A request saved by a PREVIOUS process is stale by
 # definition — the assistant already restarted, so asking again after boot is
@@ -73,7 +78,13 @@ _BOOT_GRACE_S = 2.0
 # How long a pending request stays useful. Long enough for the owner to come
 # back after a failed voiceprint or a busy turn; short enough that a forgotten
 # "confirmo reiniciar" cannot fire much later.
-CONFIRM_TIMEOUT_SECONDS = 900.0
+#
+# 30 minutes, not the original 15, by the owner's decision on 02/11/2026: a
+# request parked at 11:23 and confirmed at 11:51 had expired, the phrase fell
+# through to the "start a restart" gate and parked a new request in silence —
+# a confirmation loop that never restarted anything. Widening the window keeps
+# a legitimate "I stepped away" confirmation alive; the rate limit stays as is.
+CONFIRM_TIMEOUT_SECONDS = 1800.0
 
 # One assistant restart per five minutes.
 RATE_LIMIT_SECONDS = 300.0
@@ -87,6 +98,40 @@ _PHRASES = {
 }
 
 _RATE_MESSAGE = "one assistant restart per 5 minutes"
+
+# Origem do reinício: o manager NUNCA inventa que o dono ordenou. Um reason
+# vazio vira "origem não informada"; o rótulo antigo que main.py gravava por
+# detecção automática de intenção não é ordem literal do dono e é registrado
+# como o que de fato foi: uma detecção do app.
+UNKNOWN_ORIGIN = "origem não informada"
+AUTO_DETECTION_REASON = (
+    "detecção automática de intenção — fala sobre reiniciar, não ordem literal")
+# Rótulos que o caminho automático usava antes desta correção (main.py ainda
+# passa "ordem direta do dono" até a fatia que mexe nele). Nunca são aceitos
+# como prova de ordem: viram AUTO_DETECTION_REASON.
+_LEGACY_ORDER_LABELS = (
+    "ordem direta do dono",
+    "ordered directly by the owner",
+    "direct order from the owner",
+    "ordem direta",
+)
+
+
+def recorded_origin(reason: str = "", previous: str = "") -> str:
+    """Texto gravado como origem: real, sem atribuir ordem ao dono.
+
+    ``reason`` é o que o chamador informou; ``previous`` é o reason do pedido
+    que já estava estacionado. Vazio nos dois vira UNKNOWN_ORIGIN. Um rótulo
+    legado de ordem direta é tratado como detecção automática — ele nasceu de
+    um regex de intenção, não de uma ordem literal verificada.
+    """
+    received = _short(reason) or _short(previous)
+    if not received:
+        return UNKNOWN_ORIGIN
+    if _normalize(received) in {_normalize(label)
+                                for label in _LEGACY_ORDER_LABELS}:
+        return AUTO_DETECTION_REASON
+    return received
 
 
 @dataclass
@@ -140,11 +185,15 @@ class RestartManager:
         # Keep the rate limit next to the request file, never in a shared path.
         self.last_path = (self.state_path.with_name("restart_last.json")
                           if state_path is not None else LAST_PATH)
+        self.archive_path = (self.state_path.with_name(
+                                "restart_last_pending.json")
+                             if state_path is not None else ARCHIVE_PATH)
 
         self._lock = threading.RLock()
         self._pending: Optional[_PendingRequest] = None
         self._expired: Optional[dict] = None
         self._last_assistant_at: Optional[float] = None
+        self._last_reason: str = ""
         self._load_last()
 
         self._shutdown_cb: Optional[Callable[[], None]] = None
@@ -219,15 +268,19 @@ class RestartManager:
             "phrase":     p.phrase,
             "created_at": time.time() - max(time.monotonic() - p.at, 0.0),
         }
-        tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        self._write_json(self.state_path, payload)
+
+    def _write_json(self, path: Path, payload: dict) -> None:
+        """Atomic 0600 write; a failure is logged, never raised."""
+        tmp = path.with_suffix(path.suffix + ".tmp")
         try:
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(payload, ensure_ascii=False),
                            encoding="utf-8")
             os.chmod(tmp, 0o600)
-            os.replace(tmp, self.state_path)
+            os.replace(tmp, path)
         except OSError as e:
-            self._log(f"could not persist pending request — {e}")
+            self._log(f"could not persist {path.name} — {e}")
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
@@ -256,6 +309,7 @@ class RestartManager:
             # Same process: the in-memory limit already covers it, and a test
             # that builds two managers must not inherit the first one's limit.
             return
+        self._last_reason = _short(raw.get("reason") or "")
         age = max(time.time() - at_wall, 0.0)
         self._last_assistant_at = time.monotonic() - age
 
@@ -263,14 +317,55 @@ class RestartManager:
         """Persist when the assistant last restarted (boot rate limit)."""
         if not self._persist:
             return
+        self._last_reason = _short(reason)
+        payload = {"at": time.time(), "pid": os.getpid(),
+                   "reason": self._last_reason}
         try:
             self.last_path.parent.mkdir(parents=True, exist_ok=True)
             self.last_path.write_text(
-                json.dumps({"at": time.time(), "pid": os.getpid(),
-                            "reason": _short(reason)}, ensure_ascii=False),
-                encoding="utf-8")
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         except OSError as e:
             self._log(f"could not persist restart time — {e}")
+
+    def _archive_expired(self, p: _PendingRequest) -> None:
+        """Keep the dead request as last-known, so renewal keeps its reason."""
+        if not self._persist:
+            return
+        age = time.monotonic() - p.at
+        self._write_json(self.archive_path, {
+            "kind":                p.kind,
+            "reason":              p.reason,
+            "phrase":              p.phrase,
+            "created_at":          time.time() - max(age, 0.0),
+            "expired_at":          time.time(),
+            "expired_seconds_ago": int(max(age, 0.0)),
+        })
+
+    def _read_archive(self) -> Optional[dict]:
+        """The last expired request on disk as plain data, or None (locked)."""
+        if not self._persist:
+            return None
+        try:
+            raw = json.loads(self.archive_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        kind = str(raw.get("kind") or "")
+        if kind not in _PHRASES:
+            return None
+        return {"kind": kind,
+                "reason": _short(raw.get("reason") or ""),
+                "phrase": _PHRASES[kind]}
+
+    def _forget_archive(self) -> None:
+        """Drop the expired record once a fresh request carries it (locked)."""
+        if not self._persist:
+            return
+        try:
+            self.archive_path.unlink(missing_ok=True)
+        except OSError as e:
+            self._log(f"could not clear expired archive — {e}")
 
     def _mark_expired(self, p: _PendingRequest) -> None:
         """Remember that a request expired, so status stops lying (locked)."""
@@ -281,6 +376,8 @@ class RestartManager:
             "phrase":             p.phrase,
             "expired_seconds_ago": int(max(age, 0.0)),
         }
+        # Move, don't delete: the late-phrase path renews from this record.
+        self._archive_expired(p)
         self._pending = None
         self._clear_file()
 
@@ -288,6 +385,55 @@ class RestartManager:
         """The most recent request that timed out, or None. Plain data."""
         with self._lock:
             return dict(self._expired) if self._expired else None
+
+    def last_known(self) -> Optional[dict]:
+        """The last request that died (expired in RAM, on disk, or before boot).
+
+        Used by the late-confirmation path to know whether the owner was
+        answering an assistant restart or a PC one before renewing it.
+        """
+        with self._lock:
+            known = self._expired or self._read_archive()
+            if known is None and self._last_reason:
+                known = {"kind": "assistant", "reason": self._last_reason}
+            return dict(known) if known else None
+
+    def renew_expired(self, reason: str = "", kind: str = "") -> dict:
+        """Recreate an expired request, keeping its kind and reason.
+
+        The anomaly this exists for (02/11/2026): a request parked at 11:23 was
+        confirmed at 11:51, the TTL had run out, ``pending()`` returned None and
+        the phrase was read by the voice gate as a NEW silent request — the
+        owner waited for a restart that never came. This only rebuilds the
+        request through the normal rate-limited path; the caller must say out
+        loud that the old one expired, and the phrase has to be repeated.
+
+        ``kind`` overrides the last-known kind when the owner named one out
+        loud ("...o assistente"), so a stale PC request is never renewed as a
+        reboot the owner did not ask for.
+
+        Returns plain data:
+        ``{"renewed", "kind", "reason", "phrase", "detail"}``.
+        """
+        known = self.last_known()
+        if known is None:
+            return {"renewed": False, "kind": "", "reason": "", "phrase": "",
+                    "detail": "no earlier request on record"}
+        kind = str(kind or known.get("kind") or "assistant")
+        if kind not in _PHRASES:
+            kind = "assistant"
+        kept = (_short(reason) or _short(known.get("reason") or "")
+                or self._last_reason)
+        out = self._request(kind, kept)
+        p = self.pending()
+        if p is None:
+            return {"renewed": False, "kind": kind, "reason": kept,
+                    "phrase": "", "detail": out}
+        with self._lock:
+            self._forget_archive()
+        self._log("confirmacao tardia — pedido expirado, renovado")
+        return {"renewed": True, "kind": p["kind"], "reason": p["reason"],
+                "phrase": p["phrase"], "detail": out}
 
     # ── state ───────────────────────────────────────────────────────────────
 
@@ -369,6 +515,35 @@ class RestartManager:
             f"assistant applies it when the owner speaks, and no tool call can "
             f"confirm it for them. Until then, do not claim it happened."
         )
+
+    def confirm_owner(self, kind: str = "assistant",
+                      reason: str = "") -> str:
+        """Run a restart the OWNER just ordered out loud.
+
+        The owner's rule (02/11/2026 ~19h): when he himself asks for the
+        restart, his order is the authorisation — he does not repeat
+        "confirmo reiniciar". The identity proof belongs to the audio layer,
+        which calls this only after the privileged voiceprint matched the
+        owner; a model tool call never reaches this method
+        (actions/restart_assistant.py keeps using request_*). The five-minute
+        assistant rate limit still applies, and a request parked earlier is
+        superseded — the owner's latest order wins.
+        """
+        kind = str(kind or "").strip().lower()
+        if kind not in _PHRASES:
+            return "Unknown restart kind. Nothing was done."
+        with self._lock:
+            previous = self._pending
+            self._pending = None
+            self._clear_file()
+        reason = recorded_origin(
+            reason, getattr(previous, "reason", "") or "")
+        request = _PendingRequest(kind=kind, reason=reason,
+                                  phrase=_PHRASES[kind], at=time.monotonic())
+        self._log(f"{kind} restart requested — origem: {reason}")
+        if kind == "assistant":
+            return self._run_assistant(request)
+        return self._run_pc(request)
 
     def request_assistant(self, reason: str = "") -> str:
         """Park an assistant restart; returns the sentence for the model."""

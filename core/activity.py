@@ -21,9 +21,9 @@ Regras do formato:
 * ``lang`` vem de ``core.transcript.detect_lang`` (stopwords, sem modelo):
   ``pt``, ``en`` ou ausente quando não dá para dizer;
 * ``sanitized`` é a lista de tipos que ``core.speech_guard`` trocou antes do
-  TTS (``tool``, ``path``, ``command``, ``json``, ``lang``, unidos por ``+``
-  na ordem canônica). É a medição honesta do vazamento: a revisão de 6 h
-  conta a flag em vez de adivinhar pelo texto;
+  TTS (``tool``, ``path``, ``phone``, ``command``, ``json``, ``lang``, unidos
+  por ``+`` na ordem canônica). É a medição honesta do vazamento: a revisão
+  de 6 h conta a flag em vez de adivinhar pelo texto;
 * ``cut`` marca a fala que foi cortada no meio (TTS falhou ou um novo turno
   substituiu a resposta). ``audio_generated=false`` com ``cut=true`` diz
   "começou a sair e parou"; sem ``cut``, "nunca saiu".
@@ -51,6 +51,31 @@ from typing import Optional
 
 META_RE = re.compile(r"\s\[audio=(\{.*\})\]\s*$")
 
+# Prefixos das linhas que o próprio app escreve (ou que um supervisor injeta)
+# e que NUNCA são fala do dono, mesmo quando chegam pelo campo de texto.
+_SYSTEM_PREFIXES = ("[fluxos]", "sys:", "err:", "qoder:")
+# O Activity Log já sai com timestamp; uma linha nesse formato é registro do
+# app, não digitação do dono.
+_LOG_STAMP_RE = re.compile(
+    r"^\[\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\]")
+
+
+def is_system_text(txt: str) -> bool:
+    """True quando o texto é linha de sistema/registro, não fala do dono.
+
+    Reconhece ``[Fluxos]``, ``SYS:``, ``ERR:``, ``QODER:`` (prefixos que o app,
+    o supervisor e o Qoder escrevem no log) e qualquer linha já carimbada no
+    formato do Activity Log (``[2026-11-01 17:10:02] ...``). A checagem é só de
+    prefixo/forma: não altera o formato das linhas nem o que ``comm_review`` lê.
+    """
+    text = str(txt or "").strip()
+    if not text:
+        return False
+    if text.lower().startswith(_SYSTEM_PREFIXES):
+        return True
+    return bool(_LOG_STAMP_RE.match(text))
+
+
 _CHANNELS = frozenset({
     "voz", "texto", "whatsapp", "persona", "tarefa", "sistema",
 })
@@ -61,7 +86,7 @@ _KEY_ORDER = ("turn", "chan", "audio_requested", "audio_generated", "cut",
 
 # Os mesmos nomes de core/speech_guard.KINDS; repetidos aqui para o formato do
 # log não depender da importação do módulo de regex.
-_SANITIZED_KINDS = ("tool", "path", "command", "json", "lang")
+_SANITIZED_KINDS = ("tool", "path", "phone", "command", "json", "lang")
 
 _MAX_LATENCY_MS = 10 * 60 * 1000      # 10 min: acima disso é relógio errado
 

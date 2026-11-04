@@ -181,6 +181,28 @@ class SayBlockingFlagsTest(unittest.TestCase):
         self.assertEqual(obj.audio_in_queue.items, [])
 
 
+class LogHeardSourceTest(unittest.TestCase):
+    """Item de 12/11/2026: linha de sistema nunca vira fala do dono."""
+
+    def _obj(self):
+        return SayBlockingFlagsTest._obj(self)
+
+    def test_system_line_is_logged_as_sys_and_never_as_owner_speech(self):
+        obj = self._obj()
+        obj._log_heard("[Fluxos] supervisor matou chat_whatsapp: silencio")
+        self.assertTrue(obj.ui.logs[-1].startswith("SYS:"))
+        self.assertEqual(activity.parse(obj.ui.logs[-1])["chan"], "sistema")
+        self.assertEqual(obj._session_log, [])
+
+    def test_owner_speech_still_becomes_you_with_voice_meta(self):
+        obj = self._obj()
+        obj._log_heard("preciso reiniciar para você cadastrar mesmo")
+        self.assertTrue(obj.ui.logs[-1].startswith("YOU:"))
+        self.assertEqual(activity.parse(obj.ui.logs[-1])["chan"], "voz")
+        self.assertEqual(obj._session_log,
+                         ["User: preciso reiniciar para você cadastrar mesmo"])
+
+
 class TurnAnswerLineTest(unittest.TestCase):
     def _obj(self):
         obj = SayBlockingFlagsTest._obj(self)
@@ -218,6 +240,98 @@ class TurnAnswerLineTest(unittest.TestCase):
         data = activity.parse(line)
         self.assertFalse(data["audio_requested"])
         self.assertTrue(data["audio_generated"])
+
+
+class SystemTextTest(unittest.TestCase):
+    def test_app_and_supervisor_prefixes_are_system_text(self):
+        for text in ("[Fluxos] supervisor matou chat_whatsapp",
+                     "SYS: Microphone muted.",
+                     "ERR: Could not save the open mode",
+                     "QODER: turno em andamento"):
+            self.assertTrue(activity.is_system_text(text), text)
+
+    def test_a_line_already_stamped_like_the_activity_log_is_system_text(self):
+        self.assertTrue(activity.is_system_text(
+            "[2026-11-01 17:10:02] Gino: Bom dia, chefe."))
+        self.assertTrue(activity.is_system_text(
+            "[2026-11-01T17:10:02] SYS: anything"))
+
+    def test_owner_speech_is_not_system_text(self):
+        for text in ("Reinicie você", "bom dia", "SYS", "erro no arquivo"):
+            self.assertFalse(activity.is_system_text(text), text)
+        self.assertFalse(activity.is_system_text(""))
+
+
+class _FakeInput:
+    def __init__(self, text):
+        self._text = text
+
+    def text(self):
+        return self._text
+
+    def clear(self):
+        self._text = ""
+
+
+class _FakeLog:
+    def __init__(self):
+        self.lines = []
+
+    def append_log(self, text):
+        self.lines.append(text)
+
+
+class _SendTarget:
+    """Só os atributos que _send usa — sem criar um QWidget nos testes."""
+
+
+class UISendGateTest(unittest.TestCase):
+    """O campo de texto da UI nunca transforma log de sistema em fala do dono."""
+
+    def _send(self, text):
+        import ui
+        obj = _SendTarget()
+        obj._input = _FakeInput(text)
+        obj._log = _FakeLog()
+        obj.sent = []
+        obj.done = threading.Event()
+
+        def _on_text(txt):
+            obj.sent.append(txt)
+            obj.done.set()
+
+        obj.on_text_command = _on_text
+        ui.MainWindow._send(obj)
+        return obj
+
+    def test_fluxos_line_never_becomes_a_you_line_nor_reaches_the_brain(self):
+        obj = self._send("[Fluxos] supervisor matou chat_whatsapp: silencio")
+        self.assertEqual(
+            obj._log.lines,
+            ["SYS: entrada do Activity Log ignorada — não é fala do dono"])
+        self.assertFalse([l for l in obj._log.lines if l.startswith("YOU:")])
+        self.assertEqual(obj.sent, [])
+
+    def test_stamped_activity_line_is_logged_as_sys_and_not_sent(self):
+        obj = self._send("[2026-11-01 17:10:02] Gino: Bom dia, chefe.")
+        self.assertTrue(obj._log.lines[0].startswith("SYS:"))
+        self.assertEqual(obj.sent, [])
+
+    def test_real_owner_typing_still_becomes_you_and_reaches_the_brain(self):
+        obj = self._send("Reinicie você")
+        self.assertTrue(obj.done.wait(2.0))
+        self.assertEqual(obj._log.lines, ["YOU: Reinicie você"])
+        self.assertEqual(obj.sent, ["Reinicie você"])
+
+    def test_microphone_transcript_path_is_untouched(self):
+        # O caminho do microfone grava "YOU:" com meta [audio=...]; a linha
+        # resultante não pode ser confundida com texto de sistema.
+        line = activity.with_meta(
+            "YOU: preciso reiniciar para você cadastrar mesmo",
+            activity.make_meta(turn=1, chan="voz", requested=True,
+                               generated=True,
+                               shown="preciso reiniciar para você cadastrar"))
+        self.assertFalse(activity.is_system_text(line))
 
 
 if __name__ == "__main__":

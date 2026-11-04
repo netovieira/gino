@@ -162,6 +162,113 @@ def test_expired_request_reported_by_confirm(manager, no_popen, monkeypatch):
     no_popen.assert_not_called()
 
 
+# ── expired request renewal (02/11/2026 late confirmation) ──────────────────
+
+def test_confirmation_window_is_thirty_minutes_and_rate_limit_stays_five():
+    # Owner's decision on 02/11/2026: a 15-minute window let a legitimate
+    # "confirmo reiniciar" arrive after the TTL and turn into a silent new
+    # request. The rate limit is not part of that decision and stays untouched.
+    assert restart.CONFIRM_TIMEOUT_SECONDS == 1800.0
+    assert restart.RATE_LIMIT_SECONDS == 300.0
+
+
+def test_expired_request_is_archived_not_deleted(tmp_path, monkeypatch):
+    state = tmp_path / "restart_pending.json"
+    manager = RestartManager(dry_run=True, logger=mock.Mock(), state_path=state)
+    manager.request_assistant(reason="correções de hoje")
+
+    monkeypatch.setattr(restart, "CONFIRM_TIMEOUT_SECONDS", -1.0)
+    assert manager.pending() is None
+    assert not state.exists()
+
+    archive = tmp_path / "restart_last_pending.json"
+    assert archive.exists(), "o pedido expirado foi apagado em vez de arquivado"
+    raw = json.loads(archive.read_text(encoding="utf-8"))
+    assert raw["kind"] == "assistant"
+    assert raw["reason"] == "correções de hoje"
+    assert manager.last_known()["kind"] == "assistant"
+
+
+def test_renew_expired_keeps_the_reason_and_the_phrase_can_be_repeated(tmp_path,
+                                                                      monkeypatch):
+    state = tmp_path / "restart_pending.json"
+    logger = mock.Mock()
+    manager = RestartManager(dry_run=True, logger=logger, state_path=state)
+    manager.request_assistant(reason="correções de hoje")
+
+    monkeypatch.setattr(restart, "CONFIRM_TIMEOUT_SECONDS", -1.0)
+    assert manager.pending() is None
+    # Back to the real window: the renewal happens in the same turn.
+    monkeypatch.setattr(restart, "CONFIRM_TIMEOUT_SECONDS", 1800.0)
+
+    renewal = manager.renew_expired()
+    assert renewal["renewed"] is True
+    assert renewal["kind"] == "assistant"
+    assert renewal["reason"] == "correções de hoje"
+    assert manager.pending() is not None
+    assert not (tmp_path / "restart_last_pending.json").exists()
+
+    logs = " ".join(str(c.args[0]) for c in logger.call_args_list)
+    assert "[Restart] confirmacao tardia — pedido expirado, renovado" in logs
+
+    assert manager.confirm("confirmo reiniciar o assistente").startswith("[DRY RUN]")
+
+
+def test_renew_expired_keeps_the_pc_kind(tmp_path, monkeypatch):
+    state = tmp_path / "restart_pending.json"
+    manager = RestartManager(dry_run=True, logger=mock.Mock(), state_path=state)
+    manager.request_pc(reason="kernel")
+
+    monkeypatch.setattr(restart, "CONFIRM_TIMEOUT_SECONDS", -1.0)
+    assert manager.pending() is None
+    monkeypatch.setattr(restart, "CONFIRM_TIMEOUT_SECONDS", 1800.0)
+
+    renewal = manager.renew_expired()
+    assert renewal["renewed"] is True
+    assert renewal["kind"] == "pc"
+    assert renewal["phrase"] == "confirmo reiniciar o computador"
+    assert renewal["reason"] == "kernel"
+
+
+def test_renew_without_history_creates_nothing(manager):
+    result = manager.renew_expired()
+    assert result["renewed"] is False
+    assert manager.pending() is None
+
+
+def test_renew_expired_falls_back_to_the_last_restart_reason(tmp_path, monkeypatch):
+    state = tmp_path / "restart_pending.json"
+    (tmp_path / "restart_last.json").write_text(json.dumps(
+        {"at": time.time() - 3600.0, "pid": 999999,
+         "reason": "correções anteriores"}), encoding="utf-8")
+    manager = RestartManager(dry_run=True, logger=mock.Mock(), state_path=state)
+    manager.request_assistant(reason="")
+
+    monkeypatch.setattr(restart, "CONFIRM_TIMEOUT_SECONDS", -1.0)
+    assert manager.pending() is None
+    monkeypatch.setattr(restart, "CONFIRM_TIMEOUT_SECONDS", 1800.0)
+
+    renewal = manager.renew_expired()
+    assert renewal["renewed"] is True
+    assert renewal["reason"] == "correções anteriores"
+
+
+def test_renew_expired_explicit_kind_wins_over_the_archived_pc_request(tmp_path,
+                                                                      monkeypatch):
+    state = tmp_path / "restart_pending.json"
+    manager = RestartManager(dry_run=True, logger=mock.Mock(), state_path=state)
+    manager.request_pc(reason="kernel")
+
+    monkeypatch.setattr(restart, "CONFIRM_TIMEOUT_SECONDS", -1.0)
+    assert manager.pending() is None
+    monkeypatch.setattr(restart, "CONFIRM_TIMEOUT_SECONDS", 1800.0)
+
+    renewal = manager.renew_expired(kind="assistant")
+    assert renewal["renewed"] is True
+    assert renewal["kind"] == "assistant"
+    assert renewal["phrase"] == "confirmo reiniciar o assistente"
+
+
 # ── cancel ───────────────────────────────────────────────────────────────────
 
 def test_cancel_clears_pending(manager, no_popen):
@@ -237,6 +344,60 @@ def test_pc_confirm_requires_the_phrase(manager, no_popen):
     assert "not confirmed" in result.lower()
     pc.assert_not_called()
     assert manager.pending() is not None
+
+
+# ── origem do reinício (nunca atribuir ordem ao dono) ───────────────────────
+
+def _logged(manager) -> str:
+    return " ".join(str(call.args[0]) for call in manager._logger.call_args_list)
+
+
+def test_confirm_owner_without_origin_records_unknown_origin(manager):
+    seen = []
+    manager._run_assistant = lambda p: seen.append(p.reason) or "ok"
+
+    manager.confirm_owner(kind="assistant")
+
+    assert seen == [restart.UNKNOWN_ORIGIN]
+    assert restart.UNKNOWN_ORIGIN in _logged(manager)
+
+
+def test_confirm_owner_logs_the_real_reason_it_received(manager):
+    seen = []
+    manager._run_assistant = lambda p: seen.append(p.reason) or "ok"
+
+    manager.confirm_owner(kind="assistant", reason="testei a melhoria")
+
+    assert seen == ["testei a melhoria"]
+    assert "testei a melhoria" in _logged(manager)
+
+
+def test_confirm_owner_keeps_the_parked_reason_when_none_is_given(manager):
+    seen = []
+    manager._run_assistant = lambda p: seen.append(p.reason) or "ok"
+    manager.request_assistant(reason="correções de hoje")
+
+    manager.confirm_owner(kind="assistant")
+
+    assert seen == ["correções de hoje"]
+
+
+def test_legacy_direct_order_label_is_recorded_as_automatic_detection(manager):
+    seen = []
+    manager._run_assistant = lambda p: seen.append(p.reason) or "ok"
+
+    manager.confirm_owner(kind="assistant", reason="ordem direta do dono")
+
+    assert seen == [restart.AUTO_DETECTION_REASON]
+    assert "ordem direta do dono" not in _logged(manager)
+    assert "detecção automática de intenção" in _logged(manager)
+
+
+def test_recorded_origin_is_never_the_old_attribution_by_default():
+    assert restart.recorded_origin() == restart.UNKNOWN_ORIGIN
+    assert restart.recorded_origin("", "") == restart.UNKNOWN_ORIGIN
+    assert (restart.recorded_origin("ordem direta do dono")
+            == restart.AUTO_DETECTION_REASON)
 
 
 # ── live path (Popen mocked) ─────────────────────────────────────────────────

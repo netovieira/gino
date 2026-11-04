@@ -9,12 +9,28 @@ import main
 class FakeRestart:
     def __init__(self):
         self.pending_value = None
+        self.known = None
         self.requested = []
         self.confirmed = []
+        self.renewed = []
         self.cancelled = 0
 
     def pending(self):
         return self.pending_value
+
+    def last_known(self):
+        return self.known
+
+    def renew_expired(self, reason="", kind=""):
+        self.renewed.append(reason)
+        if self.known is None:
+            return {"renewed": False, "detail": "no earlier request on record"}
+        kind = kind or self.known.get("kind") or "assistant"
+        self.pending_value = {"kind": kind, "reason": self.known.get("reason", ""),
+                              "phrase": "confirmo reiniciar"}
+        return {"renewed": True, "kind": kind,
+                "reason": self.known.get("reason", ""),
+                "phrase": "confirmo reiniciar", "detail": "pending"}
 
     def request_assistant(self, reason=""):
         self.requested.append(("assistant", reason))
@@ -46,7 +62,7 @@ class FakeSpeaker:
     def embedding(self, _pcm):
         return [1.0, 0.0] if self.owner else [0.0, 1.0]
 
-    def identify(self, _emb):
+    def identify(self, _emb, device=None):
         if self.owner:
             return {"name": "Anthero", "score": 1.0, "known": True,
                     "authorized": True}
@@ -136,6 +152,79 @@ class RestartVoiceTest(unittest.TestCase):
             obj, "confirmo reiniciar", b"\x01\x00" * 16000))
         self.assertEqual(obj._restart.confirmed, [])
         self.assertEqual(obj._restart.cancelled, 0)
+
+    # ── late confirmation (02/11/2026 anomaly) ──────────────────────────────
+
+    def test_late_phrase_renews_and_warns_instead_of_parking_in_silence(self):
+        obj = self._obj()
+        obj._restart.known = {"kind": "assistant", "reason": "pedido por voz"}
+
+        self.assertTrue(main.JarvisLive._restart_answer_expected(
+            obj, "confirmo reiniciar o assistente"))
+        self.assertTrue(main.JarvisLive._handle_restart_confirmation(
+            obj, "confirmo reiniciar o assistente", b"\x01\x00" * 16000))
+
+        # Not executed, not silently re-requested through the gate: renewed.
+        self.assertEqual(obj._restart.confirmed, [])
+        self.assertEqual(obj._restart.requested, [])
+        self.assertEqual(obj._restart.renewed, [""])
+        self.assertIsNotNone(obj._restart.pending())
+        self.assertIn("expirou", obj.said[0])
+        self.assertIn("Repita", obj.said[0])
+
+    def test_repeated_late_phrase_does_not_loop_forever(self):
+        obj = self._obj()
+        obj._restart.known = {"kind": "assistant", "reason": "pedido por voz"}
+        phrase = "confirmo reiniciar o assistente"
+
+        self.assertTrue(main.JarvisLive._handle_restart_confirmation(
+            obj, phrase, b"\x01\x00" * 16000))
+        # The renewed request is alive, so the second phrase confirms it.
+        self.assertTrue(main.JarvisLive._handle_restart_confirmation(
+            obj, phrase, b"\x01\x00" * 16000))
+        self.assertEqual(obj._restart.confirmed, [phrase])
+        self.assertEqual(len(obj._restart.renewed), 1)
+        self.assertIsNone(obj._restart.pending())
+
+    def test_late_phrase_without_history_is_refused_and_consumed(self):
+        obj = self._obj()
+
+        self.assertTrue(main.JarvisLive._handle_restart_confirmation(
+            obj, "confirmo reiniciar o assistente", b"\x01\x00" * 16000))
+
+        self.assertEqual(obj._restart.requested, [])
+        self.assertEqual(obj._restart.confirmed, [])
+        self.assertEqual(obj._restart.renewed, [""])
+        self.assertIsNone(obj._restart.pending())
+        self.assertIn("Nada foi feito", obj.said[0])
+
+    def test_late_phrase_from_guest_renews_nothing(self):
+        obj = self._obj(owner=False)
+        obj._restart.known = {"kind": "assistant", "reason": "pedido por voz"}
+
+        self.assertTrue(main.JarvisLive._handle_restart_confirmation(
+            obj, "confirmo reiniciar o assistente", b"\x01\x00" * 16000))
+
+        self.assertEqual(obj._restart.renewed, [])
+        self.assertEqual(obj._restart.requested, [])
+        self.assertIn("Não reconheci", obj.said[0])
+
+    def test_restart_gate_does_not_turn_a_late_phrase_into_a_new_request(self):
+        obj = self._obj()
+        obj._restart.known = {"kind": "pc", "reason": "kernel"}
+
+        self.assertTrue(main.JarvisLive._restart_gate(
+            obj, "confirmo reiniciar o computador"))
+
+        self.assertEqual(obj._restart.requested, [])
+        self.assertEqual(obj._restart.renewed, [""])
+        self.assertEqual(obj._restart.pending_value["kind"], "pc")
+
+    def test_gate_still_parks_a_plain_request(self):
+        obj = self._obj()
+        self.assertTrue(main.JarvisLive._restart_gate(obj, "Reinicie você"))
+        self.assertEqual(obj._restart.requested, [("assistant", "pedido por voz")])
+        self.assertEqual(obj._restart.renewed, [])
 
 
 if __name__ == "__main__":
