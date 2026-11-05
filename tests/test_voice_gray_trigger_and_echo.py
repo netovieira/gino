@@ -332,5 +332,93 @@ class EchoNeedsRealOverlapTest(unittest.TestCase):
         self.assertFalse([l for l in obj.ui.lines if "eco do meu TTS" in l])
 
 
+class RefusalPasswordHintTest(unittest.TestCase):
+    """Recusa de voz no gatilho: o dono sai com caminho falado (05/11 09:58).
+
+    (a) com senha configurada → fala pede "senha: <a tua senha>" e "abrir
+    cadastro de voz" (10 min); (b) sem senha → diz que não há senha salva e
+    manda defini-la, sem prometer o caminho por texto; (c) nada de senha em
+    claro no log/resposta (redact_command); (d) a recusa não abre nenhuma
+    outra porta privilegiada; (e) repetição na mesma janela fala uma vez e
+    depois só loga.
+    """
+
+    def _refused(self, configured):
+        from unittest import mock
+        spk = GraySpeaker(score=0.46, known=False, name=None)
+        obj = _obj(spk)
+        with mock.patch.object(main._owner_auth, "is_configured",
+                               lambda: configured):
+            self.assertFalse(main.JarvisLive._voice_train_gate(
+                obj, "cadastra minha voz", PCM))
+        return obj
+
+    def test_password_configured_asks_for_the_typed_line(self):
+        obj = self._refused(configured=True)
+        self.assertIsNone(obj._voice_train)
+        said = "\n".join(obj.said)
+        self.assertIn("senha: <a tua senha>", said)
+        self.assertIn("abrir cadastro de voz", said)
+        self.assertIn("dez minutos", said)
+
+    def test_no_password_says_there_is_none_and_not_to_type_yet(self):
+        obj = self._refused(configured=False)
+        said = "\n".join(obj.said)
+        self.assertIn("Não há senha salva", said)
+        self.assertIn("formulário de autorização por texto", said)
+        # Sem senha não existe caminho por texto: nada de mandar digitar a
+        # linha "senha:" nem prometer a janela de dez minutos.
+        self.assertNotIn("senha: <", said)
+        self.assertNotIn("dez minutos", said)
+
+    def test_typed_password_never_appears_in_clear(self):
+        from unittest import mock
+        obj = _obj(GraySpeaker())
+        with mock.patch.object(main._owner_auth, "is_configured",
+                               lambda: False):
+            main.JarvisLive._voice_train_refusal_hint(
+                obj, "senha: segredo123", 0.2, "voz não confirmada")
+        everything = "\n".join(obj.ui.lines + obj.said)
+        self.assertNotIn("segredo123", everything)
+        self.assertIn("[senha oculta]", everything)
+
+    def test_refusal_opens_no_other_privileged_door(self):
+        obj = self._refused(configured=True)
+        # Nenhuma janela de cadastro nem de texto foi armada pela recusa.
+        self.assertFalse(main.JarvisLive._voice_bootstrap_active(obj))
+        self.assertEqual(obj._voice_bootstrap_until, 0.0)
+        self.assertEqual(float(getattr(obj, "_owner_text_until", 0.0)), 0.0)
+        # A recusa continua recusando: o mesmo clipe não passa em nenhuma
+        # porta privilegiada (sudo, energia, envio seguem o voiceprint).
+        confirmed, _s, _d = obj._owner_speaker_confirmed("pode usar sudo", PCM)
+        self.assertFalse(confirmed)
+        # Estrutural: o método novo só fala/loga; não arma janelas nem abre
+        # ações pela actiongate.
+        names = main.JarvisLive.__dict__[
+            "_voice_train_refusal_hint"].__code__.co_names
+        for banned in ("_voice_bootstrap_arm", "open_window",
+                       "arm_send_window", "_owner_text_gate",
+                       "_start_voice_training"):
+            self.assertNotIn(banned, names)
+
+    def test_immediate_repeat_speaks_once_then_only_logs(self):
+        from unittest import mock
+        obj = _obj(GraySpeaker(score=0.46, known=False, name=None))
+        with mock.patch.object(main._owner_auth, "is_configured",
+                               lambda: True):
+            main.JarvisLive._voice_train_gate(obj, "cadastra minha voz", PCM)
+            main.JarvisLive._voice_train_gate(obj, "cadastra minha voz", PCM)
+            main.JarvisLive._voice_train_gate(obj, "cadastra minha voz", PCM)
+        self.assertEqual(len(obj.said), 1, obj.said)
+        self.assertTrue(any("só log" in l for l in obj.ui.lines), obj.ui.lines)
+        # Fora da janela, a orientação pode ser falada de novo.
+        obj._voice_train_hint_at = (time.monotonic()
+                                    - main._VOICE_TRAIN_FAILURE_WINDOW_S - 1.0)
+        with mock.patch.object(main._owner_auth, "is_configured",
+                               lambda: True):
+            main.JarvisLive._voice_train_gate(obj, "cadastra minha voz", PCM)
+        self.assertEqual(len(obj.said), 2, obj.said)
+
+
 if __name__ == "__main__":
     unittest.main()

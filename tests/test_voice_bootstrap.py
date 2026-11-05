@@ -46,6 +46,15 @@ def _no_timer(monkeypatch):
     monkeypatch.setattr(main.threading, "Timer", _Timer)
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_password(monkeypatch):
+    # Determinismo: o gate lê plugin_config real. Com senha salva na máquina,
+    # "abrir cadastro de voz" digitado exige a sessão de texto antes — e o
+    # teste mudava de comportamento conforme o config. A senha é sempre
+    # stubada (ausente); nenhum segredo é lido ou gravado aqui.
+    monkeypatch.setattr(main._owner_auth, "is_configured", lambda: False)
+
+
 def test_typed_text_opens_the_window():
     obj = _obj()
     handled = main.JarvisLive._voice_bootstrap_gate(

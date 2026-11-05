@@ -9631,6 +9631,61 @@ class JarvisLive:
                 "diga 'cadastra minha voz'.", channel, account, chat)
         return True
 
+    def _voice_train_refusal_hint(self, line: str, score: float,
+                                  detail: str) -> None:
+        """Recusa de voz no gatilho: o dono sai com um caminho falado, não mudo.
+
+        (05/11/2026 09:58) Quando o voiceprint não confirma o dono no pedido de
+        cadastro e a aprovação por voz também não veio, resta a senha digitada
+        — mas só se ela existir. SEM senha salva o caminho por texto não existe
+        de verdade, e a frase diz isso em vez de fingir que basta digitar.
+        Nada aqui abre janela nem autoriza nada: quem decide é o portão de
+        texto normal (``_owner_text_gate`` / ``_voice_bootstrap_gate``). A fala
+        pedida é o formato literal do comando; o segredo em si nunca é falado,
+        e o texto da fala entra no log pelo redator (``redact_command``).
+        Anti-loop: a mesma orientação é falada uma vez por janela
+        (``_VOICE_TRAIN_FAILURE_WINDOW_S``); repetição dentro da janela é só
+        log, sem inundar a boca.
+        """
+        try:
+            now = time.monotonic()
+        except Exception:
+            now = 0.0
+        last = float(getattr(self, "_voice_train_hint_at", 0.0) or 0.0)
+        speak = (now - last) > _VOICE_TRAIN_FAILURE_WINDOW_S
+        if speak:
+            self._voice_train_hint_at = now
+        if _owner_auth.is_configured():
+            phrase = ("Não te reconheci pela voz nesta fala. Para o cadastro, "
+                      "digite primeiro: senha: <a tua senha> — na interface "
+                      "ou no seu chat. Depois digite: abrir cadastro de voz. "
+                      "Isso abre dez minutos para o cadastro.")
+        else:
+            phrase = ("Não te reconheci pela voz nesta fala. Não há senha "
+                      "salva, então o caminho por texto ainda não existe. "
+                      "Defina a senha no formulário de autorização por texto; "
+                      "só depois dela existir é que digitar a senha libera.")
+        try:
+            self.ui.write_log(
+                "SYS: cadastro de voz — orientação falada ao dono "
+                f"(score={float(score or 0.0):.2f}, {detail}): "
+                f"{_owner_auth.redact_command(phrase)}; fala ouvida: "
+                f"{_owner_auth.redact_command(str(line or ''))[:60]}")
+        except Exception:
+            pass
+        if not speak:
+            try:
+                self.ui.write_log(
+                    "SYS: cadastro de voz — orientação já falada nesta "
+                    f"janela ({_VOICE_TRAIN_FAILURE_WINDOW_S:.0f}s); só log.")
+            except Exception:
+                pass
+            return
+        try:
+            self._say_now(phrase, log=False, origin="aviso")
+        except Exception:
+            pass
+
     def _voice_train_gate(self, text: str, pcm: bytes | None = None) -> bool:
         """Guided enrollment, handled before barge-in so prompts don't eat it.
 
@@ -9699,6 +9754,7 @@ class JarvisLive:
                     f"dono (score={float(score or 0.0):.2f}, {detail}).")
             except Exception:
                 pass
+            self._voice_train_refusal_hint(line, score, detail)
             return False
         self._log_heard(text)
         self._start_voice_training("pedido do dono")
