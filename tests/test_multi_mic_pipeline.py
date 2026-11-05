@@ -181,7 +181,7 @@ def test_ambiguous_cycles_keep_the_current_source():
 
 
 def test_a_new_winner_must_confirm_before_the_stream_switches():
-    """A troca real de microfone custa dois ciclos; glitch de um ciclo, não."""
+    """A troca real custa três ciclos consecutivos (latch_wins); glitch, não."""
     now = [0.0]
     mic = _two(lambda: now[0])
     zeros = np.zeros(1024, dtype=np.float32)
@@ -194,12 +194,18 @@ def test_a_new_winner_must_confirm_before_the_stream_switches():
     mic.push(0, zeros)
     now[0] = 0.006
     pending = mic.push(1, loud(2))
-    assert pending.source == 0            # ainda não trocou
+    assert pending.source == 0            # primeira prova: ainda não trocou
     assert pending.verdict == mic_compare.AMBIGUOUS
 
     mic.push(0, zeros)
     now[0] = 0.011
-    switched = mic.push(1, loud(3))
+    second = mic.push(1, loud(3))
+    assert second.source == 0             # segunda prova: ainda não trocou
+    assert second.verdict == mic_compare.AMBIGUOUS
+
+    mic.push(0, zeros)
+    now[0] = 0.016
+    switched = mic.push(1, loud(4))
     assert switched.verdict == mic_compare.NEAR
     assert switched.source == 1
 

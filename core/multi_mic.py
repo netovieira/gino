@@ -104,12 +104,16 @@ class MultiMic:
         ]
         self.decision = Decision(name="", pairs=len(self._comparators))
         self.cycles = 0
-        # Hysteresis: the chosen stream only changes after a new winner proves
-        # itself twice. Without it, room tone and near-ties made argmax flip
-        # between microphones every cycle — an endless "fonte selecionada"
-        # alternation that also thrashed the speaker profile.
-        self._chosen: int | None = None
-        self._pending_switch: int | None = None
+        # Hysteresis latch: the chosen stream is pinned per phrase. A new
+        # source only wins after proving itself on ``latch_wins`` consecutive
+        # cycles; an unproven cycle never falls back to argmax (that argmax
+        # flip between near-tied microphones made the endless "fonte
+        # selecionada" alternation and thrashed the speaker profile).
+        self.latch_wins = 3
+        self._latched: int | None = None
+        self._candidate: int | None = None
+        self._candidate_n = 0
+        self._held = False
 
     # ── input from the callbacks ────────────────────────────────────────────
     def push(self, index: int, block: object, at: float | None = None) -> Decision | None:
@@ -173,27 +177,11 @@ class MultiMic:
         else:
             verdict = mic_compare.AMBIGUOUS
 
-        chosen = self._chosen
-        if winner is not None:
-            if chosen is None or winner == chosen:
-                chosen = winner
-                self._pending_switch = None
-            elif self._pending_switch == winner:
-                # Two consecutive cycles agree: the owner really moved.
-                chosen = winner
-                self._pending_switch = None
-            else:
-                # One cycle is not enough evidence; stay on the current
-                # stream and, for the gate, keep this cycle ambiguous.
-                self._pending_switch = winner
-                verdict = mic_compare.AMBIGUOUS
-        else:
-            self._pending_switch = None
-        if chosen is None and energies:
-            # For the gate: the strongest signal, even when it is not proven
-            # to be next to the person. Still one stream, never a sum.
-            chosen = int(np.argmax(energies))
-        self._chosen = chosen
+        chosen = self._latch(winner, energies)
+        if winner is not None and chosen is not None and winner != chosen:
+            # The new microphone has not paid for the switch yet; for the
+            # gate this cycle is not the owner's speech on the latched source.
+            verdict = mic_compare.AMBIGUOUS
         return Decision(
             verdict=verdict,
             source=chosen,
@@ -203,6 +191,58 @@ class MultiMic:
             pairs=len(self._comparators),
             compared=compared,
         )
+
+    # ── latch histerético: a fonte é travada por frase ──────────────────────
+    def _latch(self, winner: int | None, energies: list[float]) -> int | None:
+        """Choose the source with a hysteresis latch. NO LOCK HERE: the
+        caller ``_decide`` already runs under ``self._lock`` from ``push``.
+
+        Semantics: while held the latched source is pinned; the first cycle
+        adopts the winner (or, without proof, the loudest); an unproven cycle
+        KEEPS the latch (never re-runs argmax — that flip was the defect);
+        a different winner must repeat ``latch_wins`` consecutive cycles
+        before the latch moves.
+        """
+        if self._held and self._latched is not None:
+            return self._latched
+        fallback = int(np.argmax(energies)) if energies else None
+        if self._latched is None:
+            # First cycle: adopt the proven winner, else the loudest stream.
+            self._latched = winner if winner is not None else fallback
+            self._candidate = None
+            self._candidate_n = 0
+            return self._latched
+        if winner is None:
+            # No proof this cycle: keep the latch. Falling back to argmax
+            # here is exactly where the source alternation was born.
+            self._candidate = None
+            self._candidate_n = 0
+            return self._latched
+        if winner == self._latched:
+            self._candidate = None
+            self._candidate_n = 0
+            return self._latched
+        if self._candidate != winner:
+            self._candidate = winner
+            self._candidate_n = 1
+        else:
+            self._candidate_n += 1
+        if self._candidate_n >= self.latch_wins:
+            self._latched = winner
+            self._candidate = None
+            self._candidate_n = 0
+        return self._latched
+
+    def hold(self) -> None:
+        """Pin the source while the assistant speaks: the mouth cannot change
+        ears while the brain is talking (the TTS echo would re-elect)."""
+        with self._lock:
+            self._held = True
+
+    def release(self) -> None:
+        """Unpin after the speech turn: the silence reopens the election."""
+        with self._lock:
+            self._held = False
 
     # ── introspection ───────────────────────────────────────────────────────
     @property
