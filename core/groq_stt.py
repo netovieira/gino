@@ -29,8 +29,10 @@ import io
 import math
 import os
 import queue
+import re
 import threading
 import time
+import unicodedata
 import wave
 from typing import Callable, NamedTuple
 
@@ -151,6 +153,62 @@ _ENDPOINT_THRESHOLD = 0.5
 _ENDPOINT_MIN_S = 0.6      # very short commands close immediately
 _CONTINUE_WINDOW_S = 3.0   # how long to wait for the rest of the sentence
 _MAX_PENDING_S = 18.0      # never hold a fragment forever
+
+# ── Cauda adaptativa do endpointing (05/11/2026) ────────────────────────────
+# A cauda fixa de 3 s paga-se em TODO pauseamento que o modelo de "fim de
+# turno" (score já calculado em `_endpoint_complete`) chama de incompleto.
+# Medida no PC: mediana do vão YOU→resposta 7 s. Para frase comum de conversa
+# a cauda fecha em ~1,2 s (ganho de 1,8 s por turno); os 3 s ficam onde o dono
+# NÃO pode ser cortado: verbo de ação, número, confirmação ou pedido sensível.
+# Por que uma lista aqui e não a detecção dos gates: os portões privilegiados
+# vivem em main.py, que importa este módulo — importa-los de volta criaria
+# ciclo. A lei dos gates (nunca afrouxar portagem) não é tocada por esta
+# listagem: ela só escolhe entre 1,2 s e 3,0 s de silêncio; o regex é
+# deliberadamente LARGO demais — errar para os 3 s custa latência, errar para
+# o outro lado custa a frase do dono cortada no meio.
+_CONTINUE_WINDOW_CHAT_S = 1.2
+# Score "quase acabou": acima disso a pausa é respiração, não pensamento, e a
+# cauda encurta quando não há transcrição local para ler a palavra.
+_CHAT_TAIL_PROB = 0.35
+_TAIL_SENSITIVE_RE = re.compile(
+    r"\d|"
+    r"\b(reinici\w*|deslig\w*|ligar|liga\b|apag\w*|envi\w*|mandar|mande|"
+    r"mande\b|delet\w*|instal\w*|atualiz\w*|configur\w*|confirm\w*|"
+    r"aceit\w*|autoriz\w*|senha|codigo|c[oó]digo|energia|luz|luzes|"
+    r"ar[- ]?condicionado|port[aã]o|fech\w*|tranc\w*|lembret\w*|lembrar|"
+    r"agend\w*|cancel\w*|toca\b|tocar|abre\b|abrir|aumenta|diminui|"
+    r"play\b|pausa)\b",
+    re.IGNORECASE)
+
+
+def _tail_norm(text: str) -> str:
+    """Minúsculas sem acento (mesmo jogo do roteador de fluxos)."""
+    value = unicodedata.normalize("NFD", str(text or "").lower())
+    return "".join(c for c in value if unicodedata.category(c) != "Mn")
+
+
+def tail_sensitive(text: str) -> bool:
+    """A pausa aconteceu dentro de frase com verbo de ação/número/ sensível?"""
+    return bool(_TAIL_SENSITIVE_RE.search(_tail_norm(text)))
+
+
+def continue_window_for(text: str = "",
+                        probability: float | None = None) -> float:
+    """Segundos de cauda para esta pausa de vírgula.
+
+    * texto (transcrição local do trecho em curso) com sinal sensível → 3,0 s;
+    * texto de conversa comum → 1,2 s;
+    * sem texto (transcritor remoto, falha): decide o score do "fim de turno"
+      — quase-acabado (≥ 0,35) fecha em 1,2 s; pausa clara de pensamento
+      mantém os 3,0 s.
+    """
+    if tail_sensitive(text):
+        return _CONTINUE_WINDOW_S
+    if str(text or "").strip():
+        return _CONTINUE_WINDOW_CHAT_S
+    if probability is not None and probability >= _CHAT_TAIL_PROB:
+        return _CONTINUE_WINDOW_CHAT_S
+    return _CONTINUE_WINDOW_S
 
 # ── Fala retida quando o microfone fecha no meio da frase ───────────────────
 # Owner's rule (02/11/2026): he is NEVER ignored nor cut — a registered
@@ -640,6 +698,9 @@ class GroqListener:
         # Did the retained segment pass the voice gate? True unless it opened
         # through the sustained-energy valve.
         self._held_proven = True
+        # Score do "fim de turno" da última pausa medida; alimenta a cauda
+        # adaptativa (`continue_window_for`). None = ainda não medido.
+        self._endpoint_probability: float | None = None
 
     @property
     def local(self) -> bool:
@@ -1225,8 +1286,14 @@ class GroqListener:
     # ── worker thread ───────────────────────────────────────────────────────
 
     def _endpoint_complete(self, pcm: bytes) -> bool:
-        """True when the utterance is a complete turn, not a mid-sentence pause."""
+        """True when the utterance is a complete turn, not a mid-sentence pause.
+
+        O score do "fim de turno" fica em `_endpoint_probability` para a cauda
+        adaptativa (`continue_window_for`) decidir entre 1,2 s e 3,0 s quando
+        não há transcrição local para ler a palavra.
+        """
         secs = len(pcm) / (2 * self._sr)
+        self._endpoint_probability = None
         if self.sleeping or secs < _ENDPOINT_MIN_S or secs >= _MAX_PENDING_S:
             return True
         try:
@@ -1235,6 +1302,7 @@ class GroqListener:
                 return True
             result = smart_turn.predict_endpoint(pcm)
             probability = float(result.get("probability", 1.0))
+            self._endpoint_probability = probability
             if probability < _ENDPOINT_THRESHOLD:
                 print(f"[{self.label}] pausa no meio da fala "
                       f"(smart turn {probability:.2f}) — aguardando continuação")
@@ -1246,20 +1314,45 @@ class GroqListener:
                   f"({e.__class__.__name__}) — fechando o turno")
         return True
 
+    # ── cauda adaptativa ────────────────────────────────────────────────────
+
+    def _tail_hint(self, pcm: bytes) -> str:
+        """Palavras do trecho em pausa, quando a transcrição local existe.
+
+        A única forma de ler a frase ANTES de ela virar turno é o transcritor
+        local (core.local_stt): a rede (Groq) não pode ser chamada aqui. Sem
+        transcritor local, ou dormindo, a cauda é decidida só pelo score — o
+        mesmo comportamento de antes, nunca mais lento que os 3 s.
+        """
+        if self.sleeping or self._transcribe_fn is None:
+            return ""
+        try:
+            if len(pcm) / (2 * self._sr) > 10.0:
+                return ""
+            return str(self._transcribe_fn(bytes(pcm)) or "").strip()
+        except Exception:
+            return ""
+
+    def _continue_wait_for(self, pcm: bytes) -> float:
+        return continue_window_for(self._tail_hint(pcm),
+                                   self._endpoint_probability)
+
     def _run(self) -> None:
         pending = b""
         pending_at = 0.0
         pending_held = False
+        pending_wait = _CONTINUE_WINDOW_S
         while not self._stop.is_set():
             try:
                 pcm = self._q.get(timeout=0.25)
             except queue.Empty:
-                wait = _HELD_WAIT_S if pending_held else _CONTINUE_WINDOW_S
+                wait = _HELD_WAIT_S if pending_held else pending_wait
                 if pending and time.monotonic() - pending_at >= wait:
                     print(f"[{self.label}] continuação não veio — transcrevendo o trecho")
                     self._process_utterance(pending)
                     pending, pending_at = b"", 0.0
                     pending_held = False
+                    pending_wait = _CONTINUE_WINDOW_S
                 continue
             if self._stop.is_set():
                 break
@@ -1275,6 +1368,7 @@ class GroqListener:
                     self._process_utterance(pending)
                     pending, pending_at = b"", 0.0
                     pending_held = False
+                    pending_wait = _CONTINUE_WINDOW_S
                 pending, pending_at = pcm, time.monotonic()
                 pending_held = True
                 continue
@@ -1286,13 +1380,14 @@ class GroqListener:
                     self._process_utterance(pending)
                     pending, pending_at = b"", 0.0
                     pending_held = False
+                    pending_wait = _CONTINUE_WINDOW_S
                 self._process_utterance(pcm)
                 continue
 
             now = time.monotonic()
             if pending:
                 age = now - pending_at
-                if age <= (_HELD_WAIT_S if pending_held else _CONTINUE_WINDOW_S):
+                if age <= (_HELD_WAIT_S if pending_held else pending_wait):
                     gap = b"\x00\x00" * int(0.20 * self._sr)
                     merged = HeardClip(
                         pending + gap + pcm,
@@ -1315,7 +1410,12 @@ class GroqListener:
                     if (len(merged) < int(_MAX_PENDING_S * 2 * self._sr)
                             and not self._endpoint_complete(merged)):
                         pending, pending_at = merged, now
+                        # A cauda do trecho fundido se re-mede: a nova palavra
+                        # pode ter deixado a frase sensível (3 s) ou comum
+                        # (1,2 s).
+                        pending_wait = self._continue_wait_for(merged)
                         continue
+                    pending_wait = _CONTINUE_WINDOW_S
                     self._process_utterance(merged)
                     continue
                 # The user waited too long to continue: the old fragment is a
@@ -1323,10 +1423,12 @@ class GroqListener:
                 self._process_utterance(pending)
                 pending, pending_at = b"", 0.0
                 pending_held = False
+                pending_wait = _CONTINUE_WINDOW_S
 
             if (len(pcm) < int(_MAX_PENDING_S * 2 * self._sr)
                     and not self._endpoint_complete(pcm)):
                 pending, pending_at = pcm, now
+                pending_wait = self._continue_wait_for(pcm)
                 continue
             self._process_utterance(pcm)
 

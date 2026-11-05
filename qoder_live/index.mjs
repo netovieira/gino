@@ -204,6 +204,12 @@ let settleUntil = 0;
 let settleTimer = null;
 let reissueTimer = null;
 const ABORT_REISSUE_MS = 15000;   // abort de preempção chega em segundos
+// Turno de conversa (flag `chat` que o Python manda, marcada pela decisão dos
+// gates ANTES do modelo — nunca uma ação em execução): os 15 s acima são
+// LADRÃO de latência. A fala é conversa, não tem efeito colateral a proteger;
+// se o abort não chegou em 3 s, o erro segue para o Python, que refaz o turno
+// em silêncio do mesmo jeito. Turnos com ação/tool mantêm a janela longa.
+const ABORT_REISSUE_CHAT_MS = 3000;
 const ABORT_SETTLE_MS = 250;      // folga para o abort não comer a fala nova
 // Se a fala reemitida não arrancar, o dono não pode esperar para sempre: o
 // erro volta para o Python, que refaz o turno em silêncio.
@@ -1665,7 +1671,9 @@ function finishTurn(ok, textOrError, subtype = "") {
     return;
   }
   if (!ok && id && /operation\s+(?:was\s+)?aborted/i.test(failure)
-      && Date.now() - lastInterruptAt < ABORT_REISSUE_MS
+      && Date.now() - lastInterruptAt
+          < ((currentAsk && currentAsk.chat)
+              ? ABORT_REISSUE_CHAT_MS : ABORT_REISSUE_MS)
       && !turnSpoke && !turnHadTool && !turnReissued && channel
       && currentAsk && currentAsk.id === id) {
     // O abort do turno anterior comeu este: a CLI cancelou a mensagem que já

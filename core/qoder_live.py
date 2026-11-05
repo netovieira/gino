@@ -274,14 +274,18 @@ class QoderLive:
     # ── conversation ─────────────────────────────────────────────────────────
 
     def ask(self, text: str, speaker: Optional[str] = None, id: Optional[str] = None,
-            priority: Optional[str] = None, context: Optional[str] = None) -> str:
+            priority: Optional[str] = None, context: Optional[str] = None,
+            chat: bool = False) -> str:
         """Queue a turn on the warm session and return its id.
 
         Returns immediately; ``on_text``/``on_tool``/``on_done``/``on_error``
         deliver the answer. ``priority='now'`` preempts the active turn in the
-        sidecar (background agents keep running). Raises ``RuntimeError``
-        (message from ``last_error`` when known) if the sidecar is not ready or
-        has died.
+        sidecar (background agents keep running). ``chat=True`` marks a
+        conversational turn (no action verb in the gates' classification): the
+        sidecar then uses the short re-issue window after a preempt abort —
+        only the re-issue timing changes, never the privilege gates. Raises
+        ``RuntimeError`` (message from ``last_error`` when known) if the
+        sidecar is not ready or has died.
         """
         if not isinstance(text, str) or not text.strip():
             raise ValueError("ask() needs non-empty text")
@@ -294,6 +298,8 @@ class QoderLive:
             payload["priority"] = priority
         if context:
             payload["context"] = str(context)
+        if chat:
+            payload["chat"] = True
         self._send(payload, raise_errors=True)
         return message_id
 

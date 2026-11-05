@@ -209,7 +209,12 @@ class UndeliveredContentNeedsQuietAndCitationTest(unittest.TestCase):
 class NoOwnerSpeechGoesUnansweredTest(unittest.TestCase):
     """(c) descartar fala sem responder a pergunta seria pior que o atraso."""
 
-    def test_preempt_before_any_answer_enqueues_the_owner_question(self):
+    def test_preempt_before_any_answer_carries_the_owner_question_hot(self):
+        # Contrato novo (05/11/2026): o preempt não enfileira mais em
+        # prioridade zero — a pergunta vira CONTEXTO do turno novo e sai numa
+        # resposta única. "Nada morre em silêncio" continua valendo: o hot é
+        # consumido pelo turno seguinte e, se ele não vier, o vigia despeja na
+        # fila com o adiamento falado (tests/test_voice_hot_paths.py).
         j = _Jarvis()
         obj = j.obj
         _open_turn(obj, 7, "não precisa auto-play")
@@ -227,15 +232,21 @@ class NoOwnerSpeechGoesUnansweredTest(unittest.TestCase):
             main.JarvisLive._qoder_preempt(obj, "t1")
 
         self.assertEqual(j.spoken, [], "nada de fala atrasada")
-        self.assertEqual(len(added), 1, "a pergunta não pode morrer em silêncio")
-        title = added[0][0][0]
-        self.assertIn("não precisa auto-play", title)
-        self.assertEqual(added[0][1].get("payload", {}).get("origin"),
-                         "preempt-carryover")
-        # O item é o mesmo: um segundo preempt não duplica a fila.
+        self.assertEqual(added, [], "preempt comum não enfileira mais")
+        self.assertEqual(obj._carryover_hot[7]["question"],
+                         "não precisa auto-play")
+        # O item é o mesmo: um segundo preempt não duplica o carryover.
         with mock.patch.object(main, "_task_queue", fake_queue):
             main.JarvisLive._qoder_preempt(obj, "t1")
-        self.assertEqual(len(added), 1)
+        self.assertEqual(len(obj._carryover_hot), 1)
+        self.assertEqual(added, [])
+        # O turno novo leva a pergunta como contexto: uma resposta cobre as
+        # duas, e a pergunta não fica para a fila vazia.
+        with mock.patch.object(main, "_task_queue", fake_queue):
+            line = obj._consume_carryover_hot("e o volume da tv?")
+        self.assertIn("não precisa auto-play", line)
+        self.assertIn("[PERGUNTA SEM RESPOSTA]", line)
+        self.assertEqual(added, [])
 
     def test_discarding_a_cut_note_enqueues_when_nothing_was_heard(self):
         j = _Jarvis()

@@ -313,6 +313,15 @@ _PROCESS_STARTED_WALL = time.time()
 _CARRYOVER_TTL_S = 90.0
 _CARRYOVER_ORIGIN = "preempt-carryover"
 _CARRYOVER_UNANSWERED_MAX = 4
+# Carryover QUENTE (05/11/2026): a pergunta morta por barge-in/preempt antes de
+# responder não vira mais item de fila de prioridade zero — vira CONTEXTO do
+# turno novo, para uma resposta única cobrir as duas perguntas. A fila só
+# permanece para execução pesada em andamento (heavy) ou quando o hot expira
+# sem turno novo que o receba (o vigia o despeja na fila e fala o adiamento).
+# TTL curto de propósito: item das 00:51 que só reapareceu às 09:38 é a
+# assinatura da fila fria; aqui a pergunta tem prazo de segundos, não de horas.
+_CARRYOVER_HOT_TTL_S = 25.0
+_CARRYOVER_HOT_MAX = 3
 # Sem o segmenter local (Gemini Live), a única prova de fala é o transcript de
 # entrada; esta cauda cobre o silêncio entre os blocos da mesma frase.
 _USER_SPEECH_TAIL_S = 2.0
@@ -2303,6 +2312,9 @@ class JarvisLive:
         # Vezes cuja pergunta ficou sem resposta e já virou item da fila de
         # tarefas — evita duplicar o mesmo pedido a cada corte.
         self._carryover_questions: dict[int, float] = {}
+        # Perguntas QUENTES: mortas por preempt/barge-in antes de responder e
+        # ainda não entregues como contexto do turno novo. `ref -> dict`.
+        self._carryover_hot: dict[int, dict] = {}
         self._qoder_turn_started   = 0.0
         # A watchdog only fires when the turn *stalls*: every text/tool event
         # pushes the deadline forward, and a hard cap stops runaway tool chains.
@@ -5721,6 +5733,13 @@ class JarvisLive:
                 return False
         if bool(getattr(self, "_is_speaking", False)):
             return False
+        # Segurança do carryover quente (05/11/2026): pergunta guardada como
+        # contexto que nunca ganhou turno novo não some — no momento calmo o
+        # vigia a despeja na fila e fala o adiamento em uma frase.
+        try:
+            self._flush_stale_carryover_hot()
+        except Exception as e:
+            print(f"[Tasks] carryover quente não expirado: {e}")
         for task in _task_queue.tick():
             if _task_queue.status().get("current"):
                 break
@@ -7256,14 +7275,17 @@ class JarvisLive:
             print("[QoderLive] abort por barge-in — turno substituído, silenciado")
             _metrics.event("qoder turn replaced by owner voice; abort silenced")
             # Nada da resposta antiga volta por cima do assunto novo; se ela
-            # não chegou a tocar, a pergunta vira item explícito da fila.
+            # não chegou a tocar, a pergunta vira CONTEXTO do turno novo
+            # (carryover quente) — só vai à fila se havia execução pesada.
             ref = int(meta.get("turn_ref") or 0)
+            task_id = str(meta.get("task_id") or "")
             if ref and not self._answers_on_whatsapp(meta) \
                     and not self._turn_answer_delivered(ref):
-                self._carryover_question(
-                    ref, self._owner_question_for(ref),
-                    "abort por barge-in antes de responder")
-            task_id = str(meta.get("task_id") or "")
+                self._carryover_hot_store(
+                    ref, self._owner_question_for(ref)
+                    or self._task_question_for(task_id),
+                    "abort por barge-in antes de responder",
+                    heavy=bool(task_id))
             if task_id:
                 try:
                     _task_queue.cancel(task_id)
@@ -7387,13 +7409,19 @@ class JarvisLive:
                 # Dono (02/11/2026): o turno que ele acabou de substituir não
                 # pode voltar depois por cima do assunto novo. Se nada da
                 # resposta chegou a tocar, a pergunta dele não pode morrer em
-                # silêncio: vira item explícito da fila, que responde quando a
-                # conversa estiver vazia e citando o pedido original.
+                # silêncio. Desde 05/11/2026 ela NÃO vai mais para a fila de
+                # prioridade zero: vira CONTEXTO do turno novo (carryover
+                # quente, consumido adiante neste mesmo `_qoder_turn`) — uma
+                # resposta única cobre as duas. A fila permanece só para
+                # execução pesada em andamento (turno de tarefa da fila).
                 ref = int(meta.get("turn_ref") or 0)
                 if ref and not self._turn_answer_delivered(ref):
-                    self._carryover_question(
-                        ref, self._owner_question_for(ref),
-                        "turno substituído antes de responder")
+                    question = self._owner_question_for(ref) \
+                        or self._task_question_for(task_id)
+                    self._carryover_hot_store(
+                        ref, question,
+                        "turno substituído antes de responder",
+                        heavy=bool(task_id))
             if self._answers_on_whatsapp(meta):
                 if pending_wa.strip():
                     # A resposta já produzida não morre com o turno. Sai numa
@@ -7716,6 +7744,22 @@ class JarvisLive:
             rt.finish(str(turn_id))
         except Exception as e:
             print(f"[Fluxos] finish falhou: {e!r}")
+
+    def _flows_is_chat_turn(self, turn_id) -> bool:
+        """Turno classificado como conversa (sem verbo de ação)?
+
+        Usado só para a flag `chat` do sidecar (reenvio curto após abort).
+        Sem runtime de fluxos ou sem plano, conservador: False = reenvio
+        longo como hoje. Ação privilegiada jamais chega aqui: os portões
+        retornaram antes do modelo.
+        """
+        rt = self._flows_get()
+        if rt is None or turn_id is None:
+            return False
+        try:
+            return bool(rt.is_chat_turn(str(turn_id)))
+        except Exception:
+            return False
 
     def _flows_local_chat(self, turn_id) -> bool:
         """Conversa curta atendida pela boca? True se o turno já foi falado.
@@ -8157,10 +8201,21 @@ class JarvisLive:
             _tone = _emotion.prompt_line(emotion) if emotion else ""
             if _tone:
                 _context = f"{_context}\n{_tone}".strip()
+            # Responder no lugar em vez de enfileirar (05/11/2026): a pergunta
+            # que o dono cortou com a própria voz, sem resposta entregue, não
+            # espera a conversa esvaziar — entra como contexto deste turno e
+            # sai numa resposta única. Turno de tarefa da fila e retentativa
+            # não consomem: o replay não é assunto novo do dono.
+            if (not retry and not task_id
+                    and str(source or "") == "owner"):
+                _hot = self._consume_carryover_hot(text)
+                if _hot:
+                    _context = f"{_hot}\n{_context}".strip()
             self._qoder_live.ask(
                 payload, speaker=speaker, id=turn_id,
                 priority="now" if preempt else None,
-                context=_context or None)
+                context=_context or None,
+                chat=self._flows_is_chat_turn(turn_id))
         except Exception as e:
             print(f"[QoderLive] ask failed: {e!r}")
             _metrics.inc("qoder.error")
@@ -14505,6 +14560,31 @@ class JarvisLive:
         except (TypeError, ValueError):
             return ""
 
+    def _task_question_for(self, task_id) -> str:
+        """Pergunta gravada no payload de uma tarefa da fila (carryover).
+
+        Um turno de tarefa não tem fala do dono na mesa por `turn_ref`: a
+        pergunta dele mora no payload do item. Sem esta leitura, o preempt de
+        um turno de tarefa perderia a pergunta — exatamente o sumiço que a
+        correção de 05/11/2026 veio eliminar.
+        """
+        task_id = str(task_id or "")
+        if not task_id:
+            return ""
+        try:
+            rows = _task_queue.list_tasks() or []
+        except Exception:
+            return ""
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("id") or "") != task_id:
+                continue
+            payload = row.get("payload")
+            if isinstance(payload, dict):
+                return " ".join(str(payload.get("question") or "").split())
+        return ""
+
     def _owner_spoke_after(self, ref) -> bool:
         """True quando o dono já abriu um assunto mais novo que esta vez."""
         table = getattr(self, "_turn_owner_text", None)
@@ -14650,7 +14730,38 @@ class JarvisLive:
             return "dono falou depois"
         return "answer"
 
-    def _carryover_question(self, ref, question: str, reason: str = "") -> bool:
+    def _carryover_mark_seen(self, ref) -> bool:
+        """Esta vez já foi levada adiante nos últimos 900 s? (marca e diz)
+
+        Vale para os dois destinos — fila fria e contexto quente — para o mesmo
+        turno não ser carregado duas vezes por cortes encadeados. `now` é
+        time.monotonic() (segundos desde o boot): só dá para comparar com uma
+        entrada que EXISTE. Tratar a vez inédita como carimbo 0.0 fazia
+        "agora" parecer recente em máquina recém-ligada (uptime < 900 s) e a
+        pergunta do dono morria sem ser carregada.
+        """
+        lock = getattr(self, "_speech_audit_lock", None)
+        if lock is None:
+            return False
+        now = time.monotonic()
+        try:
+            with lock:
+                seen = getattr(self, "_carryover_questions", None)
+                if not isinstance(seen, dict):
+                    seen = {}
+                    self._carryover_questions = seen
+                if ref in seen and now - float(seen[ref] or 0.0) < 900.0:
+                    return True
+                for key in [k for k, ts in seen.items()
+                            if now - float(ts or 0.0) > 900.0]:
+                    seen.pop(key, None)
+                seen[ref] = now
+        except Exception:
+            return False
+        return False
+
+    def _carryover_question(self, ref, question: str, reason: str = "",
+                            *, skip_seen: bool = False) -> bool:
         """Pergunta que ficou sem resposta vira item explícito da fila.
 
         Descartar a fala sem devolver a resposta seria pior que a resposta
@@ -14681,28 +14792,11 @@ class JarvisLive:
             if newest_ref > ref and self._same_owner_subject(
                     table[newest_ref], clean):
                 return False
-        now = time.monotonic()
-        lock = getattr(self, "_speech_audit_lock", None)
-        try:
-            if lock is not None:
-                with lock:
-                    seen = getattr(self, "_carryover_questions", None)
-                    if not isinstance(seen, dict):
-                        seen = {}
-                        self._carryover_questions = seen
-                    # `now` é time.monotonic() (segundos desde o boot): só dá
-                    # para comparar com uma entrada que EXISTE. Tratar a vez
-                    # inédita como carimbo 0.0 fazia "agora" parecer recente em
-                    # máquina recém-ligada (uptime < 900 s) e a pergunta do dono
-                    # morria sem virar item da fila.
-                    if ref in seen and now - float(seen[ref] or 0.0) < 900.0:
-                        return False
-                    for key in [k for k, ts in seen.items()
-                                if now - float(ts or 0.0) > 900.0]:
-                        seen.pop(key, None)
-                    seen[ref] = now
-        except Exception:
-            pass
+        # Fila FRIA só quando o chamador já decidiu que o lugar não serve
+        # (execução pesada, expiração do quente); `skip_seen` abre exceção
+        # explícita porque o hot store marcou a vez ao guardá-la.
+        if not skip_seen and self._carryover_mark_seen(ref):
+            return False
 
         session = self._carryover_session()
         # 1) assunto abandonado sai da fila antes de qualquer decisão.
@@ -14797,6 +14891,143 @@ class JarvisLive:
         except Exception:
             pass
         return True
+
+    # ── Carryover quente: responder no lugar em vez de enfileirar ───────────
+
+    def _carryover_hot_store(self, ref, question: str, reason: str = "",
+                             *, heavy: bool = False) -> bool:
+        """Pergunta morta por preempt/barge-in antes de responder.
+
+        Padrão (heavy=False): a pergunta vira CONTEXTO do turno novo — uma
+        resposta única cobre as duas — e a fila de prioridade zero não aparece.
+        É o fim do item das 00:51 que só falou às 09:38.
+
+        heavy=True (execução pesada em andamento, o turno novo não dá conta
+        das duas): a pergunta continua na fila, MAS o adiamento é falado em
+        uma frase com o porquê. Nada some em silêncio.
+        """
+        clean = " ".join(str(question or "").split()).strip()
+        try:
+            ref = int(ref or 0)
+        except (TypeError, ValueError):
+            ref = 0
+        if not clean or ref <= 0:
+            return False
+        if heavy:
+            queued = self._carryover_question(
+                ref, clean, reason or "execução pesada em andamento")
+            if queued:
+                try:
+                    self._say_now(
+                        f"Fiquei devendo «{clean[:60]}»: tem execução pesada "
+                        "em andamento. Respondo assim que a conversa "
+                        "esvaziar.", log=True)
+                except Exception as e:
+                    print(f"[QoderLive] adiamento falado: {e}")
+            return queued
+        if self._carryover_mark_seen(ref):
+            return False
+        items = getattr(self, "_carryover_hot", None)
+        if not isinstance(items, dict):
+            items = {}
+            self._carryover_hot = items
+        items[ref] = {"question": clean[:400],
+                      "reason": str(reason or "")[:120],
+                      "at": time.monotonic()}
+        # Entulho não: se o hot estoura, o mais velho cai na fila com o
+        # adiamento falado (o mesmo contrato do expire/flush).
+        while len(items) > _CARRYOVER_HOT_MAX:
+            oldest = min(items,
+                         key=lambda k: float(items[k].get("at") or 0.0))
+            row = items.pop(oldest)
+            self._carryover_hot_expire(int(oldest),
+                                       str(row.get("question") or ""))
+        print(f"[QoderLive] pergunta sem resposta vira contexto do turno "
+              f"novo: {clean[:80]!r}")
+        return True
+
+    def _carryover_hot_expire(self, ref, question: str) -> None:
+        """Quente sem turno novo a tempo: vai à fila e o adiamento é falado."""
+        question = " ".join(str(question or "").split()).strip()
+        if not question:
+            return
+        try:
+            if self._carryover_question(
+                    ref, question, "o turno novo não chegou a tempo",
+                    skip_seen=True):
+                self._say_now(
+                    f"Sua pergunta «{question[:60]}» ficou para o momento "
+                    "em que a conversa esvaziar — ela está na fila agora.",
+                    log=True)
+        except Exception as e:
+            print(f"[QoderLive] carryover quente expirado: {e}")
+
+    def _flush_stale_carryover_hot(self) -> int:
+        """Despeja quentes vencidos na fila. Chamado pelo vigia e no consumo."""
+        items = getattr(self, "_carryover_hot", None)
+        if not isinstance(items, dict) or not items:
+            return 0
+        now = time.monotonic()
+        flushed = 0
+        for key in sorted(items):
+            row = items.get(key)
+            if not isinstance(row, dict):
+                items.pop(key, None)
+                continue
+            if now - float(row.get("at") or 0.0) <= _CARRYOVER_HOT_TTL_S:
+                continue
+            question = str(row.get("question") or "")
+            items.pop(key, None)
+            self._carryover_hot_expire(int(key), question)
+            flushed += 1
+        return flushed
+
+    def _consume_carryover_hot(self, new_text: str = "") -> str:
+        """Linha de contexto para o turno novo cobrir a pergunta pendente.
+
+        Devolve "" quando não há nada quente. Entradas com o mesmo assunto da
+        fala nova somem sem linha: o turno novo já é a resposta delas (o dono
+        repetiu a pergunta). Vencidos saem pelo caminho da fila + adiamento
+        falado — nunca somem.
+        """
+        self._flush_stale_carryover_hot()
+        items = getattr(self, "_carryover_hot", None)
+        if not isinstance(items, dict) or not items:
+            return ""
+        lines: list[str] = []
+        for key in sorted(items):
+            row = items.get(key)
+            if not isinstance(row, dict):
+                items.pop(key, None)
+                continue
+            question = str(row.get("question") or "").strip()
+            if not question:
+                items.pop(key, None)
+                continue
+            items.pop(key, None)
+            if new_text and self._same_owner_subject(new_text, question):
+                continue
+            reason = str(row.get("reason") or "").strip()
+            lines.append(
+                "[PERGUNTA SEM RESPOSTA] O dono perguntou antes "
+                f"«{question[:160]}» e a resposta foi cortada"
+                + (f" ({reason})" if reason else "")
+                + ". Responda ESSA pergunta e o pedido atual numa única "
+                "resposta, curta. Se a pergunta antiga não couber aqui, diga "
+                "em uma frase o que ficou para depois e por quê; nunca a "
+                "deixe em silêncio.")
+        if not lines:
+            return ""
+        _metrics.inc("rota.carryover_hot")
+        print(f"[QoderLive] {len(lines)} pergunta(s) sem resposta viraram "
+              "contexto do turno novo")
+        try:
+            self.ui.write_log(
+                "SYS: pergunta sem resposta vai sair junto com o pedido "
+                "novo (contexto do turno, sem fila).")
+        except Exception:
+            pass
+        return "\n".join(lines)
 
     def _cut_note_releasable(self, note: dict) -> bool:
         """A sobra desta fala pode voltar no primeiro momento calmo?

@@ -341,6 +341,24 @@ class FlowsRuntime:
                     "local_chat_ms": round(
                         (self.clock() - live.started_at) * 1000.0, 1)}
 
+    def is_chat_turn(self, turn_id: str) -> bool:
+        """O plano deste turno é conversa pura (nenhuma ação/consulta/ambiguidade)?
+
+        Não é portão de nada: só informa ao processo vivo que o sidecar pode
+        usar o reenvio curto (3 s) se o abort do turno anterior comer a fala.
+        Ação privilegiada nunca passa por aqui — os gates do app resolvem
+        antes do modelo. Sem plano ativo: False (reenvio longo, como hoje).
+        """
+        with self._lock:
+            live = self._turns.get(str(turn_id))
+        if live is None:
+            return False
+        d = live.plan.decision
+        return bool(live.plan.active and not live.plan.blocked
+                    and not d.actions and not d.lookups
+                    and not d.cancel and not d.blocked
+                    and not d.needs_fallback)
+
     def partial(self, turn_id: str, delta: str) -> None:
         if not (self.config.enabled and self.config.partial_prewarm):
             return
