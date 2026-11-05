@@ -7410,6 +7410,23 @@ class JarvisLive:
         rt = self._flows_get()
         if rt is None or turn_id is None:
             return
+        if allowed:
+            # Trava a fonte do microfone durante a fala do assistente: o eco
+            # da boca não pode reeleger o microfone no meio da frase.
+            mm = getattr(self, "_multi_mic", None)
+            try:
+                if mm is not None:
+                    mm.hold()
+            except Exception:
+                pass
+        else:
+            # A fala foi descartada: nada vai tocar, devolve a eleição.
+            mm = getattr(self, "_multi_mic", None)
+            try:
+                if mm is not None:
+                    mm.release()
+            except Exception:
+                pass
         try:
             rt.arm_speech(str(turn_id), bool(allowed))
         except Exception as e:
@@ -8075,6 +8092,47 @@ class JarvisLive:
                     float(session.get("prompt_audio_until") or 0.0))
         return bool(guard and now < guard)
 
+    def _voice_train_diag(self, session: dict | None = None) -> str:
+        """Por extenso do que o microfone e o STT viram durante o cadastro.
+
+        Blocos observados, clipes cortados por cada portão da voz
+        (core/groq_stt.VOICE_GATE_REASONS), microfone ativo e se ele tem
+        perfil salvo, flags que fecham a captura. É a linha que permite
+        diagnosticar amanhã um cancelamento com zero amostras sem adivinhação.
+        """
+        parts: list[str] = []
+        try:
+            listener = getattr(self, "_groq", None)
+            stats = (listener.voice_gate_stats()
+                     if listener is not None
+                     and hasattr(listener, "voice_gate_stats") else None)
+            if isinstance(stats, dict):
+                by = {str(k): int(v)
+                      for k, v in (stats.get("by_reason") or {}).items()
+                      if int(v or 0) > 0}
+                parts.append(
+                    f"blocos={int(stats.get('blocks') or 0)} "
+                    f"cortados={int(stats.get('clips_dropped') or 0)}"
+                    + (f" por {by}" if by else ""))
+        except Exception:
+            pass
+        try:
+            key = str(getattr(self, "_active_mic_key", "") or "?")
+            speaker = getattr(self, "_speaker", None)
+            perfil = "?"
+            if speaker is not None and hasattr(speaker, "has_profile_for"):
+                perfil = "sim" if speaker.has_profile_for(key) else "nao"
+            parts.append(f"microfone={key} perfil_salvo={perfil}")
+        except Exception:
+            pass
+        if getattr(self.ui, "muted", False):
+            parts.append("muted=sim")
+        if getattr(self, "_phone_active", False):
+            parts.append("celular_ativo=sim")
+        if session:
+            parts.append(f"ignoradas={int(session.get('ignored') or 0)}")
+        return ", ".join(parts) if parts else "sem diagnóstico"
+
     def _voice_train_check_timeout(self, now: float | None = None) -> bool:
         """End a session that sat idle too long, with an audible warning."""
         session = self._voice_train
@@ -8089,13 +8147,16 @@ class JarvisLive:
         last = float(session.get("last_activity") or 0.0)
         if not last or now - last <= _VOICE_TRAIN_IDLE_TIMEOUT_S:
             return False
+        grabbed = len(session.get("samples") or [])
         self._voice_train = None
         self._voice_train_listener(False)
         try:
             self.ui.write_log(
                 "SYS: cadastro de voz cancelado por inatividade — "
                 f"{_VOICE_TRAIN_IDLE_TIMEOUT_S:.0f}s sem resposta; "
-                "nenhuma amostra foi gravada.")
+                f"amostras={grabbed}/{session['total']}: nenhuma chegou ao "
+                f"portão do cadastro no período — "
+                f"{self._voice_train_diag(session)}.")
         except Exception:
             pass
         try:
@@ -8205,6 +8266,10 @@ class JarvisLive:
         now = time.monotonic()
         index = int(session.get("done") or 0)
         prompt = _VOICE_TRAIN_PROMPTS[index]
+        try:
+            diag = self._voice_train_diag(session)
+        except Exception:
+            diag = "sem diagnóstico"
         soft_at = float(session.get("soft_retry_at") or 0.0)
         if (session.get("soft_retry_index") != index
                 or not soft_at
@@ -8215,7 +8280,7 @@ class JarvisLive:
             try:
                 self.ui.write_log(
                     "SYS: cadastro de voz — tentativa recusada "
-                    f"({why}); repetindo a mesma frase {index + 1}/"
+                    f"({why}); {diag}; repetindo a mesma frase {index + 1}/"
                     f"{session['total']} sem contar falha.")
             except Exception:
                 pass
@@ -8232,18 +8297,21 @@ class JarvisLive:
             self.ui.write_log(
                 "SYS: cadastro de voz — tentativa "
                 f"{fails}/{_VOICE_TRAIN_MAX_FAILURES} recusada ({why}); "
-                f"mesma frase {index + 1}/{session['total']} "
+                f"{diag}; mesma frase {index + 1}/{session['total']} "
                 f"(janela {_VOICE_TRAIN_FAILURE_WINDOW_S:.0f}s).")
         except Exception:
             pass
         if fails >= _VOICE_TRAIN_MAX_FAILURES:
+            grabbed = len(session.get("samples") or [])
             self._voice_train = None
             self._voice_train_listener(False)
             self._say_now("Cadastro de voz cancelado. Não consegui confirmar "
                           "três tentativas.")
             try:
                 self.ui.write_log("SYS: cadastro de voz cancelado após "
-                                  f"{fails} tentativas recusadas.")
+                                  f"{fails} tentativas recusadas; "
+                                  f"amostras={grabbed}/{session['total']}: "
+                                  f"{diag}.")
             except Exception:
                 pass
             return True
@@ -8259,8 +8327,16 @@ class JarvisLive:
         session["last_activity"] = time.monotonic()
         if self._voice_train_cancelled(text):
             self._log_heard(text)
+            grabbed = len(session.get("samples") or [])
             self._voice_train = None
             self._voice_train_listener(False)
+            try:
+                self.ui.write_log(
+                    "SYS: cadastro de voz cancelado pelo dono; "
+                    f"amostras={grabbed}/{session['total']}: "
+                    f"{self._voice_train_diag(session)}.")
+            except Exception:
+                pass
             self._say_now("Cadastro de voz cancelado. Pode continuar normalmente.")
             return True
         # The prompt itself is still in the room: anything transcribed now is
@@ -8339,7 +8415,8 @@ class JarvisLive:
             self.ui.write_log(
                 f"SYS: cadastro de voz — frase {session['done']}/{session['total']} "
                 f"aceita (semelhança {score:.2f}) — amostras: "
-                f"{len(buffered)} no buffer, gravação no fim.")
+                f"{len(buffered)} no buffer, gravação no fim; "
+                f"{self._voice_train_diag(session)}.")
         except Exception:
             pass
         if session["done"] >= session["total"]:
@@ -9163,6 +9240,18 @@ class JarvisLive:
                 pass
             return False
         ok, score, detail = self._voice_train_owner_ok(line, pcm)
+        if (not ok and "sem cadastro de voz neste microfone" in detail):
+            # Perfil ausente no microfone ativo NÃO é voz rejeitada: é justo o
+            # microfone que ainda não tem cadastro. Bloquear o pedido aqui era
+            # o ciclo vicioso (04/11 23:22: o aviso manda dizer "cadastra minha
+            # voz" e o pedido chegava a ser ignorado por não haver perfil).
+            try:
+                self.ui.write_log(
+                    "SYS: cadastro de voz — iniciando sem perfil salvo neste "
+                    f"microfone ({detail}); as 5 frases criam o perfil.")
+            except Exception:
+                pass
+            ok = True
         if not ok:
             try:
                 self.ui.write_log(
@@ -12491,6 +12580,17 @@ class JarvisLive:
                             or _is_enroll_command(text)):
                         print(f"[Eco] turno fantasma descartado: "
                               f"{str(text)[:70]!r}")
+                        if getattr(self, "_voice_train", None) is not None:
+                            # Cadastro guiado em andamento: o fantasma não pode
+                            # sumir em silêncio — ele passa pelo portão do
+                            # cadastro, que conta, loga o motivo (eco durante o
+                            # prompt ou tentativa rejeitada) e mantém o rastros
+                            # que o timeout de 0 amostras vai mostrar.
+                            try:
+                                if self._voice_train_gate(text, pcm):
+                                    self._note_owner_speech("cadastro de voz")
+                            except Exception as e:
+                                print(f"[Voice] eco no cadastro não logado: {e}")
                         return
             except Exception:
                 pass
@@ -14877,6 +14977,15 @@ class JarvisLive:
                 dropped += 1
             for item in keep_items:
                 q.put_nowait(item)
+        if dropped:
+            # Fala descartada nunca toca: sem o dreno do playback, o hold da
+            # fonte ficaria travado para sempre. Devolve a eleição.
+            mm = getattr(self, "_multi_mic", None)
+            try:
+                if mm is not None:
+                    mm.release()
+            except Exception:
+                pass
         return dropped
 
     def _trim_say_queue(self) -> int:
@@ -17816,6 +17925,13 @@ class JarvisLive:
             return
         if not self._playback_silent():
             return
+        # A fala terminou: o microfone volta a poder trocar de fonte.
+        mm = getattr(self, "_multi_mic", None)
+        try:
+            if mm is not None:
+                mm.release()
+        except Exception:
+            pass
         self.set_speaking(False)
 
     def _note_speech_gap(self) -> None:
