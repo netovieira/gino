@@ -1,4 +1,8 @@
-"""Boca: qwen3:4b-instruct-2507-q4_K_M local (Ollama/GPU). Fala, e só.
+"""Boca: lfm3:1.7b local (Ollama/GPU). Fala, e só.
+
+Procedência da troca: 05/11/2026, ordem do dono — LFM3-1.7B Q4_K_M no lugar do
+qwen3:4b-instruct-2507-q4_K_M: mais leve (1,1 GB) e ~64% mais rápido no
+mesmo caminho; o Qwen fica instalado como rota de volta.
 
 Modelos Qwen3 podem ligar o thinking por padrão; com ``num_predict`` curto eles
 gastam todos os tokens pensando e devolvem texto vazio (``done_reason=length``).

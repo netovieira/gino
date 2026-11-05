@@ -7,7 +7,7 @@
   },
   "mouth": {
     "enabled": true,
-    "model": "qwen3:4b-instruct-2507-q4_K_M",
+    "model": "lfm3:1.7b",
     "url": "http://127.0.0.1:11434",
     "timeout_s": 25.0,
     "keep_alive": "10m",

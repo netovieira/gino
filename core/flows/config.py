@@ -71,7 +71,9 @@ class FlowsConfig:
     fallback_timeout_ms: int = 450
 
     mouth_enabled: bool = False
-    mouth_model: str = "qwen3:4b-instruct-2507-q4_K_M"
+    # Fallback do arquivo ausente: LFM3-1.7B, a boca desde 05/11/2026 (mais
+    # leve e ~64% mais rápido que o qwen3:4b, ordem do dono).
+    mouth_model: str = "lfm3:1.7b"
     mouth_url: str = "http://127.0.0.1:11434"
     mouth_timeout_s: float = 25.0
     mouth_keep_alive: str = "10m"
