@@ -7,9 +7,12 @@ Os três ladrões medidos no laudo (vão mediano 7 s, p95 ~95-101 s no PC):
       nada entra na fila de prioridade zero;
   (b) preempt com execução pesada em andamento (turno de tarefa da fila) →
       a pergunta continua na fila E o adiamento é falado em uma frase;
-  (c) conversa simples → a boca responde (uma única fala; o cérebro nem é
-      chamado — sem dupla fala nem repetição de emenda) e o turno marca `chat`
-      no sidecar;
+  (c) conversa simples → a boca dá a RESPOSTA SUPERFICIAL imediata (uma única
+      fala pela runtime) e o cérebro É CHAMADO junto para trazer o conteúdo —
+      a expectativa antiga de que "o cérebro nem é chamado" era o desvio do
+      passo 3 e morreu em 05/11/2026; a fala única segue por qoder_answered_at
+      e pela substituição do [Say] (sem repetição de emenda); o turno marca
+      `chat` no sidecar;
   (d) verbo de ação/número/confirmação mantém a cauda de 3 s no endpointing;
       frase comum de conversa fecha em ~1,2 s;
   (e) a boca jamais afirma resultado de ação — lei inegociável, cobrada em
@@ -197,8 +200,12 @@ def _wait(pred, timeout=2.0):
 
 
 def test_boca_atende_antes_e_a_emenda_do_cerebro_nao_acontece():
-    # No turno de conversa curta o cérebro remoto NUNCA é chamado (a frase da
-    # boca é a resposta inteira): não há emenda que possa repetir a boca.
+    # Na RUNTIME da conversa curta a boca fala uma única vez: o brief não
+    # compete e a frase não se repete. O cérebro agora É chamado pelo
+    # processo vivo logo atrás (passo 3; ver
+    # tests/test_flows_fala_paralela.py) — a emenda que não acontece é a
+    # repetição: se o cérebro responde antes, a boca cala (qoder_answered_at);
+    # se a boca fala antes, o [Say] substitui, nunca duas falas do mesmo tom.
     spoken = []
     rt = _runtime(spoken)
     plan = rt.start_turn("t1", "oi gino, tudo bem?", armed=True)

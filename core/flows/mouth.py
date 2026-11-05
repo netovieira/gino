@@ -273,15 +273,16 @@ class Mouth:
     def answer(self, text: str, decision: Decision,
                cancel_ev: threading.Event | None = None,
                *, context: str = "") -> MouthResult:
-        """Resposta de conversa curta, feita pela boca, sem passar pelo cérebro.
+        """RESPOSTA SUPERFICIAL de conversa curta, feita pela boca (passo 2).
 
-        Só é chamada para turnos que o roteador fechou como bate-papo puro
-        (:func:`core.flows.router.short_chat_reason`). A lei é a mesma do
-        brief: a boca NUNCA afirma resultado de ação — o guard da fase
-        ``brief`` é o portão final. Diferente do brief, aqui não existe
-        template de reserva: se o modelo falha ou o guard rejeita, a frase
-        vem VAZIA e o chamador devolve o turno ao cérebro. Silêncio da boca
-        nunca é resposta errada; invenção é.
+        Desde 05/11/2026 esta frase não substitui o cérebro: ela é o ack
+        imediato enquanto o raciocínio remoto continua com o conteúdo
+        (passos 3/4). Só é chamada para turnos que o roteador fechou como
+        bate-papo puro (:func:`core.flows.router.short_chat_reason`). A lei
+        é a mesma do brief: a boca NUNCA afirma resultado de ação — o guard
+        da fase ``brief`` é o portão final. Se o modelo falha ou o guard
+        rejeita, a frase vem VAZIA: silêncio da boca nunca é resposta
+        errada; invenção é.
         """
         if not self.config.mouth_enabled or not self.config.local_chat_enabled:
             return MouthResult(sentence="", fixed=True, raw="[chat desligado]")
@@ -314,14 +315,21 @@ class Mouth:
             error=str(result.get("error") or ""),
             fixed=not bool(sentence), guard_tripped=tripped)
 
-    def _recent_lines(self, limit: int = 6) -> str:
+    def _recent_lines(self, limit: int | None = None) -> str:
         """Últimas falas da conversa, curtas, para a rota livre.
 
-        O provedor é injetado pelo processo vivo (memória de chat). Qualquer
-        falha devolve vazio: a boca fala sem história, nunca segura o brief.
+        O provedor é injetado pelo processo vivo (memória de chat) e já vem
+        podado pela janela de ``mouth_context_minutes`` (15 min por padrão,
+        config/flows.json). O teto de falas sai de ``mouth_context_turns``
+        — medido em bytes em 05/11/2026: 8 falas ≈ 1,3 KB típico, 2,5 KB no
+        pior caso, sem regredir o prefill do cérebro (podado a ~7,9 KB).
+        Qualquer falha devolve vazio: a boca fala sem história, nunca segura
+        o brief.
         """
         if self.history is None:
             return ""
+        if limit is None:
+            limit = int(getattr(self.config, "mouth_context_turns", 8) or 8)
         try:
             turns = list(self.history() or [])
         except Exception:

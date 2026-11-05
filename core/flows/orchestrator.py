@@ -153,7 +153,8 @@ class Orchestrator:
         local_chat = ""
         if (speak and self.config.mouth_enabled
                 and self.config.local_chat_enabled):
-            local_chat = _router.short_chat_reason(text, decision)
+            local_chat = _router.short_chat_reason(
+                text, decision, name=self.assistant_name)
         plan = TurnPlan(
             turn_id=str(turn_id), text=str(text), decision=decision,
             route_ms=route_ms, fallback_ms=fallback_ms,

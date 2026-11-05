@@ -7497,6 +7497,7 @@ class JarvisLive:
                 rt = FlowsRuntime(
                     cfg, speak=self._flows_speak, log=self._flows_log,
                     on_prewarm=self._flows_on_prewarm,
+                    on_chat_route=self._flows_on_chat_route,
                     executor_runner=readonly_runner,
                     history=self._flows_history,
                     assistant_name=str(getattr(self, "_asst_name", "") or "Gino"))
@@ -7540,12 +7541,26 @@ class JarvisLive:
             print(message)
 
     def _flows_history(self) -> list[dict]:
-        """Últimas falas para a boca da rota livre (só leitura, best-effort)."""
+        """Últimas falas para a boca da rota livre (só leitura, best-effort).
+
+        Janela do fluxo do dono (05/11/2026, passo 2): os ÚLTIMOS 15 MINUTOS
+        (``mouth.context_minutes`` em config/flows.json, default 15 no
+        código — não mais as 2 h fixas) com teto de falas
+        (``context_turns``, default 8: bloco medido em ~1,3 KB típico /
+        ~2,5 KB no pior caso, sem estourar o prompt).
+        """
         try:
             memory = getattr(self, "_chat_memory", None)
             if memory is None:
                 return []
-            return list(memory.recent_turns(hours=2.0))[-6:]
+            minutes = 15.0
+            turns = 8
+            cfg = getattr(getattr(self, "_flows_rt", None), "config", None)
+            if cfg is not None:
+                minutes = float(getattr(cfg, "mouth_context_minutes", 15.0)
+                                 or 15.0)
+                turns = int(getattr(cfg, "mouth_context_turns", 8) or 8)
+            return list(memory.recent_turns(hours=minutes / 60.0))[-turns:]
         except Exception as e:
             print(f"[Fluxos] histórico da boca indisponível: {e!r}")
             return []
@@ -7733,27 +7748,22 @@ class JarvisLive:
         except Exception:
             return False
 
-    def _flows_local_chat(self, turn_id) -> bool:
-        """Conversa curta atendida pela boca? True se o turno já foi falado.
+    def _flows_on_chat_route(self, info: dict) -> None:
+        """Medição da conversa curta no instante em que a boca falou.
 
-        Espera o veredito do worker da boca (que respondeu em paralelo com a
-        diarização) e registra a medição do dono: caminho e tempo até a
-        primeira unidade de fala, por turno. None/erro = cérebro como hoje.
+        A rota boca NÃO é mais alternativa ao cérebro (fluxo do dono
+        05/11/2026, passos 2/3): a frase local é a RESPOSTA SUPERFICIAL
+        imediata e o cérebro continua atrás com o conteúdo. O callback chega
+        pela runtime quando o som sai; aqui só se registra a medição do dono
+        (caminho e tempo até a primeira unidade de fala) e a memória da fala.
         """
-        rt = self._flows_get()
-        if rt is None:
-            return False
         try:
-            info = rt.await_local_chat(str(turn_id))
-        except Exception as e:
-            print(f"[Fluxos] conversa curta falhou: {e!r}")
-            return False
-        if not info or not str(info.get("sentence") or "").strip():
-            return False
-        sentence = str(info["sentence"]).strip()
-        first_ms = float(info.get("local_chat_ms") or 0.0)
-        print(f"[Rota] caminho=boca motivo={info.get('reason')} "
-              f"primeira_unidade_ms={first_ms:.0f}")
+            sentence = str(info.get("sentence") or "").strip()
+            first_ms = float(info.get("first_ms") or 0.0)
+            print(f"[Rota] caminho=boca motivo={info.get('reason')} "
+                  f"primeira_unidade_ms={first_ms:.0f}")
+        except Exception:
+            return
         try:
             _metrics.observe("rota.boca.first_speech_s", first_ms / 1000.0)
             _metrics.inc("rota.boca.turns")
@@ -7771,13 +7781,6 @@ class JarvisLive:
             self._index_event("assistant", sentence, source="voice")
         except Exception as e:
             print(f"[Fluxos] memória da conversa curta: {e!r}")
-        self._flows_finish(turn_id)
-        try:
-            self.ui.set_state("LISTENING" if getattr(self, "_awake", True)
-                              else "SLEEPING")
-        except Exception:
-            pass
-        return True
 
     def _qoder_turn(self, text: str, pcm: bytes | None = None,
                     retry: bool = False, epoch: dict | None = None,
@@ -8100,17 +8103,16 @@ class JarvisLive:
         # durante a diarização vai ao ar agora. Num recado de persona a boca do
         # Gino continua calada.
         self._flows_arm_speech(turn_id, bool(speak))
-        # Frente local (05/11/2026): conversa curta sem ação é respondida pela
-        # boca (Ollama, ~2 s) e o cérebro remoto NUNCA é chamado. O roteador
-        # fechou a rota no begin(); a frase passou pelo guard da lei (a) na
-        # boca. Qualquer falha, atraso ou dúvida devolve o turno ao Qoder como
-        # hoje. Texto digitado, WhatsApp e recado de persona não mudam de rota.
-        if (not retry and speak and not is_relay
-                and str(source or "") == "owner"
-                and str(reply_channel or "voice") == "voice"
-                and pcm is not None):
-            if self._flows_local_chat(turn_id):
-                return
+        # Frente local (05/11/2026, passos 2/3 do fluxo do dono): em conversa
+        # curta a boca dá a RESPOSTA SUPERFICIAL imediata (worker em paralelo,
+        # <1 s de espera) e o cérebro É CHAMADO DE MESMO logo atrás — nunca
+        # condicionado ao veredito da boca. Não há `return` aqui: esperar o
+        # veredito (o antigo await de 4 s) atrasava o cérebro, e pular o
+        # cérebro sumia com o conteúdo. A fala única é garantida pela
+        # substituição existente (qoder_answered_at cala a boca que chega
+        # depois; [Say] descarta fala velha quando chega fala nova; brief
+        # cancelado pelo cérebro). Texto digitado, WhatsApp e recado de
+        # persona não mudam de rota.
         self._qoder_ignore = False
         # A fresh turn was not cut: an old `interrupt()` must not drop the
         # first line this turn speaks (Qoder never resets it elsewhere).

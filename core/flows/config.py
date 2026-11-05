@@ -80,6 +80,13 @@ class FlowsConfig:
     mouth_brief_max_tokens: int = 40
     mouth_complement_max_tokens: int = 70
     mouth_chat_max_tokens: int = 60
+    # Janela de contexto da boca (fluxo do dono, 05/11/2026, passo 2): os
+    # últimos 15 MINUTOS de conversa, configurável. O teto de falas existe
+    # para não estourar o prompt: medido em 05/11/2026 na memória real, o
+    # bloco formatado fica em ~1,3 KB típico / ~2,5 KB no pior caso com 8
+    # falas (cada linha já sai truncada a 180 chars em mouth._recent_lines).
+    mouth_context_minutes: float = 15.0
+    mouth_context_turns: int = 8
     # Conversa curta na boca (frente local): o roteador decide antes do
     # cérebro; desligável sem código se a medição mostrar regressão.
     local_chat_enabled: bool = True
@@ -130,6 +137,7 @@ class FlowsConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "FlowsConfig":
         data = data or {}
+        default = cls()
         router = data.get("router") or {}
         mouth = data.get("mouth") or {}
         partial = data.get("partial") or {}
@@ -175,6 +183,16 @@ class FlowsConfig:
         except (TypeError, ValueError):
             mouth_timeout = 25.0
         try:
+            context_minutes = float(mouth.get("context_minutes")
+                                    or default.mouth_context_minutes)
+        except (TypeError, ValueError):
+            context_minutes = default.mouth_context_minutes
+        try:
+            context_turns = int(mouth.get("context_turns")
+                                 or default.mouth_context_turns)
+        except (TypeError, ValueError):
+            context_turns = default.mouth_context_turns
+        try:
             executor_timeout = int(executor.get("timeout_ms") or 4000)
         except (TypeError, ValueError):
             executor_timeout = 4000
@@ -191,7 +209,6 @@ class FlowsConfig:
                 supervisor.get(key), default_tokens=default.tokens,
                 default_ttl=default.ttl_s, default_ephemeral=default.ephemeral)
 
-        default = cls()
         return cls(
             enabled=bool(data.get("enabled", False)),
             router_enabled=bool(router.get("enabled", True)),
@@ -205,6 +222,8 @@ class FlowsConfig:
             mouth_brief_max_tokens=max(8, brief_tokens),
             mouth_complement_max_tokens=max(8, complement_tokens),
             mouth_chat_max_tokens=max(16, chat_tokens),
+            mouth_context_minutes=min(240.0, max(1.0, context_minutes)),
+            mouth_context_turns=min(20, max(1, context_turns)),
             local_chat_enabled=bool(mouth.get("chat_local", True)),
             mouth_brief_routes=brief_routes,
             partial_prewarm=bool(partial.get("prewarm", True)),

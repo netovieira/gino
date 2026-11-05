@@ -47,7 +47,10 @@ class _LiveTurn:
     cancelled: bool = False
     cancel_reason: str = ""
     # D: conversa curta na boca — o worker responde em paralelo com a
-    # diarização e o processo vivo espera o veredito antes de tocar o cérebro.
+    # diarização como RESPOSTA SUPERFICIAL imediata (fluxo do dono 05/11/2026,
+    # passo 2). O processo vivo NÃO espera mais o veredito: o cérebro é
+    # chamado junto (passo 3) e a substituição de fala é dos eventos
+    # `qoder_answered_at` / `[Say]`, nunca de um `return` que pulava o cérebro.
     chat_event: threading.Event | None = None
     chat_info: dict[str, Any] | None = None
 
@@ -60,6 +63,7 @@ class FlowsRuntime:
                  fallback: Callable[[str, int], dict[str, Any] | None] | None = None,
                  executor_runner: Callable[[str, dict[str, Any]], Any] | None = None,
                  history: Callable[[], list[dict[str, Any]]] | None = None,
+                 on_chat_route: Callable[[dict[str, Any]], None] | None = None,
                  assistant_name: str = "Gino",
                  clock: Callable[[], float] = time.monotonic,
                  start_expiry_thread: bool = True):
@@ -67,6 +71,7 @@ class FlowsRuntime:
         self.speak = speak
         self.log = log or (lambda _msg: None)
         self.on_prewarm = on_prewarm
+        self.on_chat_route = on_chat_route
         self.clock = clock
         self.assistant_name = assistant_name
         self.supervisor = Supervisor(clock=clock)
@@ -145,9 +150,10 @@ class FlowsRuntime:
         if (speak_allowed and plan.local_chat
                 and self.config.local_chat_enabled
                 and self.config.mouth_enabled):
-            # Conversa curta: a resposta REAL sai da boca local, gerada já em
-            # paralelo com a diarização. O brief não fala nestes turnos — a
-            # frase do cérebro viria depois de uma boca que já respondeu.
+            # Conversa curta: a boca gera a RESPOSTA SUPERFICIAL já em
+            # paralelo com a diarização (passo 2 do fluxo). O cérebro também
+            # é chamado logo (passo 3): a frase local não é alternativa ao
+            # raciocínio, é o ack de <1 s; o conteúdo chega atrás.
             live.chat_event = threading.Event()
             threading.Thread(target=self._chat_worker, args=(plan.turn_id,),
                              name="flows-chat", daemon=True).start()
@@ -285,6 +291,12 @@ class FlowsRuntime:
                     if (self._closed or self._turns.get(str(turn_id)) is not live
                             or live.cancelled):
                         result = None
+                    elif live.qoder_answered_at:
+                        # O cérebro respondeu antes de a boca falar: a frase
+                        # superficial morre (lei da fala única, sem duplicar).
+                        result = None
+                        self._log("[Fluxos] conversa curta calada: o cérebro "
+                                  "respondeu antes da boca")
                     elif live.speech_armed:
                         should_speak = True
                     else:
@@ -316,9 +328,12 @@ class FlowsRuntime:
                          timeout_s: float = 4.0) -> dict[str, Any] | None:
         """Veredito da conversa curta: dict com a frase falada, ou None.
 
-        ``None`` significa o cérebro como hoje: turno sem rota de boca, boca
-        que falhou, ou boca que atrasou (o turno não pode ficar preso atrás
-        dela — o dono não espera a frente local).
+        Desde 05/11/2026 (fluxo do dono, passo 3) o processo vivo NÃO espera
+        mais este veredito: o cérebro é chamado independentemente da boca, e
+        a frase superficial vai ao ar sozinha quando ficar pronta. O método
+        fica para medição e testes; nenhum canto de ``main.py`` pode voltar a
+        segurar um turno nele (se a boca for esperada, o cérebro fica igual
+        era antes — lei do dono).
         """
         with self._lock:
             live = self._turns.get(str(turn_id))
@@ -517,6 +532,18 @@ class FlowsRuntime:
         except Exception as exc:
             self._log(f"[Fluxos] fala {kind} falhou: {exc!r}")
             return
+        if kind == "chat" and self.on_chat_route is not None:
+            # Mediação do dono (passo 2): no instante em que a resposta
+            # superficial SAI, não quando foi decidida. O processo vivo registra
+            # `[Rota] caminho=boca primeira_unidade_ms=...`.
+            try:
+                self.on_chat_route({
+                    "sentence": text,
+                    "reason": str(live.plan.local_chat),
+                    "first_ms": round(
+                        (self.clock() - live.started_at) * 1000.0, 1)})
+            except Exception as exc:
+                self._log(f"[Fluxos] rota boca (medição) falhou: {exc!r}")
         self._log(f"[Fluxos] boca ({kind}): {text!r}")
 
     @staticmethod

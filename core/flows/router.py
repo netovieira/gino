@@ -91,7 +91,21 @@ CHAT_YOU_RE = re.compile(
 CHAT_ECHO_RE = re.compile(
     r"\b(repete|repita|pode repetir|o que eu (falei|disse|pedi agora)|"
     r"o que voce (disse|falou|acabou de falar)|o que foi dito|"
+    r"como assim|que historia e essa|"
     r"resume o que (eu )?(falei|disse|voce disse)|do que a gente estava falando)\b")
+# Desabafo contra o próprio Gino e vocativo puro: evidência do activity log
+# de 05/11/2026 (43 turnos ``type=turn``): xingamento sem verbo de ação,
+# "voce ta quebrando" e "Gino." sozinho eram conversa pura e mesmo assim
+# o veredito era 0 rota-boca. Estes padrões fecham só esses casos — verbo
+# de ação, confirmação, número e excluidores continuam no cérebro (a
+# checagem deles vem antes, na mesma ordem conservadora de sempre).
+CHAT_VENT_RE = re.compile(
+    r"\b(vai se foder|vai tomar no cu|caralho|porra|merda|filho da puta|"
+    r"otario|otaria|imbecil|idiota|burro|burra|mentiroso|mentirosa|"
+    r"mentira|inutil|lerdo|sem nocao|sem vergonha)\b")
+CHAT_FAULT_RE = re.compile(
+    r"\bvoce (ta|esta|ficou|anda) (muito |meio |)?(quebrando|estragando|"
+    r"atrapalhando|atrasado|parado|perdido|ignorando|mentindo|errando)\b")
 CHAT_LOCAL_RES = (CHAT_GREET_RE, CHAT_BYE_RE, CHAT_THANKS_RE, CHAT_YOU_RE,
                   CHAT_ECHO_RE)
 # Excluidores: qualquer um destes manda o turno para o cérebro, sem discussão.
@@ -103,14 +117,17 @@ CHAT_EXCLUDE_RE = re.compile(
     r"link|arquivo|pasta|codigo|programa|instala|atualiza|configura|abre o|"
     r"lembrete|lembra|memoria|ontem|anteontem|semana passada|mes passado|"
     r"ano passado|email|e-mail|whatsapp|spotify|youtube|chrome|terminal|"
-    r"volume|musica|som\b|film|filme)\b")
+    r"volume|musica|som\b|film|filme|confirma\w*)\b")
 
 
-def short_chat_reason(text: str, decision: "Decision | None" = None) -> str:
-    """Motivo da fala sair da boca local, ou '' para ir ao cérebro.
+def short_chat_reason(text: str, decision: "Decision | None" = None,
+                      *, name: str = "gino") -> str:
+    """Motivo da fala sair da boca como RESPOSTA SUPERFICIAL imediata, ou ''.
 
-    Conservador por construção: só fecham rota as falas que casam num padrão
-    explícito de conversa pessoal E não casam em nenhum excluidor. Sem
+    Desde 05/11/2026 (fluxo do dono, passos 2/3) fechar esta rota NÃO desliga
+    o cérebro: a frase da boca vira o ack de menos de 1 s e o raciocínio roda
+    junto. Conservador por construção: só fecham rota as falas que casam num
+    padrão explícito de conversa pessoal E não casam em nenhum excluidor. Sem
     decisão de regra (fallback, ferramenta, consulta, cancelamento, bloqueio)
     o turno vai ao raciocínio como hoje.
     """
@@ -119,6 +136,12 @@ def short_chat_reason(text: str, decision: "Decision | None" = None) -> str:
         return ""
     if re.search(r"\d", n):
         return ""
+    addr = norm(name)
+    if addr and re.fullmatch(
+            r"(?:{})(?:[\s.,!?;:]+{})*[\s.,!?;:]*".format(
+                re.escape(addr), re.escape(addr)), n):
+        # Vocativo puro ("Gino.") — chamar sem assunto é conversa.
+        return "chamou"
     if decision is not None:
         if (decision.actions or decision.lookups or decision.cancel
                 or decision.blocked or decision.needs_fallback):
@@ -143,6 +166,8 @@ def short_chat_reason(text: str, decision: "Decision | None" = None) -> str:
         return "despedida"
     if CHAT_THANKS_RE.search(n):
         return "agradecimento"
+    if CHAT_VENT_RE.search(n) or CHAT_FAULT_RE.search(n):
+        return "desabafo"
     if CHAT_GREET_RE.search(n):
         return "saudacao"
     return ""
