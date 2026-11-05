@@ -19,13 +19,21 @@ WHY A SECOND CONFIRMATION MODULE
     listen. What it guarantees is that *nothing irreversible happens in the same
     call that asks for it*.
 
-WHY THE HELPER IS DETACHED
+WHY THE HELPER IS DETACHED — AND NOT ONLY DETACHED
     A process cannot reliably re-exec itself while Qt, the audio stream and the
     Live session are still shutting down. So the assistant restart spawns a
     tiny shell that waits for the current PID to disappear, then runs
     ``run-jarvis.sh --tray`` in a new session. The app then asks ``main`` for a
     clean shutdown via ``shutdown_cb``. If the hook is not bound we refuse
     rather than spawn a helper that would wait forever.
+
+    A NEW SESSION IS NOT A NEW CGROUP (05/11/2026): the helper born with
+    ``start_new_session=True`` stayed in the app's systemd scope and was swept
+    with it when GNOME stopped the scope — every automatic relaunch today died
+    before waiting. The helper must ESCAPE the cgroup (see
+    ``_spawn_relaunch_helper``): preferred is a transient ``systemd-run --user``
+    oneshot unit; fallback is setsid plus explicit migration to a delegated
+    cgroup leaf; last resort is the old in-scope helper, logged as such.
 
 WHY THE PENDING REQUEST IS ON DISK
     The manager used to keep the parked request only in memory. The model's
@@ -50,6 +58,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -169,6 +178,60 @@ def _helper_command(pid: int) -> str:
             f"exec {shlex.quote(RUN_SCRIPT)} --tray")
 
 
+def _helper_unit_name(pid: int) -> str:
+    """Nome único da unidade transitória; também é o marcador de proveniência.
+
+    core/boot_audit lê esse prefixo no cgroup do processo novo para dizer que
+    o boot veio do relançamento automático, não de um clique no ícone.
+    """
+    return f"jarvis-relaunch-{int(pid)}-{int(time.time())}"
+
+
+def systemd_run_helper_argv(script: str, unit: str) -> list[str]:
+    """Escape 1 (escolhido): unidade transitória sob o gerenciador do usuário.
+
+    ``systemd-run --user`` nasce fora do scope do app (o GNOME não varre a
+    unidade quando mata o scope) e ``--collect`` a descarta ao terminar.
+    Testado nesta máquina em 05/11/2026 com o app vivo intacto: o helper
+    sobreviveu ao stop do scope transitório que o criou.
+    """
+    return ["systemd-run", "--user", "--no-block", "--quiet", "--collect",
+            "--property=Type=oneshot", f"--unit={unit}",
+            "/bin/sh", "-c", script]
+
+
+def _cgroup_escape_leaf(pid: int) -> Path:
+    """Folha delegada própria sob user@<uid>.service para o escape 2.
+
+    Medido nesta máquina: escrever o PID no cgroup.procs de
+    ``user.slice/user-<uid>.slice`` dá EACCES e no de ``user@<uid>.service``
+    dá EBUSY (restrição de processos internos); o que funciona sem privilégio
+    é criar uma folha própria ali embaixo e mover o PID para ela.
+    """
+    uid = os.getuid()
+    return Path(f"/sys/fs/cgroup/user.slice/user-{uid}.slice"
+                f"/user@{uid}.service/gino-relaunch-{int(pid)}"
+                f"-{int(time.time())}")
+
+
+def _move_pid_out_of_app_cgroup(pid: int) -> bool:
+    """Escape 2: migração explícita do PID para a folha delegada."""
+    leaf = _cgroup_escape_leaf(pid)
+    try:
+        leaf.mkdir(parents=True, exist_ok=False)
+    except OSError:
+        return False
+    try:
+        (leaf / "cgroup.procs").write_text(f"{int(pid)}\n", encoding="utf-8")
+        return True
+    except OSError:
+        try:
+            leaf.rmdir()
+        except OSError:
+            pass
+        return False
+
+
 class RestartManager:
     """Two-step restart requests. One instance per app, bound in main."""
 
@@ -198,24 +261,31 @@ class RestartManager:
 
         self._shutdown_cb: Optional[Callable[[], None]] = None
         self._confirm_cb: Optional[Callable[[str], None]] = None
+        self._expire_cb: Optional[Callable[[str], None]] = None
         self._pc_restart: Optional[Callable[[], object]] = None
 
     # ── wiring ──────────────────────────────────────────────────────────────
 
     def bind(self, shutdown_cb: Optional[Callable[[], None]] = None,
              confirm_cb: Optional[Callable[[str], None]] = None,
-             pc_restart: Optional[Callable[[], object]] = None) -> None:
+             pc_restart: Optional[Callable[[], object]] = None,
+             expire_cb: Optional[Callable[[str], None]] = None) -> None:
         """Wire the manager to the app.
 
         shutdown_cb: called with no arguments to end the app cleanly.
         confirm_cb:  called with the sentence to speak, asking for the phrase
                      (optional — the model can do the asking itself).
+        expire_cb:   called with the sentence announcing that a parked request
+                     expired without execution. Must be short (it runs under
+                     the manager lock) and must never call back into the
+                     manager — the app wires it to its spoken-notice channel.
         pc_restart:  the callable that reboots the machine; defaults to
                      actions.computer_settings.restart_computer at execution
                      time, never at import time.
         """
         self._shutdown_cb = shutdown_cb if callable(shutdown_cb) else None
         self._confirm_cb = confirm_cb if callable(confirm_cb) else None
+        self._expire_cb = expire_cb if callable(expire_cb) else None
         self._pc_restart = pc_restart if callable(pc_restart) else None
 
     def _log(self, message: str) -> None:
@@ -368,7 +438,13 @@ class RestartManager:
             self._log(f"could not clear expired archive — {e}")
 
     def _mark_expired(self, p: _PendingRequest) -> None:
-        """Remember that a request expired, so status stops lying (locked)."""
+        """Remember that a request expired, so status stops lying (locked).
+
+        The expiry is NOT silent anymore (05/11/2026): a parked request that
+        died without execution gets one spoken notice to the owner through
+        ``expire_cb``. Before this the request parked at 11:44 expired at
+        13:21 and the owner never heard a word about it.
+        """
         age = time.monotonic() - p.at
         self._expired = {
             "kind":               p.kind,
@@ -380,6 +456,20 @@ class RestartManager:
         self._archive_expired(p)
         self._pending = None
         self._clear_file()
+        if self._expire_cb is not None:
+            try:
+                # Short call under the lock; never re-enters the manager.
+                self._expire_cb(self.expired_notice(p))
+            except Exception as e:
+                self._log(f"aviso de expiração falhou — {e}")
+
+    def expired_notice(self, p: _PendingRequest) -> str:
+        """Frase curta e falável avisando que o pedido estacionado expirou."""
+        wall = time.time() - max(time.monotonic() - p.at, 0.0)
+        hhmm = time.strftime("%H:%M", time.localtime(wall))
+        rotulo = "do assistente" if p.kind == "assistant" else "do computador"
+        return (f"O pedido de reinício {rotulo} das {hhmm} expirou sem "
+                f"execução, criador.")
 
     def last_expired(self) -> Optional[dict]:
         """The most recent request that timed out, or None. Plain data."""
@@ -600,6 +690,57 @@ class RestartManager:
         return (f"Assistant restart is rate-limited to {_RATE_MESSAGE}; "
                 f"try again in {remaining} seconds. Nothing was done.")
 
+    def _spawn_relaunch_helper(self, script: str) -> Optional[str]:
+        """Lança o helper FORA do cgroup deste processo; descreve o mecanismo.
+
+        ``start_new_session`` muda sessão/grupo, não cgroup: nascido dentro do
+        scope do app o helper é varrido junto quando o systemd o para
+        (provado em 05/11/2026 — nenhum relançamento automático do dia
+        sobreviveu). Ordem testada nesta máquina:
+          1. ``systemd-run --user`` — unidade transitória oneshot, fora do
+             scope; o ambiente do app vivo tem DISPLAY, XDG_RUNTIME_DIR e
+             DBUS_SESSION_BUS_ADDRESS, então o bus do usuário alcança.
+          2. setsid + migração explícita para folha delegada (2 funciona sem
+             privilégio só na folha; ver ``_cgroup_escape_leaf``).
+          3. Último recurso: o helper antigo dentro do scope do app — pode
+             morrer junto, documentado no log; melhor que não agendar nada.
+        Retorna a descrição do mecanismo usado, ou None se não lançou.
+        """
+        pid = os.getpid()
+        if shutil.which("systemd-run"):
+            unit = _helper_unit_name(pid)
+            try:
+                # rc != 0 cobre bus ausente, unit duplicada e binário quebrado.
+                done = subprocess.run(
+                    systemd_run_helper_argv(script, unit),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, timeout=10)
+                if done.returncode == 0:
+                    return f"systemd-run --user {unit}"
+                self._log("systemd-run --user falhou (rc="
+                          f"{done.returncode}) — tentando fuga de cgroup")
+            except Exception as e:
+                self._log(f"systemd-run --user indisponível ({e}) — "
+                          "tentando fuga de cgroup")
+        # Fallback 2: nasce detached por sessão e é MOVIDO para fora do
+        # cgroup do app antes que o scope seja encerrado.
+        try:
+            proc = subprocess.Popen(
+                ["/bin/sh", "-c", script],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True,
+                start_new_session=True,
+            )
+        except Exception as e:
+            self._log(f"could not spawn restart helper — {e}")
+            return None
+        if _move_pid_out_of_app_cgroup(proc.pid):
+            return f"setsid + cgroup leaf (pid {proc.pid})"
+        # Fallback 3: último recurso documentado — segue vivo no scope do app.
+        self._log("aviso: helper ficou DENTRO do cgroup do app — pode "
+                  "morrer junto com o scope (último recurso)")
+        return f"in-scope helper (pid {proc.pid})"
+
     def _run_assistant(self, p: _PendingRequest) -> str:
         blocked = self._rate_limited()
         if blocked:
@@ -616,7 +757,9 @@ class RestartManager:
                 # protocol can be tested without ever spawning a process.
                 self._last_assistant_at = time.monotonic()
             return (f"[DRY RUN] Nothing was executed. Would run: "
-                    f"/bin/sh -c {shlex.quote(script)} and then end this app.")
+                    f"/bin/sh -c {shlex.quote(script)} detached outside this "
+                    f"cgroup (systemd-run --user; fallback setsid + leaf) and "
+                    f"then end this app.")
 
         if self._shutdown_cb is None:
             self._log("assistant restart refused — no shutdown hook bound")
@@ -628,19 +771,10 @@ class RestartManager:
             return (f"Cannot restart the assistant: {RUN_SCRIPT} was not found. "
                     f"Nothing was done.")
 
-        try:
-            subprocess.Popen(
-                ["/bin/sh", "-c", script],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-                start_new_session=True,
-            )
-        except Exception as e:
-            self._log(f"could not spawn restart helper — {e}")
-            return (f"Could not schedule the assistant restart: {e}. "
-                    f"Nothing was done.")
+        mechanism = self._spawn_relaunch_helper(script)
+        if mechanism is None:
+            return ("Could not schedule the assistant restart. "
+                    "Nothing was done.")
 
         with self._lock:
             self._last_assistant_at = time.monotonic()
@@ -649,7 +783,7 @@ class RestartManager:
         # immediately on the new boot.
         self._save_last(p.reason)
 
-        self._log("assistant restart scheduled"
+        self._log(f"assistant restart scheduled via {mechanism}"
                   + (f" — reason: {p.reason}" if p.reason else ""))
         try:
             self._shutdown_cb()

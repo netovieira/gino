@@ -3301,6 +3301,7 @@ class JarvisLive:
         except Exception as e:
             print(f"[Fluxos] warm hook failed: {e!r}")
         chain_txt = " → ".join(_brain.label(r) for r in st["chain"])
+        self._log_boot_provenance()
         self.ui.write_log(f"SYS: {self._asst_name} online — cérebro: {chain_txt}, "
                           f"voz {_brain.voice_label(st)}. Gemini desligado.")
         print(f"[Economy] chain: {chain_txt}")
@@ -5366,7 +5367,9 @@ class JarvisLive:
             try:
                 self._restart = _restart.RestartManager(logger=print)
                 self._restart.bind(shutdown_cb=self._restart_shutdown,
-                                   pc_restart=self._pc_restart_confirmed)
+                                   pc_restart=self._pc_restart_confirmed,
+                                   expire_cb=lambda line: self._say_now(
+                                       line, log=True, origin="aviso"))
                 _restart_action.bind(self._restart)
             except Exception as e:
                 self._restart = None
@@ -11884,6 +11887,22 @@ class JarvisLive:
         # it in silence — the 02/11/2026 loop, where the owner waited forever.
         return bool(_RESTART_CONFIRM_RE.search(text or ""))
 
+    def _log_boot_provenance(self) -> None:
+        """Uma linha de proveniência do processo por boot (decisão do dono).
+
+        O reinício manual (fechar e clicar no ícone) não deixava rastro nenhum
+        nos logs do app — só o journald via. A linha diz PID, hora, PPID, pai,
+        cgroup e origem inferida; uma vez só por processo.
+        """
+        if getattr(self, "_boot_provenance_done", False):
+            return
+        self._boot_provenance_done = True
+        try:
+            from core import boot_audit
+            self.ui.write_log(f"SYS: {boot_audit.provenance_line()}")
+        except Exception as e:
+            print(f"[Boot] proveniência indisponível: {e}")
+
     def _restart_reply(self, message: str, *, reply_channel: str = "",
                        wa_account: str | None = None,
                        wa_chat: str | None = None) -> None:
@@ -11950,8 +11969,19 @@ class JarvisLive:
             # microphone, not an intruder, and the owner can simply repeat.
             if not remote:
                 self._log_heard(text)
-            self._restart_reply("Não reconheci sua voz como dono agora. Repita a "
-                                "frase 'confirmo reiniciar'.",
+            # Autorizar reinício por senha digitada é decisão PENDENTE do dono:
+            # a política atual é "reinício só com a fala do dono", então aqui
+            # não entra o caminho de senha do cadastro de voz — só o motivo
+            # explícito e o prazo, para a recusa nunca morrer em silêncio.
+            prazo_s = int(pending.get("expires_in") or 0)
+            prazo = time.strftime(
+                "%H:%M", time.localtime(time.time() + max(prazo_s, 0)))
+            self._voice_audit(
+                "confirmação de reinício recusada — voz não reconhecida "
+                "como dono; pedido mantido até o prazo")
+            self._restart_reply("Não reconheci sua voz como dono agora. Você "
+                                "pode repetir a confirmação quando for "
+                                f"reconhecido. O pedido expira às {prazo}.",
                                 reply_channel=reply_channel,
                                 wa_account=wa_account, wa_chat=wa_chat)
             return True
@@ -19917,6 +19947,7 @@ class JarvisLive:
 
                     # Wake word: if enabled, come up ASLEEP (mic gated, silent)
                     # until the user says "Hey Jarvis" or taps wake in the UI.
+                    self._log_boot_provenance()
                     if self._wake_enabled:
                         self._ensure_wake_detector()
                         self._awake = False

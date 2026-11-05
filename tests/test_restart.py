@@ -33,6 +33,18 @@ def _unbound_action():
     action.bind(None)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_systemd_run(monkeypatch):
+    """Nenhum teste do protocolo pode tocar o systemd --user de verdade.
+
+    O caminho preferido do helper usa subprocess.run(systemd-run ...); sem
+    esta guarda um teste futuro com dry_run=False criaria uma unidade real.
+    """
+    run = mock.Mock(side_effect=AssertionError("subprocess.run was called"))
+    monkeypatch.setattr(restart.subprocess, "run", run)
+    return run
+
+
 @pytest.fixture
 def manager():
     return RestartManager(dry_run=True, logger=mock.Mock())
@@ -402,9 +414,17 @@ def test_recorded_origin_is_never_the_old_attribution_by_default():
 
 # ── live path (Popen mocked) ─────────────────────────────────────────────────
 
-def test_live_assistant_restart_spawns_detached_helper_then_shuts_down(monkeypatch,
-                                                                       tmp_path):
-    popen = mock.Mock(return_value=mock.Mock())
+def test_live_assistant_restart_spawns_helper_outside_cgroup(monkeypatch,
+                                                              tmp_path):
+    """The relaunch helper must escape the app cgroup (defect of 05/11/2026).
+
+    ``start_new_session=True`` kept the helper in the app's systemd scope and
+    GNOME swept it with the scope; the chosen mechanism is a transient
+    ``systemd-run --user`` oneshot unit.
+    """
+    run = mock.Mock(return_value=mock.Mock(returncode=0))
+    popen = mock.Mock(side_effect=AssertionError("subprocess.Popen was called"))
+    monkeypatch.setattr(restart.subprocess, "run", run)
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
     shutdown = mock.Mock()
     manager = RestartManager(dry_run=False, logger=mock.Mock(),
@@ -415,16 +435,63 @@ def test_live_assistant_restart_spawns_detached_helper_then_shuts_down(monkeypat
     result = manager.confirm("confirmo reiniciar o assistente")
 
     assert "Restarting the assistant now" in result
-    assert popen.call_count == 1
-    args, kwargs = popen.call_args
-    argv = args[0]
-    assert argv[0] == "/bin/sh" and argv[1] == "-c"
-    script = argv[2]
+    assert run.call_count == 1
+    argv = run.call_args[0][0]
+    assert argv[:2] == ["systemd-run", "--user"]
+    assert "--no-block" in argv and "--collect" in argv
+    assert "--property=Type=oneshot" in argv
+    assert any(a.startswith("--unit=jarvis-relaunch-") for a in argv)
+    script = argv[-1]
     assert f"kill -0 {os.getpid()}" in script
     assert "/home/anthero/jarvis/run-jarvis.sh --tray" in script
-    assert kwargs["start_new_session"] is True
+    assert argv[-3] == "/bin/sh" and argv[-2] == "-c"
     shutdown.assert_called_once_with()
     assert manager.pending() is None
+
+
+def test_live_assistant_restart_falls_back_to_setsid_leaf(monkeypatch, tmp_path):
+    """systemd-run unavailable → setsid + explicit migration to leaf cgroup."""
+    monkeypatch.setattr(restart.shutil, "which",
+                        lambda _name: None)  # sem systemd-run no PATH
+    popen = mock.Mock(return_value=mock.Mock(pid=424242))
+    monkeypatch.setattr(restart.subprocess, "Popen", popen)
+    moved = []
+    monkeypatch.setattr(restart, "_move_pid_out_of_app_cgroup",
+                        lambda pid: moved.append(pid) or True)
+    manager = RestartManager(dry_run=False, logger=mock.Mock(),
+                             state_path=tmp_path / "restart_pending.json")
+    manager.bind(shutdown_cb=mock.Mock())
+
+    manager.request_assistant()
+    result = manager.confirm("confirmo reiniciar o assistente")
+
+    assert "Restarting the assistant now" in result
+    assert moved == [424242]
+    args, kwargs = popen.call_args
+    assert args[0][:2] == ["/bin/sh", "-c"]
+    assert kwargs["start_new_session"] is True
+
+
+def test_live_assistant_restart_last_resort_keeps_in_scope_helper(monkeypatch,
+                                                                  tmp_path):
+    """Nem systemd-run nem folha: o helper antigo ainda é agendado e o log avisa."""
+    monkeypatch.setattr(restart.shutil, "which", lambda _name: None)
+    popen = mock.Mock(return_value=mock.Mock(pid=424242))
+    monkeypatch.setattr(restart.subprocess, "Popen", popen)
+    monkeypatch.setattr(restart, "_move_pid_out_of_app_cgroup",
+                        lambda _pid: False)
+    logger = mock.Mock()
+    manager = RestartManager(dry_run=False, logger=logger,
+                             state_path=tmp_path / "restart_pending.json")
+    manager.bind(shutdown_cb=mock.Mock())
+
+    manager.request_assistant()
+    result = manager.confirm("confirmo reiniciar o assistente")
+
+    assert "Restarting the assistant now" in result
+    assert popen.call_count == 1
+    logged = " ".join(str(c) for c in logger.call_args_list)
+    assert "DENTRO do cgroup" in logged
 
 
 def test_live_assistant_restart_without_shutdown_hook_refuses(monkeypatch,
