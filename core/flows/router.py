@@ -63,6 +63,90 @@ TASK_RE = re.compile(
     r"\b(abre|abrir|toca|tocar|poe|coloca|bota|pausa|para|baixa|abaixa|"
     r"aumenta|sobe|muda|reinicia|desliga|envia|manda|lembra|agenda|play)\b")
 
+# ── conversa curta na boca (frente local, cérebro só para ação/raciocínio) ───
+#
+# Decisão do dono (03/11/2026): o cérebro remoto leva ~16 s para a primeira
+# frase; conversa curta (saudação, "como você está", bate-papo sobre o próprio
+# Gino, eco do que foi dito agora) sai da boca local em ~2 s. O roteador é
+# conservador por construção: a rota só fecha para a boca quando a fala CASA
+# num padrão explícito de conversa E não casa em nenhum excluidor. Dúvida,
+# número, ferramenta, cálculo, memória antiga ou fato do mundo vão ao cérebro
+# exatamente como hoje. A boca jamais afirma resultado de ação: o guard da
+# fase "brief" continua sendo o portão final da frase (lei a).
+SHORT_CHAT_MAX_CHARS = 140
+CHAT_GREET_RE = re.compile(
+    r"\b(oi|opa|eai|e ai|eae|bom dia|boa tarde|boa noite|tudo bem|tudo bom|"
+    r"tudo certo|beleza|fala ai|acorda|esta ai|vc esta ai|oi gino|gino oi)\b")
+CHAT_BYE_RE = re.compile(
+    r"\b(tchau|adeus|ate amanha|ate logo|ate mais|falou|boa noite|bom descanso)\b")
+CHAT_THANKS_RE = re.compile(r"\b(obrigado|obrigada|valeu|brigado|parabens)\b")
+CHAT_YOU_RE = re.compile(
+    r"\b(como (voce|vc|si) esta|como voce ta|como esta voce|voce esta bem|"
+    r"voce ta bem|tudo bem com (voce|vc)|como foi seu dia|como esta seu dia|"
+    r"quem (e|eh) voce|o que (voce|vc) (e|eh)|voce (e|eh) (um|uma) (robo|"
+    r"programa|ia|inteligencia)|voce e real|voce e vivo|voce esta feliz|"
+    r"voce esta triste|voce esta cansado|voce dorme|voce sonha|voce me ama|"
+    r"voce gosta de mim|quem te criou|qual (e|eh) seu nome|o que voce faz|"
+    r"voce trabalha|como voce se sente|o que voce acha de voce)\b")
+CHAT_ECHO_RE = re.compile(
+    r"\b(repete|repita|pode repetir|o que eu (falei|disse|pedi agora)|"
+    r"o que voce (disse|falou|acabou de falar)|o que foi dito|"
+    r"resume o que (eu )?(falei|disse|voce disse)|do que a gente estava falando)\b")
+CHAT_LOCAL_RES = (CHAT_GREET_RE, CHAT_BYE_RE, CHAT_THANKS_RE, CHAT_YOU_RE,
+                  CHAT_ECHO_RE)
+# Excluidores: qualquer um destes manda o turno para o cérebro, sem discussão.
+CHAT_EXCLUDE_RE = re.compile(
+    r"\b(quando|onde|por que|porque|como (faco|consigo|funciona|abro|ponho)|"
+    r"o que (e|eh|sao)\s|quem (e|eh)\s+(?!voce)|quanto|custa|calcul|soma|"
+    r"subtra|multiplica|divid|media |por cento|clima|tempo (hoje|amanha)|"
+    r"preco|cotacao|noticia|jogo|placar|google|busca|pesquis|traduz|site|url|"
+    r"link|arquivo|pasta|codigo|programa|instala|atualiza|configura|abre o|"
+    r"lembrete|lembra|memoria|ontem|anteontem|semana passada|mes passado|"
+    r"ano passado|email|e-mail|whatsapp|spotify|youtube|chrome|terminal|"
+    r"volume|musica|som\b|film|filme)\b")
+
+
+def short_chat_reason(text: str, decision: "Decision | None" = None) -> str:
+    """Motivo da fala sair da boca local, ou '' para ir ao cérebro.
+
+    Conservador por construção: só fecham rota as falas que casam num padrão
+    explícito de conversa pessoal E não casam em nenhum excluidor. Sem
+    decisão de regra (fallback, ferramenta, consulta, cancelamento, bloqueio)
+    o turno vai ao raciocínio como hoje.
+    """
+    n = norm(text)
+    if not n or len(n) > SHORT_CHAT_MAX_CHARS:
+        return ""
+    if re.search(r"\d", n):
+        return ""
+    if decision is not None:
+        if (decision.actions or decision.lookups or decision.cancel
+                or decision.blocked or decision.needs_fallback):
+            return ""
+        if decision.rule not in ("saudacao", "livre"):
+            return ""
+        if decision.rule == "saudacao" and not CHAT_EXCLUDE_RE.search(n):
+            return "saudacao"
+    else:
+        if not GREET_RE.search(n):
+            return ""
+    if any(r.search(n) for r in (TASK_RE, CONFIRM_RE, MUSIC_RE, TIME_RE,
+                                 CONTEXT_RE, AMBIG_RE)):
+        return ""
+    if CHAT_EXCLUDE_RE.search(n):
+        return ""
+    if CHAT_YOU_RE.search(n):
+        return "bate-papo"
+    if CHAT_ECHO_RE.search(n):
+        return "eco-recente"
+    if CHAT_BYE_RE.search(n):
+        return "despedida"
+    if CHAT_THANKS_RE.search(n):
+        return "agradecimento"
+    if CHAT_GREET_RE.search(n):
+        return "saudacao"
+    return ""
+
 
 @dataclass
 class Action:

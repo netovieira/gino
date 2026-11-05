@@ -1469,14 +1469,17 @@ def strip_style_tags(text: str) -> str:
 # correção é de pipeline de áudio, não de espera pelo cérebro:
 #   * a PRIMEIRA unidade é curta (24-32 caracteres) para o primeiro som sair
 #     no menor tempo possível;
-#   * as seguintes agregam frases (160-220 caracteres) para reduzir o número
-#     de pedidos ao sintetizador;
+#   * as seguintes agregam frases até 60 caracteres (medido 05/11/2026: a
+#     unidade de 220 chars custava 6 a 9,6 s de Fish e a fila atrasada abria
+#     buraco audível de até 2,7 s entre unidades; a ~30 chars/s do modelo
+#     livre, 44-60 chars sintetizam em ~2 s e o lookahead de uma unidade
+#     mantém a junção pronta antes do fim da anterior);
 #   * o corte é sempre em fim de frase, vírgula ou espaço — nunca no meio de
 #     uma palavra.
 SPEECH_FIRST_MIN_CHARS = 24
 SPEECH_FIRST_MAX_CHARS = 32
-SPEECH_UNIT_MIN_CHARS = 160
-SPEECH_UNIT_MAX_CHARS = 220
+SPEECH_UNIT_MIN_CHARS = 44
+SPEECH_UNIT_MAX_CHARS = 60
 # Folga de junção entre duas unidades quando a seguinte JÁ está pronta. É
 # respiração intencional, não buraco de síntese; abaixo do `_FISH_GAP` de
 # 220 ms usado dentro de uma frase antiga.

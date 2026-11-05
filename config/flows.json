@@ -13,6 +13,8 @@
     "keep_alive": "10m",
     "brief_max_tokens": 40,
     "complement_max_tokens": 70,
+    "chat_max_tokens": 60,
+    "chat_local": true,
     "brief_routes": [
       "musica",
       "hora",

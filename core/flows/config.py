@@ -77,6 +77,10 @@ class FlowsConfig:
     mouth_keep_alive: str = "10m"
     mouth_brief_max_tokens: int = 40
     mouth_complement_max_tokens: int = 70
+    mouth_chat_max_tokens: int = 60
+    # Conversa curta na boca (frente local): o roteador decide antes do
+    # cérebro; desligável sem código se a medição mostrar regressão.
+    local_chat_enabled: bool = True
     mouth_brief_routes: tuple[str, ...] = (
         "musica", "hora", "app", "lembrete", "confirma", "consulta", "livre")
 
@@ -161,6 +165,10 @@ class FlowsConfig:
         except (TypeError, ValueError):
             complement_tokens = 70
         try:
+            chat_tokens = int(mouth.get("chat_max_tokens") or 60)
+        except (TypeError, ValueError):
+            chat_tokens = 60
+        try:
             mouth_timeout = float(mouth.get("timeout_s") or 25.0)
         except (TypeError, ValueError):
             mouth_timeout = 25.0
@@ -194,6 +202,8 @@ class FlowsConfig:
             mouth_keep_alive=str(mouth.get("keep_alive") or default.mouth_keep_alive),
             mouth_brief_max_tokens=max(8, brief_tokens),
             mouth_complement_max_tokens=max(8, complement_tokens),
+            mouth_chat_max_tokens=max(16, chat_tokens),
+            local_chat_enabled=bool(mouth.get("chat_local", True)),
             mouth_brief_routes=brief_routes,
             partial_prewarm=bool(partial.get("prewarm", True)),
             partial_speech=bool(partial.get("speech", False)),

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from . import partial as _partial
+from . import router as _router
 from .config import FALLBACK_REMOTE, FlowsConfig
 from .executor import Executor, ExecutorResult
 from .mouth import Mouth, MouthResult
@@ -52,6 +53,10 @@ class TurnPlan:
     context: str = ""
     prewarmed_from_partial: bool = False
     spawned: list[str] = field(default_factory=list)
+    # Motivo pelo qual a CONVERSA CURTA pode sair da boca local sem passar
+    # pelo cérebro remoto ('' = o turno pertence ao raciocínio). É uma
+    # sugestão conservadora do roteador; a frase final ainda passa pelo guard.
+    local_chat: str = ""
 
     @property
     def route(self) -> str:
@@ -145,10 +150,15 @@ class Orchestrator:
         route_ms = (self.clock() - route_started) * 1000.0
 
         context = self._context_for(decision)
+        local_chat = ""
+        if (speak and self.config.mouth_enabled
+                and self.config.local_chat_enabled):
+            local_chat = _router.short_chat_reason(text, decision)
         plan = TurnPlan(
             turn_id=str(turn_id), text=str(text), decision=decision,
             route_ms=route_ms, fallback_ms=fallback_ms,
-            used_fallback=used_fallback, context=context)
+            used_fallback=used_fallback, context=context,
+            local_chat=local_chat)
 
         state = _TurnState(plan=plan)
         with self._lock:
@@ -304,6 +314,25 @@ class Orchestrator:
                 state.brief_spoken = True
         self._event("brief", plan.turn_id, sentence=result.sentence,
                     ms=round(result.ms, 1),
+                    guard=result.guard_tripped, fixed=result.fixed)
+        return result
+
+    def local_answer(self, plan: TurnPlan,
+                     cancel_event: threading.Event | None = None) -> MouthResult:
+        """Conversa curta respondida pela boca, sem cérebro (rota do begin).
+
+        O guard da fase ``brief`` é o portão final: se a frase afirmar
+        resultado de ação, vier com número ou vazar ferramenta, ela morre
+        aqui e o chamador devolve o turno ao cérebro. Lei (a) não se afrouxa
+        nesta rota; ela é a mesma boca com mais uma frase para dizer.
+        """
+        if not plan.local_chat:
+            return MouthResult(sentence="", fixed=True,
+                               raw="[rota nao fechada para a boca]")
+        result = self.mouth.answer(plan.text, plan.decision, cancel_event,
+                                   context=plan.context)
+        self._event("local_chat", plan.turn_id, sentence=result.sentence,
+                    reason=plan.local_chat, ms=round(result.ms, 1),
                     guard=result.guard_tripped, fixed=result.fixed)
         return result
 

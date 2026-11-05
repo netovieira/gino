@@ -46,7 +46,7 @@ def _jarvis(**attrs):
 
 def _prompt(obj) -> str:
     with mock.patch.object(main, "_sleep",
-                           SimpleNamespace(latest_context=lambda: "")):
+                           SimpleNamespace(latest_context=lambda **kw: "")):
         return main.JarvisLive._qoder_system_prompt(obj)
 
 

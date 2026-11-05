@@ -43,8 +43,13 @@ class _LiveTurn:
     brief_started_at: float = 0.0
     brief_spoken_at: float = 0.0
     pending_brief: str = ""
+    pending_kind: str = "brief"
     cancelled: bool = False
     cancel_reason: str = ""
+    # D: conversa curta na boca — o worker responde em paralelo com a
+    # diarização e o processo vivo espera o veredito antes de tocar o cérebro.
+    chat_event: threading.Event | None = None
+    chat_info: dict[str, Any] | None = None
 
 
 class FlowsRuntime:
@@ -137,7 +142,16 @@ class FlowsRuntime:
         if any(a.requires_confirm for a in plan.decision.actions):
             threading.Thread(target=self._gate_worker, args=(plan.turn_id,),
                              name="flows-gate", daemon=True).start()
-        if speak_allowed and self._should_brief(plan):
+        if (speak_allowed and plan.local_chat
+                and self.config.local_chat_enabled
+                and self.config.mouth_enabled):
+            # Conversa curta: a resposta REAL sai da boca local, gerada já em
+            # paralelo com a diarização. O brief não fala nestes turnos — a
+            # frase do cérebro viria depois de uma boca que já respondeu.
+            live.chat_event = threading.Event()
+            threading.Thread(target=self._chat_worker, args=(plan.turn_id,),
+                             name="flows-chat", daemon=True).start()
+        elif speak_allowed and self._should_brief(plan):
             # O brief começa a ser gerado JÁ. Se ``armed`` for falso (voiceprint
             # ainda decidindo), a frase fica pronta e só vai ao ar no arm.
             threading.Thread(target=self._brief_worker, args=(plan.turn_id,),
@@ -174,7 +188,7 @@ class FlowsRuntime:
                           f"da fala ({pending!r})")
                 return False
         if pending:
-            self._speak(live, pending, kind="brief")
+            self._speak(live, pending, kind=live.pending_kind)
         return True
 
     def _gate_worker(self, turn_id: str) -> None:
@@ -247,6 +261,86 @@ class FlowsRuntime:
                 return
         self._speak(live, result.sentence, kind="brief")
 
+    def _chat_worker(self, turn_id: str) -> None:
+        """D: resposta de conversa curta feita pela boca, sem tocar o cérebro.
+
+        O guard da fase ``brief`` decide a última palavra: se a frase vier
+        vazia (modelo fora do ar, guard travado), o turno NUNCA é respondido
+        pela boca — o worker recua para o brief normal e o processo vivo
+        segue para o cérebro. A boca pode anunciar que ouviu; fato só vira
+        fala quando a ferramenta devolve (lei a, intocada aqui).
+        """
+        info: dict[str, Any] | None = None
+        live = None
+        try:
+            with self._lock:
+                live = self._turns.get(str(turn_id))
+                if (live is None or self._closed or live.cancelled
+                        or live.qoder_answered_at):
+                    return
+            result = self.orchestrator.local_answer(live.plan)
+            if result.sentence:
+                should_speak = False
+                with self._lock:
+                    if (self._closed or self._turns.get(str(turn_id)) is not live
+                            or live.cancelled):
+                        result = None
+                    elif live.speech_armed:
+                        should_speak = True
+                    else:
+                        live.pending_brief = result.sentence
+                        live.pending_kind = "chat"
+                        self._log("[Fluxos] resposta da boca pronta aguardando "
+                                  f"voiceprint: {result.sentence!r}")
+                    if result is not None:
+                        info = {"sentence": result.sentence,
+                                "reason": str(live.plan.local_chat),
+                                "chat_ms": round(float(result.ms), 1)}
+                if info is not None and should_speak:
+                    self._speak(live, result.sentence, kind="chat")
+        except Exception as exc:
+            self._log(f"[Fluxos] conversa curta falhou: {exc!r}")
+            info = None
+        finally:
+            if info is None and live is not None:
+                # A boca não respondeu: o brief normal volta a ser o ack do
+                # turno enquanto o cérebro pega a fala.
+                self._brief_worker(turn_id)
+            with self._lock:
+                if live is not None:
+                    live.chat_info = info
+                    if live.chat_event is not None:
+                        live.chat_event.set()
+
+    def await_local_chat(self, turn_id: str,
+                         timeout_s: float = 4.0) -> dict[str, Any] | None:
+        """Veredito da conversa curta: dict com a frase falada, ou None.
+
+        ``None`` significa o cérebro como hoje: turno sem rota de boca, boca
+        que falhou, ou boca que atrasou (o turno não pode ficar preso atrás
+        dela — o dono não espera a frente local).
+        """
+        with self._lock:
+            live = self._turns.get(str(turn_id))
+            if live is None or live.chat_event is None:
+                return None
+            event = live.chat_event
+        if not event.wait(max(0.05, float(timeout_s))):
+            with self._lock:
+                live.cancelled = True
+                live.cancel_reason = "conversa curta atrasou"
+            self._log("[Fluxos] conversa curta atrasou; o cérebro assume "
+                      f"o turno ({turn_id})")
+            return None
+        with self._lock:
+            info = live.chat_info
+            if info is None:
+                return None
+            return {**info,
+                    "route": str(live.plan.route),
+                    "local_chat_ms": round(
+                        (self.clock() - live.started_at) * 1000.0, 1)}
+
     def partial(self, turn_id: str, delta: str) -> None:
         if not (self.config.enabled and self.config.partial_prewarm):
             return
@@ -292,6 +386,10 @@ class FlowsRuntime:
 
     def _release(self, live: _LiveTurn, phrase: str) -> None:
         if not phrase or not live.speak_allowed or not live.speech_armed:
+            return
+        if live.plan.local_chat:
+            # D: no turno de conversa curta a boca fala a RESPOSTA; o ack de
+            # parcial competiria com ela.
             return
         if live.qoder_answered_at:
             return

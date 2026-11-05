@@ -2,13 +2,15 @@
 
 O dono mediu a boca esperando o pedido HTTP inteiro de cada frase. O
 segmentador corta a PRIMEIRA unidade em 24-32 caracteres (som abre cedo) e
-agrega as seguintes em 160-220, sempre em fim de frase/vírgula/palavra. Nunca
+agrega as seguintes em 44-60 (~2 s de Fish; 220 chars custavam 6-9,6 s),
+sempre em fim de frase/vírgula/palavra. Nunca
 toca o Fish Audio: aqui só o corte puro é exercitado.
 """
 from __future__ import annotations
 
 import unittest
 
+import main
 from core.brain import (
     SPEECH_FIRST_MAX_CHARS,
     SPEECH_FIRST_MIN_CHARS,
@@ -54,6 +56,19 @@ class FirstUnitTest(unittest.TestCase):
 
 
 class AggregatedUnitTest(unittest.TestCase):
+    def test_orcamento_de_sintese_da_unidade(self):
+        # Medido 05/11/2026: a unidade de 220 chars custava 6 a 9,6 s de Fish
+        # e a fila atrasada abria buraco audível de até 2,7 s. A ~30 chars/s
+        # do modelo livre, a agregada cabe em ~2 s; a junção sem buraco
+        # (_SPEECH_JUNCTION_GAP_S) continua coberta por test_say_junction_gap.
+        self.assertLessEqual(SPEECH_UNIT_MAX_CHARS, 72,
+                             "unidade agregada acima do orçamento de ~2 s")
+        self.assertLessEqual(SPEECH_UNIT_MIN_CHARS, SPEECH_UNIT_MAX_CHARS)
+        # teto da fila de texto: a primeira (32) + uma agregada
+        self.assertLessEqual(
+            main._SAY_UNIT_TEXT_MAX,
+            SPEECH_FIRST_MAX_CHARS + SPEECH_UNIT_MAX_CHARS + 4)
+
     def test_unidades_seguintes_vem_agregadas(self):
         units = SpeechUnitSegmenter().feed(TEXT, final=True)
         tail = units[1:]

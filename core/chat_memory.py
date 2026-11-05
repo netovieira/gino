@@ -931,11 +931,14 @@ class ChatMemory:
             return ""
 
     def warmup_block(self, max_chars=7000, recent_turns=14, now=None,
-                     resumed=False) -> str:
+                     resumed=False, index_chars=None) -> str:
         """What a fresh Qoder session reads at boot to warm the same chat.
 
         The index gives the shape of the memory; the last turns give the exact
-        words. Both are bounded so the prompt stays cheap.
+        words. Both are bounded so the prompt stays cheap. ``index_chars``
+        caps the level index on its own (the voice turn sends a much smaller
+        prefill than the session's default); ``None`` keeps the historical
+        cap so existing callers are untouched.
         """
         try:
             max_chars = max(500, int(max_chars))
@@ -943,7 +946,14 @@ class ChatMemory:
         except (TypeError, ValueError):
             max_chars, recent_turns = 7000, 14
         try:
-            index = self.index_block(max_chars=2600, now=now, resumed=resumed)
+            index_max = (int(index_chars) if index_chars is not None
+                         else 2600)
+            index_max = max(200, index_max)
+        except (TypeError, ValueError):
+            index_max = 2600
+        try:
+            index = self.index_block(max_chars=index_max, now=now,
+                                     resumed=resumed)
             turns = self.recent_turns(hours=HOT_HOURS, now=now)
             if recent_turns:
                 turns = turns[-recent_turns:]

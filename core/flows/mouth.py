@@ -59,6 +59,22 @@ SYS_FREE = (
     "Fala do dono: estou cansado hoje. -> Entendi, criador.\n"
     "Fala do dono: me explica aquilo. -> Deixa eu organizar isso, criador."
 )
+SYS_CHAT = (
+    "Você é o Gino, o assistente falado do dono, em português do Brasil. "
+    "Esta é conversa curta: o orquestrador já decidiu que não há ferramenta, "
+    "cálculo nem memória antiga no pedido. Responda em UMA ou DUAS frases "
+    "faladas, diretas e com a persona (verbal primeiro, concreto, sem "
+    "enfeite). REGRAS INVIOLÁVEIS: você NÃO executou nada neste turno — "
+    "nunca afirme feito, pronto, aberto, tocando, anotado ou enviado; nunca "
+    "narre o que está fazendo (gerúndio de ação é proibido); nunca invente "
+    "número, hora, nome ou fato do mundo; se a resposta depender de qualquer "
+    "uma dessas coisas, responda só à parte pessoal e seja breve. Sem aspas, "
+    "sem prefixo, sem explicação: responda só a frase.\n"
+    "Exemplos:\n"
+    "Fala do dono: como você está? -> Bem, criador; máquina alegre e sem "
+    "incêndio hoje.\n"
+    "Fala do dono: bom dia -> Bom dia, criador. A casa está de pé."
+)
 SYS_COMPLEMENT = (
     "Você é a BOCA do Gino, um assistente falado em português do Brasil. "
     "Recebe FATOS de trabalhadores e diz UMA frase curta (máx. 18 palavras) "
@@ -244,6 +260,50 @@ class Mouth:
             sentence = ""
         return MouthResult(
             sentence=(sentence or _guard.template_for(None, decision.draft)),
+            ms=float(result.get("first_sentence_ms") or 0.0),
+            ttft_ms=float(result.get("ttft_ms") or 0.0),
+            raw=str(result.get("text") or ""),
+            error=str(result.get("error") or ""),
+            fixed=not bool(sentence), guard_tripped=tripped)
+
+    def answer(self, text: str, decision: Decision,
+               cancel_ev: threading.Event | None = None,
+               *, context: str = "") -> MouthResult:
+        """Resposta de conversa curta, feita pela boca, sem passar pelo cérebro.
+
+        Só é chamada para turnos que o roteador fechou como bate-papo puro
+        (:func:`core.flows.router.short_chat_reason`). A lei é a mesma do
+        brief: a boca NUNCA afirma resultado de ação — o guard da fase
+        ``brief`` é o portão final. Diferente do brief, aqui não existe
+        template de reserva: se o modelo falha ou o guard rejeita, a frase
+        vem VAZIA e o chamador devolve o turno ao cérebro. Silêncio da boca
+        nunca é resposta errada; invenção é.
+        """
+        if not self.config.mouth_enabled or not self.config.local_chat_enabled:
+            return MouthResult(sentence="", fixed=True, raw="[chat desligado]")
+        history = self._recent_lines()
+        user = ((f"Conversa recente:\n{history}\n" if history else "")
+                + (f"Contexto do turno: {context}\n" if context else "")
+                + f"Fala do dono: {text}\nSua resposta:")
+        self.calls += 1
+        result = self._call(
+            [{"role": "system", "content": SYS_CHAT},
+             {"role": "user", "content": user}],
+            self.config.mouth_chat_max_tokens, early_sentence=True,
+            temperature=0.6, cancel_ev=cancel_ev)
+        sentence = clean_sentence(result.get("text") or "")
+        tripped = ""
+        if sentence:
+            ok, why = _guard.guard(sentence, None, "brief")
+            if not ok:
+                self.guard_trips += 1
+                tripped = why
+                sentence = ""
+        if result.get("error"):
+            self.failures += 1
+            sentence = ""
+        return MouthResult(
+            sentence=sentence,
             ms=float(result.get("first_sentence_ms") or 0.0),
             ttft_ms=float(result.get("ttft_ms") or 0.0),
             raw=str(result.get("text") or ""),

@@ -461,6 +461,11 @@ class ConversationalGateTest(unittest.TestCase):
 
     def _obj(self, analysis: dict, records: list | None = None):
         obj = object.__new__(main.JarvisLive)
+        # Fluxos desligados: este arquivo mede o voiceprint e a indulgência.
+        # A frente local de conversa curta (05/11/2026) responderia "oi" na
+        # boca antes do ask; o portão testado aqui é outro (e o teste fica
+        # hermético: nada sai à máquina).
+        obj._flows_rt = False
         obj._last_user_speech = time.monotonic()
         obj._qoder_retry_used = False
         obj._restart = None

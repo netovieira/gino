@@ -271,6 +271,11 @@ class TurnContextTest(unittest.TestCase):
 
     def _obj(self):
         obj = object.__new__(main.JarvisLive)
+        # Fluxos desligados no arreio: este arquivo mede a EMOÇÃO e o ask do
+        # cérebro. A frente local de conversa curta (05/11/2026) atenderia
+        # "bom dia" na boca e o ask não aconteceria; o gate testado aqui é
+        # outro. (E o teste fica hermético: nenhuma chamada sai à máquina.)
+        obj._flows_rt = False
         obj._last_user_speech = time.monotonic()
         obj._qoder_retry_used = False
         obj._device_enroll_cancel_gate = lambda *a, **k: False
