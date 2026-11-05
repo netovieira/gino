@@ -207,6 +207,12 @@ class AsleepDiscardsAreNeverSilent(unittest.TestCase):
         obj = self._asleep()
         calls: list[tuple] = []
         obj._qoder_turn = lambda text, pcm=None, **k: calls.append((text, pcm))
+        # Determinístico: o filtro pós-despertar lê name_gate_enabled do
+        # config vivo (estado do usuário, não do código). Este teste fixa o
+        # despertar pelo cue; o name gate tem testes próprios.
+        orig = main.get_name_gate_enabled
+        main.get_name_gate_enabled = lambda: False
+        self.addCleanup(setattr, main, "get_name_gate_enabled", orig)
         main.JarvisLive._on_groq_text(obj, "Cara, para de me ignorar porra.", PCM)
         self.assertTrue(obj._awake)
         self.assertEqual(calls[0][0], "Cara, para de me ignorar porra.")

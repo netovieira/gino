@@ -8243,7 +8243,12 @@ class MainWindow(QMainWindow):
             self._log.append_log(
                 "SYS: entrada do Activity Log ignorada — não é fala do dono")
             return
-        self._log.append_log(f"YOU: {txt}")
+        try:
+            from core import owner_auth as _owner_auth
+            shown = _owner_auth.redact_command(txt)
+        except Exception:
+            shown = txt
+        self._log.append_log(f"YOU: {shown}")
         if self.on_text_command:
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
 

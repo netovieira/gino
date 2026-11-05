@@ -123,12 +123,21 @@ def _clip(pre_rms=0.008, gain=7.0, speech_s=0.0):
 
 
 class FakeEchoGuard:
-    """The only surface the wake guard needs from EchoTextGuard."""
+    """The only surface the wake guard needs from EchoTextGuard.
 
-    def __init__(self, active):
+    ``text_echo`` is the text-overlap answer: the wake gate only calls a line
+    echo when the transcript matches one of my speeches in the window
+    (_echo_verdict), so the fixture needs both axes.
+    """
+
+    def __init__(self, active, text_echo=False):
         self.active = bool(active)
+        self.text_echo = bool(text_echo)
 
     def matches(self, _text):
+        return self.text_echo
+
+    def quoted_repeat(self, _text):
         return False
 
     def spoke_during(self, _inicio, _fim):
@@ -238,17 +247,36 @@ class BareAddressWakeTest(unittest.TestCase):
 
 
 class EchoGuardWakeTest(unittest.TestCase):
-    def test_wake_right_after_tts_requires_more_than_the_gray_floor(self):
-        # A corrupted PC profile gives the TTS tail 0.41 — inside the 0.38
-        # indulgence band. During our own echo window that is not a call, and
-        # level/sustained-speech alone cannot substitute for the voiceprint.
+    def test_real_text_echo_after_tts_is_discarded_with_the_reason(self):
+        # The transcript matches a speech of mine inside the window: echo, and
+        # the discard log now says WHICH criterion hit (texto sobreposto).
+        # (At the top of _on_groq_text a text-echo is already dropped before
+        # the wake branch; this pins the sleep-gate verdict itself.)
         obj = _asleep(FakeSpeaker(score=0.41, known=False, name=""))
-        obj._echo_text = FakeEchoGuard(active=True)
+        obj._echo_text = FakeEchoGuard(active=True, text_echo=True)
+        clip = _clip(pre_rms=0.06, gain=1.0, speech_s=0.5)
+        self.assertFalse(main.JarvisLive._asleep_utterance_wakes(
+            obj, "Vou verificar o roteador agora mesmo", clip))
+        self.assertFalse(obj._awake)
+        echo_lines = [l for l in obj.ui.logs if "eco do meu TTS" in l]
+        self.assertTrue(echo_lines, obj.ui.logs)
+        self.assertIn("eco por texto sobreposto", echo_lines[0])
+
+    def test_unrelated_phrase_after_tts_is_not_called_echo(self):
+        # 09:31:08 policy: a sentence that overlaps nothing I said is NOT
+        # echo, even with the window open and a gray-band score. A bare
+        # "Gino." still does not wake — the bare-address proof gate keeps
+        # the stricter voiceprint demand inside the echo window (eco_tts),
+        # it just stops labelling the line as my playback.
+        obj = _asleep(FakeSpeaker(score=0.41, known=False, name=""))
+        obj._echo_text = FakeEchoGuard(active=True, text_echo=False)
         clip = _clip(pre_rms=0.06, gain=1.0, speech_s=0.5)
         main.JarvisLive._on_groq_text(obj, "Gino.", clip)
         self.assertFalse(obj._awake)
-        self.assertTrue([l for l in obj.ui.logs if "eco do meu TTS" in l],
-                        obj.ui.logs)
+        self.assertFalse([l for l in obj.ui.logs if "eco do meu TTS" in l],
+                         obj.ui.logs)
+        nu_lines = [l for l in obj.ui.logs if "endereço nu" in l]
+        self.assertTrue(nu_lines, obj.ui.logs)
         ok, _score, detail = main.JarvisLive._bare_address_evidence(obj, clip)
         self.assertFalse(ok, detail)
         self.assertIn("eco_tts", detail)

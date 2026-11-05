@@ -466,8 +466,20 @@ def get_plugin_setting(namespace: str, key: str, default=None):
 
 def save_plugin_config(namespace: str, values: dict) -> None:
     """Merge `values` into a namespace's stored config (read-modify-write, like
-    every other helper here). Only the provided keys are touched."""
+    every other helper here). Only the provided keys are touched.
+
+    ``owner_auth`` is special: the plaintext password never reaches the file.
+    A non-empty ``password`` field is hashed into ``password_hash``; an empty
+    field keeps the existing hash, so saving the form does not wipe it.
+    """
     ensure_config_dir()
+    values = dict(values or {})
+    if namespace == "owner_auth":
+        raw = values.pop("password", None)
+        values.pop("password_hash", None)
+        if raw is not None and str(raw).strip():
+            from core.owner_auth import hash_password
+            values["password_hash"] = hash_password(str(raw).strip())
     data: dict = {}
     if CONFIG_FILE.exists():
         try:

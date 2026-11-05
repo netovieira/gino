@@ -147,6 +147,7 @@ from core import rootgate as _rootgate
 from core import actiongate as _actiongate
 from core import qoder_jobs as _qoder_jobs
 from core import free_models as _free_models
+from core import owner_auth as _owner_auth
 from core.viseme               import VisemeStream
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
@@ -1232,6 +1233,31 @@ _VOICE_TRAIN_FEATURE_RE = re.compile(
     r"feature|funcionalidade|recurso|plugin|skill|script|"
     r"registro\s+autom[aá]tico|adiciona\s+essa\s+tamb[eé]m)\b",
     re.IGNORECASE)
+# Janela temporária de cadastro. Só abre por TEXTO digitado na interface
+# (nunca por voz/TV) e relaxa APENAS a confirmação de dono para INICIAR o
+# cadastro guiado. Reinício, energia, envio, WhatsApp e todo o resto continuam
+# exigindo o voiceprint do dono. Fecha sozinha ao concluir as 5 frases, por
+# comando explícito ou pelo TTL abaixo.
+_VOICE_BOOTSTRAP_RE = re.compile(
+    r"\b(?:abrir|abre|liberar|libera|destravar|destrava|permitir|permite)\b"
+    r"[^.!?]{0,40}\bcadastro\s+(?:da|de)\s+voz\b"
+    r"|\bmodo\s+cadastro\s+(?:da|de)\s+voz\b",
+    re.IGNORECASE)
+_VOICE_BOOTSTRAP_CLOSE_RE = re.compile(
+    r"\b(?:fechar|fecha|encerrar|encerra|bloquear|bloqueia|desligar|desliga)\b"
+    r"[^.!?]{0,40}\bcadastro\s+(?:da|de)\s+voz\b",
+    re.IGNORECASE)
+_VOICE_BOOTSTRAP_TTL_S = 600.0
+# Typed password authorization. It opens the ordinary risky-action window and
+# a 10-minute typed-owner session (which also unlocks the enrollment trigger).
+# The password is consumed before the model/memory and never logged.
+_OWNER_TEXT_LOCK_RE = re.compile(
+    r"^\s*(?:/bloquear|bloquear\s+senha|"
+    r"fechar\s+autoriza(?:ção|cao))\s*$",
+    re.IGNORECASE)
+_OWNER_TEXT_TTL_S = 600.0
+_OWNER_TEXT_MAX_FAILS = 5
+_OWNER_TEXT_LOCK_S = 60.0
 _VOICE_TRAIN_CANCEL_RE = re.compile(
     r"^\s*(?:cancela|cancelar|para|pare|depois|chega|deixa)\b", re.IGNORECASE)
 # Refusals cancel immediately, even mid-phrase ("eu não pedi isso").
@@ -2236,6 +2262,19 @@ class JarvisLive:
         self._last_known_at        = 0.0
         self._voice_train          = None
         self._voice_train_offered  = False
+        # O gatilho de cadastro entrou pela faixa cinzenta do microfone
+        # conhecido? Só marca a SESSÃO; nenhuma outra porta lê isto.
+        self._voice_train_gray_open = False
+        # Janela temporária que permite INICIAR o cadastro sem voiceprint.
+        # Nasce fechada; só texto digitado arma (ver _voice_bootstrap_gate).
+        self._voice_bootstrap_until = 0.0
+        self._voice_bootstrap_by    = ""
+        # Autorização por senha digitada (UI/WhatsApp). Independente da voz:
+        # abre a janela curta de ações de risco e uma sessão de texto de 10 min.
+        self._owner_text_until        = 0.0
+        self._owner_text_channel      = ""
+        self._owner_text_fails        = 0
+        self._owner_text_locked_until = 0.0
         # Janela de cadastro do perfil "celular" do dono. Nasce fechada; só a
         # voz confirmada no microfone arma, e cada nota é conferida contra as
         # anteriores desta janela (ver core/voice_device_enroll.py).
@@ -2892,17 +2931,23 @@ class JarvisLive:
         # Our own TTS tail can be transcribed as a plausible sentence, and a
         # corrupted PC profile scores it inside the gray band. During the echo
         # window only a strong owner voiceprint can wake her — never the
-        # indulgence floor, never level/energy alone.
-        if self._echo_guard_window(pcm) and (
-                not confirmed or score < _WAKE_ECHO_MIN_SCORE):
-            line = ("SYS: dormindo — fala descartada como eco do meu TTS: "
-                    f"«{str(text or '')[:80]}» (score={score:.2f}, {detail}).")
-            try:
-                self.ui.write_log(line)
-            except Exception:
-                pass
-            print(line)
-            return False
+        # indulgence floor, never level/energy alone. BUT the verdict of echo
+        # now requires real text overlap with a speech of mine in the window
+        # (_echo_verdict): a sentence that matches nothing I said is not echo
+        # and goes through the normal gate (09:31:08: "Cadastrai minha voz."
+        # discarded as echo while my last line was "Já te digo, criador").
+        if (not confirmed or score < _WAKE_ECHO_MIN_SCORE):
+            echo, why = self._echo_verdict(text, pcm)
+            if echo:
+                line = ("SYS: dormindo — fala descartada como eco do meu TTS: "
+                        f"«{str(text or '')[:80]}» (score={score:.2f}, "
+                        f"{detail}; eco por {why}).")
+                try:
+                    self.ui.write_log(line)
+                except Exception:
+                    pass
+                print(line)
+                return False
         cue = bool(_OWNER_ADDRESS_CUE_RE.search(text or ""))
         now = time.monotonic()
         speaks = [t for t in getattr(self, "_asleep_owner_speech", []) or []
@@ -4396,6 +4441,17 @@ class JarvisLive:
                     account, item, path, direct=direct)
         elif not text:
             return False
+
+        # Typed owner authorization and the temporary enrollment window work
+        # from the owner's WhatsApp chat too. They are consumed here, before
+        # the message reaches memory, the model or the voice gates.
+        if direct and not is_voice:
+            if self._owner_text_gate(text, "whatsapp",
+                                     account=account, chat=chat):
+                return True
+            if self._voice_bootstrap_gate(text, None, "whatsapp",
+                                          account, chat):
+                return True
 
         # A note that answers a PARKED restart keeps its audio for the
         # confirmation gate even when the strict pre-check could not match the
@@ -8233,6 +8289,65 @@ class JarvisLive:
         return bool(_VOICE_TRAIN_CANCEL_RE.search(line)
                     or _VOICE_TRAIN_REFUSE_RE.search(line))
 
+    def _voice_train_gray_ok(self, pcm: bytes | None) -> tuple[bool, float, str]:
+        """Cadastro: dono já conhecido neste microfone, dentro da faixa cinzenta.
+
+        Só o GATILHO DE CADASTRO usa isto. O perfil do dono foi contaminado por
+        eco em cadastros antigos, então o voiceprint reprova o próprio dono
+        (09:30:09: score 0.46, AS-norm -1.17 contra piso 0.00) e o mecanismo
+        que substituiria o perfil podre só aceitava quem o podre já reconhecia
+        — deadlock. A cinza aqui é a que a classe já define
+        (``_indulgence_floor``, DEFAULT_VOICE_INDULGENCE_GRAY_FLOOR): recusa
+        terceiro (voz conhecida que não é o dono), TV/acústica difusa,
+        microfone sem perfil do dono e score abaixo da cinza. O que valida o
+        dono de verdade são as cinco frases autoconsistentes (ver
+        _voice_train_step e core.speaker_id.session_coherence).
+        """
+        speaker = getattr(self, "_speaker", None)
+        if speaker is None or not pcm:
+            return False, 0.0, "sem áudio ou sem cadastro de voz"
+        owner = str(getattr(speaker, "owner_name", "") or "").strip().lower()
+        if not owner:
+            return False, 0.0, "sem dono cadastrado"
+        try:
+            emb = speaker.embedding(pcm)
+            match = _speaker_id.identify_conversational(
+                speaker, emb, voiced_seconds=self._voiced_seconds(pcm))
+        except Exception as e:
+            return False, 0.0, f"erro na voz: {e}"
+        score = float(match.get("effective_score")
+                      if match.get("effective_score") is not None
+                      else (match.get("score") or 0.0))
+        name = str(match.get("name") or "").strip().lower()
+        # O microfone precisa ser reconhecido como DELA: perfil do dono
+        # conhecido e autorizado neste aparelho. Voz de terceiro ou voz
+        # desconhecida continuam recusadas, como sempre.
+        if not (match.get("known") and match.get("authorized")):
+            return False, score, "voz não reconhecida neste microfone"
+        if name != owner:
+            return False, score, f"voz={name or 'desconhecida'} (não o dono)"
+        try:
+            decision = self._owner_decision_for_match(
+                match, device=None, privileged=False, transcript="",
+                voiced_seconds=self._voiced_seconds(pcm),
+                acoustic=self._mic_acoustic_verdict())
+        except Exception:
+            decision = None
+        if decision is not None:
+            if decision.profile_state == (
+                    _owner_decision.ProfileState.NO_PROFILE.value):
+                return False, score, "sem perfil deste dono neste microfone"
+            if not decision.can_answer:
+                return False, score, "sem fala útil para comparar"
+            if str(decision.acoustic or "") == _owner_decision.DIFFUSE:
+                return False, score, "acústica difusa (TV)"
+            score = float(decision.score or score)
+        if score < self._indulgence_floor():
+            return False, score, "abaixo da faixa cinzenta deste microfone"
+        device = str((decision.device if decision is not None
+                      else match.get("device")) or "?").strip() or "?"
+        return True, score, f"faixa cinzenta do microfone conhecido (perfil={device})"
+
     def _voice_train_owner_ok(self, text: str,
                               pcm: bytes | None) -> tuple[bool, float, str]:
         """(confirmed, score, detail) — is the voice asking for the training?
@@ -8241,15 +8356,37 @@ class JarvisLive:
         with, so the explicit request is the only evidence available; a later
         one must pass the same voiceprint confirmation as spoken consent,
         gray-band indulgência included (only-owner-enrolled, score >= floor).
-        The five phrases themselves are never re-checked against the old
-        centroid — that profile is exactly what the recadastro replaces.
+        On top of that, the ENROLLMENT TRIGGER alone also accepts the owner's
+        gray band on his already-known microphone (``_voice_train_gray_ok``):
+        a profile contaminated by echo rejects the owner himself, and the
+        deadlock had no spoken exit. Nothing else becomes privileged by this —
+        every other gate still calls ``_owner_speaker_confirmed`` directly —
+        and the five phrases must be self-consistent before the old profile
+        is replaced. The five phrases themselves are never re-checked against
+        the old centroid — that profile is exactly what the recadastro
+        replaces.
         """
+        self._voice_train_gray_open = False
         if not pcm:
             return False, 0.0, "sem áudio"
         try:
             if not self._has_owner_enrolled():
                 return True, 0.0, "primeira voz (sem cadastro)"
-            return self._owner_speaker_confirmed(text, pcm)
+            confirmed, score, detail = self._owner_speaker_confirmed(text, pcm)
+            if confirmed:
+                return True, score, detail
+            gray, gscore, gdetail = self._voice_train_gray_ok(pcm)
+            if gray:
+                try:
+                    self.ui.write_log(
+                        "SYS: cadastro de voz — gatilho entrou por faixa "
+                        f"cinzenta (score={float(gscore or 0.0):.2f}, "
+                        f"{gdetail}); as 5 frases validam o dono.")
+                except Exception:
+                    pass
+                self._voice_train_gray_open = True
+                return True, gscore, f"faixa cinzenta do cadastro ({gdetail})"
+            return False, score, detail
         except Exception as e:
             return False, 0.0, f"erro na voz: {e}"
 
@@ -8421,6 +8558,36 @@ class JarvisLive:
             pass
         if session["done"] >= session["total"]:
             total = session["total"]
+            # Autoconsistência das cinco frases: é ISSO que valida o dono
+            # quando o gatilho entrou pela faixa cinzenta. Eco do meu TTS ou
+            # pessoa diferente no meio do trecho formam um segundo grupo e a
+            # sessão é recusada ANTES de encostar no perfil velho.
+            try:
+                coherent, members, _n = _speaker_id.session_coherence(
+                    list(buffered))
+            except Exception as e:
+                coherent, members = False, -1
+                try:
+                    self.ui.write_log(
+                        "SYS: cadastro de voz — checagem de coerência "
+                        f"indisponível: {str(e)[:60]}.")
+                except Exception:
+                    pass
+            if not coherent:
+                self._voice_train = None
+                self._voice_train_listener(False)
+                why = ("erro na checagem" if members < 0
+                       else f"{members} de {total} no mesmo grupo")
+                try:
+                    self.ui.write_log(
+                        "SYS: cadastro de voz recusado — as 5 frases não "
+                        f"batem entre si ({why}); nada foi substituído.")
+                except Exception:
+                    pass
+                self._say_now("As suas cinco frases não bateram entre si — "
+                              "parecem vozes diferentes ou eco no meio. Nada "
+                              "foi gravado; seu perfil continua como estava.")
+                return True
             self._voice_train = None
             self._voice_train_listener(False)
             backup = ""
@@ -8448,6 +8615,21 @@ class JarvisLive:
                 self._say_now("Não consegui gravar as amostras novas. As antigas "
                               "continuam como estavam.")
                 return True
+            # Enrollment finished: the temporary window closes and the
+            # owner-only trigger is restored automatically.
+            self._voice_bootstrap_close("concluído")
+            if session.get("gray_trigger"):
+                # Aberto pela cinza: dizer em voz alta que o perfil velho, que
+                # rejeitava o próprio dono, foi de fato substituído.
+                self._say_now("Seu perfil antigo estava contaminado e não te "
+                              "reconhecia; ele foi substituído pela sua voz "
+                              "nova destas cinco frases coerentes.")
+                try:
+                    self.ui.write_log(
+                        "SYS: cadastro de voz concluído por faixa cinzenta — "
+                        "perfil velho substituído pelas 5 novas amostras.")
+                except Exception:
+                    pass
             self._say_now(f"Pronto, {session['owner']}. Substituí as amostras "
                           f"antigas por {stored} novas da sua voz. Agora eu devo "
                           "te reconhecer mesmo quando você fala baixo ou está "
@@ -9204,6 +9386,251 @@ class JarvisLive:
             pass
         return True
 
+    # ── Autorização por senha digitada (UI e WhatsApp) ─────────────────────
+    def _owner_text_active(self) -> bool:
+        until = float(getattr(self, "_owner_text_until", 0.0) or 0.0)
+        return bool(until and time.monotonic() < until)
+
+    def _owner_text_remaining(self) -> float:
+        until = float(getattr(self, "_owner_text_until", 0.0) or 0.0)
+        return max(0.0, until - time.monotonic()) if until else 0.0
+
+    def _owner_text_close(self, reason: str = "pedido do dono") -> None:
+        was = self._owner_text_active()
+        self._owner_text_until = 0.0
+        self._owner_text_channel = ""
+        if was:
+            try:
+                self.ui.write_log(
+                    f"SYS: autorização por texto encerrada ({reason}).")
+            except Exception:
+                pass
+
+    def _owner_text_notify(self, text: str, channel: str,
+                           account: str | None = None,
+                           chat: str | None = None) -> None:
+        """Answer on the channel that typed the password, never the room."""
+        line = str(text or "").strip()
+        if not line:
+            return
+        if channel == "whatsapp" and account and chat:
+            try:
+                self._send_whatsapp_answer(account, chat, line, "text")
+                return
+            except Exception as e:
+                print(f"[OwnerAuth] resposta no WhatsApp falhou: {e}")
+        try:
+            self.ui.write_log(f"SYS: {line}")
+        except Exception:
+            pass
+        try:
+            self._say_now(line, log=False, origin="aviso")
+        except Exception:
+            pass
+
+    def _owner_text_gate(self, text: str, channel: str,
+                         account: str | None = None,
+                         chat: str | None = None) -> bool:
+        """Consume a typed password command from the UI or owner WhatsApp.
+
+        Accepted forms: ``senha: <senha>``, ``senha=<senha>``,
+        ``autorizar: <senha>`` and ``/autorizar <senha>``. A correct password
+        opens the ordinary 120 s risky-action window, the 15-minute WhatsApp
+        send window and a 10-minute typed-owner session. It never authorizes
+        restart, power or e-mail by itself, and it never reaches the model.
+        """
+        line = str(text or "").strip()
+        if not line:
+            return False
+        if _OWNER_TEXT_LOCK_RE.match(line):
+            if self._owner_text_active():
+                self._owner_text_close("pedido do dono")
+                self._owner_text_notify(
+                    "Autorização por texto encerrada.", channel, account, chat)
+            else:
+                self._owner_text_notify(
+                    "Não havia autorização por texto ativa.", channel,
+                    account, chat)
+            return True
+        password = _owner_auth.password_from_command(line)
+        if password is None:
+            return False
+        if channel not in ("ui", "whatsapp"):
+            return False
+        now = time.monotonic()
+        if now < float(getattr(self, "_owner_text_locked_until", 0.0) or 0.0):
+            self._owner_text_notify(
+                "Muitas tentativas de senha. Aguarde um minuto.", channel,
+                account, chat)
+            return True
+        if not _owner_auth.is_configured():
+            self._owner_text_notify(
+                "Nenhuma senha configurada. Abra PLUGIN SETTINGS → OWNER AUTH.",
+                channel, account, chat)
+            return True
+        if not _owner_auth.verify(password):
+            self._owner_text_fails = int(
+                getattr(self, "_owner_text_fails", 0) or 0) + 1
+            try:
+                self.ui.write_log("SYS: senha de autorização por texto "
+                                  "recusada (não registrada).")
+            except Exception:
+                pass
+            if self._owner_text_fails >= _OWNER_TEXT_MAX_FAILS:
+                self._owner_text_fails = 0
+                self._owner_text_locked_until = now + _OWNER_TEXT_LOCK_S
+                self._owner_text_notify(
+                    "Senha incorreta. Muitas tentativas; aguarde um minuto.",
+                    channel, account, chat)
+            else:
+                self._owner_text_notify(
+                    "Senha incorreta.", channel, account, chat)
+            return True
+        self._owner_text_fails = 0
+        self._owner_text_until = now + _OWNER_TEXT_TTL_S
+        self._owner_text_channel = channel
+        try:
+            secs = float(_actiongate.open_window())
+        except Exception as e:
+            print(f"[OwnerAuth] janela de ação falhou: {e}")
+            secs = 0.0
+        try:
+            _actiongate.arm_send_window()
+        except Exception as e:
+            print(f"[OwnerAuth] janela de envio falhou: {e}")
+        minutes = int(round(_OWNER_TEXT_TTL_S / 60.0))
+        try:
+            self.ui.write_log(
+                f"SYS: autorização por texto aberta ({channel}, "
+                f"{minutes} min; janela de ação {secs:.0f}s).")
+        except Exception:
+            pass
+        self._owner_text_notify(
+            f"Autorizado por texto por {minutes} minutos. A janela de ações "
+            f"de risco está aberta por {secs:.0f}s e o próximo envio de "
+            "WhatsApp está liberado. Para o cadastro de voz, digite "
+            "'abrir cadastro de voz'.", channel, account, chat)
+        return True
+
+    # ── Janela temporária de cadastro (só texto digita abre) ────────────────
+    def _voice_bootstrap_active(self) -> bool:
+        until = float(getattr(self, "_voice_bootstrap_until", 0.0) or 0.0)
+        return bool(until and time.monotonic() < until)
+
+    def _voice_bootstrap_remaining(self) -> float:
+        until = float(getattr(self, "_voice_bootstrap_until", 0.0) or 0.0)
+        return max(0.0, until - time.monotonic()) if until else 0.0
+
+    def _voice_bootstrap_arm(self, by: str = "texto") -> None:
+        """Open the enrollment trigger for a short, explicit window."""
+        self._voice_bootstrap_until = time.monotonic() + _VOICE_BOOTSTRAP_TTL_S
+        self._voice_bootstrap_by = str(by or "texto")[:40]
+        minutes = int(round(_VOICE_BOOTSTRAP_TTL_S / 60.0))
+        try:
+            self.ui.write_log(
+                f"SYS: cadastro de voz liberado por {minutes} min "
+                f"({self._voice_bootstrap_by}). A regra só-dono continua "
+                "valendo para reinício, energia, envio e todo o resto.")
+        except Exception:
+            pass
+        try:
+            self._say_now(
+                f"Cadastro de voz liberado por {minutes} minutos. "
+                "Diga: cadastra minha voz.", log=False, origin="aviso")
+        except Exception:
+            pass
+        try:
+            timer = threading.Timer(_VOICE_BOOTSTRAP_TTL_S,
+                                    self._voice_bootstrap_expire)
+            timer.daemon = True
+            timer.start()
+        except Exception as e:
+            print(f"[Voice] timer do cadastro temporário: {e}")
+
+    def _voice_bootstrap_expire(self) -> None:
+        until = float(getattr(self, "_voice_bootstrap_until", 0.0) or 0.0)
+        if until and time.monotonic() >= until:
+            self._voice_bootstrap_close("expirou", speak=True)
+
+    def _voice_bootstrap_close(self, reason: str = "pedido do dono",
+                               *, speak: bool = False) -> None:
+        was = self._voice_bootstrap_active()
+        self._voice_bootstrap_until = 0.0
+        self._voice_bootstrap_by = ""
+        if not was:
+            return
+        try:
+            self.ui.write_log(
+                "SYS: cadastro de voz liberado encerrado "
+                f"({reason}); a regra só-dono voltou.")
+        except Exception:
+            pass
+        if speak:
+            try:
+                self._say_now(
+                    "O cadastro temporário foi encerrado. "
+                    "A regra de só o dono voltou.", log=False, origin="aviso")
+            except Exception:
+                pass
+
+    def _voice_bootstrap_gate(self, text: str,
+                              pcm: bytes | None = None,
+                              channel: str = "ui",
+                              account: str | None = None,
+                              chat: str | None = None) -> bool:
+        """Arm/close the temporary window from TYPED text only.
+
+        A spoken line never opens it: the TV, a guest or the assistant's own
+        echo could say the words. Typing in the UI or in the owner's WhatsApp
+        chat is a deliberate owner act. When a typed password is configured,
+        the 10-minute owner-text session must be open first.
+        """
+        line = str(text or "")
+        if not line:
+            return False
+        if _VOICE_BOOTSTRAP_CLOSE_RE.search(line):
+            if self._voice_bootstrap_active():
+                self._voice_bootstrap_close(
+                    "pedido do dono", speak=(channel != "whatsapp"))
+                if channel == "whatsapp":
+                    self._owner_text_notify(
+                        "Cadastro de voz liberado encerrado.", channel,
+                        account, chat)
+            else:
+                self._owner_text_notify(
+                    "O cadastro já está na regra normal: só a voz do dono "
+                    "inicia.", channel, account, chat)
+            return True
+        if not _VOICE_BOOTSTRAP_RE.search(line):
+            return False
+        if pcm:
+            try:
+                self.ui.write_log(
+                    "SYS: liberação de cadastro ignorada — precisa ser "
+                    "digitada, não falada.")
+            except Exception:
+                pass
+            try:
+                self._say_now(
+                    "Para liberar o cadastro, digite na interface ou no "
+                    "WhatsApp. Voz não abre essa janela.",
+                    log=False, origin="aviso")
+            except Exception:
+                pass
+            return True
+        if _owner_auth.is_configured() and not self._owner_text_active():
+            self._owner_text_notify(
+                "Digite primeiro: senha: SUA_SENHA. Depois "
+                "'abrir cadastro de voz'.", channel, account, chat)
+            return True
+        self._voice_bootstrap_arm(
+            "texto autorizado" if _owner_auth.is_configured() else "texto")
+        if channel == "whatsapp":
+            self._owner_text_notify(
+                "Cadastro de voz liberado por 10 minutos. No microfone do PC, "
+                "diga 'cadastra minha voz'.", channel, account, chat)
+        return True
+
     def _voice_train_gate(self, text: str, pcm: bytes | None = None) -> bool:
         """Guided enrollment, handled before barge-in so prompts don't eat it.
 
@@ -9240,6 +9667,19 @@ class JarvisLive:
                 pass
             return False
         ok, score, detail = self._voice_train_owner_ok(line, pcm)
+        if not ok and self._voice_bootstrap_active():
+            # Temporary window (armed by typed text): the trigger no longer
+            # needs the voiceprint, because the old profile may be too thin to
+            # recognise the owner. Only STARTING enrollment is relaxed here;
+            # every privileged gate still uses _owner_speaker_confirmed.
+            try:
+                self.ui.write_log(
+                    "SYS: cadastro de voz — janela temporária ativa "
+                    f"({self._voice_bootstrap_remaining():.0f}s restantes); "
+                    f"iniciando sem exigir o voiceprint ({detail}).")
+            except Exception:
+                pass
+            ok = True
         if (not ok and "sem cadastro de voz neste microfone" in detail):
             # Perfil ausente no microfone ativo NÃO é voz rejeitada: é justo o
             # microfone que ainda não tem cadastro. Bloquear o pedido aqui era
@@ -9262,6 +9702,14 @@ class JarvisLive:
             return False
         self._log_heard(text)
         self._start_voice_training("pedido do dono")
+        if (getattr(self, "_voice_train_gray_open", False)
+                and self._voice_train is not None):
+            # Gatilho aberto pela cinza do microfone conhecido: a sessão fica
+            # marcada para o aviso em voz alta no fim (perfil velho
+            # substituído) e para nada mais — nenhuma outra porta privileged
+            # olha esta flag.
+            self._voice_train["gray_trigger"] = True
+        self._voice_train_gray_open = False
         return True
 
     def _voice_training_hint(self) -> None:
@@ -9278,11 +9726,16 @@ class JarvisLive:
         self._voice_train_offered = True
         name = self._speaker.owner_name or "Anthero"
         try:
+            how = ("digite 'senha: SUA_SENHA' e depois 'abrir cadastro de voz'"
+                   if _owner_auth.is_configured()
+                   else "digite 'abrir cadastro de voz'")
             self.ui.write_log("SYS: voz com poucas amostras — cadastro guiado "
-                              "disponível (\"cadastra minha voz\").")
+                              f"disponível ({how}; depois diga 'cadastra minha "
+                              "voz').")
             self._say_now(f"{name}, eu ainda tenho poucas amostras da sua voz. "
-                          "Diga 'cadastra minha voz' quando quiser que eu faça "
-                          "como o Ok Google e peça cinco frases.")
+                          f"Se eu não te reconhecer, {how} na interface e "
+                          "depois diga 'cadastra minha voz' — eu peço cinco "
+                          "frases.")
         except Exception:
             pass
 
@@ -10064,8 +10517,9 @@ class JarvisLive:
         label = str(getattr(self, "_active_mic_label", "") or device or "?")
         said = (f"Não tenho cadastro da sua voz no microfone em uso ({label}). "
                 "Não vou comparar com o perfil de outro microfone — o resultado "
-                "sairia errado. Com este microfone ativo, diga: cadastra minha "
-                "voz.")
+                "sairia errado. Desmute o microfone e diga: cadastra minha "
+                "voz. Se o pedido for recusado, digite na interface "
+                "'abrir cadastro de voz' e repita.")
         try:
             self.ui.write_log(f"SYS: reconhecimento sem perfil no microfone "
                               f"{label} ({key}) — orientação falada.")
@@ -12012,6 +12466,12 @@ class JarvisLive:
         text = str(text or "").strip()
         if not text:
             return
+        # Typed owner authorization and the temporary enrollment window are
+        # local switches; they never reach the model.
+        if self._owner_text_gate(text, "ui"):
+            return
+        if self._voice_bootstrap_gate(text, None, "ui"):
+            return
         # Respect wake-word sleep by WAKING her: a typed command is deliberate,
         # so it opens the conversation instead of being refused at the door.
         # Digitar é um ato tão deliberado quanto tocar em WAKE NOW: o texto
@@ -12080,6 +12540,37 @@ class JarvisLive:
             return bool(guard.spoke_during(now - dur, now))
         except Exception:
             return False
+
+    def _echo_verdict(self, text: str, pcm: bytes | None) -> tuple[bool, str]:
+        """É eco DE VERDADE? Exige sobreposição de texto com a minha fala.
+
+        A janela temporal sozinha não é prova: 09:31:08 — o dono disse
+        "Cadastrai minha voz." e a linha foi descartada como "eco do meu TTS"
+        enquanto a minha última fala tinha sido "Já te digo, criador" — zero
+        sobreposição com o que eu disse. Eco é a transcrição BATER com uma
+        fala minha ativa ou recentíssima (``EchoTextGuard.matches``, já limitada
+        à janela das falas realmente audíveis), e não ser a citação que eu
+        pedi para o dono repetir. O cancelador de eco da captura não muda
+        aqui; muda só parar de chamar de eco uma frase que não corresponde a
+        nada que eu falei.
+        """
+        if not self._echo_guard_window(pcm):
+            return False, "sem fala minha ativa ou recentíssima"
+        guard = getattr(self, "_echo_text", None)
+        if guard is None:
+            return False, "sem histórico das minhas falas para comparar"
+        try:
+            hit = bool(guard.matches(text))
+        except Exception:
+            hit = False
+        if not hit:
+            return False, "texto não bate com nenhuma fala minha na janela"
+        try:
+            if guard.quoted_repeat(text):
+                return False, "é a citação que eu pedi para repetir"
+        except Exception:
+            pass
+        return True, "texto sobreposto à minha fala ativa/recentíssima"
 
     # Follow-up window for the name filter: ONLY when what JARVIS just said
     # ends in a question mark is the next utterance accepted without the name,
@@ -12553,6 +13044,11 @@ class JarvisLive:
         loop = getattr(self, "_loop", None)
         if not loop or not self.session:
             return
+        # A spoken request to open the temporary enrollment window is refused
+        # here: the TV, a guest or our own echo must never open it. Only typed
+        # text can (see _on_text_command and the WhatsApp owner chat).
+        if self._voice_bootstrap_gate(text, pcm, "voice"):
+            return
         # Eco do próprio TTS: o cancelador do PipeWire falhou e o microfone
         # devolveu a nossa fala, que o transcritor entrega como se fosse o
         # dono. Só o canal de voz (com PCM) é julgado — texto digitado nunca
@@ -12755,19 +13251,26 @@ class JarvisLive:
                 # appears right after our own TTS may be the TTS coming back,
                 # not the owner. During that window only a strong owner
                 # voiceprint wakes her — the gray-band indulgence is not proof.
+                # Being the echo, though, now requires text that OVERLAPS one
+                # of my speeches in the window (_echo_verdict): with nothing I
+                # said matching this line, it is not echo and the normal wake
+                # rules below decide (with the strict bare-address proof).
                 if self._echo_guard_window(pcm):
                     _ok, _score, _detail = self._owner_speaker_confirmed(
                         text, pcm, allow_indulgence=False)
                     if not _ok or _score < _WAKE_ECHO_MIN_SCORE:
-                        line = (f"SYS: dormindo — «{str(text)[:60]}» "
-                                "descartada como eco do meu TTS "
-                                f"(score={_score:.2f}, {_detail}).")
-                        try:
-                            self.ui.write_log(line)
-                        except Exception:
-                            pass
-                        print(line)
-                        return
+                        echo, why = self._echo_verdict(text, pcm)
+                        if echo:
+                            line = (f"SYS: dormindo — «{str(text)[:60]}» "
+                                    "descartada como eco do meu TTS "
+                                    f"(score={_score:.2f}, {_detail}; "
+                                    f"eco por {why}).")
+                            try:
+                                self.ui.write_log(line)
+                            except Exception:
+                                pass
+                            print(line)
+                            return
                 # An isolated name ("Gino.") used to wake with no check at all:
                 # any STT hallucination, any TV line that happened to be
                 # transcribed as the name. It now needs proof (owner voiceprint

@@ -137,6 +137,12 @@ OWNER_PENDING_KEEP = 50
 NOTICE_AGE_S = 300.0
 
 _lock       = threading.RLock()
+# Neonize's Go runtime dies with "concurrent map writes" if two clients are
+# constructed and have their events registered at the same time. The boot used
+# to start both WhatsApp accounts in parallel and killed the whole app. This
+# lock serializes only construction/registration; connect() itself stays
+# outside it because it blocks for the lifetime of the session.
+_client_init_lock = threading.RLock()
 _inbox_lock = threading.RLock()
 _logger     = None
 
@@ -801,10 +807,21 @@ def qr_age(account: str | None = None) -> float:
 
 def _append_inbox(item: dict, acct: _Account) -> None:
     try:
+        # The password command is consumed by main.py before the model, but
+        # this inbox is written first. Persist a marker, never the secret; the
+        # in-memory item keeps the text the gate needs.
+        safe = item
+        try:
+            from core import owner_auth as _owner_auth
+            if _owner_auth.is_password_command(item.get("text")):
+                safe = dict(item)
+                safe["text"] = _owner_auth.REDACTED
+        except Exception:
+            pass
         acct.inbox_file.parent.mkdir(parents=True, exist_ok=True)
         with _inbox_lock:
             with acct.inbox_file.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                f.write(json.dumps(safe, ensure_ascii=False) + "\n")
                 acct.appended += 1
                 if acct.appended >= INBOX_TRIM_EVERY:
                     acct.appended = 0
@@ -2094,6 +2111,39 @@ def _on_message(client, ev, acct: _Account) -> None:
 
 # ── ciclo de vida ────────────────────────────────────────────────────────────
 
+def _build_client(acct: _Account, NewClient, ev):
+    """Create one Neonize client with its handlers, serialized.
+
+    The Go runtime behind Neonize is not safe for two concurrent
+    ``NewClient``/event registrations; doing so aborts the process with
+    ``fatal error: concurrent map writes`` (seen at boot with two accounts).
+    The lock covers only this setup — ``connect()`` runs outside it because it
+    blocks for the whole session.
+    """
+    with _client_init_lock:
+        client = NewClient(str(acct.session_db), uuid=acct.uuid)
+        client.event.qr(lambda _c, data, a=acct: _draw_qr(data, a))
+        client.event(ev.ConnectedEv)(
+            lambda _c, _e, a=acct: _on_connected(client, _e, a))
+        client.event(ev.DisconnectedEv)(
+            lambda _c, _e, a=acct: _on_disconnected(client, _e, a))
+        client.event(ev.LoggedOutEv)(
+            lambda _c, _e, a=acct: _on_logged_out(client, _e, a))
+        client.event(ev.MessageEv)(
+            lambda _c, _e, a=acct: _on_message(client, _e, a))
+        # Recibo de entrega/leitura: sem isto "enviado" era só ausência
+        # de exceção. O handler é opcional em versões antigas do neonize.
+        receipt_ev = getattr(ev, "ReceiptEv", None)
+        if receipt_ev is not None:
+            client.event(receipt_ev)(
+                lambda _c, _e, a=acct: _on_receipt(_e, a))
+        replaced_ev = getattr(ev, "StreamReplacedEv", None)
+        if replaced_ev is not None:
+            client.event(replaced_ev)(
+                lambda _c, _e, a=acct: _on_stream_replaced(_c, _e, a))
+        return client
+
+
 def _run(acct: _Account) -> None:
     """Thread de UMA conta: `connect()` bloqueia, e é por isso que ela existe."""
     global _go_loaded
@@ -2110,26 +2160,7 @@ def _run(acct: _Account) -> None:
     while not acct.stopping:
         client = None
         try:
-            client = NewClient(str(acct.session_db), uuid=acct.uuid)
-            client.event.qr(lambda _c, data, a=acct: _draw_qr(data, a))
-            client.event(ev.ConnectedEv)(
-                lambda _c, _e, a=acct: _on_connected(client, _e, a))
-            client.event(ev.DisconnectedEv)(
-                lambda _c, _e, a=acct: _on_disconnected(client, _e, a))
-            client.event(ev.LoggedOutEv)(
-                lambda _c, _e, a=acct: _on_logged_out(client, _e, a))
-            client.event(ev.MessageEv)(
-                lambda _c, _e, a=acct: _on_message(client, _e, a))
-            # Recibo de entrega/leitura: sem isto "enviado" era só ausência
-            # de exceção. O handler é opcional em versões antigas do neonize.
-            receipt_ev = getattr(ev, "ReceiptEv", None)
-            if receipt_ev is not None:
-                client.event(receipt_ev)(
-                    lambda _c, _e, a=acct: _on_receipt(_e, a))
-            replaced_ev = getattr(ev, "StreamReplacedEv", None)
-            if replaced_ev is not None:
-                client.event(replaced_ev)(
-                    lambda _c, _e, a=acct: _on_stream_replaced(_c, _e, a))
+            client = _build_client(acct, NewClient, ev)
             with _lock:
                 acct.client = client
                 acct.error = ""
@@ -2247,10 +2278,11 @@ def connect_all(on_message=None, logger=None,
                 settle_s: float = BOOT_SETTLE_S) -> list[dict]:
     """Sobe cada conta habilitada uma vez e devolve o estado REAL de cada uma.
 
-    É o que o boot chama. As contas sobem em paralelo (cada `_start_account`
-    espera no máximo `START_WAIT_S`), e depois há uma janela curta para as mais
-    lentas fecharem o handshake. Uma tentativa só: não há laço aqui — o `_run`
-    já reconecta uma queda, com o intervalo de sempre.
+    É o que o boot chama. As contas sobem em SEQUÊNCIA (cada `_start_account`
+    espera no máximo `START_WAIT_S` pelo connected/QR/erro antes da próxima):
+    o runtime Go do Neonize aborta com "concurrent map writes" quando dois
+    clientes são criados/conectados ao mesmo tempo. Uma tentativa só: não há
+    laço aqui — o `_run` já reconecta uma queda, com o intervalo de sempre.
 
     Cada item: ``{"name", "uuid", "connected", "state", "paired", "number",
     "qr", "detail"}``, com ``state`` em ``"connected"``, ``"auth"`` (QR
@@ -2269,17 +2301,11 @@ def connect_all(on_message=None, logger=None,
         return [_boot_entry(a, error="o WhatsApp precisa do neonize")
                 for a in targets]
 
-    workers = []
+    # Sequential on purpose: Neonize's Go runtime aborts the whole process on
+    # concurrent client construction/connection. _start_account waits for the
+    # handshake (connected/QR/error) before the next account starts.
     for acct in targets:
-        worker = threading.Thread(
-            target=_start_account, args=(acct, on_message), daemon=True,
-            name=f"jarvis-whatsapp-connect-{acct.uuid}")
-        worker.start()
-        workers.append(worker)
-
-    deadline = time.time() + START_WAIT_S
-    for worker in workers:
-        worker.join(timeout=max(0.0, deadline - time.time()))
+        _start_account(acct, on_message)
     # Janela de tolerância só para quem ainda não deu sinal nenhum. Conta com
     # QR na tela ou erro já está decidida: esperar mais só atrasa o aviso.
     settle_deadline = time.time() + max(0.0, float(settle_s or 0.0))

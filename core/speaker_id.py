@@ -351,6 +351,37 @@ def _centroid_from_samples(
     return _normalize(member.mean(axis=0)), keep
 
 
+# ── coerência da sessão de cadastro guiado (as 5 frases) ─────────────────────
+# O gatilho de cadastro aceita o dono pela faixa cinzenta do microfone dele;
+# quem valida o dono de verdade é a autoconsistência das cinco frases. Eco do
+# TTS ou outra pessoa no meio do trecho forma um segundo grupo: de 5 amostras,
+# no máximo 1 pode ficar fora do grupo coeso (uma pronúncia ruim ainda passa;
+# duas vozes diferentes no meio, não). O limiar de coesão é o mesmo do cluster
+# do centroid (_CENTROID_CLUSTER), não um número novo.
+ENROLL_COHERENT_MIN = 4
+
+
+def session_coherence(vectors: list[Any] | np.ndarray,
+                      *, cluster_threshold: float = _CENTROID_CLUSTER,
+                      min_members: int = ENROLL_COHERENT_MIN,
+                      ) -> tuple[bool, int, int]:
+    """(ok, members, total): quantas amostras da sessão formam um só grupo.
+
+    Semeia no medóide, tira a média do grupo em torno dele e conta quem fica
+    a pelo menos ``cluster_threshold`` dessa média. Menos de duas amostras ou
+    menos de ``min_members`` no maior grupo não substitui perfil nenhum.
+    """
+    arr = np.asarray([_normalize(v) for v in vectors], dtype=np.float64)
+    total = int(arr.shape[0]) if arr.ndim == 2 else 0
+    if total < 2:
+        return True, total, total
+    sims = arr @ arr.T
+    seed = int(np.argmax(sims.mean(axis=1)))
+    mean = _normalize(arr[sims[seed] >= cluster_threshold].mean(axis=0))
+    members = int(np.count_nonzero(arr @ mean >= cluster_threshold))
+    return members >= int(min_members), members, total
+
+
 def _match_effective(match: dict | None) -> float:
     """Effective score of an ``identify`` result (centroid or best sample)."""
     if not match:
