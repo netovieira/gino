@@ -7585,12 +7585,13 @@ class JarvisLive:
         O chat direto do dono é identificado pelo MESMO caminho da captura
         (``core.whatsapp_watch.is_direct``: o número pareado da própria conta
         ou o ``owner_chat`` da configuração — lidos vivo, nenhum número é
-        comparado ou escrito em log). Política (dono, SKILL.md do WhatsApp):
-          * chat direto do dono citando o nome do assistente -> ``owner``;
-          * chat direto sem o nome -> decide o portão de nome, exatamente
-            como na voz: desligado, ou dentro da janela de continuação, o
-            turno segue ``owner``; ligado e sem nome -> ``untrusted`` com o
-            motivo legível ``name_gate``;
+        comparado ou escrito em log). Política (dono, SKILL.md do WhatsApp,
+        regra 2): chat direto do dono é turno da conversa e o nome NUNCA é
+        exigido — a decisão de chat direto tem precedência sobre o portão de
+        nome (incidente 05/11/2026: com ``name_gate_enabled`` ligado, o dono
+        recebeu no próprio chat a frase "chame pelo nome"). Portanto:
+          * chat direto do dono -> ``owner``, com ou sem o nome, com ou sem
+            o portão de nome ligado;
           * grupo ou chat de terceiro -> ``untrusted`` (como sempre);
           * eventos de monitor não passam daqui: são sempre ``untrusted`` no
             ``_flows_monitor_event``.
@@ -7610,20 +7611,9 @@ class JarvisLive:
                     direct = False
         if not direct:
             return "untrusted", "chat_nao_direto"
-        if meta.get("wa_named") is not None:
-            named = bool(meta.get("wa_named"))
-        else:
-            named = self._addressed_to_me(text)
-        if named:
-            return "owner", ""
-        if not get_name_gate_enabled():
-            return "owner", ""
-        try:
-            if self._in_followup_window():
-                return "owner", ""
-        except Exception:
-            pass
-        return "untrusted", "name_gate"
+        # Chat direto do dono: nome não é exigido, portão de nome não se
+        # aplica (regra 2 do dono). Se chegou aqui como direto, é turno.
+        return "owner", ""
 
     def _flows_begin_turn(self, turn_id: str, text: str,
                           meta: dict | None = None,
@@ -7640,35 +7630,14 @@ class JarvisLive:
                      and not self._answers_on_whatsapp(meta)
                      and str(meta.get("reply_channel") or "voice") == "voice")
             trust = "owner"
-            block_reason = ""
             if source == "whatsapp":
-                # Só o chat direto do dono (com o nome, ou como o portão de
-                # nome manda) deixa de ser não-confiável. Grupo, terceiro e
-                # monitor seguem ``untrusted`` — e texto NUNCA abre portão
+                # Só o chat direto do dono deixa de ser não-confiável, e sem
+                # exigência de nome (regra 2). Grupo, terceiro e monitor
+                # seguem ``untrusted`` — e texto NUNCA abre portão
                 # privilegiado: isso é do core/owner_auth, não do trust.
-                trust, block_reason = self._whatsapp_turn_trust(text, meta)
+                trust, _motivo = self._whatsapp_turn_trust(text, meta)
             plan = rt.start_turn(turn_id, text, speak_allowed=speak,
                                  source=source, trust=trust, armed=armed)
-            if block_reason == "name_gate":
-                # Fim do silêncio: o dono escreveu no chat dele e o portão de
-                # nome travou o turno. Isso merece linha legível no log e uma
-                # frase de resposta — sem nunca citar número ou conta pareada.
-                try:
-                    self.ui.write_log(
-                        "SYS: WhatsApp: turno do dono barrado pelo portão "
-                        "de nome — a linha precisa citar o nome do "
-                        "assistente.")
-                except Exception:
-                    pass
-                try:
-                    self._owner_text_notify(
-                        f"Para eu responder por aqui, chame pelo nome: "
-                        f"comece a mensagem com \"{self._asst_name}\".",
-                        "whatsapp",
-                        account=str(meta.get("wa_account") or ""),
-                        chat=str(meta.get("wa_chat") or ""))
-                except Exception:
-                    pass
             return plan
         except Exception as e:
             print(f"[Fluxos] begin falhou: {e!r}")

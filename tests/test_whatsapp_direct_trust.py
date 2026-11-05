@@ -5,9 +5,10 @@ WhatsApp virava ``trust="untrusted"`` em ``_flows_begin_turn`` e o orquestrador
 fechava o turno em silêncio — inclusive as do próprio dono no chat direto dele.
 A política corrigida (SKILL.md do WhatsApp):
 
-  * chat direto do dono citando o nome    -> ``owner`` (turno ativo);
-  * chat direto sem o nome, portão ligado -> ``untrusted`` COM motivo legível
-    no log e uma frase de resposta pedindo o nome (nunca número/conta);
+  * chat direto do dono                      -> ``owner`` com ou sem o nome;
+    o portão de nome tem PRECEDÊNCIA invertida (regra 2 do dono, incidente
+    05/11/2026): no chat direto dele o nome nunca é exigido e a frase
+    "chame pelo nome" nunca é enviada;
   * grupo ou chat de terceiro             -> ``untrusted`` como antes;
   * monitor_event                         -> ``untrusted`` sempre;
   * texto do WhatsApp NUNCA executa ação privilegiada, mesmo com trust owner.
@@ -112,28 +113,24 @@ def test_direct_with_name_reaches_orchestrator_as_active_turn():
     assert plan.active and not plan.blocked
 
 
-# ── (b) direto sem nome, portão ligado: bloqueio com motivo legível ─────────
-def test_direct_without_name_gate_on_blocks_with_readable_reason():
+# ── (b) direto sem nome, portão LIGADO: chat direto tem precedência ─────────
+def test_direct_without_name_gate_on_is_owner_and_never_refused():
+    """Regra 2 do dono (incidente 05/11/2026): o portão de nome NUNCA barra o
+    chat direto nem dispara a frase "chame pelo nome" no chat dele."""
     rt = FakeRuntime()
     obj = _obj(rt)
     with mock.patch("main.get_name_gate_enabled", return_value=True), \
             mock.patch.object(type(obj), "_in_followup_window",
                               lambda _s: False):
-        obj._flows_begin_turn("t2", "que horas são?",
-                              _meta(wa_chat=OWNER_CHAT, wa_direct=True,
-                                    wa_named=False))
-    assert rt.begins[0]["trust"] == "untrusted"
-    # motivo legível no log, sem número nem nome de conta
-    assert any("portão de nome" in line for line in obj.ui.lines)
+        plan = obj._flows_begin_turn("t2", "que horas são?",
+                                     _meta(wa_chat=OWNER_CHAT, wa_direct=True,
+                                           wa_named=False))
+    assert rt.begins[0]["trust"] == "owner"
+    assert plan is not None and plan.active and not plan.blocked
+    assert obj._sent == []                       # nenhuma recusa no chat dele
     joined = " ".join(obj.ui.lines)
+    assert "chame pelo nome" not in joined
     assert OWNER_CHAT not in joined and "principal" not in joined
-    # fim do silêncio: uma frase curta ao dono pedindo o nome
-    assert len(obj._sent) == 1
-    line, channel, account, chat = obj._sent[0]
-    assert channel == "whatsapp" and account == "principal"
-    assert chat == OWNER_CHAT
-    assert "Gino" in line
-    assert OWNER_CHAT not in line and not any(c.isdigit() for c in line)
 
 
 def test_direct_without_name_gate_off_is_owner():
