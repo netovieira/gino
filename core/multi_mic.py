@@ -104,6 +104,12 @@ class MultiMic:
         ]
         self.decision = Decision(name="", pairs=len(self._comparators))
         self.cycles = 0
+        # Hysteresis: the chosen stream only changes after a new winner proves
+        # itself twice. Without it, room tone and near-ties made argmax flip
+        # between microphones every cycle — an endless "fonte selecionada"
+        # alternation that also thrashed the speaker profile.
+        self._chosen: int | None = None
+        self._pending_switch: int | None = None
 
     # ── input from the callbacks ────────────────────────────────────────────
     def push(self, index: int, block: object, at: float | None = None) -> Decision | None:
@@ -166,11 +172,28 @@ class MultiMic:
             verdict = mic_compare.DIFFUSE
         else:
             verdict = mic_compare.AMBIGUOUS
-        chosen = winner
+
+        chosen = self._chosen
+        if winner is not None:
+            if chosen is None or winner == chosen:
+                chosen = winner
+                self._pending_switch = None
+            elif self._pending_switch == winner:
+                # Two consecutive cycles agree: the owner really moved.
+                chosen = winner
+                self._pending_switch = None
+            else:
+                # One cycle is not enough evidence; stay on the current
+                # stream and, for the gate, keep this cycle ambiguous.
+                self._pending_switch = winner
+                verdict = mic_compare.AMBIGUOUS
+        else:
+            self._pending_switch = None
         if chosen is None and energies:
             # For the gate: the strongest signal, even when it is not proven
             # to be next to the person. Still one stream, never a sum.
             chosen = int(np.argmax(energies))
+        self._chosen = chosen
         return Decision(
             verdict=verdict,
             source=chosen,

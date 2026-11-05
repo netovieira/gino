@@ -413,6 +413,16 @@ def _patch_config(**fields) -> None:
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
 
+def save_qoder_live_model(name: str) -> None:
+    """Persist the conversation model chosen for Qoder Live."""
+    _patch_config(qoder_live_model=(name or "").strip())
+
+
+def save_qoder_heavy_model(name: str) -> None:
+    """Persist the executor/subagent model chosen for Qoder Live."""
+    _patch_config(qoder_heavy_model=(name or "").strip())
+
+
 def get_input_device() -> str:
     """Microphone device name, or '' for the system default."""
     return (load_api_keys().get("input_device", "") or "").strip()

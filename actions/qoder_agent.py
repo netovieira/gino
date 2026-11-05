@@ -6,8 +6,8 @@ WHAT IT IS FOR
     and routing, not at writing a module. This action is the delegation: the
     user says "pede pro Qoder revisar esse projeto", "manda o Qoder escrever
     esse script", and this file hands that job to the free Qoder models
-    (core/qoder.py: DeepSeek-Flash for heavy work, Qwen3.8-Flash for quick
-    turns). Paid models are refused by the allowlist.
+    (core/qoder.py). The model comes from the free catalog and a paid one is
+    replaced automatically, with the switch announced.
 
 THE THREE MODES
     answer   (default) a question about code, an explanation, a snippet. May
@@ -572,7 +572,7 @@ TOOL = {
             },
             "model": {
                 "type": "STRING",
-                "description": "Optional free model id (DeepSeek-Flash for heavy "
+                "description": "Optional free model id (from the Qoder catalog; "
                                "work, Qwen3.8-Flash for quick turns). Paid models "
                                "are refused."
             },

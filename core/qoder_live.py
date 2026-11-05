@@ -18,6 +18,7 @@ PROTOCOL (see ``qoder_live/index.mjs`` for the source of truth)
     Sidecar -> Python:
         {"type": "ready", "model": "Qwen3.8-Flash", "warmup_ms": 1234}
         {"type": "models", "models": [...], "source": "remote"|"fallback"}
+        {"type": "model_switch", "from": "...", "to": "...", "role": "..."}
         {"type": "session", "id": "..."}            (resumable session id)
         {"type": "session", "id": "...", "persona": "<slug>"}
         {"type": "text", "id": "...", "text": "...", "delta": true|false}
@@ -115,6 +116,7 @@ class QoderLive:
         on_persona_error: Optional[Callable[[str, str], None]] = None,
         on_persona_session: Optional[Callable[[str, str], None]] = None,
         on_models: Optional[Callable[[list[dict[str, Any]]], None]] = None,
+        on_model_switch: Optional[Callable[[str, str, str], None]] = None,
         on_thinking: Optional[Callable[[Optional[str], str], None]] = None,
         logger: Optional[Callable[[str], None]] = print,
     ) -> None:
@@ -140,6 +142,7 @@ class QoderLive:
         self.on_persona_error = on_persona_error
         self.on_persona_session = on_persona_session
         self.on_models = on_models
+        self.on_model_switch = on_model_switch
         self.on_thinking = on_thinking
         self.logger = logger or NOOP_LOGGER
 
@@ -554,6 +557,13 @@ class QoderLive:
         elif kind == "models":
             models = message.get("models")
             self._emit("on_models", models if isinstance(models, list) else [])
+        elif kind == "model_switch":
+            self._emit(
+                "on_model_switch",
+                str(message.get("from") or ""),
+                str(message.get("to") or ""),
+                str(message.get("role") or ""),
+            )
         elif kind == "session":
             session_id = str(message.get("id") or "")
             if session_id:

@@ -25,7 +25,7 @@ SETTINGS
     config/api_keys.json:
 
         transport  cli | proxy                   (cli = the `qoder` binary)
-        model      DeepSeek-Flash                (see MODELS below / --list-models)
+        model      Qwen3.8-Flash                (free catalog models; see MODELS)
         thinking   adaptive | enabled | disabled | auto
         reasoning_effort  low | medium | high | max
         context_window    tokens (e.g. 1000000 for the 1M window)
@@ -36,7 +36,7 @@ SETTINGS
       cli    calls the `qoder` binary the person already has installed and
              logged in (`qoder -p --output-format json …`). This is the default
              because it reaches the models the CLI advertises — including the
-             free DeepSeek-Flash with a 1M context and a real thinking budget —
+             free catalog models with a 1M context and a real thinking budget —
              without depending on the container being up.
       proxy  the container from setup-qoder.sh, OpenAI-style on 127.0.0.1:3000.
              Kept as a fallback: if the CLI is missing or not logged in, ask()
@@ -65,10 +65,12 @@ NAMESPACE = "qoder"
 CONTAINER = "qoder-proxy"
 DEFAULT_BASE_URL = "http://127.0.0.1:3000/v1"
 # Model ids for the CLI's --model flag (qoder --list-models).
-# FREE ONLY — the assistant may never select a paid model. "Auto" and
-# "Efficient" are deliberately absent: Auto can pick a paid model on its own.
-FREE_MODELS = ("DeepSeek-Flash", "Qwen3.8-Flash")
-HEAVY_MODEL = "DeepSeek-Flash"   # delegated work: deeper reasoning, 1M window
+# FREE ONLY — the assistant may never select a paid model. The catalog written
+# by Qoder Live (memory/models.json) decides what is free right now; this tuple
+# is only the last-resort allowlist when no catalog exists. "Auto" is absent:
+# it can pick a paid model on its own.
+FREE_MODELS = ("Qwen3.8-Flash", "Efficient")
+HEAVY_MODEL = "Qwen3.8-Flash"    # delegated work: free, 1M window
 FAST_MODEL = "Qwen3.8-Flash"     # conversation: quick, thinking off, small window
 DEFAULT_MODEL = HEAVY_MODEL
 CLI_DEFAULT_THINKING = "adaptive"      # auto | adaptive | enabled | disabled
@@ -84,18 +86,33 @@ DEFAULT_TIMEOUT = 120
 DEFAULT_JOB_TIMEOUT = 600
 JOB_TIMEOUT_MAX = 3_600
 
-# Only the free models are offered. The id on the left is what goes on the
-# wire; the label says what each one is for.
-MODELS = {
-    "DeepSeek-Flash": "DeepSeek Flash — free, 1M context (trabalho pesado)",
-    "Qwen3.8-Flash":  "Qwen 3.8 Flash — free, rápido (conversa)",
-}
+# Only the free models are offered. Built from the catalog so a model that
+# becomes paid disappears from the form instead of being picked by accident.
+def _free_choices() -> dict[str, str]:
+    try:
+        from core import free_models as _free
+        return _free.free_choices()
+    except Exception:
+        return {name: "Gratuito (catálogo Qoder indisponível)."
+                for name in FREE_MODELS}
+
+
+MODELS = _free_choices()
 
 
 def free_model(model: str | None) -> str:
-    """The requested model if it is on the free allowlist, else the heavy one."""
-    m = str(model or "").strip()
-    return m if m in FREE_MODELS else HEAVY_MODEL
+    """Resolve ``model`` to a model the catalog marks as free.
+
+    A configured paid model is replaced by the first free model, and the
+    switch is announced once through core.free_models listeners.
+    """
+    try:
+        from core import free_models as _free
+        chosen, _previous = _free.resolve(model or HEAVY_MODEL, "qoder")
+        return chosen
+    except Exception:
+        m = str(model or "").strip()
+        return m if m in FREE_MODELS else HEAVY_MODEL
 
 # The answer to "why is the proxy not there": these two do not get better by
 # being retried within the same turn.
@@ -178,7 +195,7 @@ def settings(get_plugin_config=None, profile: str = "work") -> dict:
     tools_arg = "default" if tools_arg is None else str(tools_arg)
 
     if profile == "fast":
-        model = FAST_MODEL
+        model = free_model(FAST_MODEL)
         thinking = FAST_THINKING
         effort = FAST_EFFORT
         context = FAST_CONTEXT

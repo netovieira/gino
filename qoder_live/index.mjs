@@ -51,9 +51,12 @@ import {
 import { z } from "zod";
 import { NoticeGate } from "./notice_gate.mjs";
 
-const ALLOWED_MODELS = new Set(["Qwen3.8-Flash", "DeepSeek-Flash"]);
+// Free only. The catalog (memory/models.json, refreshed from the Qoder SDK)
+// decides what is free right now; these names are the last-resort allowlist
+// when no catalog exists. DeepSeek-Flash is deliberately absent: it is paid in
+// the current catalog (priceFactor 0.1) and used to be the executor's model.
 const DEFAULT_MODEL = "Qwen3.8-Flash";
-const HEAVY_MODEL = "DeepSeek-Flash";   // subagents: 1M window, deeper reasoning
+const SAFE_FREE_MODELS = ["Qwen3.8-Flash", "Efficient"];
 const DEFAULT_CONTEXT_SIZE = 200000;
 const REASONING_LEVELS = new Set(["low", "medium", "high", "max"]);
 const PERSONA_MAX_CALLS_PER_ASK = 4;
@@ -76,9 +79,81 @@ const CWD = process.env.JARVIS_CWD || "/home/anthero/jarvis";
 const READ_EVERYWHERE = path.parse(path.resolve(CWD)).root || path.sep;
 const ASSISTANT_NAME = process.env.JARVIS_ASSISTANT_NAME || "Gino";
 const RESUME_SESSION = String(process.env.JARVIS_RESUME_SESSION || "").trim();
-const MODEL = ALLOWED_MODELS.has(String(process.env.JARVIS_MODEL || "").trim())
-  ? String(process.env.JARVIS_MODEL).trim()
-  : DEFAULT_MODEL;
+const DISK_MODELS_PATH = path.join(CWD, "memory", "models.json");
+
+function readDiskCatalog() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(DISK_MODELS_PATH, "utf8"));
+    const list = Array.isArray(raw) ? raw : raw?.models;
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+function entryIsFree(entry) {
+  if (!entry || typeof entry !== "object") return false;
+  if (entry.isFree === true) return true;
+  const factor = Number(entry.priceFactor);
+  return Number.isFinite(factor) && factor === 0;
+}
+
+function catalogName(entry) {
+  return String(entry?.displayName || entry?.value || "").trim();
+}
+
+function findCatalogModel(list, name) {
+  const wanted = String(name || "").trim().toLowerCase();
+  if (!wanted) return null;
+  return (list || []).find((entry) =>
+    String(entry?.value || "").toLowerCase() === wanted
+    || String(entry?.displayName || "").toLowerCase() === wanted) || null;
+}
+
+function preferenceRank(name) {
+  const index = SAFE_FREE_MODELS.findIndex(
+    (safe) => safe.toLowerCase() === String(name || "").toLowerCase());
+  return index === -1 ? SAFE_FREE_MODELS.length : index;
+}
+
+function pickFreeModel(list, preferred) {
+  const wanted = String(preferred || "").trim() || DEFAULT_MODEL;
+  const entry = findCatalogModel(list, wanted);
+  if (entry && entryIsFree(entry)) {
+    return { model: catalogName(entry), from: null };
+  }
+  const catalog = Array.isArray(list) ? list : [];
+  const free = catalog.filter(entryIsFree)
+    .sort((a, b) => preferenceRank(catalogName(a)) - preferenceRank(catalogName(b)));
+  if (!free.length) {
+    // No catalog or nothing free: never guess a paid model.
+    const model = SAFE_FREE_MODELS.includes(wanted) ? wanted : DEFAULT_MODEL;
+    return { model, from: model === wanted ? null : wanted };
+  }
+  const model = catalogName(free[0]);
+  return { model, from: model === wanted ? null : wanted };
+}
+
+function isFreeModel(name, list = catalogModels || readDiskCatalog()) {
+  const entry = findCatalogModel(list, name);
+  if (entry) return entryIsFree(entry);
+  return !list.length && SAFE_FREE_MODELS.includes(String(name || "").trim());
+}
+
+const DISK_CATALOG = readDiskCatalog();
+const START_MODEL = pickFreeModel(
+  DISK_CATALOG, String(process.env.JARVIS_MODEL || "").trim());
+const START_HEAVY = pickFreeModel(
+  DISK_CATALOG,
+  String(process.env.JARVIS_HEAVY_MODEL || process.env.JARVIS_MODEL || "").trim());
+let MODEL = START_MODEL.model;
+let HEAVY_MODEL = START_HEAVY.model;
+if (START_MODEL.from) {
+  log(`modelo ${START_MODEL.from} não é gratuito no catálogo — usando ${MODEL}`);
+}
+if (START_HEAVY.from) {
+  log(`modelo ${START_HEAVY.from} não é gratuito no catálogo — usando ${HEAVY_MODEL}`);
+}
 // Runtime policy skills. Technical docs in the same folder are deliberately
 // not loaded into the live prompt. Only a one-line rule summary goes inline;
 // the full policy stays in skills/<name>/SKILL.md and is read on demand. The
@@ -487,13 +562,28 @@ let catalogModels = null;
 let catalogSource = "fallback";
 let modelsEmitted = false;
 
-function catalogModelFor(value) {
-  if (!catalogModels) return null;
-  const wanted = String(value || "").trim().toLowerCase();
-  if (!wanted) return null;
-  return catalogModels.find((model) =>
-    String(model.value || "").toLowerCase() === wanted
-    || String(model.displayName || "").toLowerCase() === wanted) || null;
+// Called as soon as the remote catalog arrives: if the model in use became
+// paid (or vanished), switch to a free one and tell Python so the owner hears
+// it. Never silently keeps a paid model.
+function reconcileModels() {
+  const list = catalogModels || readDiskCatalog();
+  if (!list.length) return [];
+  const changes = [];
+  const fast = pickFreeModel(list, MODEL);
+  if (fast.from) {
+    changes.push({ role: "conversa", from: fast.from, to: fast.model });
+    MODEL = fast.model;
+  }
+  const heavy = pickFreeModel(list, HEAVY_MODEL);
+  if (heavy.from) {
+    changes.push({ role: "subagente", from: heavy.from, to: heavy.model });
+    HEAVY_MODEL = heavy.model;
+  }
+  for (const change of changes) {
+    log(`modelo ${change.from} não é gratuito — trocado por ${change.to} (${change.role})`);
+    out({ type: "model_switch", from: change.from, to: change.to, role: change.role });
+  }
+  return changes;
 }
 
 async function loadModelCatalogFrom(q) {
@@ -517,6 +607,7 @@ async function loadModelCatalogFrom(q) {
       source: "remote",
       updated_at: new Date().toISOString(),
     });
+    reconcileModels();
     log(`catálogo de modelos: ${models.length} modelos`);
     return models;
   } catch (e) {
@@ -947,6 +1038,14 @@ async function closePersonaState(state) {
 }
 
 async function ensurePersonaSession(persona) {
+  // Persona models obey the same rule: free only. A paid model in the
+  // registration is replaced before the session hash is taken.
+  if (!isFreeModel(persona.model, catalogModels || readDiskCatalog())) {
+    const free = pickFreeModel(catalogModels || readDiskCatalog(),
+                               persona.model);
+    log(`persona ${persona.slug}: modelo ${persona.model} não é gratuito — usando ${free.model}`);
+    persona.model = free.model;
+  }
   const hash = personaConfigHash(persona);
   let state = personaStates.get(persona.slug);
   let changed = false;
@@ -958,11 +1057,6 @@ async function ensurePersonaSession(persona) {
   }
   if (state && !state.dead) return state;
   if (state?.dead) personaStates.delete(persona.slug);
-
-  if (catalogSource === "remote" && !catalogModelFor(persona.model)
-      && !ALLOWED_MODELS.has(persona.model)) {
-    throw new Error(`modelo ${persona.model} não está no catálogo do Qoder`);
-  }
 
   const store = loadPersonaSessionStore();
   const saved = store[persona.slug];
@@ -1489,12 +1583,17 @@ const SYSTEM_PROMPT = loadSystemPrompt();
 const EXECUTOR_AGENT = {
   description: "Executa mudanças e investigações pesadas no projeto (editar, testar, instalar, rodar comandos, git) sem travar a conversa.",
   prompt: "Você é o executor do Gino. Receba a tarefa descrita pela conversa e execute até o fim: leia o código antes de mudar, rode os testes relevantes, verifique o resultado e não invente sucesso. Não peça confirmação para o que o dono já pediu na conversa; peça somente se a tarefa mudar o escopo ou for irreversível. Responda em português com um resumo curto do que mudou e da verificação. Nunca faça push sem o dono ter pedido explicitamente. Se estiver chegando perto do limite de turnos, pare de agir e responda agora um resumo do que já fez, do que falta e do próximo passo — nunca morra em silêncio quando o limite estourar.",
-  model: HEAVY_MODEL,
   tools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash", "WebFetch", "WebSearch", "Agent"],
   permissionMode: "acceptEdits",
   background: true,
   maxTurns: 150,
 };
+
+// The executor inherits the free model resolved at startup (and re-resolved
+// after the remote catalog arrives) — never a hardcoded paid one.
+function executorAgent() {
+  return { ...EXECUTOR_AGENT, model: HEAVY_MODEL };
+}
 
 function optionsFor(maxTurns) {
   return {
@@ -1514,7 +1613,7 @@ function optionsFor(maxTurns) {
     canUseTool,
     mcpServers: { jarvis: makeJarvisServer() },
     allowedTools: ALLOWED_TOOLS,
-    agents: { executor: EXECUTOR_AGENT },
+    agents: { executor: executorAgent() },
     includePartialMessages: true,
     persistSession: true,
     resume: RESUME_SESSION || undefined,
@@ -1939,14 +2038,15 @@ function selftest() {
   const personaOpts = personaOptions(personaSample);
   const mainOpts = optionsFor(1);
   const checks = {
-    model: ALLOWED_MODELS.has(MODEL),
+    model: isFreeModel(MODEL),
     destructive: DESTRUCTIVE.test("sudo reboot") && DESTRUCTIVE.test("rm -rf /") && DESTRUCTIVE.test("systemctl restart foo") && !DESTRUCTIVE.test("ls -la"),
     mcp_tools: MCP_NAMES.length === 10,
     system_prompt: SYSTEM_PROMPT.length > 100,
     prompt_chars: SYSTEM_PROMPT.length,
     skill_index_chars: loadSkillIndex().length,
     skills: skills.every((p) => fs.existsSync(p)),
-    background_agent: EXECUTOR_AGENT.background === true && EXECUTOR_AGENT.model === HEAVY_MODEL,
+    background_agent: EXECUTOR_AGENT.background === true
+      && executorAgent().model === HEAVY_MODEL && isFreeModel(HEAVY_MODEL),
     internal_context: userMessage("x", "next", "ctx").message.content[0].text.includes("[CONTEXTO INTERNO"),
     bridge_url: BRIDGE_URL.startsWith("http"),
     persona_tools: PERSONA_ALLOWED_TOOLS.includes("Read")

@@ -159,6 +159,51 @@ def test_tie_between_two_near_votes_is_ambiguous():
     assert decision.verdict != mic_compare.NEAR
 
 
+def test_ambiguous_cycles_keep_the_current_source():
+    """Ruído de sala não pode alternar a fonte a cada ciclo."""
+    now = [0.0]
+    mic = _two(lambda: now[0])
+    zeros = np.zeros(1024, dtype=np.float32)
+    mic.push(0, zeros)
+    now[0] = 0.001
+    first = mic.push(1, zeros.copy())
+    assert first.source == 0
+    for k in range(8):
+        loud = _noise(1024, 0.30, seed=20 + k)
+        quiet = _noise(1024, 0.21, seed=40 + k)
+        a, b = (loud, quiet) if k % 2 == 0 else (quiet, loud)
+        now[0] += 0.005
+        assert mic.push(0, a) is None
+        now[0] += 0.001
+        decision = mic.push(1, b)
+        assert decision.verdict == mic_compare.AMBIGUOUS
+        assert decision.source == 0
+
+
+def test_a_new_winner_must_confirm_before_the_stream_switches():
+    """A troca real de microfone custa dois ciclos; glitch de um ciclo, não."""
+    now = [0.0]
+    mic = _two(lambda: now[0])
+    zeros = np.zeros(1024, dtype=np.float32)
+    loud = lambda seed: _noise(1024, 0.40, seed=seed)
+    mic.push(0, loud(1))
+    now[0] = 0.001
+    first = mic.push(1, zeros)
+    assert first.verdict == mic_compare.NEAR and first.source == 0
+
+    mic.push(0, zeros)
+    now[0] = 0.006
+    pending = mic.push(1, loud(2))
+    assert pending.source == 0            # ainda não trocou
+    assert pending.verdict == mic_compare.AMBIGUOUS
+
+    mic.push(0, zeros)
+    now[0] = 0.011
+    switched = mic.push(1, loud(3))
+    assert switched.verdict == mic_compare.NEAR
+    assert switched.source == 1
+
+
 # ── quais fontes físicas entram ─────────────────────────────────────────────
 
 

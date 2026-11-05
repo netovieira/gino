@@ -70,6 +70,8 @@ class _TurnState:
     partial_changed_at: float = 0.0
     partial_released: bool = False
     prewarm_count: int = 0
+    prewarm_last_route: str = ""
+    prewarm_logged_at: float = 0.0
 
 
 class Orchestrator:
@@ -229,9 +231,16 @@ class Orchestrator:
                 # despacha tarefa; só aquece a decisão do turno final.
                 decision = self.router.parse(state.partial_text)
                 state.plan.context = self._context_for(decision)
-                self._event("prewarm", state.plan.turn_id,
-                            route=decision.route,
-                            chars=len(state.partial_text))
+                # Partials arrive many times per second. The route is still
+                # recomputed every time, but the Activity Log gets one line
+                # when the route changes or twice per second — not a storm.
+                if (decision.route != state.prewarm_last_route
+                        or now - state.prewarm_logged_at >= 0.5):
+                    state.prewarm_last_route = decision.route
+                    state.prewarm_logged_at = now
+                    self._event("prewarm", state.plan.turn_id,
+                                route=decision.route,
+                                chars=len(state.partial_text))
             self.supervisor.touch(CHAT_REASONING, now=now)
         decision = self._partial_release(state, now)
         return decision

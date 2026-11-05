@@ -75,7 +75,7 @@ PRESETS = {
     # skips it on any turn that carries tools, which is exactly the "smart for
     # conversation, local for tools" split. base_url is unused for this rung.
     # The conversation uses the FAST free model (thinking off, small window);
-    # delegated work uses DeepSeek-Flash with the full settings.
+    # delegated work uses the free Qoder catalog model with full settings.
     "qodercli":   {"base_url": "", "model": "Qwen3.8-Flash",
                    "key_url": "qoder login (CLI)"},
 }

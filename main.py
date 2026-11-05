@@ -129,6 +129,7 @@ from memory.config_manager     import (
     get_blocked_phrases,
     get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
     save_voice, DEFAULT_VOICE,
+    save_qoder_live_model, save_qoder_heavy_model,
 )
 from core                     import gemini as _gemini
 from core.plugin_loader        import discover_plugins
@@ -145,6 +146,7 @@ from core import duck as _duck
 from core import rootgate as _rootgate
 from core import actiongate as _actiongate
 from core import qoder_jobs as _qoder_jobs
+from core import free_models as _free_models
 from core.viseme               import VisemeStream
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
@@ -286,6 +288,17 @@ _QODER_ABORT_RE = re.compile(
     r"|\bcancell?ederror\b"
     r"|\b(?:turn|turno|request|requisi[cç][aã]o)\s+(?:was\s+)?(?:aborted|cancell?ed)\b"
     r"|\binterrompid[oa]\s+por\s+voz\b",
+    re.IGNORECASE,
+)
+
+# A paid model that ran out of credits is not a transient failure: retrying the
+# same turn on the same model only repeats the error. These strings are what
+# the Qoder CLI/SDK report; the handler below switches to a free model instead.
+_QODER_CREDIT_RE = re.compile(
+    r"credit\s+usage\s+limit|credits?\s+(?:are\s+)?depleted"
+    r"|insufficient\s+(?:credits?|balance|funds)"
+    r"|prepayment|upgrade\s+your\s+subscription"
+    r"|(?:402|payment\s+required)",
     re.IGNORECASE,
 )
 
@@ -2186,6 +2199,10 @@ class JarvisLive:
         self._qoder_turn_timeout_s = 45.0
         self._qoder_restart_limit  = 5
         self._qoder_ready_at       = 0.0
+        self._qoder_model          = ""
+        self._qoder_heavy_model    = ""
+        self._qoder_credit_switch_at = 0.0
+        self._qoder_credit_blocked = False
         self._qoder_lock           = threading.RLock()
         self._qoder_text_buf: dict[str, str] = {}
         self._qoder_spoken: dict[str, list[str]] = {}
@@ -5290,11 +5307,27 @@ class JarvisLive:
         system_file = BASE_DIR / "memory" / "chat" / "qoder_live_system.txt"
         self._qoder_resume_session = self._load_qoder_session()
         self._write_qoder_system_prompt()
+        # The owner's rule is free-only. Resolve both the conversation and the
+        # executor model against the Qoder catalog before the sidecar starts;
+        # a configured paid model is replaced and the switch is announced.
+        try:
+            _free_models.register_listener(self._on_free_model_switch)
+        except Exception as e:
+            print(f"[Modelos] listener: {e}")
+        from core import qoder as _qoder_mod
+        live_model, _ = _free_models.resolve(
+            str(cfg.get("qoder_live_model") or ""), "conversa")
+        heavy_model, _ = _free_models.resolve(
+            str(cfg.get("qoder_heavy_model") or _qoder_mod.HEAVY_MODEL),
+            "subagente")
+        self._qoder_model = live_model
+        self._qoder_heavy_model = heavy_model
         env = os.environ.copy()
         env.update({
             "JARVIS_BRIDGE_URL": self._bridge.url(),
             "JARVIS_BRIDGE_TOKEN": self._bridge_token,
-            "JARVIS_MODEL": str(cfg.get("qoder_live_model") or "Qwen3.8-Flash"),
+            "JARVIS_MODEL": live_model,
+            "JARVIS_HEAVY_MODEL": heavy_model,
             "JARVIS_CWD": str(BASE_DIR),
             "JARVIS_ASSISTANT_NAME": self._asst_name,
             "JARVIS_SYSTEM_PROMPT_FILE": str(system_file),
@@ -5318,6 +5351,7 @@ class JarvisLive:
             on_persona_error=self._qoder_on_persona_error,
             on_persona_session=self._qoder_on_persona_session,
             on_models=self._qoder_on_models,
+            on_model_switch=self._qoder_on_model_switch,
             on_thinking=self._qoder_on_thinking,
             logger=print,
         )
@@ -5888,6 +5922,9 @@ class JarvisLive:
 
     def _qoder_on_ready(self, model: str, warmup_ms: float) -> None:
         self._qoder_ready_at = time.monotonic()
+        self._qoder_credit_blocked = False
+        if model:
+            self._qoder_model = str(model)
         self._qoder_restart_attempts = 0
         self._qoder_session_reset_tried = False
         _health.set_component("qoder_live", True,
@@ -5965,6 +6002,10 @@ class JarvisLive:
         summary = str(event.get("summary") or "").strip()
         if summary:
             print(f"[QoderLive] task {status or 'done'}: {summary[:300]}")
+        credit_error = bool(_QODER_CREDIT_RE.search(summary))
+        if credit_error:
+            _metrics.event("qoder subagent credit error; switching free model")
+            self._switch_qoder_after_credit(summary, "subagente")
         try:
             _task_mirror.finish_subagent(
                 event.get("task_id") or event.get("id"),
@@ -5999,6 +6040,10 @@ class JarvisLive:
                 self._announce_task_completion(
                     f"subagent:{task_key}:done",
                     f"Terminei em segundo plano: {label}.")
+            elif credit_error:
+                # The switch announcement already explains the failure; a
+                # second generic line would only repeat it.
+                pass
             else:
                 self._announce_task_completion(
                     f"subagent:{task_key}:{status or 'encerrado'}",
@@ -6028,6 +6073,13 @@ class JarvisLive:
         if self._qoder_shutting_down or not self._qoder_live_enabled:
             return
         if self._qoder_live is None:
+            return
+        if getattr(self, "_qoder_credit_blocked", False):
+            # Restarting without a free replacement would only repeat the same
+            # credit failure. Wait for the catalog to gain a free model.
+            _health.set_component("qoder_live", False,
+                                  "sem modelo gratuito disponível")
+            _metrics.event("qoder restart blocked: no free model")
             return
         with self._qoder_lock:
             thread = self._qoder_restart_thread
@@ -6634,6 +6686,36 @@ class JarvisLive:
         except Exception:
             pass
 
+    def _on_free_model_switch(self, previous: str, chosen: str,
+                              reason: str) -> None:
+        """The configured model became paid: tell the owner which free one
+        took over. Logged and spoken once per switch."""
+        text = (f"Troquei o modelo {previous} pelo {chosen}, "
+                f"que continua gratuito.")
+        try:
+            self.ui.write_log(f"SYS: {text}")
+        except Exception:
+            pass
+        try:
+            self._say_now(text, log=False, origin="aviso")
+        except Exception as e:
+            print(f"[Modelos] aviso falou: {e}")
+
+    def _qoder_on_model_switch(self, previous: str, chosen: str,
+                               role: str) -> None:
+        if not previous or not chosen or previous == chosen:
+            return
+        if role == "subagente":
+            self._qoder_heavy_model = chosen
+        else:
+            self._qoder_model = chosen
+        try:
+            _free_models.announce(
+                previous, chosen,
+                f"ajuste do modelo de {role or 'conversa'}")
+        except Exception as e:
+            print(f"[Modelos] troca do sidecar: {e}")
+
     def _qoder_on_thinking(self, persona: str | None, text: str) -> None:
         """One contextual cue from an older sidecar; never generic filler."""
         text = str(text or "").strip()
@@ -6888,6 +6970,96 @@ class JarvisLive:
             table.pop(stale, None)
         return str(turn_id)
 
+    def _switch_qoder_after_credit(self, error: str, role: str = "conversa") -> bool:
+        """Replace a model that ran out of credits with a free one.
+
+        Never retries the same call on the same model: the error is not
+        transient, and on a paid model each retry keeps failing (and, before
+        the catalog check, kept spending). The switch is persisted so the next
+        start does not go back to it.
+        """
+        now = time.monotonic()
+        last = float(getattr(self, "_qoder_credit_switch_at", 0.0) or 0.0)
+        if now - last < 120.0:
+            return True
+        self._qoder_credit_switch_at = now
+        current = (self._qoder_heavy_model if role == "subagente"
+                   else self._qoder_model)
+        new_model = _free_models.alternative(current)
+        if not new_model:
+            self._qoder_credit_blocked = True
+            line = ("SYS: o modelo do Qoder ficou sem créditos e não há outro "
+                    "gratuito no catálogo — não vou repetir a chamada.")
+            try:
+                self.ui.write_log(line)
+            except Exception:
+                pass
+            try:
+                self._say_now(
+                    "O modelo atual ficou sem créditos e não há outro gratuito. "
+                    "Não vou repetir a chamada.", log=False, origin="aviso")
+            except Exception as e:
+                print(f"[Modelos] aviso sem alternativa: {e}")
+            # Check again later instead of a hot retry loop: the catalog may
+            # gain a free model without restarting the app.
+            self._schedule_credit_retry()
+            return True
+        self._qoder_credit_blocked = False
+        if role == "subagente":
+            self._qoder_heavy_model = new_model
+            try:
+                save_qoder_heavy_model(new_model)
+            except Exception as e:
+                print(f"[Modelos] salvar subagente: {e}")
+        else:
+            self._qoder_model = new_model
+            try:
+                save_qoder_live_model(new_model)
+            except Exception as e:
+                print(f"[Modelos] salvar conversa: {e}")
+        if current:
+            _free_models.announce(
+                current, new_model, "o modelo anterior ficou sem créditos")
+        live = self._qoder_live
+        if live is not None:
+            live.env["JARVIS_MODEL" if role != "subagente"
+                     else "JARVIS_HEAVY_MODEL"] = new_model
+
+            def _restart() -> None:
+                try:
+                    live.stop()
+                except Exception as e:
+                    print(f"[Modelos] parar sidecar: {e!r}")
+                with self._qoder_lock:
+                    self._qoder_restart_attempts = 0
+                self._schedule_qoder_restart()
+
+            threading.Thread(target=_restart, daemon=True,
+                             name="qoder-model-switch").start()
+        print(f"[Modelos] sem créditos em {current or '?'} ({role}) — "
+              f"trocado por {new_model}; reiniciando o sidecar")
+        return True
+
+    def _retry_qoder_after_credit(self) -> None:
+        if self._qoder_shutting_down or not getattr(
+                self, "_qoder_credit_blocked", False):
+            return
+        current = self._qoder_model or self._qoder_heavy_model
+        if _free_models.alternative(current):
+            self._qoder_credit_blocked = False
+            _metrics.event("qoder free model available again")
+            self._schedule_qoder_restart()
+            return
+        self._schedule_credit_retry()
+
+    def _schedule_credit_retry(self) -> None:
+        try:
+            timer = threading.Timer(300.0, self._retry_qoder_after_credit)
+            timer.daemon = True
+            timer.start()
+        except Exception as e:
+            print(f"[Modelos] reagendamento: {e}")
+
     def _qoder_on_error(self, turn_id, error: str) -> None:
         err = str(error or "")
         # A saved session id can be rejected by a newer CLI/model. Retry once
@@ -6899,6 +7071,12 @@ class JarvisLive:
             self._clear_qoder_session()
             _metrics.event("qoder resume rejected; starting fresh")
             self._schedule_qoder_restart()
+        credit_error = bool(_QODER_CREDIT_RE.search(err))
+        if credit_error:
+            # Not transient: switch the model before any relaunch. The switch
+            # announcement is the line the owner hears, never a silent retry.
+            _metrics.event("qoder credit error; switching free model")
+            self._switch_qoder_after_credit(err, "conversa")
         with self._qoder_lock:
             voice_preempted = bool(
                 getattr(self, "_qoder_voice_preempts", {}).pop(turn_id, None))
@@ -6979,6 +7157,13 @@ class JarvisLive:
             # announce a stumble or a retry — the owner waited for the proviso
             # and then for the answer. If the wait is long, the murmur rule of
             # skills/conversation/SKILL.md applies.
+            if credit_error:
+                # The model was swapped and the sidecar will warm on a free
+                # one; the same words are answered when it is back. Never
+                # relaunch on the model that just refused for lack of credit.
+                self._qoder_hold(original, None, "modelo sem créditos",
+                                 announce=False)
+                return
             if not self._qoder_live_ready():
                 self._qoder_hold(original, None, "erro no turno")
             elif not self._qoder_retry_used:
