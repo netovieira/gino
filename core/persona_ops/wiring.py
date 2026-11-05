@@ -89,7 +89,15 @@ class PersonaOps:
     # ── destinatário do pedido ──────────────────────────────────────────────
     def note_ask(self, persona: str, turn_id: str, addressee: Any, *,
                  channel: str = "voice",
-                 name: str = "") -> None:
+                 name: str = "",
+                 delivery: Mapping[str, Any] | None = None) -> None:
+        """Registra o destinatário daquele pedido.
+
+        ``delivery`` (opcional) é o destino de resposta quando o canal é o
+        WhatsApp do turno (conta+chat de origem da mensagem). Vive SÓ em
+        memória: o audit recebe o resto, porque id de chat/conta nunca é
+        escrito em log — quem audita depois usa o rótulo curto do evento.
+        """
         slug = str(persona or "").strip()
         if not slug:
             return
@@ -102,9 +110,12 @@ class PersonaOps:
             "name": str(name or ""),
             "at": time.time(),
         }
+        if isinstance(delivery, Mapping) and delivery:
+            entry = dict(entry, delivery=dict(delivery))
         with self._lock:
             self._asks.setdefault(slug, deque()).append(entry)
-        self.audit({"event": "persona_ask", **entry})
+        self.audit({"event": "persona_ask",
+                    **{k: v for k, v in entry.items() if k != "delivery"}})
 
     def current_ask(self, persona: str) -> dict[str, Any] | None:
         with self._lock:

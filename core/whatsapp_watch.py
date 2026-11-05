@@ -207,6 +207,83 @@ def calls_assistant(item: dict, account: str = "") -> bool:
                for number in _MENTION_RE.findall(str(text or "")))
 
 
+# ── persona pelo nome / conta atribuída (FLUXO MAPEAMENTO WHATSAPP, passo 1) ─
+#
+# O observador também verifica NOME DE PERSONAS: mensagem com vocativo de
+# persona cadastrada, ou mensagem direta no WhatsApp atribuído a ela (chave
+# `whatsapp_account` do cadastro — deixa de ser enfeite: é o fator
+# `conta_atribuida` abaixo). O vocativo usa o MESMO resolvedor da voz
+# (`core.persona_ops.relay.find_addressed_persona`); aqui não existe um
+# segundo matcher. Sem persona, a mensagem é só boca/cérebro como sempre;
+# com persona, vai pros dois E para a ela (quem entrega a resposta dela no
+# chat é `main.py`, pelo caminho persona_ask já existente). Grupo nunca chega
+# a esta checagem: a recusa de grupo acontece antes, em `is_candidate` e no
+# `_dispatch` — e o eco `from_me` em chat de terceiro continua fora: o ramo
+# dele em `is_candidate` NÃO consulta persona (eco sem nome do assistente não
+# vira ordem; com nome do assistente vale como sempre valeu).
+
+# Fonte de personas injetável (testes); None = lê o cadastro real.
+_personas_source = None
+
+
+def set_personas_source(fn) -> None:
+    """Injeta a fonte de personas (callable -> iterable de cadastros)."""
+    global _personas_source
+    _personas_source = fn
+
+
+def _live_personas() -> list:
+    if _personas_source is not None:
+        try:
+            return [p for p in (_personas_source() or []) if isinstance(p, dict)]
+        except Exception:
+            return []
+    try:
+        from core import personas as _personas
+        return [p for p in (_personas.list_personas() or [])
+                if isinstance(p, dict)]
+    except Exception:
+        return []
+
+
+def addressed_persona(text: object, account: str = "") -> dict | None:
+    """A persona cadastrada a quem esta mensagem individual se dirige.
+
+    Fatores de identidade, nesta ordem:
+    1. ``vocativo`` — o texto chama a persona pelo nome (resolvedor da voz);
+    2. ``conta_atribuida`` — a conta que recebeu a mensagem é a
+       ``whatsapp_account`` de UMA única persona cadastrada (lei do passo 1:
+       mensagem direta no whats atribuído é dela por padrão, sem nome).
+    Zero ou duas personas na conta, persona desconhecida ou nome que não casa
+    vocativo: None — a rota normal decide e nenhuma persona é inventada.
+    """
+    personas = _live_personas()
+    if not personas:
+        return None
+    try:
+        from core.persona_ops.relay import find_addressed_persona
+        hit = find_addressed_persona(str(text or ""), personas)
+    except Exception:
+        return None
+    if hit is not None:
+        return {"slug": hit.slug, "name": hit.name, "factor": "vocativo"}
+    acct = str(account or "").strip().casefold()
+    if not acct:
+        return None
+    assigned = [p for p in personas
+                if str(p.get("whatsapp_account") or "").strip().casefold()
+                == acct]
+    if len(assigned) != 1:
+        return None
+    persona = assigned[0]
+    slug = str(persona.get("id") or persona.get("name") or "").strip()
+    if not slug:
+        return None
+    return {"slug": slug,
+            "name": str(persona.get("name") or slug).strip(),
+            "factor": "conta_atribuida"}
+
+
 def _same_chat(a: object, b: object) -> bool:
     """Mesmo chat escrito de dois jeitos ("+55 17 9..." vs "5517...").
 
@@ -439,7 +516,14 @@ def is_candidate(item: dict, account: str = "") -> bool:
     # gatilho na outra conta.
     if _is_own_account(chat):
         return False
-    return calls_assistant(item, account)
+    if calls_assistant(item, account):
+        return True
+    # Passo 1 do FLUXO MAPEAMENTO WHATSAPP: a mensagem individual também é
+    # candidata quando se dirige a uma persona cadastrada — pelo vocativo
+    # dela ou por chegar na conta atribuída a ela. O handler (main.py) mantém
+    # a rota normal de boca/cérebro E entrega à persona; o texto de terceiro
+    # continua não autorizando nada e o eco `from_me` nunca passou por aqui.
+    return addressed_persona(item.get("text"), account) is not None
 
 
 def is_direct(account: str, item: dict) -> bool:
