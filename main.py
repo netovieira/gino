@@ -4635,6 +4635,11 @@ class JarvisLive:
             "confirm_pcm": confirm_pcm,
             # Só o chat DIRETO do dono pode confirmar um reinício por nota.
             "confirm_direct": bool(direct),
+            # Identificação já feita lá em cima (whatsapp_watch.is_direct) e
+            # a citação do nome na mensagem RAW — o trust do fluxo reusa sem
+            # recalcular, e nenhum número é escrito em log.
+            "wa_direct": bool(direct),
+            "wa_named": bool(self._addressed_to_me(text)),
         }
         if not self._qoder_live_ready():
             self._qoder_hold(instruction, pcm=voice_pcm, epoch=epoch,
@@ -7543,9 +7548,55 @@ class JarvisLive:
         except Exception as e:
             print(f"[Fluxos] monitor falhou: {e!r}")
 
+    def _whatsapp_turn_trust(self, text: str, meta: dict) -> tuple[str, str]:
+        """(trust, motivo) de um turno que chegou pelo WhatsApp.
+
+        O chat direto do dono é identificado pelo MESMO caminho da captura
+        (``core.whatsapp_watch.is_direct``: o número pareado da própria conta
+        ou o ``owner_chat`` da configuração — lidos vivo, nenhum número é
+        comparado ou escrito em log). Política (dono, SKILL.md do WhatsApp):
+          * chat direto do dono citando o nome do assistente -> ``owner``;
+          * chat direto sem o nome -> decide o portão de nome, exatamente
+            como na voz: desligado, ou dentro da janela de continuação, o
+            turno segue ``owner``; ligado e sem nome -> ``untrusted`` com o
+            motivo legível ``name_gate``;
+          * grupo ou chat de terceiro -> ``untrusted`` (como sempre);
+          * eventos de monitor não passam daqui: são sempre ``untrusted`` no
+            ``_flows_monitor_event``.
+        """
+        account = str(meta.get("wa_account") or "")
+        chat = str(meta.get("wa_chat") or "")
+        if "wa_direct" in meta and meta.get("wa_direct") is not None:
+            direct = bool(meta.get("wa_direct"))
+        else:
+            direct = False
+            if account and chat:
+                try:
+                    from core import whatsapp_watch
+                    direct = bool(
+                        whatsapp_watch.is_direct(account, {"chat": chat}))
+                except Exception:
+                    direct = False
+        if not direct:
+            return "untrusted", "chat_nao_direto"
+        if meta.get("wa_named") is not None:
+            named = bool(meta.get("wa_named"))
+        else:
+            named = self._addressed_to_me(text)
+        if named:
+            return "owner", ""
+        if not get_name_gate_enabled():
+            return "owner", ""
+        try:
+            if self._in_followup_window():
+                return "owner", ""
+        except Exception:
+            pass
+        return "untrusted", "name_gate"
+
     def _flows_begin_turn(self, turn_id: str, text: str,
                           meta: dict | None = None,
-                          *, armed: bool = True) -> None:
+                          *, armed: bool = True):
         rt = self._flows_get()
         if rt is None:
             return
@@ -7557,11 +7608,40 @@ class JarvisLive:
             speak = (bool(meta.get("speak", True))
                      and not self._answers_on_whatsapp(meta)
                      and str(meta.get("reply_channel") or "voice") == "voice")
-            trust = "untrusted" if source == "whatsapp" else "owner"
-            rt.start_turn(turn_id, text, speak_allowed=speak,
-                          source=source, trust=trust, armed=armed)
+            trust = "owner"
+            block_reason = ""
+            if source == "whatsapp":
+                # Só o chat direto do dono (com o nome, ou como o portão de
+                # nome manda) deixa de ser não-confiável. Grupo, terceiro e
+                # monitor seguem ``untrusted`` — e texto NUNCA abre portão
+                # privilegiado: isso é do core/owner_auth, não do trust.
+                trust, block_reason = self._whatsapp_turn_trust(text, meta)
+            plan = rt.start_turn(turn_id, text, speak_allowed=speak,
+                                 source=source, trust=trust, armed=armed)
+            if block_reason == "name_gate":
+                # Fim do silêncio: o dono escreveu no chat dele e o portão de
+                # nome travou o turno. Isso merece linha legível no log e uma
+                # frase de resposta — sem nunca citar número ou conta pareada.
+                try:
+                    self.ui.write_log(
+                        "SYS: WhatsApp: turno do dono barrado pelo portão "
+                        "de nome — a linha precisa citar o nome do "
+                        "assistente.")
+                except Exception:
+                    pass
+                try:
+                    self._owner_text_notify(
+                        f"Para eu responder por aqui, chame pelo nome: "
+                        f"comece a mensagem com \"{self._asst_name}\".",
+                        "whatsapp",
+                        account=str(meta.get("wa_account") or ""),
+                        chat=str(meta.get("wa_chat") or ""))
+                except Exception:
+                    pass
+            return plan
         except Exception as e:
             print(f"[Fluxos] begin falhou: {e!r}")
+        return None
 
     def _flows_arm_speech(self, turn_id, allowed: bool = True) -> None:
         """Voiceprint decidiu: libera (ou descarta) a fala já preparada."""
@@ -7693,7 +7773,9 @@ class JarvisLive:
                     owner_voice: bool = False,
                     gate_text: str | None = None,
                     confirm_pcm: bytes | None = None,
-                    confirm_direct: bool = False) -> None:
+                    confirm_direct: bool = False,
+                    wa_direct: bool | None = None,
+                    wa_named: bool | None = None) -> None:
         """One user turn through the persistent Qoder session.
 
         ``owner_voice`` means the PCM beside this text was ALREADY confirmed as
@@ -7819,7 +7901,10 @@ class JarvisLive:
         self._flows_begin_turn(
             turn_id, text,
             {"source": str(source or "owner"), "speak": bool(speak),
-             "reply_channel": str(reply_channel or "voice")},
+             "reply_channel": str(reply_channel or "voice"),
+             "wa_account": str(wa_account or ""),
+             "wa_chat": str(wa_chat or ""),
+             "wa_direct": wa_direct, "wa_named": wa_named},
             armed=False)
         # Clipe SEM prova de voz (válvula de energia sustentada, ~1.28 s) não
         # vai ao voiceprint: era por aí que um clique/impacto com energia
