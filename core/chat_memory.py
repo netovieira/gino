@@ -37,10 +37,12 @@ STORAGE
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import threading
 import unicodedata
+from contextlib import contextmanager
 from datetime import date as _date
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -57,6 +59,45 @@ MAX_THREADS = 12
 MAX_TOPIC_LINKS = 6
 
 _LOCK = threading.RLock()
+
+# ``_LOCK`` only serialises threads of ONE process. Background agents and the
+# live app can hold the same store open from different PIDs, so every
+# read-modify-write path (turns, notes, topics, state) also takes an advisory
+# flock on ``<base_dir>/.store.lock``. The gate is per-thread reentrant, so
+# nested public calls do not deadlock themselves.
+_gate_tls = threading.local()
+
+
+@contextmanager
+def _store_gate(base_dir):
+    stack = getattr(_gate_tls, "stack", None)
+    if stack is None:
+        stack = _gate_tls.stack = []
+    path = str(Path(base_dir) / ".store.lock")
+    for entry in stack:
+        if entry[1] == path:
+            entry[2] += 1
+            try:
+                yield
+            finally:
+                entry[2] -= 1
+            return
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        os.close(fd)
+        raise
+    entry = [fd, path, 1]
+    stack.append(entry)
+    try:
+        yield
+    finally:
+        stack.remove(entry)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 _ROLE_LABELS = {
     "user": "Você",
@@ -358,7 +399,7 @@ class ChatMemory:
         """Record that the OWNER actually spoke (not a reminder/status turn)."""
         try:
             dt = _as_dt(at) or _now()
-            with _LOCK:
+            with _store_gate(self.base_dir), _LOCK:
                 self._ensure_layout()
                 state = self._read_state()
                 stamp = f"{dt:%Y-%m-%d %H:%M}"
@@ -419,7 +460,7 @@ class ChatMemory:
     def begin_new_subject(self, gap_hours=0.0) -> None:
         """Close the old thread in state and record the pause as a note."""
         try:
-            with _LOCK:
+            with _store_gate(self.base_dir), _LOCK:
                 state = self._read_state()
                 state["current_topic"] = ""
                 note = (f"pausa de {_human_gap(float(gap_hours or 0))}; "
@@ -442,7 +483,7 @@ class ChatMemory:
                 return ""
             line = f"- {dt:%H:%M} {_role_label(role)}: {clean[:MAX_TURN_CHARS]}"
             hour_path = self.hours_dir / f"{dt:%Y-%m-%d}" / f"{dt:%H}.md"
-            with _LOCK:
+            with _store_gate(self.base_dir), _LOCK:
                 self._ensure_layout()
                 old = _safe_read(hour_path)
                 if not old.strip():
@@ -559,7 +600,7 @@ class ChatMemory:
         result = {"window_hours": HOT_HOURS, "hot_lines": 0, "days": []}
         try:
             current = _as_dt(now) or _now()
-            with _LOCK:
+            with _store_gate(self.base_dir), _LOCK:
                 self._ensure_layout()
                 hot = self._ensure_hot(current)
                 result["hot_lines"] = len(hot.splitlines())
@@ -580,7 +621,7 @@ class ChatMemory:
         try:
             day = _coerce_day(date)
             day_key = f"{day:%Y-%m-%d}"
-            with _LOCK:
+            with _store_gate(self.base_dir), _LOCK:
                 self._ensure_layout()
                 folder = self.hours_dir / day_key
                 files = sorted(folder.glob("*.md")) if folder.is_dir() else []
@@ -682,7 +723,7 @@ class ChatMemory:
             text = str(content or "")
             if text and not text.endswith("\n"):
                 text += "\n"
-            with _LOCK:
+            with _store_gate(self.base_dir), _LOCK:
                 self._ensure_layout()
                 _atomic_write(self.topics_dir / f"{clean}.md", text)
                 state = self._read_state()
@@ -696,13 +737,21 @@ class ChatMemory:
             return ""
 
     def note(self, text, kind="note") -> str:
-        """Record a short mark (also updates topic/threads for some kinds)."""
+        """Record a short mark (also updates topic/threads for some kinds).
+
+        The note is written twice, on purpose: into ``state.md`` (the live
+        thread the prompt reads) and into the hour file (the permanent corpus
+        ``search`` walks). Without the hour copy a note vanished as soon as
+        ``MAX_NOTES`` rotated it out of state — decisions recorded by tools
+        became unrecoverable while their timestamp proved they had been saved.
+        """
         try:
             clean = " ".join(str(text or "").split()).strip()[:400]
             if not clean:
                 return ""
             label = _slugify(str(kind or "note"), "note")[:24]
-            with _LOCK:
+            dt = _now()
+            with _store_gate(self.base_dir), _LOCK:
                 self._ensure_layout()
                 state = self._read_state()
                 if label in ("topico", "topic", "assunto"):
@@ -716,11 +765,18 @@ class ChatMemory:
                         t for t in state["open_threads"] if _fold(t) != wanted
                     ]
                 state["notes"].append({
-                    "at": f"{_now():%Y-%m-%d %H:%M}",
+                    "at": f"{dt:%Y-%m-%d %H:%M}",
                     "kind": label,
                     "text": clean,
                 })
                 self._write_state(state)
+                hour_path = self.hours_dir / f"{dt:%Y-%m-%d}" / f"{dt:%H}.md"
+                old = _safe_read(hour_path)
+                if not old.strip():
+                    old = f"# {dt:%Y-%m-%d %H}h\n\n"
+                note_line = f"- {dt:%H:%M} Nota [{label}]: {clean}"
+                _atomic_write(hour_path, old.rstrip("\n") + "\n" + note_line + "\n")
+                self._ensure_hot(dt)
             return f"Anotado: {clean[:120]}"
         except Exception as e:
             print(f"[ChatMemory] note failed: {e}")
@@ -731,15 +787,37 @@ class ChatMemory:
         paths: list[Path] = []
         try:
             paths.extend(sorted(self.hours_dir.glob("*/*.md"), reverse=True))
+            # The spider pages (``index/hours``) carry event text recorded by
+            # other agents; without them memory_search cannot see what the
+            # teia indexed.
+            index_hours = self.base_dir / "index" / "hours"
+            if index_hours.is_dir():
+                paths.extend(sorted(index_hours.glob("*/*.md"), reverse=True))
             paths.extend(sorted(self.days_dir.glob("*/index.md"), reverse=True))
             paths.extend(sorted(self.topics_dir.glob("*.md")))
+            # ``sleep/`` is the compacted-night level of the owner's policy.
+            sleep_dir = self.base_dir / "sleep"
+            if sleep_dir.is_dir():
+                paths.extend(sorted(sleep_dir.glob("*.md"), reverse=True))
         except Exception as e:
             print(f"[ChatMemory] search scan failed: {e}")
+        paths.append(self.hot_path)
         paths.append(self.state_path)
         return paths
 
     def search(self, query, limit=10) -> list[dict]:
-        """Accent-insensitive line search across hours, days, topics, state."""
+        """Accent-insensitive partial search with inverse-frequency ranking.
+
+        Old behaviour was an exact AND of every token inside ONE line, so any
+        long question ("latência boca local prefill") returned nothing even
+        though the store held lines about latency, prefill and the mouth —
+        just not all four words together. Now a line matches when it holds at
+        least one token, and it is scored by *rarity*: each matched token is
+        weighted by ``1/(1+lines_containing_it)``, so a rare word like
+        "prefill" outranks generic ones like "boca"/"local". An exact phrase
+        match doubles the rarest token's weight. Ties keep file order — hours
+        are scanned newest first, so recent memory surfaces first.
+        """
         try:
             limit = max(1, int(limit))
         except (TypeError, ValueError):
@@ -750,32 +828,45 @@ class ChatMemory:
         tokens = [t for t in _fold(text).split() if t]
         if not tokens:
             return []
-        results: list[dict] = []
-        seen: set[str] = set()
+        phrase = _fold(text)
+        doc_freq = {token: 0 for token in tokens}
+        # line -> (insertion_index, source, matched tokens)
+        hits: dict[str, tuple[int, str, set]] = {}
         try:
             with _LOCK:
                 for path in self._search_paths():
+                    try:
+                        source = path.relative_to(self.base_dir).as_posix()
+                    except ValueError:
+                        source = path.name
                     for raw in _safe_read(path).splitlines():
                         line = raw.strip()
                         if not line or line.startswith("#"):
                             continue
                         folded = _fold(line)
-                        if not all(token in folded for token in tokens):
+                        matched = {t for t in tokens if t in folded}
+                        if not matched:
                             continue
-                        if line in seen:
+                        if line in hits:
                             continue
-                        seen.add(line)
-                        try:
-                            source = path.relative_to(self.base_dir).as_posix()
-                        except ValueError:
-                            source = path.name
-                        results.append({"source": source,
-                                        "text": line[:400]})
-                        if len(results) >= limit:
-                            return results
+                        for token in matched:
+                            doc_freq[token] += 1
+                        hits[line] = (len(hits), source, matched)
         except Exception as e:
             print(f"[ChatMemory] search failed: {e}")
-        return results
+            return []
+        weight = {token: 1.0 / (1.0 + freq)
+                  for token, freq in doc_freq.items()}
+
+        scored: list[tuple[float, int, str, str]] = []
+        for line, (idx, source, matched) in hits.items():
+            score = sum(weight[t] for t in matched)
+            if len(tokens) > 1 and phrase in _fold(line):
+                score += max(weight.values())
+            scored.append((-score, idx, source, line))
+        scored.sort()
+        return [{"source": source, "text": line[:400]}
+                for _neg, _i, source, line in scored[:limit]]
 
     # ── prompt ──────────────────────────────────────────────────────────────
     def prompt_block(self, max_chars=2000) -> str:
