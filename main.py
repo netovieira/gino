@@ -146,6 +146,7 @@ from core import duck as _duck
 from core import rootgate as _rootgate
 from core import actiongate as _actiongate
 from core import qoder_jobs as _qoder_jobs
+from core import job_grant as _job_grant
 from core import free_models as _free_models
 from core import owner_auth as _owner_auth
 from core.viseme               import VisemeStream
@@ -1354,6 +1355,13 @@ _OWNER_TEXT_LOCK_RE = re.compile(
 _OWNER_TEXT_TTL_S = 600.0
 _OWNER_TEXT_MAX_FAILS = 5
 _OWNER_TEXT_LOCK_S = 60.0
+# Response verbs of a waiting Qoder job (same tuples actions/qoder_job maps).
+# They have their own live-chat route; the identity gate is core/job_grant.
+_JOB_REPLY_ACTIONS = frozenset({
+    "answer", "responder", "resposta", "reply",
+    "approve", "aprovar", "aplicar", "aplica", "confirmar", "sim",
+    "reject", "recusar", "rejeitar", "nao", "não", "descartar",
+})
 _VOICE_TRAIN_CANCEL_RE = re.compile(
     r"^\s*(?:cancela|cancelar|para|pare|depois|chega|deixa)\b", re.IGNORECASE)
 # Refusals cancel immediately, even mid-phrase ("eu não pedi isso").
@@ -5983,11 +5991,46 @@ class JarvisLive:
             print(f"[Librarian] resumo Qoder falhou: {e}")
             return ""
 
+    def _arm_job_grant(self, factor: str) -> float:
+        """Abre a janela one-shot de resposta ao job que espera o dono.
+
+        Chamada apenas por caminhos que já verificaram a identidade do dono:
+        a voz confirmada por voiceprint em `_try_action_consent` e a senha
+        digitada correta em `_owner_text_gate`. O modelo nunca chega aqui.
+        Se não há job esperando, nada é aberto — uma aprovação não vale para
+        um plano que ainda não existe. Segundos do fator nunca são logados
+        com canal nem número; o fator sai na auditoria do consumo.
+        """
+        try:
+            job_id = _qoder_jobs.pending_reply_id()
+            if not job_id:
+                return 0.0
+            secs = _job_grant.arm(job_id, factor)
+            if secs:
+                print(f"[JobGrant] janela de resposta ao job aberta ({secs:.0f}s)")
+            return secs
+        except Exception as e:
+            print(f"[JobGrant] armar: {e}")
+            return 0.0
+
+    def _job_reply_action(self, args) -> str:
+        """A ação de resposta do job levada nestes args, ou ''.
+
+        FLUXO TRABALHO, passo 5: `approve`/`reject`/`answer` têm rota própria
+        no chat ao vivo — sobrevivem à recusa de dispatch abaixo. Quem decide
+        se passam é core/job_grant.py (voz do dono com voiceprint ou senha
+        digitada), nunca o modelo. `start` e a execução continuam fora do
+        chat ao vivo, sob TIER_HIGH: o trabalho pesado é do subagente.
+        """
+        action = str((args or {}).get("action") or "").strip().lower()
+        return action if action in _JOB_REPLY_ACTIONS else ""
+
     def _bridge_dispatch(self, name: str, args: dict) -> str:
         """Run a JARVIS action for the bridge from its worker thread."""
         if str(name) in ("qoder_job", "qoder_agent", "local_ask"):
-            return ("Essa ação não existe no chat ao vivo. Para executar qualquer "
-                    "trabalho pesado, chame Agent com run_in_background=true.")
+            if not (str(name) == "qoder_job" and self._job_reply_action(args)):
+                return ("Essa ação não existe no chat ao vivo. Para executar qualquer "
+                        "trabalho pesado, chame Agent com run_in_background=true.")
         if self._loop is None:
             raise RuntimeError("event loop indisponível")
         started = time.monotonic()
@@ -6032,6 +6075,13 @@ class JarvisLive:
                     args if isinstance(args, dict) else {})
             except Exception:
                 return False
+        if (str(name) == "qoder_job"
+                and self._job_reply_action(args if isinstance(args, dict) else {})):
+            # A resposta ao job tem portão próprio (core/job_grant): vale só a
+            # janela aberta pela voz do dono ou pela senha digitada, one-shot,
+            # conferida de novo no handler. Sem janela nada passa — o portão
+            # genérico não é afrouxado para nenhuma outra ação.
+            return _job_grant.has_valid(_qoder_jobs.pending_reply_id())
         return _actiongate.whatsapp_reply_allowed(name, args)
 
     def _bridge_confirm(self, title: str, message: str) -> bool:
@@ -6145,6 +6195,41 @@ class JarvisLive:
         )
         return announced
 
+    def _announce_text_fallback(self, text: str, *, label: str = "",
+                                turn: int | None = None) -> None:
+        """Conclusão de fundo barrada pela boca fechada: vai como TEXTO.
+
+        A lei do dono (05/11): todo fim de trabalho em segundo plano gera
+        anúncio em uma frase, e quando a fala está retida (silêncio/mute) a
+        mensagem vai como texto — nunca se perde. O mute não estoca fala para
+        a boca dizer depois (lei de 03/11, respeitada aqui): a frase entra
+        como texto do assistente na tela/log de atividade e na memória da
+        sessão, com `audio_generated=false` para a revisão contar. Nenhum
+        canal nem número sai desta linha.
+        """
+        text = str(text or "").strip()
+        if not text:
+            return
+        speaker = str(label or getattr(self, "_asst_name", "") or "Gino")
+        ref = turn if isinstance(turn, int) else int(
+            getattr(self, "_turn_ref", 0) or 0)
+        try:
+            meta = _activity.make_meta(
+                turn=ref if isinstance(ref, int) and ref else None,
+                chan="voz", requested=True, generated=False,
+                shown=text, origin="aviso-texto")
+            self.ui.write_log(self._log_line(f"{speaker}: {text}", meta))
+        except Exception as e:
+            print(f"[Aviso] log do texto retido: {e}")
+        try:
+            self._session_log.append(f"{speaker}: {text}")
+        except Exception:
+            pass
+        try:
+            self.ui.show_content("Conclusão em segundo plano", text)
+        except Exception:
+            pass
+
     def _qoder_on_task(self, event: dict) -> None:
         """A background subagent started or finished — never blocks the chat."""
         phase = str(event.get("phase") or "")
@@ -6174,6 +6259,11 @@ class JarvisLive:
                                       event)
             except Exception as e:
                 print(f"[TaskMirror] progresso: {e}")
+            # O mesmo andamento que hoje só vira log/espelho ganha voz no
+            # modo vivo: uma frase curta com estado real, teto de 40 s,
+            # sem narrar ferramenta/caminho/JSON (lei do guard).
+            self._live_progress_speech(
+                str(event.get("summary") or event.get("description") or ""))
             return
         if phase != "done":
             return
@@ -9762,6 +9852,9 @@ class JarvisLive:
         self._owner_text_fails = 0
         self._owner_text_until = now + _OWNER_TEXT_TTL_S
         self._owner_text_channel = channel
+        # FLUXO TRABALHO, passo 5: a senha digitada correta é o segundo fator
+        # que aprova um plano. Abre a janela one-shot do job se há um esperando.
+        self._arm_job_grant("senha digitada")
         try:
             secs = float(_actiongate.open_window())
         except Exception as e:
@@ -12531,6 +12624,13 @@ class JarvisLive:
     def _deliver_qoder_event_direct(self, ev: dict) -> None:
         """No synthetic user turn: note the outcome and say one short line."""
         kind = str(ev.get("kind") or "")
+        if kind == "progress":
+            # Lei do dono 05/11 (FLUXO TRABALHO, passo 7): andamento tem frase
+            # ao dono no modo vivo, com o gap de 40 s do padrão legado. Antes
+            # isto retornava em silêncio — a corrida de 18:22 às 18:39 deu
+            # zero atualização falada.
+            self._live_progress_speech(str(ev.get("text") or ""))
+            return
         if kind not in ("done", "error", "question", "approval", "cancelled"):
             return
         text = str(ev.get("text") or "").strip()
@@ -12544,8 +12644,12 @@ class JarvisLive:
             note = f"pergunta pendente [{label}]: {spoken[:300]}"
         elif kind == "approval":
             spoken = (f"O plano para {label} está pronto; nada foi alterado. "
-                      "Quer que eu aplique?")
+                      "Quer que eu aplique? Você pode pedir para abrir o "
+                      "plano na tela.")
+            _plan_path = str(ev.get("plan_path") or "").strip()
             note = f"plano aguardando aprovação [{label}]: {text[:300]}"
+            if _plan_path:
+                note += f" | arquivo do plano: {_plan_path}"
         elif kind == "done":
             spoken = f"Terminei em segundo plano: {label}."
             note = f"concluído [{label}]: {text[:300]}"
@@ -12631,6 +12735,59 @@ class JarvisLive:
             return (f"[QODER · CANCELADO] A tarefa '{task}' foi cancelada. "
                     "Avise o usuário em uma frase.")
         return ""
+
+    def _live_progress_line(self, text: str) -> str:
+        """A frase falável de andamento, ou '' quando não diz nada de real.
+
+        A lei da boca (core/flows/guard.py) continua: "estou executando/
+        rodando" vazio não é conteúdo. Ferramenta, caminho e JSON não chegam
+        ao ouvido — o speech_guard troca o que vaza e, se sobrar só narrativa,
+        a frase morre aqui. Frase repetida também não sai duas vezes.
+        """
+        clean = " ".join(str(text or "").split())
+        if not clean:
+            return ""
+        if clean.casefold() == str(
+                getattr(self, "_last_progress_spoken", "") or "").casefold():
+            return ""
+        try:
+            from core.flows import guard as _mouth_guard
+        except Exception:
+            _mouth_guard = None
+        if _mouth_guard is not None and _mouth_guard.announcement(clean):
+            return ""
+        if "{" in clean or "}" in clean:
+            return ""
+        try:
+            guarded = _speech_guard.sanitize(clean)
+        except Exception:
+            return ""
+        line = str(guarded.text or "").strip()
+        if not line:
+            return ""
+        if _mouth_guard is not None and _mouth_guard.announcement(line):
+            return ""
+        self._last_progress_spoken = clean
+        return line
+
+    def _live_progress_speech(self, text: str) -> None:
+        """Andamento no modo vivo: no máximo uma frase a cada 40 s.
+
+        Reaproveita o teto legado (`_qoder_progress_allowed`: 40 s entre
+        falas e ao menos 5 s depois de o dono falar). Turnos comuns não são
+        afetados: a frase sai como aviso de segundo plano, nunca na frente
+        de uma resposta em curso.
+        """
+        line = self._live_progress_line(text)
+        if not line:
+            return
+        if not self._qoder_progress_allowed():
+            return
+        try:
+            print(f"[QoderLive] andamento falado: {line[:80]}")
+            self._say_now(line, log=True, origin="aviso")
+        except Exception as e:
+            print(f"[QoderLive] fala de andamento: {e}")
 
     def _qoder_progress_allowed(self) -> bool:
         """Progress is a background murmur: never while the user is talking,
@@ -14196,6 +14353,11 @@ class JarvisLive:
         self._voice_audit(
             "consentimento por voz aberto para o dono.",
             f"score={float(score or 0.0):.2f} {detail}")
+        # FLUXO TRABALHO, passo 5: a voz do dono confirmada por voiceprint é
+        # um dos dois fatores que aprovam um plano. Abre a janela one-shot do
+        # job (core/job_grant) — só se há job esperando; o texto digitado
+        # chegou aqui com pcm=None e foi recusado lá acima.
+        self._arm_job_grant("voz do dono")
         if not pending:
             secs = _actiongate.arm_send_window()
             if pcm:
@@ -16646,6 +16808,16 @@ class JarvisLive:
                         f"{str(text)[:120]}")
                 except Exception:
                     pass
+            # Furo provado dos 15 casos mudos (log: "microfone mutado — Gino
+            # não falou: Terminei em segundo plano ..." — activity.log:17539,
+            # 17553, 17575 de 05/11): a conclusão morria sem voz E sem texto.
+            # A lei do mute continua — nada de fala acumulada para depois —
+            # mas a mensagem não se perde: com a boca calada ela vai como
+            # TEXTO (painel, sessão e tela), uma vez só (wake_announce já
+            # reclamou o id antes de chegar aqui).
+            if str(origin or "") == "aviso":
+                self._announce_text_fallback(text, label=str(label or ""),
+                                             turn=ref)
             return
         # O ÚNICO ponto de decisão de fala: se o assunto está cortado, a boca
         # não sintetiza. O texto vai para a tela/WhatsApp e a fala fica na
@@ -19811,6 +19983,9 @@ class JarvisLive:
         self._reconnect_event = asyncio.Event()
         # Background Qoder jobs deliver progress/questions through this sink.
         _qoder_jobs.set_sink(self._on_qoder_event)
+        # Auditoria da resposta ao plano (core/job_grant): quem aprovou e por
+        # qual fator, sem nomear canal nem número.
+        _job_grant.set_audit(self.ui.write_log)
 
         # ── Wire the shared core services to the interface ───────────────────
         # The confirmation gate is useless without a way to ask, and a memory

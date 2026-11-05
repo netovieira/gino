@@ -23,6 +23,7 @@ ONE JOB AT A TIME
 """
 from __future__ import annotations
 
+import pathlib
 import threading
 import time
 import uuid
@@ -36,6 +37,11 @@ _QUEUE: list["Job"] = []
 _JOBS: dict[str, "Job"] = {}
 _PROGRESS_GAP = 40.0        # seconds between spoken progress lines
 _FINISHED_KEEP = 8          # remembered jobs for status/answer lookups
+
+
+def _default_plans_dir() -> pathlib.Path:
+    """Where Qoder keeps plan Markdown — the folder obsidian mirrors."""
+    return pathlib.Path.home() / ".qoder" / "plans"
 
 
 class Job:
@@ -52,6 +58,7 @@ class Job:
         self.requires_approval = bool(requires_approval)
         self.approved: bool | None = None
         self.plan = ""
+        self.plan_path = ""
         self.created_at = time.monotonic()
         self.started_at: float | None = None
         self.finished_at: float | None = None
@@ -74,6 +81,7 @@ class Job:
             "progress": self.progress,
             "question": dict(self.question) if self.question else None,
             "plan": self.plan,
+            "plan_path": self.plan_path,
             "result": self.result,
             "error": self.error,
         }
@@ -232,6 +240,64 @@ def has_approval() -> bool:
     with _LOCK:
         return (_ACTIVE is not None and _ACTIVE.state == "waiting_approval"
                 and bool(_ACTIVE.plan))
+
+
+def pending_reply_id() -> str:
+    """Id do job que pode receber a resposta do dono agora ('' se não há).
+
+    É a chave da janela em core/job_grant.py: uma aprovação aberta para um
+    plano não vale para outro.
+    """
+    with _LOCK:
+        if (_ACTIVE is not None
+                and _ACTIVE.state in ("waiting_approval", "waiting_user")):
+            return _ACTIVE.id
+        return ""
+
+
+def plan_markdown(job: "Job", plan: str = "") -> str:
+    """O plano no formato do contrato: título, passos, mudança, risco, veto."""
+    title = str(job.task or "tarefa").strip() or "tarefa"
+    body = str(plan or job.plan or "").strip() or "(o Qoder não descreveu passos)"
+    return (
+        f"# Plano — {title}\n\n"
+        f"- Job: {job.id}\n"
+        f"- Modo: {job.mode} | Modelo: {job.model}\n\n"
+        "## Passos\n\n"
+        f"{body}\n\n"
+        "## O que vai mudar\n\n"
+        "Somente o que está nos Passos acima, e apenas depois da sua "
+        "aprovação (voz do dono ou senha digitada).\n\n"
+        "## Risco\n\n"
+        "Nada foi alterado ainda. A escrita acontece numa passagem separada, "
+        "só após a aprovação.\n\n"
+        "## O que NÃO será feito\n\n"
+        "- Nada antes da sua aprovação.\n"
+        "- Nada fora do escopo dos Passos acima.\n"
+        "- Nenhum push, nenhum reinício, nenhum envio a terceiros.\n"
+    )
+
+
+def save_plan_file(job: "Job", plan: str = "", plans_dir=None) -> str:
+    """Grava o plano em ``~/.qoder/plans/<id>.md`` ANTES de pedir aprovação.
+
+    O diretório é o mesmo que ``core.obsidian.mirror_plans`` já espelha para
+    o cofre ``~/Jarvis/Planos``; a ação ``open_in`` existente abre o arquivo
+    na tela sem nenhum código novo de abertura ou espelhamento. Falha de
+    escrita nunca derruba o job — devolve '' e o pedido de aprovação segue.
+    """
+    try:
+        base = (pathlib.Path(plans_dir).expanduser() if plans_dir
+                else _default_plans_dir())
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / f"{job.id}.md"
+        tmp = path.with_name(f"{path.name}.part")
+        tmp.write_text(plan_markdown(job, plan), encoding="utf-8")
+        tmp.replace(path)
+        return str(path)
+    except Exception as e:
+        print(f"[QoderJob] plano em arquivo falhou: {e}")
+        return ""
 
 
 def cancel() -> str:
@@ -418,10 +484,16 @@ def _run_once(job: Job) -> None:
             plan = str(reply or "").strip()
             if not plan:
                 raise RuntimeError("o Qoder não devolveu um plano")
+            # FLUXO TRABALHO, passos 3-4: o plano vira arquivo ANTES do
+            # pedido de aprovação, para a ação `open_in` existente abri-lo
+            # no Obsidian sem código novo de abertura nem segundo espelho.
+            plan_path = save_plan_file(job, plan)
             with _LOCK:
                 job.plan = plan
+                job.plan_path = plan_path
                 job.state = "waiting_approval"
-            _emit("approval", job, plan=plan[:6000], text=plan[:800])
+            _emit("approval", job, plan=plan[:6000], text=plan[:800],
+                  plan_path=plan_path)
             return
 
         prepared = qa.prepare_job(job)

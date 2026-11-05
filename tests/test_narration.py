@@ -8,8 +8,10 @@ import pytest
 from core import narration
 
 ROOT = Path(__file__).resolve().parents[1]
+# `.qoder` guarda worktrees/sessões do próprio assistente: cópias antigas do
+# repo que não são código vivo e não devem contar como ofensa no scan.
 SKIP_DIRS = {".git", ".venv", "__pycache__", "node_modules", "models", "memory",
-             "tests", "logs"}
+             "tests", "logs", ".qoder"}
 
 
 def _policy(monkeypatch=None, delay=None):
