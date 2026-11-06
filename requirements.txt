@@ -101,6 +101,7 @@ transformers>=4.48,<5
 scipy>=1.11,<2
 noisereduce>=3.0,<4              # RNNoise pre-filter (FASE2-TASK1)
 speechbrain>=1.0,<2              # ECAPA-TDNN speaker ID (FASE2-TASK2)
+sentence-transformers>=3.0,<4    # semantic embeddings na busca de memória (FASE3-TASK2)
 
 # ── Opt-in voice unlock (Secret Service / keyring) ───────────────────────────
 keyring>=25

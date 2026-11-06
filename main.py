@@ -5604,8 +5604,13 @@ class JarvisLive:
                 print(f"[QoderLive] power actions disabled: {e}")
 
         try:
-            self._chat_memory = _chat_memory.ChatMemory()
+            _embed_fn = _chat_memory.make_sentence_embedder()
+            self._chat_memory = _chat_memory.ChatMemory(embed_fn=_embed_fn)
             _health.set_component("memory", True, str(self._chat_memory.base_dir))
+            # Pre-compute embeddings for the conversation history in the
+            # background so the first semantic search is fast.
+            if _embed_fn is not None:
+                _chat_memory._background_index(self._chat_memory)
         except Exception as e:
             self._chat_memory = None
             _health.set_component("memory", False, str(e)[:160])

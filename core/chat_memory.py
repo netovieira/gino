@@ -69,6 +69,100 @@ from datetime import date as _date
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# ── semantic embeddings (sentence-transformers, optional) ────────────────────
+# Lazy-loaded: the model is downloaded on first use and cached in
+# ~/.cache/huggingface.  Import is guarded so the rest of the memory module
+# works even when sentence-transformers is not installed.
+_EMBEDDER_MODEL_NAME = "all-MiniLM-L6-v2"
+_embedder_lock = threading.Lock()
+_embedder_model = None
+_embedder_failed = False
+
+
+def make_sentence_embedder():
+    """Return a callable ``text -> list[float]`` backed by MiniLM-L6-v2.
+
+    The model is loaded lazily on the first call and cached for the lifetime
+    of the process.  Returns ``None`` when sentence-transformers is not
+    installed or the model fails to load — the caller should fall back to
+    TF-IDF in that case.
+    """
+    global _embedder_model, _embedder_failed
+
+    if _embedder_failed:
+        return None
+
+    if _embedder_model is not None:
+        model = _embedder_model
+
+        def _encode(text):
+            try:
+                vec = model.encode(
+                    [str(text or "")],
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                )
+                return [float(x) for x in vec[0]]
+            except Exception:
+                return None
+
+        return _encode
+
+    with _embedder_lock:
+        # Double-checked locking: another thread may have loaded it.
+        if _embedder_failed:
+            return None
+        if _embedder_model is not None:
+            return make_sentence_embedder()
+        try:
+            from sentence_transformers import SentenceTransformer
+            _embedder_model = SentenceTransformer(_EMBEDDER_MODEL_NAME)
+        except Exception as e:
+            print(f"[ChatMemory] sentence-transformers indisponível: {e}")
+            _embedder_failed = True
+            return None
+        return make_sentence_embedder()
+
+
+def _background_index(memory_instance):
+    """Reindex + pre-compute embeddings in a daemon thread.
+
+    Called once at boot so the first semantic search does not pay the
+    per-line encoding cost.  Errors are swallowed — the main flow must
+    never block on background work.
+    """
+    def _run():
+        try:
+            memory_instance.reindex()
+            if memory_instance.embed_fn is None:
+                return
+            with _LOCK:
+                units = memory_instance._corpus_units()
+                if not units:
+                    units = memory_instance._reload_corpus()
+            vectors = memory_instance._load_embeddings()
+            fresh = False
+            for _uid, source, line, _folded, _ts in units:
+                key = memory_instance._embed_key(source, line)
+                if key in vectors:
+                    continue
+                try:
+                    vec = memory_instance.embed_fn(line)
+                except Exception:
+                    continue
+                if _is_vector(vec):
+                    vectors[key] = [float(x) for x in vec]
+                    fresh = True
+            if fresh:
+                memory_instance._save_embeddings()
+        except Exception as e:
+            print(f"[ChatMemory] background index failed: {e}")
+
+    t = threading.Thread(target=_run, daemon=True,
+                         name="memory-bg-index")
+    t.start()
+    return t
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_BASE_DIR = BASE_DIR / "memory" / "chat"
 
@@ -469,6 +563,31 @@ def _cosine(a, b) -> float:
     if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
     return dot / (norm_a * norm_b)
+
+
+# Boilerplate patterns that should never appear in search results.
+# These are structural metadata lines from state.md and hot.md that pollute
+# rankings: their semantic embeddings are closer to random queries than the
+# actual conversation content, so they displace useful results.
+# NOTE: patterns are matched AFTER _fold() (accent-insensitive lowercase),
+# so they must use unaccented ASCII only.
+_BOILERPLATE_PATTERNS = (
+    "estado da conversa",
+    "indice quente",
+    "last_seen:",
+    "last_user_at:",
+    "current_topic:",
+    "open_threads:",
+    "sem falas nas ultimas",
+    "sem fala nas ultimas",
+    "sem conversa registrada",
+)
+
+
+def _is_boilerplate(line: str) -> bool:
+    """True for metadata/structural lines that should not rank in search."""
+    low = _fold(line)
+    return any(p in low for p in _BOILERPLATE_PATTERNS)
 
 
 class ChatMemory:
@@ -1286,8 +1405,10 @@ class ChatMemory:
                        limit: int) -> list[dict] | None:
         """Preferred path when an embed_fn is wired: cosine over lazily
         computed, persisted vectors. Returns ``None`` — forcing the TF-IDF
-        fallback — on ANY inconsistency: model down, empty vector, or a
-        stored vector of a different dimension (corrupt/foreign index)."""
+        fallback — when the model cannot embed the query or no units could
+        be scored. Individual units that fail to embed are skipped (not
+        fatal): a single short or unusual line must not disable semantic
+        search for the whole corpus."""
         fn = self.embed_fn
         if fn is None or not units:
             return None
@@ -1309,20 +1430,22 @@ class ChatMemory:
                 try:
                     vec = fn(line)
                 except Exception:
-                    vec = None
+                    continue  # skip this unit, keep searching the rest
                 if not _is_vector(vec):
-                    return None  # model died mid-sweep -> mandatory fallback
+                    continue
                 if len(vec) != dim:
-                    return None  # dimension guard -> mandatory fallback
+                    continue  # dimension mismatch for this unit -> skip
                 vectors[key] = [float(x) for x in vec]
                 fresh = True
             elif len(vec) != dim:
-                return None
+                continue  # stored vector from a different model -> skip
             sim = _cosine(qv, vec)
             scored.append((-(sim + _recency_bonus(ts, now_ts)),
                            uid, source, line))
         if fresh:
             self._save_embeddings()
+        if not scored:
+            return None  # no unit could be scored -> mandatory TF-IDF fallback
         scored.sort()
         return [{"source": source, "text": line[:400]}
                 for _s, _u, source, line in scored[:limit]]
@@ -1362,6 +1485,12 @@ class ChatMemory:
                 units = self._corpus_units()
                 if not units:
                     units = self._reload_corpus()
+                # Strip structural metadata (state.md headers, hot.md
+                # placeholders) — these lines pollute both vector and TF-IDF
+                # rankings because their semantics match random queries by
+                # accident.  The conversation content in hours/, days/,
+                # topics/ and sleep/ is what the owner actually searches for.
+                units = [u for u in units if not _is_boilerplate(u[2])]
                 if self.embed_fn is not None:
                     found = self._search_vector(query, units, limit)
                     if found is not None:
@@ -1377,7 +1506,7 @@ class ChatMemory:
             return {
                 "files": len(self._units_cache),
                 "units": sum(len(u) for u in self._units_cache.values()),
-                "embeddings": len(self._embeddings or {}),
+                "embeddings": len(self._load_embeddings()),
                 "embedder": self.embed_fn is not None,
             }
 
