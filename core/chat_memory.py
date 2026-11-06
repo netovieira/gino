@@ -78,6 +78,17 @@ _embedder_lock = threading.Lock()
 _embedder_model = None
 _embedder_failed = False
 
+# ── vector index (FAISS, optional) ──────────────────────────────────────────
+# When faiss-cpu is installed, nearest-neighbour search replaces the linear
+# cosine scan.  The index is persisted alongside embeddings.json and rebuilt
+# automatically when out of sync.  Absence of FAISS is transparent: search
+# falls back to the linear path, exactly as when the embedder itself is
+# missing.
+try:
+    from core.memory_vector import VectorIndex
+except ImportError:
+    VectorIndex = None  # type: ignore[assignment,misc]
+
 
 def make_sentence_embedder():
     """Return a callable ``text -> list[float]`` backed by MiniLM-L6-v2.
@@ -125,7 +136,8 @@ def make_sentence_embedder():
 
 
 def _background_index(memory_instance):
-    """Reindex + pre-compute embeddings in a daemon thread.
+    """Reindex + pre-compute embeddings + build FAISS index in a daemon
+    thread.
 
     Called once at boot so the first semantic search does not pay the
     per-line encoding cost.  Errors are swallowed — the main flow must
@@ -155,6 +167,11 @@ def _background_index(memory_instance):
                     fresh = True
             if fresh:
                 memory_instance._save_embeddings()
+            # Build the FAISS index from the persisted embeddings so the
+            # first search does not pay the build cost.
+            vi = memory_instance._vector_index
+            if vi is not None and vectors:
+                vi.ensure_loaded(vectors)
         except Exception as e:
             print(f"[ChatMemory] background index failed: {e}")
 
@@ -611,6 +628,12 @@ class ChatMemory:
         self.embeddings_path = self.index_dir / "embeddings.json"
         self._units_cache: dict[str, list[tuple]] = {}
         self._embeddings: dict | None = None
+        # FAISS vector index: instantiated only when the library is
+        # available.  ``_vector_index`` is ``None`` when faiss-cpu is
+        # missing, which makes every call-site fall through to the linear
+        # cosine scan — same behaviour as before FASE4-TASK2.
+        self._vector_index = (VectorIndex(self.index_dir)
+                              if VectorIndex is not None else None)
         with _LOCK:
             self._ensure_layout()
 
@@ -1387,14 +1410,20 @@ class ChatMemory:
 
     def _prune_embeddings(self, valid_sources: set) -> None:
         """Touched-set pruning for the vector store: drop every vector whose
-        source file is gone (keys start with the relative source path)."""
+        source file is gone (keys start with the relative source path).
+        Also removes pruned keys from the FAISS index when available."""
         if not self._embeddings:
             return
         kept = {k: v for k, v in self._embeddings.items()
                 if k.partition("#")[0] in valid_sources}
-        if len(kept) != len(self._embeddings):
+        removed_keys = set(self._embeddings) - set(kept)
+        if removed_keys:
             self._embeddings = kept
             self._save_embeddings()
+            # Remove pruned keys from the FAISS index
+            vi = self._vector_index
+            if vi is not None and removed_keys & vi._key_set:
+                vi.remove(removed_keys)
 
     def _embed_key(self, source: str, line: str) -> str:
         # Content-addressed: an unchanged line keeps its vector across
@@ -1403,12 +1432,20 @@ class ChatMemory:
 
     def _search_vector(self, query: str, units: list[tuple],
                        limit: int) -> list[dict] | None:
-        """Preferred path when an embed_fn is wired: cosine over lazily
-        computed, persisted vectors. Returns ``None`` — forcing the TF-IDF
-        fallback — when the model cannot embed the query or no units could
-        be scored. Individual units that fail to embed are skipped (not
-        fatal): a single short or unusual line must not disable semantic
-        search for the whole corpus."""
+        """Preferred path when an embed_fn is wired: nearest-neighbour
+        search over lazily computed, persisted vectors.
+
+        When FAISS is available the heavy lifting (top-k by cosine) is
+        delegated to the vector index — O(log n) instead of O(n). The
+        recency bonus is still applied on top of the FAISS scores so the
+        ranking remains consistent with the linear-scan path.
+
+        Returns ``None`` — forcing the TF-IDF fallback — when the model
+        cannot embed the query or no units could be scored. Individual
+        units that fail to embed are skipped (not fatal): a single short
+        or unusual line must not disable semantic search for the whole
+        corpus.
+        """
         fn = self.embed_fn
         if fn is None or not units:
             return None
@@ -1421,29 +1458,75 @@ class ChatMemory:
         dim = len(qv)
         vectors = self._load_embeddings()
         fresh = False
+        # ── ensure every unit has an embedding (lazy computation) ───────
+        for uid, source, line, _folded, ts in units:
+            key = self._embed_key(source, line)
+            if key in vectors:
+                if len(vectors[key]) != dim:
+                    del vectors[key]  # stale vector from a different model
+                else:
+                    continue
+            try:
+                vec = fn(line)
+            except Exception:
+                continue  # skip this unit, keep searching the rest
+            if not _is_vector(vec) or len(vec) != dim:
+                continue
+            vectors[key] = [float(x) for x in vec]
+            fresh = True
+        if fresh:
+            self._save_embeddings()
+        if not vectors:
+            return None  # nothing to search
+
         now_ts = _now().timestamp()
-        scored: list[tuple] = []
+        vi = self._vector_index
+
+        # ── FAISS path (fast nearest-neighbour) ─────────────────────────
+        if vi is not None:
+            try:
+                if not vi.ensure_loaded(vectors):
+                    vi.build(vectors)
+                # Add any vectors computed since the last build
+                for key, vec in vectors.items():
+                    if key not in vi._key_set and len(vec) == (vi.dim or dim):
+                        vi.add(key, vec)
+                if vi.is_built:
+                    hits = vi.search(qv, k=max(limit * 3, limit))
+                    if hits:
+                        # Build a uid lookup for recency bonus
+                        unit_lookup: dict[str, tuple] = {}
+                        for uid, source, line, _folded, ts in units:
+                            key = self._embed_key(source, line)
+                            if key not in unit_lookup:
+                                unit_lookup[key] = (uid, source, line, ts)
+                        scored: list[tuple] = []
+                        for key, cos_sim in hits:
+                            entry = unit_lookup.get(key)
+                            if entry is None:
+                                continue
+                            uid, source, line, ts = entry
+                            score = cos_sim + _recency_bonus(ts, now_ts)
+                            scored.append((-score, uid, source, line))
+                        scored.sort()
+                        if scored:
+                            return [{"source": source, "text": line[:400]}
+                                    for _s, _u, source, line
+                                    in scored[:limit]]
+            except Exception as e:
+                print(f"[ChatMemory] FAISS search failed, "
+                      f"falling back to linear: {e}")
+
+        # ── Linear-scan fallback (no FAISS or FAISS returned nothing) ───
+        scored = []
         for uid, source, line, _folded, ts in units:
             key = self._embed_key(source, line)
             vec = vectors.get(key)
-            if vec is None:
-                try:
-                    vec = fn(line)
-                except Exception:
-                    continue  # skip this unit, keep searching the rest
-                if not _is_vector(vec):
-                    continue
-                if len(vec) != dim:
-                    continue  # dimension mismatch for this unit -> skip
-                vectors[key] = [float(x) for x in vec]
-                fresh = True
-            elif len(vec) != dim:
-                continue  # stored vector from a different model -> skip
+            if vec is None or len(vec) != dim:
+                continue
             sim = _cosine(qv, vec)
             scored.append((-(sim + _recency_bonus(ts, now_ts)),
                            uid, source, line))
-        if fresh:
-            self._save_embeddings()
         if not scored:
             return None  # no unit could be scored -> mandatory TF-IDF fallback
         scored.sort()
@@ -1502,13 +1585,17 @@ class ChatMemory:
 
     def index_status(self) -> dict:
         """Small introspection for tools/tests: what the index holds."""
+        vi = self._vector_index
         with _LOCK:
-            return {
+            status = {
                 "files": len(self._units_cache),
                 "units": sum(len(u) for u in self._units_cache.values()),
                 "embeddings": len(self._load_embeddings()),
                 "embedder": self.embed_fn is not None,
+                "faiss": vi is not None and vi.is_built,
+                "faiss_size": vi.size if (vi is not None and vi.is_built) else 0,
             }
+            return status
 
     # ── prompt ──────────────────────────────────────────────────────────────
     def prompt_block(self, max_chars=2000) -> str:
