@@ -151,11 +151,17 @@ def guard(text: str, facts: list[dict[str, Any]] | None,
         return False, f"fase desconhecida: {phase!r}"
 
     # Lei (a): só afirma com fato autorizado (ok, não simulado, não pendente).
+    # FASE3-TASK3: consulta o verificador externo antes de aceitar a asserção.
     allow = any(bool(f.get("assertion")) for f in facts)
     if not allow:
         hit = has_assertion(text)
         if hit:
             return False, f"asserção sem fato autorizado: {hit!r}"
+
+    # Verifica externamente os fatos que carregam recibo de tool call.
+    verified = _verify_facts(facts)
+    if verified is False:
+        return False, "verificação externa do resultado falhou"
 
     pending = [str(f.get("pending_confirm")) for f in facts
                if f.get("pending_confirm")]
@@ -224,3 +230,41 @@ def template_for(facts: list[dict[str, Any]] | None,
     if safe and announcement(safe):
         return ""
     return safe
+
+
+# ── FASE3-TASK3: verificacao externa de fatos ─────────────────────────────
+
+def _verify_facts(facts: list[dict[str, Any]]) -> bool | None:
+    """Consulta o verificador externo para fatos com recibo de tool call.
+
+    Retorna:
+      True  — todos os fatos verificaveis passaram (ou nenhum era verificavel).
+      False — pelo menos um fato falhou na verificacao externa.
+      None  — nenhum fato carregava metadados de tool call (call_id + tool).
+
+    A verificacao eh sincrona e deliberadamente rapida (< 50 ms para arquivos).
+    """
+    verifier = None
+    try:
+        from core.action_verifier import get_verifier
+        verifier = get_verifier()
+    except Exception:
+        return None
+
+    checked = 0
+    for fact in facts:
+        if not fact.get("assertion"):
+            continue
+        call_id = fact.get("call_id")
+        tool = fact.get("tool")
+        if not call_id or not tool:
+            continue
+        args = fact.get("tool_args") or {}
+        result = fact.get("tool_result")
+        ok = verifier.verify_sync(str(call_id), str(tool),
+                                  args if isinstance(args, dict) else {},
+                                  result)
+        checked += 1
+        if not ok:
+            return False
+    return checked > 0 or None
