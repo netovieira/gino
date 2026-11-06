@@ -1938,6 +1938,63 @@ def fetch_body(name_or_uuid: str, uid_or_key: str,
                 pass
 
 
+# ── medição do filtro (FASE2-TASK5) ─────────────────────────────────────────
+
+class _FilterMetrics:
+    """Contadores por conta: recebidos, filtrados, notificados, tempo."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data: dict[str, dict] = {}
+
+    def record(self, account: str, *, received: int = 0, filtered: int = 0,
+               notified: int = 0, processing_ms: float = 0.0) -> None:
+        with self._lock:
+            entry = self._data.setdefault(account, {
+                "received": 0, "filtered": 0, "notified": 0,
+                "processing_ms": 0.0, "count": 0})
+            entry["received"] += received
+            entry["filtered"] += filtered
+            entry["notified"] += notified
+            entry["processing_ms"] += processing_ms
+            entry["count"] += 1 if (received or filtered or notified) else 0
+
+    def snapshot(self) -> dict[str, dict]:
+        with self._lock:
+            return {k: dict(v) for k, v in self._data.items()}
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+
+_filter_metrics = _FilterMetrics()
+
+
+def filter_metrics() -> dict[str, dict]:
+    """Contadores de filtro por conta (FASE2-TASK5)."""
+    return _filter_metrics.snapshot()
+
+
+def measure_filter() -> dict[str, dict]:
+    """Roda UMA varredura e devolve as métricas do filtro (FASE2-TASK5).
+
+    Métricas: total recebidos, filtrados (ignorados), notificados e tempo
+    médio de processamento por e-mail, por conta. Registra no activity log.
+    """
+    _filter_metrics.clear()
+    poll_once()
+    metrics = _filter_metrics.snapshot()
+    # Log the metrics
+    for acct_name, data in metrics.items():
+        avg_ms = (data["processing_ms"] / data["count"]
+                  if data["count"] else 0.0)
+        _log(f"métrica filtro {acct_name}: recebidos={data['received']} "
+             f"filtrados={data['filtered']} notificados={data['notified']} "
+             f"tempo_médio={avg_ms:.1f}ms")
+    return metrics
+
+
 # ── varredura em background (silenciosa por padrão) ─────────────────────────
 
 _watch_lock = threading.Lock()
@@ -2026,12 +2083,16 @@ def poll_once(hook=None) -> list[dict]:
                     _log(f"o passo de códigos de {acct.name} falhou: {e}")
             if callable(hook) and acct.notify:
                 for item in fresh:
+                    item_start = time.monotonic()
                     if str(item.get("uid") or "") in code_uids:
                         continue          # já foi falado como código
                     rule = match_filter(item, acct.filters)
                     if rule is None:
                         if acct.filters:
                             _filter_trace(acct, item, None, "ignora")
+                            _filter_metrics.record(
+                                acct.name, received=1, filtered=1,
+                                processing_ms=(time.monotonic() - item_start) * 1000)
                         continue
                     action = str((rule or {}).get("action") or "avisa")
                     if acct.filters:
@@ -2039,6 +2100,9 @@ def poll_once(hook=None) -> list[dict]:
                         # dono); conta sem regra não tem decisão de filtro.
                         _filter_trace(acct, item, rule, action)
                     if action == "ignora":
+                        _filter_metrics.record(
+                            acct.name, received=1, filtered=1,
+                            processing_ms=(time.monotonic() - item_start) * 1000)
                         continue
                     if action == "classificar" and (rule or {}).get("body"):
                         # O trecho sai DAQUI, da conexão já aberta e somente
@@ -2057,8 +2121,36 @@ def poll_once(hook=None) -> list[dict]:
                             hook(dict(item))
                     except Exception as e:
                         _log(f"aviso de e-mail novo não entregue: {e}")
+                        _filter_metrics.record(
+                            acct.name, received=1,
+                            processing_ms=(time.monotonic() - item_start) * 1000)
                     else:
                         delivered.append(item)
+                        _filter_metrics.record(
+                            acct.name, received=1, notified=1,
+                            processing_ms=(time.monotonic() - item_start) * 1000)
+            elif acct.notify:
+                # Conta com notify mas sem hook: ainda registra métricas
+                for item in fresh:
+                    item_start = time.monotonic()
+                    if str(item.get("uid") or "") in code_uids:
+                        continue
+                    rule = match_filter(item, acct.filters)
+                    if rule is None:
+                        if acct.filters:
+                            _filter_metrics.record(
+                                acct.name, received=1, filtered=1,
+                                processing_ms=(time.monotonic() - item_start) * 1000)
+                        continue
+                    action = str((rule or {}).get("action") or "avisa")
+                    if action == "ignora":
+                        _filter_metrics.record(
+                            acct.name, received=1, filtered=1,
+                            processing_ms=(time.monotonic() - item_start) * 1000)
+                    else:
+                        _filter_metrics.record(
+                            acct.name, received=1, notified=1,
+                            processing_ms=(time.monotonic() - item_start) * 1000)
             if not acct.connected or acct.fail_streak:
                 # A varredura voltou a abrir a caixa: registra a recuperação
                 # (e é isto que limpa a contagem de falhas consecutivas).
