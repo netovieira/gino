@@ -89,7 +89,8 @@ class Orchestrator:
                  log: Callable[[str], None] | None = None,
                  on_event: Callable[[dict[str, Any]], None] | None = None,
                  assistant_name: str = "Gino",
-                 history: Callable[[], list[dict[str, Any]]] | None = None):
+                 history: Callable[[], list[dict[str, Any]]] | None = None,
+                 attention: Any | None = None):
         self.config = config
         self.clock = clock
         self.log = log or (lambda _msg: None)
@@ -103,6 +104,10 @@ class Orchestrator:
             enabled=config.executor_enabled)
         self.supervisor = supervisor or Supervisor(clock=clock)
         self.fallback = fallback
+        # FASE4-TASK5: monitor de atenção por webcam (opcional).
+        # Quando injetado, o orquestrador registra eventos de atenção
+        # e pode silenciar notificações quando o usuário não está olhando.
+        self.attention = attention
         self._turns: dict[str, _TurnState] = {}
         self._lock = threading.RLock()
         self._register_defaults()
@@ -358,10 +363,12 @@ class Orchestrator:
         if not actions:
             return []
         if event is not None and event.is_set():
-            return [self.executor.run(f"k{i}", a.tool, a.args,
+            results = [self.executor.run(f"k{i}", a.tool, a.args,
                                       requires_confirm=a.requires_confirm,
                                       cancel_event=event)
                     for i, a in enumerate(actions, 1)]
+            self._check_unverified_turn(plan, results)
+            return results
         results: list[ExecutorResult] = []
         pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=min(8, len(actions)),
@@ -384,7 +391,24 @@ class Orchestrator:
         self.supervisor.add_usage(CHAT_EXECUTOR, 256)
         self._event("results", plan.turn_id,
                     facts=[f for r in results for f in r.facts])
+        # FASE3-TASK4: verifica se algum resultado está unverified e marca o turno.
+        self._check_unverified_turn(plan, results)
         return results
+
+    def _check_unverified_turn(self, plan: TurnPlan,
+                                results: list[ExecutorResult]) -> None:
+        """FASE3-TASK4: marca o turno como UNVERIFIED se algum resultado não tem prova material."""
+        has_unverified = any(r.unverified for r in results)
+        if has_unverified:
+            self._event("TURN_UNVERIFIED", plan.turn_id,
+                        task_ids=[r.task_id for r in results if r.unverified],
+                        reason="ação sem prova material (recibo HMAC + verificação)")
+            # Loga no activity log.
+            from core.flows.executor import _log_unverified
+            for r in results:
+                if r.unverified:
+                    _log_unverified(r.task_id, plan.turn_id,
+                                    "turno marcado UNVERIFIED pelo orquestrador")
 
     # ── cancelamento ────────────────────────────────────────────────────────
     def cancel(self, turn_id: str, reason: str = "cancelado") -> bool:
@@ -427,7 +451,7 @@ class Orchestrator:
     def metrics(self) -> dict[str, Any]:
         with self._lock:
             turns = len(self._turns)
-        return {
+        m = {
             "router": {
                 "rule_decisions": self.router.rule_decisions,
                 "fallback_decisions": self.router.fallback_decisions,
@@ -440,6 +464,50 @@ class Orchestrator:
             "supervisor": self.supervisor.snapshot(),
             "active_turns": turns,
         }
+        # FASE4-TASK5: inclui estado de atenção quando o monitor existe.
+        if self.attention is not None:
+            try:
+                m["attention"] = self.attention.attention_event()
+            except Exception:
+                m["attention"] = {"error": "monitor indisponível"}
+        return m
+
+    # ── atenção (FASE4-TASK5) ─────────────────────────────────────────────
+    def is_user_attentive(self) -> bool:
+        """True quando o usuário está olhando para a tela.
+
+        Se nenhum monitor de atenção foi injetado, retorna True (presença
+        assumida — comportamento legado).
+        """
+        if self.attention is None:
+            return True
+        try:
+            return self.attention.is_attentive
+        except Exception:
+            return True
+
+    def should_deliver_notification(self) -> bool:
+        """Se uma notificação deve ser entregue agora.
+
+        Combina a atenção do usuário com a decisão do monitor. Sem monitor,
+        sempre entrega (legado).
+        """
+        if self.attention is None:
+            return True
+        try:
+            return self.attention.should_notify()
+        except Exception:
+            return True
+
+    def log_attention_event(self) -> None:
+        """Registra o estado de atenção no log de eventos do orquestrador."""
+        if self.attention is None:
+            return
+        try:
+            event = self.attention.attention_event()
+            self._event("attention", **event)
+        except Exception:
+            pass
 
     def _event(self, kind: str, *args: Any, **fields: Any) -> None:
         if not self.config.log_events:
