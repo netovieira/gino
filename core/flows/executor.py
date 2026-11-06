@@ -4,8 +4,9 @@ Recebe do orquestrador ferramenta + argumentos PRONTOS, verifica se a
 ferramenta existe no catálogo, executa no processo dele e devolve um fato. Ele
 não conversa, não escolhe ferramenta e não confirma nada:
 
-* ``requires_owner_confirm`` nunca vira execução: devolve ``pending_confirm``
-  (lei b); a autoridade continua no gate de voz do app;
+* ``requires_owner_confirm`` nunca vira execução sem consulta a grants: antes
+  de devolver ``pending_confirm``, consulta voice_grants para a pessoa
+  identificada — se houver grant ativo cobrindo o escopo, executa;
 * ferramenta fora do catálogo é recusada antes de qualquer efeito;
 * o runner é injetado (o app decide como executa). Sem runner, o executor é
   um stub declarado e devolve erro — jamais finge sucesso.
@@ -13,6 +14,15 @@ não conversa, não escolhe ferramenta e não confirma nada:
 O fato só vira asserção (``assertion=True``) quando o runner devolve sucesso
 real, não simulado, sem confirmação pendente e sem cancelamento. É esse campo
 que o guard da boca consulta.
+
+INTEGRAÇÃO COM VOICE_GRANTS (FASE1-TASK3)
+    Antes de exigir confirmação do dono, o executor consulta os grants
+    persistentes por pessoa (core/voice_grants). Se a pessoa identificada
+    (rótulo nominal do speaker) tem grant ativo cobrindo o escopo da ação,
+    a execução prossegue sem pedir confirmação. O padrão permanece NEGAÇÃO:
+    sem grant ativo, pede confirmação. A integração com actiongate (janelas
+    de 120s do dono) é: se a janela do actiongate está aberta, executa
+    (dono presente); se expirou, consulta grants.
 """
 from __future__ import annotations
 
@@ -23,6 +33,25 @@ from threading import Event
 from typing import Any, Callable
 
 Runner = Callable[[str, dict[str, Any]], Any]
+
+
+def _tool_to_scope(tool: str) -> Any:
+    """Mapeia nome de ferramenta para escopo de grant (Scope ou None).
+    
+    Retorna None se a ferramenta não tem escopo de grant associado.
+    Importa voice_grants lazy para evitar ciclo de dependência.
+    """
+    from core import voice_grants as vg
+    
+    tool_lower = str(tool or "").lower()
+    if "whatsapp" in tool_lower:
+        return vg.Scope(vg.SCOPE_WHATSAPP)
+    if "email" in tool_lower or "mail" in tool_lower:
+        return vg.Scope(vg.SCOPE_EMAIL)
+    if tool_lower in ("send_message",):
+        return vg.Scope(vg.SCOPE_WHATSAPP)
+    # Projeto: precisa de args com project/project_path
+    return None
 
 
 def readonly_runner(tool: str, args: dict[str, Any] | None = None) -> Any:
@@ -112,9 +141,44 @@ class Executor:
     def knows(self, tool: str) -> bool:
         return str(tool) in self.catalog
 
+    def _actiongate_or_grant_allows(self, tool: str, args: dict[str, Any],
+                                     *, person: str = "",
+                                     now: float | None = None) -> bool:
+        """True se actiongate (janela do dono) OU voice_grants permite a ação.
+        
+        Ordem de consulta:
+          1. actiongate.authorized(): janela de 120s do dono aberta -> True
+          2. voice_grants.allows(person, scope): grant ativo para a pessoa -> True
+          3. Senão -> False (pede confirmação)
+        """
+        # 1) actiongate: janela do dono aberta
+        try:
+            from core import actiongate
+            if actiongate.authorized():
+                return True
+        except Exception:
+            pass  # actiongate indisponível: segue para grants
+        
+        # 2) voice_grants: grant persistente por pessoa
+        person = str(person or "").strip()
+        if not person:
+            return False  # sem pessoa identificada: não tem grant
+        
+        try:
+            from core import voice_grants as vg
+            scope = _tool_to_scope(tool)
+            if scope is None:
+                return False  # ferramenta sem escopo de grant
+            moment = time.monotonic() if now is None else float(now)
+            return vg.allows(person, scope, now=moment)
+        except Exception:
+            return False  # grants indisponível: nega
+
     def run(self, task_id: str, tool: str, args: dict[str, Any] | None = None,
             *, requires_confirm: bool = False,
-            cancel_event: Event | None = None) -> ExecutorResult:
+            cancel_event: Event | None = None,
+            person: str = "",
+            now: float | None = None) -> ExecutorResult:
         started = time.monotonic()
         args = dict(args or {})
         result = ExecutorResult(task_id=str(task_id))
@@ -142,16 +206,25 @@ class Executor:
             return finish()
 
         if requires_confirm:
-            # Lei (b): não executa, só prepara e pede a frase falada.
-            result.ok = True
-            result.pending_confirm = True
-            result.facts = [{
-                "spoken": "só falta a sua confirmação falada",
-                "ok": True, "assertion": False, "simulated": False,
-                "pending_confirm": pending_phrase(tool, args),
-                "detail": "pending_confirm; nada foi executado",
-            }]
-            return finish()
+            # FASE1-TASK3: consulta grants ANTES de exigir confirmação.
+            # 1) actiongate (janela de 120s do dono): se aberta, executa.
+            # 2) voice_grants (grant persistente por pessoa): se ativo, executa.
+            # 3) Senão, pede confirmação (pending_confirm).
+            if self._actiongate_or_grant_allows(tool, args, person=person,
+                                                 now=now):
+                # Janela do dono ou grant ativo: prossegue para execução.
+                pass
+            else:
+                # Lei (b): não executa, só prepara e pede a frase falada.
+                result.ok = True
+                result.pending_confirm = True
+                result.facts = [{
+                    "spoken": "só falta a sua confirmação falada",
+                    "ok": True, "assertion": False, "simulated": False,
+                    "pending_confirm": pending_phrase(tool, args),
+                    "detail": "pending_confirm; nada foi executado",
+                }]
+                return finish()
 
         if not self.enabled:
             result.error = "executor desligado por config"
