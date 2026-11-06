@@ -28,8 +28,13 @@ from __future__ import annotations
 import threading
 import time
 
-# Fatores aceitos — os únicos que a lei do dono prevê para aprovação.
-FACTORS = ("voz do dono", "senha digitada")
+from core.owner_auth import FACTORS  # veredito único: voz do dono OU senha digitada
+
+# Fatores aceitos — os únicos que a lei do dono prevê para aprovação: as
+# MESMAS constantes que core/actiongate.py e core/owner_auth.py usam, para
+# que todas as janelas privilegiadas (job, ação, envio) falem do mesmo
+# veredito de fator. Reinício/energia/sudo (core/rootgate.py) só aceitam
+# FACTOR_VOICE.
 
 # Mesma duração da janela de ação do actiongate: quem abriu uma abriu a outra.
 WINDOW_S = 120.0
