@@ -5007,6 +5007,10 @@ class JarvisLive:
             if not pcm:
                 self._wa_tts_text = voice_text
                 return ""
+            # Continuidade medida (05/11/2026): replies de ~25-29 s saíam com
+            # 24 buracos internos > 120 ms. Nenhum silêncio do arquivo passa
+            # de 100 ms — vale para peça única, Edge e qualquer motor.
+            pcm = _b.smooth_pcm_silence(pcm, 24000, max_internal_ms=100)
             out_dir = BASE_DIR / "memory" / "whatsapp_media"
             out_dir.mkdir(parents=True, exist_ok=True)
             stem = f"reply_{uuid.uuid4().hex}"

@@ -1448,7 +1448,10 @@ def tts_fish_pcm24k(text: str, st: dict, style: str | None = None) -> bytes:
 
 
 _FISH_SPLIT = re.compile(r"(?<=[,;:])\s+")
-_FISH_GAP = b"\x00" * int(24000 * 0.22) * 2      # 220 ms of silence between pieces
+# 05/11/2026: o `_FISH_GAP` de 220 ms de zeros entre peças foi medido no áudio
+# enviado do WhatsApp (28,7 s, 24 buracos internos > 120 ms, soma de 5,9 s) e
+# derrubado — as peças agora são emendadas com `smooth_pcm_silence`, que corta
+# o padding do modelo na junção em vez de somar silêncio artificial a ele.
 
 # Marcadores naturais de tom do Fish (`[calm]`, `[excited]`, `[soft tone]`).
 # O Edge não entende nada disso: ele lê cada caractere, então a tag TEM que
@@ -1481,8 +1484,8 @@ SPEECH_FIRST_MAX_CHARS = 32
 SPEECH_UNIT_MIN_CHARS = 44
 SPEECH_UNIT_MAX_CHARS = 60
 # Folga de junção entre duas unidades quando a seguinte JÁ está pronta. É
-# respiração intencional, não buraco de síntese; abaixo do `_FISH_GAP` de
-# 220 ms usado dentro de uma frase antiga.
+# respiração intencional do pipeline de playback (entre unidades), não buraco
+# de síntese; o interior da frase emenda com `smooth_pcm_silence` (<=100 ms).
 SPEECH_JUNCTION_GAP_S = 0.14
 
 _SPEECH_SENTENCE_END = re.compile(r"[.!?…]+(?=\s|$)")
@@ -1767,6 +1770,66 @@ def refresh_fish_voice(st: dict, voice_id: str | None = None,
     return st
 
 
+def smooth_pcm_silence(pcm: bytes, sample_rate: int = 24000,
+                       max_internal_ms: int = 100,
+                       keep_leading_ms: int = 20,
+                       keep_trailing_ms: int = 60) -> bytes:
+    """Emenda contínua: nenhum silêncio interno passa de ``max_internal_ms``.
+
+    O defeito medido no áudio enviado do WhatsApp (05/11/2026): 28,7 s com 24
+    buracos internos acima de 120 ms (soma 5,9 s, maior 340 ms) — silêncio de
+    zeros do gap entre peças somado ao padding que o modelo cola no começo e
+    no fim de cada pedido. Aqui o PCM int16 é lido em molduras de 10 ms;
+    molduras com RMS abaixo de ~0,005 (ruído de síntese) são silêncio e runs
+    internos são cortados para ``max_internal_ms``, com as bordas do arquivo
+    aparadas a ``keep_leading_ms``/``keep_trailing_ms``. Áudio com menos de
+    200 ms passa intocado (fixture de teste não é fala). Não inventa samples:
+    só remove molduras inteiras, então a voz emendada sai contínua.
+    """
+    from array import array
+
+    if not pcm or len(pcm) < 2 * sample_rate // 5:   # < 200 ms
+        return pcm
+    samples = array("h")
+    samples.frombytes(pcm[: (len(pcm) // 2) * 2])
+    frame = max(1, sample_rate // 100)               # 10 ms
+    nframes = len(samples) // frame
+    thr_sq = 163 * 163                               # RMS ~0,005 em int16
+    is_sil = []
+    for i in range(nframes):
+        base = i * frame
+        energy = 0
+        for v in samples[base:base + frame]:
+            energy += v * v
+        is_sil.append(energy < thr_sq * frame)
+
+    max_keep = max(1, max_internal_ms // 10)
+    lead_keep = max(0, keep_leading_ms // 10)
+    trail_keep = max(0, keep_trailing_ms // 10)
+    out = array("h")
+    i = 0
+    while i < nframes:
+        if not is_sil[i]:
+            out.extend(samples[i * frame:(i + 1) * frame])
+            i += 1
+            continue
+        j = i
+        while j < nframes and is_sil[j]:
+            j += 1
+        if i == 0:
+            cap = lead_keep                          # silêncio antes da fala
+        elif j == nframes:
+            cap = trail_keep                         # silêncio depois da fala
+        else:
+            cap = max_keep                           # buraco interno
+        for k in range(i, i + min(j - i, cap)):
+            out.extend(samples[k * frame:(k + 1) * frame])
+        i = j
+    # cauda além da última moldura cheia (sample ímpar): preservada só se
+    # houver fala antes, nunca como silêncio extra.
+    return out.tobytes()
+
+
 def synth_pcm24k(text: str, st: dict, voice_id: str | None = None,
                  style: str | None = None) -> bytes:
     """One sentence → 24 kHz PCM with whichever voice engine is configured.
@@ -1794,14 +1857,14 @@ def synth_pcm24k(text: str, st: dict, voice_id: str | None = None,
                 return tts_fish_pcm24k(clean, state, style=tag)
             return tts_fish_pcm24k(clean, state)
         out = bytearray()
-        for i, piece in enumerate(pieces):
-            if i:
-                out.extend(_FISH_GAP)
+        for piece in pieces:
             if tag:
                 out.extend(tts_fish_pcm24k(piece, state, style=tag))
             else:
                 out.extend(tts_fish_pcm24k(piece, state))
-        return bytes(out)
+        # Sem gap artificial: o padding natural de cada peça é cortado na
+        # junção (e o resto vira texto — nunca um áudio cheio de buraco).
+        return smooth_pcm_silence(bytes(out))
     SPEECH_STATS.note_http()
     return tts_pcm24k(strip_style_tags(text), st["tts_voice"])
 
