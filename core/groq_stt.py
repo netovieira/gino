@@ -644,6 +644,20 @@ class GroqListener:
             "turns_opened_by_bypass": 0,   # sustained energy, no proof
             "clips_dropped": 0,            # emitted clips refused by the gate
         }
+        # ── Silero VAD: detector primário de atividade de voz ──────────────────
+        # When the ONNX model is present, Silero VAD is the primary "is this
+        # speech?" detector. It runs on every block (stateful, needs context)
+        # and its result is OR'd with the RMS threshold. Without the model
+        # file, behavior is identical to before — RMS-only detection.
+        # The counter lets tests assert the VAD is actually being called.
+        self._vad = None
+        self._vad_calls = 0
+        try:
+            from core import silero_vad as _silero
+            if _silero.available():
+                self._vad = _silero.SileroVAD()
+        except Exception:
+            pass
         # The pre-roll ring. It is written on EVERY block that reaches feed()
         # and discards the oldest frame by itself; the microphone callback
         # keeps feeding it while asleep (and during our own playback), so the
@@ -926,6 +940,11 @@ class GroqListener:
             self._release_held()
         level = float(np.sqrt(np.mean(x * x))) / 32768.0
 
+        # Silero VAD: ask on every block to keep the model's stateful context
+        # alive across the speech onset. The result is OR'd with the RMS
+        # threshold below — VAD is the primary detector, RMS the fallback.
+        vad_speech = self._vad_says_speech(raw)
+
         if self._drop_segment:
             # The reply started: whatever was half-open belongs to the previous
             # turn, not to a mixed utterance with the assistant's own voice.
@@ -955,7 +974,9 @@ class GroqListener:
             self._peak, self._peak_t = 0.0, now
 
         if not self._active:
-            if level > thresh:
+            # Detection: Silero VAD (primary) OR RMS above threshold (fallback).
+            # A block is a speech candidate when either signal says so.
+            if vad_speech or level > thresh:
                 self._above += 1
                 # Energy is not voice. Every candidate frame is measured by the
                 # transient gate; only frames that pass count towards opening
@@ -974,7 +995,8 @@ class GroqListener:
             return
 
         self._seg.append(raw)
-        if level > thresh:
+        # Voiced block: Silero VAD (primary) OR RMS above threshold (fallback).
+        if vad_speech or level > thresh:
             self._voiced += 1
             self._below = 0
             if self._probe_voice(raw).ok:
@@ -1005,6 +1027,26 @@ class GroqListener:
             if self._voiced >= voiced_cap:
                 self._cut_segment(voiced_cap)
 
+    # ── Silero VAD ────────────────────────────────────────────────────────────
+
+    @property
+    def vad_active(self) -> bool:
+        """True when the Silero VAD model is loaded and being used."""
+        return self._vad is not None
+
+    def _vad_says_speech(self, raw: bytes) -> bool:
+        """Ask Silero VAD whether this block contains speech.
+
+        Called on EVERY block (including silence) so the model keeps its
+        stateful context across the speech onset. Returns False when the
+        model is not loaded — the RMS threshold keeps being the sole
+        detector, exactly as before this integration.
+        """
+        if self._vad is None:
+            return False
+        self._vad_calls += 1
+        return self._vad.is_speech(raw)
+
     # ── voice gate ──────────────────────────────────────────────────────────
 
     def _probe_voice(self, raw: bytes) -> VoiceProof:
@@ -1034,6 +1076,10 @@ class GroqListener:
         """Open an utterance on the current block (proof already counted)."""
         self._active = True
         self.speaking = True
+        # Reset the VAD state for the new utterance: the model's internal
+        # context belongs to the previous segment and must not leak into it.
+        if self._vad is not None:
+            self._vad.reset()
         # The ring already holds the full pre-roll plus the blocks the detector
         # needed to fire: hand the whole thing to the utterance, then start a
         # fresh ring for the continuation.
@@ -1155,6 +1201,10 @@ class GroqListener:
         self._seg, self._active, self.speaking = [], False, False
         self._above = self._below = self._voiced = 0
         self._reset_voice_state()
+        # Reset VAD state: the utterance is closed, the model's context must
+        # not carry over into the next segment's silence tracking.
+        if self._vad is not None:
+            self._vad.reset()
         # The closed utterance is already going to the STT: its frames must not
         # become the pre-roll of the next sentence (that would duplicate words).
         self._pre.clear()
