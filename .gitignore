@@ -11,6 +11,8 @@
 config/api_keys.json
 # The dashboard's TLS private key and certificate:
 config/certs/
+# Chave HMAC de recibos de tool calls (segredo critografico):
+config/certs/tool_hmac.key
 # A LINKED WhatsApp session — committing it hands somebody your account:
 config/whatsapp_web/
 # Google OAuth tokens (Gmail / Calendar plugins):

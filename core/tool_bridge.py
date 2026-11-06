@@ -42,6 +42,8 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from core import tool_receipts as _receipts
+
 # ── risk tiers ───────────────────────────────────────────────────────────────
 #
 # safe   — reads, status, search. No side effects worth asking about.
@@ -471,6 +473,13 @@ class ToolBridge:
         self._denials_lock = threading.RLock()
         self._load_pending()
 
+        # ── tool receipts (HMAC) ──────────────────────────────────────────
+        self._receipts_key: Optional[bytes] = None
+        try:
+            self._receipts_key = _receipts.load_key()
+        except Exception:
+            self._receipts_key = None
+
         self._server = None
         self._thread: Optional[threading.Thread] = None
 
@@ -760,6 +769,7 @@ class ToolBridge:
 
         text = result if isinstance(result, str) else str(result)
         self._audit_action(name, args, tier, approved=approved, result=text, status="ok")
+        self._issue_receipt(name, args, result)
         return {"status": "ok", "action": name, "tier": tier,
                 "approved": True, "result": text}
 
@@ -1297,6 +1307,29 @@ class ToolBridge:
                     fh.write(line + "\n")
         except Exception as exc:  # auditing must never break a call
             self._log(f"[ToolBridge] Could not write audit record: {exc}")
+
+    # ── tool receipts (HMAC) ──────────────────────────────────────────────
+
+    def _issue_receipt(self, tool: str, args: dict, result: Any) -> None:
+        """Gera e persiste um recibo HMAC para o tool call.
+
+        O recibo eh acrescentado ao mesmo JSONL de audit (append-only).
+        Falhas sao silenciadas — recibos nao podem quebrar um call.
+        A chave nunca eh logada; apenas o HMAC resultante vai ao disco.
+        """
+        if self._receipts_key is None or self._audit_path is None:
+            return
+        try:
+            receipt = _receipts.make_receipt(
+                tool, args if isinstance(args, dict) else {}, result,
+                key=self._receipts_key,
+            )
+            line = json.dumps(receipt, ensure_ascii=False, default=str)
+            with self._audit_lock:
+                with self._audit_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+        except Exception as exc:
+            self._log(f"[ToolBridge] could not issue receipt: {exc}")
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 

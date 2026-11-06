@@ -403,7 +403,9 @@ class AuditTests(unittest.TestCase):
 
     def _records(self):
         lines = self.audit_path.read_text(encoding="utf-8").splitlines()
-        return [json.loads(line) for line in lines]
+        parsed = [json.loads(line) for line in lines if line.strip()]
+        # Filter out HMAC receipts (they have 'call_id'+'hmac' instead of 'action')
+        return [r for r in parsed if "action" in r]
 
     def test_audit_redacts_secret_arguments_and_records_result(self):
         dispatch = RecordingDispatch(result="done")
