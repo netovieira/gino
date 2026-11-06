@@ -29,6 +29,24 @@ STORAGE
         hours/YYYY-MM-DD/HH.md       turns of one hour
         days/YYYY-MM-DD/index.md     links to the hour files + last turns
         topics/<slug>.md             subjects written by tools/notes
+        .index/manifest.json         sha256 per file + dir signatures (below)
+        .index/embeddings.json       lazily computed, persisted query vectors
+
+SEARCH INDEX (the owner's ``athena`` recipe, adapted to a markdown store)
+    ``reindex()`` keeps a manifest of sha256 hashes with per-directory
+    signatures: a file whose directory signature is unchanged is not even
+    re-opened, so a normal search does no full-table sweep. Only files whose
+    hash changed are re-tokenised (touched set) and files that disappeared
+    are pruned from the manifest, the unit cache and the embedding store.
+    ``search()`` ranks with smoothed TF-IDF
+    (``log(1 + n/(1+df))``) plus a recency term — recency MUST weigh here,
+    unlike the reference indexer — and ties break on the stable unit id, so
+    the same query always returns the same order. When an ``embed_fn`` is
+    wired, cosine over the persisted lazy embeddings is the preferred path;
+    any problem (no model, empty vector, dimension mismatch) falls back to
+    TF-IDF, never to an empty answer. Sweeps honour a cost gate: at most
+    ``max_files`` content hashes per pass, and ``dry_run=True`` reports
+    without writing a single byte.
 
     All writes are atomic (tmp file + os.replace) and serialised by a lock.
     Malformed JSON/MD on disk never raises: the reader skips what it cannot
@@ -38,7 +56,11 @@ STORAGE
 from __future__ import annotations
 
 import fcntl
+import hashlib
+import json
+import math
 import os
+import posixpath
 import re
 import threading
 import unicodedata
@@ -57,6 +79,17 @@ MAX_TURN_CHARS = 1000
 MAX_NOTES = 20
 MAX_THREADS = 12
 MAX_TOPIC_LINKS = 6
+
+# ── search index knobs (athena recipe, adapted) ─────────────────────────────
+INDEX_DIR_NAME = ".index"
+MANIFEST_VERSION = 1
+# Cost gate per sweep: a single reindex() content-hashes at most this many
+# files. Unchanged files (fresh directory signature) never reach this counter,
+# so normal stores sweep in O(changed), not O(files).
+DEFAULT_MAX_FILES = 500
+# Recency MUST weigh in the ranking (the reference indexer dropped it).
+RECENCY_HALF_LIFE_DAYS = 14.0
+RECENCY_WEIGHT = 0.8
 
 _LOCK = threading.RLock()
 
@@ -264,10 +297,76 @@ def _parse_hour_file(path: Path, day: _date) -> list[tuple[datetime, str, str]]:
     return turns
 
 
+# ── index helpers (sha256 manifest, recency, cosine) ────────────────────────
+
+_RE_SOURCE_DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+_RE_SOURCE_HOUR = re.compile(r"/(\d{2})\.md$")
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(str(text).encode("utf-8", "replace")).hexdigest()
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _unit_ts(rel: str, path: Path) -> float:
+    """Epoch of a file's memory date: path first, mtime as fallback.
+
+    The date lives in the layout (``hours/YYYY-MM-DD/HH.md``,
+    ``days/YYYY-MM-DD/``, ``sleep/YYYY-MM-DD.md``); ``state.md``/``hot.md``
+    carry no date and fall back to mtime, which is what the writer just set.
+    """
+    m = _RE_SOURCE_DATE.search(rel)
+    if m:
+        hour = 0
+        hm = _RE_SOURCE_HOUR.search(rel)
+        if hm and 0 <= int(hm.group(1)) < 24:
+            hour = int(hm.group(1))
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                            hour).timestamp()
+        except ValueError:
+            pass
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return _now().timestamp()
+
+
+def _recency_bonus(ts: float, now_ts: float) -> float:
+    """Half-life decay quantised to whole days — deterministic per day.
+
+    Quantisation matters: without it two runs minutes apart could break a
+    tie differently, and the owner's contract is same query, same order.
+    """
+    age_days = int(max(0.0, now_ts - float(ts)) // 86400)
+    return RECENCY_WEIGHT * (0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS))
+
+
+def _is_vector(value) -> bool:
+    return (isinstance(value, (list, tuple)) and len(value) > 0
+            and all(isinstance(x, (int, float)) for x in value))
+
+
+def _cosine(a, b) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 class ChatMemory:
     """Continuous conversation memory stored as markdown files."""
 
-    def __init__(self, base_dir=None):
+    def __init__(self, base_dir=None, embed_fn=None):
         self.base_dir = Path(base_dir).expanduser() if base_dir else DEFAULT_BASE_DIR
         self.hours_dir = self.base_dir / "hours"
         self.days_dir = self.base_dir / "days"
@@ -275,6 +374,16 @@ class ChatMemory:
         self.state_path = self.base_dir / "state.md"
         self.hot_path = self.base_dir / "hot.md"
         self.index_path = self.base_dir / "index.md"
+        # Optional vectoriser (callable text -> list[float] | None). Never
+        # called by default: production runs the deterministic TF-IDF path,
+        # and the embedding path must degrade to it whenever the model is
+        # absent, silent or of a different dimension.
+        self.embed_fn = embed_fn
+        self.index_dir = self.base_dir / INDEX_DIR_NAME
+        self.manifest_path = self.index_dir / "manifest.json"
+        self.embeddings_path = self.index_dir / "embeddings.json"
+        self._units_cache: dict[str, list[tuple]] = {}
+        self._embeddings: dict | None = None
         with _LOCK:
             self._ensure_layout()
 
@@ -805,18 +914,324 @@ class ChatMemory:
         paths.append(self.state_path)
         return paths
 
-    def search(self, query, limit=10) -> list[dict]:
-        """Accent-insensitive partial search with inverse-frequency ranking.
+    @staticmethod
+    def _source_of(path: Path, base_dir: Path) -> str:
+        try:
+            return path.relative_to(base_dir).as_posix()
+        except ValueError:
+            return path.name
 
-        Old behaviour was an exact AND of every token inside ONE line, so any
-        long question ("latência boca local prefill") returned nothing even
-        though the store held lines about latency, prefill and the mouth —
-        just not all four words together. Now a line matches when it holds at
-        least one token, and it is scored by *rarity*: each matched token is
-        weighted by ``1/(1+lines_containing_it)``, so a rare word like
-        "prefill" outranks generic ones like "boca"/"local". An exact phrase
-        match doubles the rarest token's weight. Ties keep file order — hours
-        are scanned newest first, so recent memory surfaces first.
+    def _build_units(self, rel: str, path: Path) -> list[tuple]:
+        """Tokenise one file into searchable units: (uid, source, line,
+        folded, ts). Heading lines are indexed with the ``#`` stripped — the
+        title of a topic page is the strongest evidence of what it is about
+        ("latência do turno de voz" must find ``topics/latencia-...md``)."""
+        ts = _unit_ts(rel, path)
+        units: list[tuple] = []
+        for idx, raw in enumerate(_safe_read(path).splitlines()):
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                line = line.lstrip("#").strip()
+                if not line:
+                    continue
+            units.append((f"{rel}#{idx}", rel, line, _fold(line), ts))
+        return units
+
+    def _load_manifest(self) -> dict:
+        try:
+            raw = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                files = raw.get("files")
+                dirs = raw.get("dirs")
+                return {
+                    "files": files if isinstance(files, dict) else {},
+                    "dirs": dirs if isinstance(dirs, dict) else {},
+                }
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[ChatMemory] manifest repair ({self.manifest_path}): {e}")
+        return {"files": {}, "dirs": {}}
+
+    def _save_manifest(self, files: dict, dirs: dict) -> None:
+        try:
+            payload = json.dumps(
+                {"version": MANIFEST_VERSION, "files": files, "dirs": dirs},
+                ensure_ascii=False, indent=2, sort_keys=True,
+            ) + "\n"
+            _atomic_write(self.manifest_path, payload)
+        except Exception as e:
+            print(f"[ChatMemory] manifest write failed: {e}")
+
+    def reindex(self, max_files=DEFAULT_MAX_FILES, dry_run=False) -> dict:
+        """Incremental manifest sweep with the athena cost gate.
+
+        - sha256 per file, persisted in ``.index/manifest.json``;
+        - a signature per directory (name|size|mtime_ns of its children):
+          while the signature holds, the files inside are not even opened,
+          so there is no full-table hash on every search;
+        - touched-set pruning: only files whose hash changed are
+          re-tokenised; files that vanished are dropped from the manifest,
+          the unit cache and the embedding store;
+        - ``max_files`` caps how many files get content-hashed per sweep
+          (the rest keep their previous state and the sweep reports
+          ``capped``); ``dry_run=True`` only reports — nothing is written.
+        """
+        stats = {"scanned": 0, "unchanged": 0, "changed": 0, "added": 0,
+                 "removed": 0, "skipped": 0, "capped": False,
+                 "dry_run": bool(dry_run)}
+        try:
+            with _store_gate(self.base_dir), _LOCK:
+                self._reindex_locked(stats, max_files, dry_run)
+        except Exception as e:
+            print(f"[ChatMemory] reindex failed: {e}")
+        return stats
+
+    def _reindex_locked(self, stats: dict, max_files, dry_run: bool) -> None:
+        base = self.base_dir
+        present: dict[str, Path] = {}
+        for path in self._search_paths():
+            present[self._source_of(path, base)] = path
+        manifest = self._load_manifest()
+        meta, old_dirs = manifest["files"], manifest["dirs"]
+        stats["scanned"] = len(present)
+
+        # Directory signatures: one hash per parent dir over the stat
+        # fingerprint of its children. Unchanged signature == nobody
+        # created, deleted or rewrote a file in that dir since last sweep.
+        dir_items: dict[str, list[str]] = {}
+        for rel, path in present.items():
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            fp = f"{path.name}|{st.st_size}|{st.st_mtime_ns}"
+            dir_items.setdefault(posixpath.dirname(rel), []).append(fp)
+        dirs_new = {parent: _hash_text("\n".join(sorted(items)))
+                    for parent, items in dir_items.items()}
+
+        tainted: set[str] = set()  # dirs with a file skipped by the gate
+        mutated = False
+        hashed = 0
+        for rel in sorted(present):
+            path = present[rel]
+            parent = posixpath.dirname(rel)
+            cached = self._units_cache.get(rel)
+            entry = meta.get(rel) if isinstance(meta.get(rel), dict) else None
+            if (cached is not None and entry is not None and entry.get("hash")
+                    and old_dirs.get(parent) == dirs_new.get(parent)):
+                stats["unchanged"] += 1  # fresh signature: no re-hash at all
+                continue
+            if max_files is not None and hashed >= max_files:
+                stats["skipped"] += 1
+                stats["capped"] = True
+                tainted.add(parent)
+                continue
+            hashed += 1
+            try:
+                digest = _hash_file(path)
+            except OSError:
+                stats["skipped"] += 1
+                tainted.add(parent)
+                continue
+            digest_same = entry is not None and entry.get("hash") == digest
+            if digest_same:
+                # Content unchanged since the manifest was written. A fresh
+                # process still needs the tokenised units in memory, but the
+                # manifest entry itself is untouched — no prune, no rewrite.
+                stats["unchanged"] += 1
+                if cached is None and not dry_run:
+                    self._units_cache[rel] = self._build_units(rel, path)
+            else:
+                stats["changed" if (entry and entry.get("hash"))
+                      else "added"] += 1
+                mutated = True
+                if not dry_run:
+                    self._units_cache[rel] = self._build_units(rel, path)
+                    meta[rel] = {"hash": digest,
+                                 "units": len(self._units_cache[rel])}
+
+        removed = [rel for rel in tuple(meta) if rel not in present]
+        if dry_run:
+            stats["removed"] = len(removed)
+            return
+        for rel in removed:
+            meta.pop(rel, None)
+            self._units_cache.pop(rel, None)
+        stats["removed"] = len(removed)
+        if removed:
+            mutated = True
+            self._prune_embeddings(set(meta))
+        # A directory whose sweep was cut by the gate keeps its OLD
+        # signature, so the next sweep re-checks its files instead of
+        # trusting a signature produced from an unfinished pass.
+        for parent in tainted:
+            dirs_new[parent] = old_dirs.get(parent)
+        if mutated or not self.manifest_path.exists():
+            self._save_manifest(meta, dirs_new)
+
+    def _corpus_units(self) -> list[tuple]:
+        """All indexed units in sweep order, de-duplicated by line text
+        (first source wins — same rule as the bc8baa6 baseline)."""
+        units: list[tuple] = []
+        seen: set[str] = set()
+        for path in self._search_paths():
+            for unit in self._units_cache.get(
+                    self._source_of(path, self.base_dir), ()):
+                if unit[2] in seen:
+                    continue
+                seen.add(unit[2])
+                units.append(unit)
+        return units
+
+    def _reload_corpus(self) -> list[tuple]:
+        """Self-heal: reindex failed/was gated away — read the store once
+        directly so a search never dies of an empty cache."""
+        for path in self._search_paths():
+            rel = self._source_of(path, self.base_dir)
+            self._units_cache[rel] = self._build_units(rel, path)
+        return self._corpus_units()
+
+    def _search_tfidf(self, units: list[tuple], tokens: list[str],
+                      phrase: str, limit: int) -> list[dict]:
+        """Smoothed TF-IDF over the indexed units, recency-weighted.
+
+        ``idf = log(1 + n/(1+df))`` never divides by zero and never zeroes
+        out a term seen everywhere. TF stays binary per line (presence of
+        the token), exactly the bc8baa6 semantics the owner reapproved —
+        lines are short and repetition there is emphasis, not topic. The
+        phrase bonus doubles the rarest token, and ties break on the
+        stable unit id, so the order is a pure function of
+        (corpus, query, day).
+        """
+        n = len(units)
+        if not n or not tokens:
+            return []
+        df = {token: 0 for token in tokens}
+        for _uid, _src, _line, folded, _ts in units:
+            for token in tokens:
+                if token in folded:
+                    df[token] += 1
+        idf = {token: math.log(1.0 + n / (1.0 + count))
+               for token, count in df.items()}
+        max_idf = max(idf.values())
+        now_ts = _now().timestamp()
+        scored: list[tuple] = []
+        for uid, source, line, folded, ts in units:
+            matched = [t for t in tokens if t in folded]
+            if not matched:
+                continue
+            score = sum(idf[t] for t in matched)
+            if len(tokens) > 1 and phrase in folded:
+                score += max_idf
+            score += _recency_bonus(ts, now_ts)
+            scored.append((-score, uid, source, line))
+        scored.sort()
+        return [{"source": source, "text": line[:400]}
+                for _s, _u, source, line in scored[:limit]]
+
+    def _load_embeddings(self) -> dict:
+        if self._embeddings is None:
+            store: dict = {}
+            try:
+                raw = json.loads(self.embeddings_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    for key, vec in raw.get("vectors", {}).items():
+                        if _is_vector(vec):
+                            store[str(key)] = [float(x) for x in vec]
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                print(f"[ChatMemory] embeddings repair ({self.embeddings_path}): {e}")
+            self._embeddings = store
+        return self._embeddings
+
+    def _save_embeddings(self) -> None:
+        try:
+            payload = json.dumps({"version": MANIFEST_VERSION,
+                                  "vectors": self._embeddings or {}},
+                                 ensure_ascii=False, sort_keys=True)
+            _atomic_write(self.embeddings_path, payload + "\n")
+        except Exception as e:
+            print(f"[ChatMemory] embeddings write failed: {e}")
+
+    def _prune_embeddings(self, valid_sources: set) -> None:
+        """Touched-set pruning for the vector store: drop every vector whose
+        source file is gone (keys start with the relative source path)."""
+        if not self._embeddings:
+            return
+        kept = {k: v for k, v in self._embeddings.items()
+                if k.partition("#")[0] in valid_sources}
+        if len(kept) != len(self._embeddings):
+            self._embeddings = kept
+            self._save_embeddings()
+
+    def _embed_key(self, source: str, line: str) -> str:
+        # Content-addressed: an unchanged line keeps its vector across
+        # reindexes; only its content changing invalidates it.
+        return f"{source}#{_hash_text(line)[:16]}"
+
+    def _search_vector(self, query: str, units: list[tuple],
+                       limit: int) -> list[dict] | None:
+        """Preferred path when an embed_fn is wired: cosine over lazily
+        computed, persisted vectors. Returns ``None`` — forcing the TF-IDF
+        fallback — on ANY inconsistency: model down, empty vector, or a
+        stored vector of a different dimension (corrupt/foreign index)."""
+        fn = self.embed_fn
+        if fn is None or not units:
+            return None
+        try:
+            qv = fn(query)
+        except Exception:
+            return None
+        if not _is_vector(qv):
+            return None
+        dim = len(qv)
+        vectors = self._load_embeddings()
+        fresh = False
+        now_ts = _now().timestamp()
+        scored: list[tuple] = []
+        for uid, source, line, _folded, ts in units:
+            key = self._embed_key(source, line)
+            vec = vectors.get(key)
+            if vec is None:
+                try:
+                    vec = fn(line)
+                except Exception:
+                    vec = None
+                if not _is_vector(vec):
+                    return None  # model died mid-sweep -> mandatory fallback
+                if len(vec) != dim:
+                    return None  # dimension guard -> mandatory fallback
+                vectors[key] = [float(x) for x in vec]
+                fresh = True
+            elif len(vec) != dim:
+                return None
+            sim = _cosine(qv, vec)
+            scored.append((-(sim + _recency_bonus(ts, now_ts)),
+                           uid, source, line))
+        if fresh:
+            self._save_embeddings()
+        scored.sort()
+        return [{"source": source, "text": line[:400]}
+                for _s, _u, source, line in scored[:limit]]
+
+    def search(self, query, limit=10) -> list[dict]:
+        """Accent-insensitive partial search over the manifest-indexed corpus.
+
+        Kept from the bc8baa6 base: a line matches when it holds at least
+        one token (no more AND-exata), rare tokens outrank generic ones and
+        an exact phrase doubles the rarest weight. Transplanted from the
+        owner's athena indexer: the corpus is a sha256 manifest with
+        touched-set pruning instead of a per-call full scan; IDF is the
+        smoothed ``log(1 + n/(1+df))``; ranking ties break on the stable
+        unit id so the same query always returns the same order; and an
+        optional embedder ranks by cosine first but ALWAYS degrades to
+        TF-IDF when there is no model, no vector or a dimension mismatch.
+        Recency weighs in the ranking here (athena forgot it): a line gets
+        a half-life decay bonus from its memory date, quantised per day.
         """
         try:
             limit = max(1, int(limit))
@@ -829,44 +1244,33 @@ class ChatMemory:
         if not tokens:
             return []
         phrase = _fold(text)
-        doc_freq = {token: 0 for token in tokens}
-        # line -> (insertion_index, source, matched tokens)
-        hits: dict[str, tuple[int, str, set]] = {}
         try:
+            # reindex() takes the flock gate first and the RLock inside; the
+            # writer path takes the same order (gate -> _LOCK). Never invert
+            # it here or a search and an append_turn could deadlock.
+            self.reindex()
             with _LOCK:
-                for path in self._search_paths():
-                    try:
-                        source = path.relative_to(self.base_dir).as_posix()
-                    except ValueError:
-                        source = path.name
-                    for raw in _safe_read(path).splitlines():
-                        line = raw.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        folded = _fold(line)
-                        matched = {t for t in tokens if t in folded}
-                        if not matched:
-                            continue
-                        if line in hits:
-                            continue
-                        for token in matched:
-                            doc_freq[token] += 1
-                        hits[line] = (len(hits), source, matched)
+                units = self._corpus_units()
+                if not units:
+                    units = self._reload_corpus()
+                if self.embed_fn is not None:
+                    found = self._search_vector(query, units, limit)
+                    if found is not None:
+                        return found
+                return self._search_tfidf(units, tokens, phrase, limit)
         except Exception as e:
             print(f"[ChatMemory] search failed: {e}")
             return []
-        weight = {token: 1.0 / (1.0 + freq)
-                  for token, freq in doc_freq.items()}
 
-        scored: list[tuple[float, int, str, str]] = []
-        for line, (idx, source, matched) in hits.items():
-            score = sum(weight[t] for t in matched)
-            if len(tokens) > 1 and phrase in _fold(line):
-                score += max(weight.values())
-            scored.append((-score, idx, source, line))
-        scored.sort()
-        return [{"source": source, "text": line[:400]}
-                for _neg, _i, source, line in scored[:limit]]
+    def index_status(self) -> dict:
+        """Small introspection for tools/tests: what the index holds."""
+        with _LOCK:
+            return {
+                "files": len(self._units_cache),
+                "units": sum(len(u) for u in self._units_cache.values()),
+                "embeddings": len(self._embeddings or {}),
+                "embedder": self.embed_fn is not None,
+            }
 
     # ── prompt ──────────────────────────────────────────────────────────────
     def prompt_block(self, max_chars=2000) -> str:
