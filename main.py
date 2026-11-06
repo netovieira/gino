@@ -895,9 +895,11 @@ _QODER_COMPACT_SECTIONS = {
     ),
     "JUDGEMENT": (
         "[JUDGEMENT]\n"
-        "Take the most reasonable reading and act; settle WHO/WHAT the request "
-        "is about before answering. When a rule is not obvious, read the full "
-        "protocol in core/prompt.txt.\n\n"
+        "Settle WHO/WHAT the request is about before answering. When a request "
+        "is ambiguous, insufficient or a needed detail is missing, ASK the "
+        "owner — never choose for him (owner's top law, 05/11/2026: he decides, "
+        "you execute). When a rule is not obvious, read the full protocol in "
+        "core/prompt.txt.\n\n"
     ),
     "PERSONA": (
         "[PERSONA]\n"
