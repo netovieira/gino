@@ -100,14 +100,27 @@ class VoiceEnrollSamplesTest(unittest.TestCase):
 
     def test_mic_without_saved_profile_still_accumulates(self):
         """(b) Microfone sem perfil salvo não rejeita a voz: o pedido do dono
-        abre o fluxo e as frases acumulam amostras."""
+        abre o fluxo e as frases acumulam amostras.
+
+        2.2 do contrato: com a janela de texto aberta (o caminho existente da
+        senha/abertura digitada) o fluxo começa direto; sem ela, a pergunta
+        "É O DONO?" passa a existir — o "sim" sozinho nunca abriu nada."""
         obj = _obj()
         obj._owner_speaker_confirmed = lambda _t, _p: (
             False, 0.0, "sem cadastro de voz neste microfone (perfil=edifier)")
+        # Ramificação nova: sem janela digitada, o pedido vira a pergunta.
+        self.assertTrue(main.JarvisLive._voice_train_gate(
+            obj, "cadastra minha voz", _sample()))
+        self.assertIsNone(obj._voice_train)
+        ask = getattr(obj, "_voice_enroll_ask", None)
+        self.assertTrue(ask and ask.get("kind") == "owner")
+        self.assertTrue(any("perguntando" in ln for ln in obj.ui.lines))
+        # E o caminho antigo continua: com a janela aberta por texto o fluxo
+        # começa e as frases acumulam amostras.
+        obj._voice_bootstrap_until = time.monotonic() + 600.0
         self.assertTrue(main.JarvisLive._voice_train_gate(
             obj, "cadastra minha voz", _sample()))
         self.assertIsNotNone(obj._voice_train)
-        self.assertTrue(any("iniciando sem perfil" in ln for ln in obj.ui.lines))
         self.assertTrue(main.JarvisLive._voice_train_gate(
             obj, main._VOICE_TRAIN_PROMPTS[0], _sample()))
         self.assertEqual(len(obj._voice_train["samples"]), 1)
@@ -126,12 +139,17 @@ class VoiceEnrollSamplesTest(unittest.TestCase):
         obj = _obj()
         self.assertTrue(main.JarvisLive._voice_train_gate(
             obj, "cadastra minha voz", _sample()))
-        obj._voice_train["last_activity"] = time.monotonic() - 120.0
+        obj._voice_train["last_activity"] = (
+            time.monotonic() - main._VOICE_TRAIN_IDLE_TIMEOUT_S - 30.0)
         self.assertTrue(main.JarvisLive._voice_train_check_timeout(obj))
         self.assertIsNone(obj._voice_train)
         cancel = [ln for ln in obj.ui.lines if "cancelado por inatividade" in ln]
         self.assertTrue(cancel)
         self.assertIn("amostras=0/5", cancel[0])
+        # Motivo e origem legíveis (item 4 do contrato de hoje: a sessão
+        # morreu aos 60s com zero amostras e o log não dizia por quê).
+        self.assertIn("motivo=timeout", cancel[0])
+        self.assertIn("origem=", cancel[0])
         self.assertIn("blocos=40", cancel[0])
         self.assertIn("silencio", cancel[0])
         self.assertIn("microfone=c920", cancel[0])

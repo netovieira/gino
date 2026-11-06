@@ -31,6 +31,13 @@ SEPARATE FROM ROOT
     device control). It never authorises sudo or root — core/rootgate.py owns
     that, with its own window. Opening one does not open the other.
 
+SEPARATE FROM STANDING PERSON-GRANTS
+    Everything here is a WINDOW: it opens on a spoken consent and dies on a
+    deadline. The contract's standing grants per person ("dê acesso total a
+    VALMIRA", FLUXOS.md ramificação "*") live in core/voice_grants.py and
+    are created only by the owner under a privileged verdict. A window here
+    is not a grant there, and a grant there never opens a window here.
+
 AUTONOMOUS WHATSAPP REPLIES
     A narrower grant, checked by the bridge's preauthorize hook rather than by
     confirm(): when a new individual WhatsApp message addresses the assistant

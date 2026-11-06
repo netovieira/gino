@@ -216,7 +216,7 @@ class GrayTriggerTest(unittest.TestCase):
 class SessionCoherenceTest(unittest.TestCase):
     """(d) 5 amostras autoconsistentes substituem; discrepantes são recusadas."""
 
-    def _run_five(self, vectors, gray=False):
+    def _run_five(self, vectors, gray=False, answer="substituir"):
         if gray:
             obj = _obj(GraySpeaker(score=0.46, vectors=vectors))
             self.assertTrue(main.JarvisLive._voice_train_gate(
@@ -230,6 +230,12 @@ class SessionCoherenceTest(unittest.TestCase):
             self.assertTrue(main.JarvisLive._voice_train_gate(
                 obj, prompt, _phrase_pcm(i)), prompt)
         self.assertIsNone(obj._voice_train)
+        # 2.1 do contrato: com cadastro existe, o fluxo PERGUNTA adicionar ou
+        # substituir antes de gravar. A resposta é uma fala curta no portão.
+        # (Sessão recusada por incoerência nunca chega a perguntar.)
+        if answer is not None and getattr(obj, "_voice_enroll_ask", None):
+            self.assertTrue(main.JarvisLive._voice_train_gate(
+                obj, answer, PCM))
         return obj
 
     def test_five_consistent_samples_replace_the_old_profile(self):
