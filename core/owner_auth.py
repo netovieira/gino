@@ -18,6 +18,16 @@ import secrets
 
 PREFIX = "pbkdf2_sha256"
 REDACTED = "[senha oculta]"
+
+# ── Veredito compartilhado de fatores ───────────────────────────────────────
+# A lei do dono: o fator aceito para autorização privilegiada é a VOZ DO DONO
+# OU A SENHA DIGITADA (texto no app ou no WhatsApp dele — não existe campo
+# próprio de senha). Todo portão que distingue fatores cita estas constantes:
+# actiongate (janelas de ação/envio), job_grant (resposta a planos) e, por
+# exclusão, rootgate/reinício/energia, que só aceitam FACTOR_VOICE.
+FACTOR_VOICE = "voz do dono"
+FACTOR_TEXT = "senha digitada"
+FACTORS = (FACTOR_VOICE, FACTOR_TEXT)
 # Accepted typed forms: "senha: X", "senha=X", "autorizar: X", "/autorizar X".
 PASSWORD_RE = re.compile(
     r"^\s*(?:(?:/|\.)autorizar\s+|(?:autorizar|senha)\s*[:=]\s*)"

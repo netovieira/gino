@@ -10058,8 +10058,10 @@ class JarvisLive:
 
         Accepted forms: ``senha: <senha>``, ``senha=<senha>``,
         ``autorizar: <senha>`` and ``/autorizar <senha>``. A correct password
-        opens the ordinary 120 s risky-action window, the 15-minute WhatsApp
-        send window and a 10-minute typed-owner session. It never authorizes
+        is the owner's typed factor — the SAME veredito de fator da voz — and
+        opens the ordinary 120 s risky-action window, the 15-minute message-
+        send window (WhatsApp e send_message, mesmo escopo, mesmo TTL) e um
+        10-minute typed-owner session. It never authorizes
         restart, power or e-mail by itself, and it never reaches the model.
         """
         line = str(text or "").strip()
@@ -10114,14 +10116,19 @@ class JarvisLive:
         self._owner_text_channel = channel
         # FLUXO TRABALHO, passo 5: a senha digitada correta é o segundo fator
         # que aprova um plano. Abre a janela one-shot do job se há um esperando.
-        self._arm_job_grant("senha digitada")
+        self._arm_job_grant("senha digitada")  # == _owner_auth.FACTOR_TEXT
         try:
-            secs = float(_actiongate.open_window())
+            secs = float(_actiongate.open_window(
+                factor=_owner_auth.FACTOR_TEXT))
         except Exception as e:
             print(f"[OwnerAuth] janela de ação falhou: {e}")
             secs = 0.0
         try:
-            _actiongate.arm_send_window()
+            # Fator senha: a janela de envio cobre o ENVIO inteiro (WhatsApp e
+            # send_message) com o mesmo TTL — portão único, sem exceção por
+            # ação (defeito de 13/11/2026 23:07: send_message caía em "voice
+            # yet" quando a janela genérica de 120 s expirava).
+            _actiongate.arm_send_window(factor=_owner_auth.FACTOR_TEXT)
         except Exception as e:
             print(f"[OwnerAuth] janela de envio falhou: {e}")
         minutes = int(round(_OWNER_TEXT_TTL_S / 60.0))
@@ -10134,7 +10141,7 @@ class JarvisLive:
         self._owner_text_notify(
             f"Autorizado por texto por {minutes} minutos. A janela de ações "
             f"de risco está aberta por {secs:.0f}s e o próximo envio de "
-            "WhatsApp está liberado. Para o cadastro de voz, digite "
+            "mensagem está liberado. Para o cadastro de voz, digite "
             "'abrir cadastro de voz'.", channel, account, chat)
         return True
 
