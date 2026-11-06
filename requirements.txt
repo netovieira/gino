@@ -99,6 +99,8 @@ onnxruntime>=1.16,<2
 sherpa-onnx==2.0.1
 transformers>=4.48,<5
 scipy>=1.11,<2
+noisereduce>=3.0,<4              # RNNoise pre-filter (FASE2-TASK1)
+speechbrain>=1.0,<2              # ECAPA-TDNN speaker ID (FASE2-TASK2)
 
 # ── Opt-in voice unlock (Secret Service / keyring) ───────────────────────────
 keyring>=25

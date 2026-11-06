@@ -7,6 +7,7 @@ Vosk     – offline streaming transcription (lighter)
 import json
 import numpy as np
 
+from core import noise_filter as _noise
 from core import silero_vad as _silero_vad
 
 
@@ -134,6 +135,12 @@ class WhisperSTT:
     def transcribe(self, audio: np.ndarray) -> str:
         """Transcribe a float32 mono 16 kHz numpy array. Returns transcript string."""
         try:
+            # ── RNNoise pre-filter (FASE2-TASK1) ──────────────────────────
+            # Apply noise reduction to the accumulated audio BEFORE VAD filter
+            # and Whisper transcription.  When noisereduce is unavailable,
+            # filter_array is a transparent passthrough.
+            if _noise.available():
+                audio = _noise.filter_array(audio)
             # Pre-filter with Silero VAD (or RMS fallback) to strip silence
             # before sending to Whisper.  This reduces hallucinations on
             # room noise and improves transcription accuracy.

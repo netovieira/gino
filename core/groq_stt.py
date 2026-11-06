@@ -40,6 +40,7 @@ import numpy as np
 import requests
 
 from core import duck as _duck
+from core import noise_filter as _noise
 from core import silero_vad
 
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -923,7 +924,12 @@ class GroqListener:
         if x.size == 0:
             return
         self._last_feed_at = time.monotonic()
-        raw = np.asarray(block, dtype=np.int16).tobytes()
+        # ── RNNoise pre-filter (FASE2-TASK1) ─────────────────────────────
+        # Apply noise reduction to each 64 ms block BEFORE the VAD/RMS
+        # threshold and before storing in the ring buffer.  When the filter
+        # is unavailable, ``filter_block`` is a transparent passthrough.
+        raw_unfiltered = np.asarray(block, dtype=np.int16).tobytes()
+        raw = _noise.filter_block(raw_unfiltered, self._sr) if _noise.available() else raw_unfiltered
         # Record FIRST, before any gate below can return: the ring is the only
         # copy of the audio that precedes a detection, and it must keep running
         # while the stream is open (asleep, echo tail, our own playback).
@@ -940,7 +946,10 @@ class GroqListener:
             # the reopen, and the retained speech goes back into the worker
             # where the endpointing window joins it with this same phrase.
             self._release_held()
-        level = float(np.sqrt(np.mean(x * x))) / 32768.0
+        # Level is computed from the FILTERED audio so the RMS threshold
+        # benefits from the noise suppression (FASE2-TASK1).
+        x_filtered = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+        level = float(np.sqrt(np.mean(x_filtered * x_filtered))) / 32768.0
 
         if self._drop_segment:
             # The reply started: whatever was half-open belongs to the previous
