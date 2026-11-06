@@ -149,6 +149,8 @@ from core import qoder_jobs as _qoder_jobs
 from core import job_grant as _job_grant
 from core import free_models as _free_models
 from core import owner_auth as _owner_auth
+from core import voice_grants as _voice_grants
+from core import voice_identity as _voice_identity
 from core.viseme               import VisemeStream
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
@@ -1347,6 +1349,35 @@ _VOICE_BOOTSTRAP_CLOSE_RE = re.compile(
     r"[^.!?]{0,40}\bcadastro\s+(?:da|de)\s+voz\b",
     re.IGNORECASE)
 _VOICE_BOOTSTRAP_TTL_S = 600.0
+
+# ── Ramificação 2.1 / 2.2 do contrato (skills/fluxos/FLUXOS.md) ────────────
+# Pergunta ADICIONAR ou SUBSTITUIR quando o dono já tem amostras. SEM
+# resposta (silêncio/timeout) = NÃO GRAVA NADA — nunca substituir em silêncio.
+_VOICE_ENROLL_ADD_WORDS = frozenset({
+    "adicionar", "adicione", "adiciona", "acrescentar", "acrescente",
+    "acrescenta", "somar", "some", "soma", "juntar", "junte", "junta",
+    "mais", "manter", "mantem", "completar", "complete", "completa",
+    "acrescentadas", "adicionadas", "adicionar as novas",
+})
+_VOICE_ENROLL_REPLACE_WORDS = frozenset({
+    "substituir", "substitua", "substitui", "trocar", "troque", "troca",
+    "reescrever", "regravar", "substituir tudo", "trocar tudo",
+})
+_VOICE_ENROLL_ANSWER_TIMEOUT_S = 45.0
+# A resposta à pergunta "É O DONO?" é apenas o ROTEADOR da ramificação 2.2:
+# ela nunca autoriza sozinha (ver _voice_enroll_answer_owner).
+_VOICE_OWNER_ASK_TIMEOUT_S = 45.0
+_VOICE_OWNER_YES_WORDS = frozenset({
+    "sim", "sou", "sou eu", "exatamente", "correto", "confirmo", "confirmo",
+})
+# Voz do visitante na sessão guiada (ramificação 2.2.2 / 6.2 — cadastro
+# permitido, credencial de visitante). Os limiares abaixo SÃO DECISÃO DO DONO
+# (valores conservadores de partida, reportados no resumo): só fala humana
+# clara e autoconsistente virou visitante. O portão da pergunta aceita voz
+# de visitante já cadastrada ACIMA do piso de indulgência — nunca a faixa
+# cinzenta, nunca "desconhecida".
+_VISITOR_ENROLL_MIN_VOICED_S = 5.0
+
 # Typed password authorization. It opens the ordinary risky-action window and
 # a 10-minute typed-owner session (which also unlocks the enrollment trigger).
 # The password is consumed before the model/memory and never logged.
@@ -1476,7 +1507,16 @@ _VOICE_TRAIN_ECHO_TAIL_S = 0.30
 _VOICE_TRAIN_SYNTH_MAX_S = 20.0
 # Cadastro com o dono ausente: sem nenhuma resposta por este tempo, a sessão
 # morre com aviso (antes ela ficava armada indefinidamente).
-_VOICE_TRAIN_IDLE_TIMEOUT_S = 60.0
+# Janela de inatividade do cadastro guiado. Medida de hoje (05/11, a única
+# sessão real do dia morreu aos 60s com 0/5 amostras): o dono só responde
+# depois que meu TTS TERMINA — as frases prompt medem 2,3-5,4s de áudio
+# sintetizado e o relógio da janela só pega quando a última sai pela boca.
+# O dono então precisa ouvir, repetir e o STT entregar o segmento (~2s de
+# silêncio final no modo cadastro). 60s dava folga só para uma frase; 150s
+# = ~5s de prompt + ~145s de resposta, e a janela ainda fecha por eco (o
+# prompt ativo segura o timeout) ou cancelamento falado, então sessão zumbi
+# não fica ouvindo o ambiente para sempre. O watch acorda a cada 2s.
+_VOICE_TRAIN_IDLE_TIMEOUT_S = 150.0
 # Falhas só contam dentro desta janela; uma tentativa errada isolada de
 # madrugada não pode se somar a outra de minutos depois para cancelar o roteiro.
 _VOICE_TRAIN_FAILURE_WINDOW_S = 90.0
@@ -2371,6 +2411,13 @@ class JarvisLive:
         self._last_known_at        = 0.0
         self._voice_train          = None
         self._voice_train_offered  = False
+        # Perguntas pendentes do contrato (FLUXOS.md 2.1/2.2): "É O DONO?"
+        # antes de abrir sessão, "adicionar ou substituir" antes de gravar.
+        # Nasce fechada; expira sem gravar nada.
+        self._voice_enroll_ask     = None
+        # Store de grants por pessoa (core/voice_grants). Lazy: criado na
+        # primeira consulta; teste pode injetar caminho temporário.
+        self._voice_grants_store   = None
         # O gatilho de cadastro entrou pela faixa cinzenta do microfone
         # conhecido? Só marca a SESSÃO; nenhuma outra porta lê isto.
         self._voice_train_gray_open = False
@@ -4636,6 +4683,11 @@ class JarvisLive:
             if self._voice_bootstrap_gate(text, None, "whatsapp",
                                           account, chat):
                 return True
+            # Grant por texto exige a mesma prova dura do UI: só vale com a
+            # sessão de senha digitada aberta agora (number spoofing não é
+            # voiceprint do dono).
+            if self._voice_grant_gate(text, None):
+                return True
 
         # A note that answers a PARKED restart keeps its audio for the
         # confirmation gate even when the strict pre-check could not match the
@@ -6240,9 +6292,18 @@ class JarvisLive:
             # A resposta ao job tem portão próprio (core/job_grant): vale só a
             # janela aberta pela voz do dono ou pela senha digitada, one-shot,
             # conferida de novo no handler. Sem janela nada passa — o portão
-            # genérico não é afrouxado para nenhuma outra ação.
+            # genérico não é afrouxado para nenhuma outra ação, e grant por
+            # pessoa (core/voice_grants) NÃO cobre resposta de job do dono.
             return _job_grant.has_valid(_qoder_jobs.pending_reply_id())
-        return _actiongate.whatsapp_reply_allowed(name, args)
+        if _actiongate.whatsapp_reply_allowed(name, args):
+            return True
+        # Consulta dos GRANTS antes da recusa (contrato 2.2.2.* e ramificação
+        # "*): o padrão permanece NEGAÇÃO — só passa a fala cuja voz
+        # cadastrada tem grant ativo cobrindo a categoria nominal do pedido
+        # (projeto/e-mail/WhatsApp). Escrita de perfil de voz não é escopo
+        # concedível (core/voice_grants); as janelas de risco normais valem
+        # para quem não tem grant.
+        return self._voice_grant_allows(name, args)
 
     def _bridge_confirm(self, title: str, message: str) -> bool:
         """Owner-factor confirmation for bridge actions (medium/high tier).
@@ -8638,14 +8699,32 @@ class JarvisLive:
         except Exception:
             pass
 
-    def _start_voice_training(self, why: str = "") -> None:
-        owner = (self._speaker.owner_name or "Anthero") if self._speaker else "Anthero"
+    def _start_voice_training(self, why: str = "", *,
+                              kind: str = "owner") -> None:
+        """Abre a sessão guiada de 5 frases.
+
+        ``kind``: "owner" (dono cadastrando/substituindo; no fim, se já há
+        cadastro a sessão pergunta ADICIONAR ou SUBSTITUIR — ramificação 2.1)
+        ou "visitor" (ramificação 2.2.2 / 6.2: cadastro com credencial de
+        VISITANTE — as amostras entram NÃO autorizadas, só a coerência das
+        5 frases valida que é a mesma pessoa; nada aqui dá acesso a projeto,
+        e-mail ou WhatsApp).
+        """
+        visitor = (str(kind or "") == "visitor")
+        # Nenhuma pergunta do contrato sobrevive à abertura de uma sessão.
+        self._voice_enroll_ask = None
+        if visitor:
+            owner = self._next_visitor_label()
+        else:
+            owner = ((self._speaker.owner_name or "Anthero")
+                     if self._speaker else "Anthero")
         total = len(_VOICE_TRAIN_PROMPTS)
         # ``samples`` buffers the five embeddings in memory: the store is
         # written once, at the end, replacing the old set (see step 5/5).
         now = time.monotonic()
         self._voice_train = {"done": 0, "total": total, "owner": owner,
                              "fails": 0, "samples": [],
+                             "kind": "visitor" if visitor else "owner",
                              "prompt_guard_until": 0.0,
                              "prompt_audio_until": 0.0,
                              "prompt_pending": False,
@@ -8667,12 +8746,36 @@ class JarvisLive:
                 print(f"[Voice] não consegui acordar para o cadastro: {e}")
         self._voice_train_listener(True)
         self.ui.write_log("SYS: cadastro de voz guiado — "
-                          f"{total} frases ({why or 'pedido do dono'}).")
-        self._voice_train_prompt(
-            self._voice_train,
-            f"Vou fazer como o Ok Google, {owner}: {total} frases curtas "
-            f"para eu aprender a sua voz. Repita: {_VOICE_TRAIN_PROMPTS[0]}")
+                          f"{total} frases ({why or 'pedido do dono'})"
+                          + (", credencial de visitante" if visitor else "")
+                          + ".")
+        if visitor:
+            self._voice_train_prompt(
+                self._voice_train,
+                f"Certo, vou te cadastrar como visitante: {total} frases "
+                f"curtas. Repita: {_VOICE_TRAIN_PROMPTS[0]}")
+        else:
+            self._voice_train_prompt(
+                self._voice_train,
+                f"Vou fazer como o Ok Google, {owner}: {total} frases curtas "
+                f"para eu aprender a sua voz. Repita: {_VOICE_TRAIN_PROMPTS[0]}")
         self._voice_train_watch(self._voice_train)
+
+    def _next_visitor_label(self) -> str:
+        """Rótulo interno ('visitante-1', 'visitante-2'…) — nunca um dado
+        pessoal; é só a chave do perfil de visitante no índice."""
+        used: set[str] = set()
+        try:
+            for rec in (self._speaker.list() if self._speaker else []):
+                name = str(rec.get("name") or "").strip().lower()
+                if name.startswith("visitante-"):
+                    used.add(name)
+        except Exception:
+            pass
+        n = 1
+        while f"visitante-{n}" in used:
+            n += 1
+        return f"visitante-{n}"
 
     def _voice_train_listener(self, enabled: bool) -> None:
         """Tell the segmenter to wait ~1.8 s of silence during enrollment."""
@@ -8822,8 +8925,17 @@ class JarvisLive:
             parts.append(f"ignoradas={int(session.get('ignored') or 0)}")
         return ", ".join(parts) if parts else "sem diagnóstico"
 
-    def _voice_train_check_timeout(self, now: float | None = None) -> bool:
-        """End a session that sat idle too long, with an audible warning."""
+    def _voice_train_check_timeout(self, now: float | None = None,
+                                  reason: str = "timeout") -> bool:
+        """End a session that sat idle too long, with an audible warning.
+
+        O fim é SEMPRE registrado com motivo e origem legíveis (timeout,
+        eco, transitório, mic…): foi assim que a sessão de hoje morreu com
+        0/5 amostras sem que ninguém soubesse por quê. O watch (2s) garante
+        que o prazo estendido não vire sessão zumbi: a janela também fecha
+        por cancelamento falado e o portão de eco continua descartando o
+        próprio prompt enquanto ele estiver no ar.
+        """
         session = self._voice_train
         if not session:
             return False
@@ -8840,9 +8952,15 @@ class JarvisLive:
         self._voice_train = None
         self._voice_train_listener(False)
         try:
+            origin = _voice_identity.origin_from_detail(
+                self._voice_train_diag(session))
+        except Exception:
+            origin = "?"
+        try:
             self.ui.write_log(
                 "SYS: cadastro de voz cancelado por inatividade — "
-                f"{_VOICE_TRAIN_IDLE_TIMEOUT_S:.0f}s sem resposta; "
+                f"motivo={reason} ({_VOICE_TRAIN_IDLE_TIMEOUT_S:.0f}s sem "
+                f"resposta), origem={origin}; "
                 f"amostras={grabbed}/{session['total']}: nenhuma chegou ao "
                 f"portão do cadastro no período — "
                 f"{self._voice_train_diag(session)}.")
@@ -9080,6 +9198,7 @@ class JarvisLive:
             try:
                 self.ui.write_log("SYS: cadastro de voz cancelado após "
                                   f"{fails} tentativas recusadas; "
+                                  "motivo=tentativas origem=tentativas; "
                                   f"amostras={grabbed}/{session['total']}: "
                                   f"{diag}.")
             except Exception:
@@ -9214,7 +9333,10 @@ class JarvisLive:
                 try:
                     self.ui.write_log(
                         "SYS: cadastro de voz recusado — as 5 frases não "
-                        f"batem entre si ({why}); nada foi substituído.")
+                        f"batem entre si ({why}); "
+                        f"motivo=incoerencia origem="
+                        f"{_voice_identity.origin_from_detail(why)}; "
+                        "nada foi substituído.")
                 except Exception:
                     pass
                 self._say_now("As suas cinco frases não bateram entre si — "
@@ -9223,64 +9345,185 @@ class JarvisLive:
                 return True
             self._voice_train = None
             self._voice_train_listener(False)
-            backup = ""
-            device = self._capture_device_label()
-            try:
-                if self._has_owner_enrolled():
-                    result = self._speaker.replace_samples(
-                        session["owner"], buffered, authorized=True,
-                        device=device)
-                else:
-                    # First enrollment: nothing to replace, just create it.
-                    result = self._speaker.enroll(
-                        session["owner"], buffered, authorized=True,
-                        device=device) or {}
-                stored = int(result.get("samples") or len(buffered))
-                backup = str(result.get("backup") or "")
-                self._refresh_voice_cohorts("cadastro guiado")
-            except Exception as e:
-                try:
-                    self.ui.write_log(
-                        "SYS: cadastro de voz — não consegui substituir as "
-                        f"amostras: {str(e)[:80]}.")
-                except Exception:
-                    pass
-                self._say_now("Não consegui gravar as amostras novas. As antigas "
-                              "continuam como estavam.")
-                return True
-            # Enrollment finished: the temporary window closes and the
-            # owner-only trigger is restored automatically.
-            self._voice_bootstrap_close("concluído")
-            if session.get("gray_trigger"):
-                # Aberto pela cinza: dizer em voz alta que o perfil velho, que
-                # rejeitava o próprio dono, foi de fato substituído.
-                self._say_now("Seu perfil antigo estava contaminado e não te "
-                              "reconhecia; ele foi substituído pela sua voz "
-                              "nova destas cinco frases coerentes.")
-                try:
-                    self.ui.write_log(
-                        "SYS: cadastro de voz concluído por faixa cinzenta — "
-                        "perfil velho substituído pelas 5 novas amostras.")
-                except Exception:
-                    pass
-            self._say_now(f"Pronto, {session['owner']}. Substituí as amostras "
-                          f"antigas por {stored} novas da sua voz. Agora eu devo "
-                          "te reconhecer mesmo quando você fala baixo ou está "
-                          "com o nariz entupido.")
-            try:
-                self.ui.write_log(
-                    f"SYS: voz de {session['owner']} substituída — "
-                    f"{total} frases aceitas, {stored} amostras no índice"
-                    + (f", backup {Path(backup).name}" if backup else "")
-                    + ".")
-            except Exception:
-                pass
-            return True
+            return self._voice_enroll_finish(session, list(buffered))
         self._voice_train_prompt(
             session,
             f"Boa, {session['done']} de {session['total']}. Agora repita: "
             f"{_VOICE_TRAIN_PROMPTS[session['done']]}")
         return True
+
+    # ── Fim do cadastro: ramificações 2.1 e 2.2.2 do contrato ──────────────
+    def _voice_enroll_finish(self, session: dict, buffered: list) -> bool:
+        """As 5 frases coerentes acabaram: escolher a rota de gravação.
+
+        Dono COM cadastro: pergunta ADICIONAR ou SUBSTITUIR (ramificação 2.1)
+        antes de encostar no índice. SEM resposta no prazo = NÃO GRAVA NADA
+        — nunca substituir em silêncio. Dono sem cadastro: cria o perfil.
+        Visitante (ramificação 2.2.2 / 6.2): grava NÃO autorizado.
+        """
+        if str(session.get("kind") or "") == "visitor":
+            return self._voice_enroll_commit(session, buffered, "visitor")
+        if self._has_owner_enrolled():
+            # 2.1: já existe cadastro — a escolha é do dono, falada.
+            self._voice_enroll_ask = {
+                "kind": "mode", "owner": session["owner"],
+                "samples": buffered,
+                "gray_trigger": bool(session.get("gray_trigger")),
+                "until": time.monotonic() + _VOICE_ENROLL_ANSWER_TIMEOUT_S,
+            }
+            self._say_now("Suas cinco frases bateram entre si. Quer ADICIONAR "
+                          "essas amostras às que já tenho, ou SUBSTITUIR as "
+                          "antigas? Se não responder, não gravo nada.")
+            try:
+                self.ui.write_log("SYS: cadastro de voz — frases aceitas; "
+                                  "perguntando adicionar ou substituir "
+                                  "(sem resposta, nada é gravado).")
+            except Exception:
+                pass
+            return True
+        return self._voice_enroll_commit(session, buffered, "create")
+
+    def _voice_enroll_commit(self, session: dict, buffered: list,
+                             choice: str) -> bool:
+        """A rota escolhida chega ao GRAVADOR JÁ EXISTENTE do app.
+
+        "replace" → ``SpeakerId.replace_samples`` (perfil deste microfone);
+        "add"     → o caminho de adição já existente, ``SpeakerId.auto_enroll``
+                    (o mesmo +1 do auto-enroll conversacional em
+                    ``_auto_enroll_voice``) frase a frase — nada é substituído;
+        "create"  → primeira voz: ``SpeakerId.enroll``;
+        "visitor" → ``SpeakerId.enroll`` com ``authorized=False``: credencial
+                    de VISITANTE (só leitura de dados fora de projeto, e-mail
+                    e WhatsApp — o portão privilegiado continua negando).
+        """
+        backup = ""
+        device = self._capture_device_label()
+        owner = session["owner"]
+        try:
+            if choice == "add":
+                added, blocked = self._voice_enroll_add(buffered)
+                if added:
+                    self._refresh_voice_cohorts("adicionar amostras")
+                    self._say_now(f"Adicionei {added} das {len(buffered)} "
+                                  "frases às suas amostras; nada foi "
+                                  "substituído.")
+                else:
+                    self._say_now("Não consegui adicionar essas amostras "
+                                  f"({blocked}). Nada foi substituído; seu "
+                                  "perfil continua como estava.")
+                try:
+                    self.ui.write_log(
+                        "SYS: cadastro de voz — adicionar escolhido: "
+                        f"{added}/{len(buffered)} via auto-enroll "
+                        f"({blocked}); perfil não substituído.")
+                except Exception:
+                    pass
+                return True
+            if choice == "visitor":
+                # Credencial de VISITANTE: authorized=False. O cadastro é
+                # permitido pelo contrato (2.2.2 / 6.2) e NÃO dá acesso a
+                # projeto, e-mail ou WhatsApp — isso é o portão privilegiado
+                # (owner_decision), que um grant do dono pode ampliar.
+                result = self._speaker.enroll(
+                    owner, buffered, authorized=False, device=device) or {}
+                stored = int(result.get("samples") or len(buffered))
+                self._refresh_voice_cohorts("cadastro de visitante")
+                self._say_now(f"Pronto. Registrei a sua voz como "
+                              f"{owner}: posso responder ao você, mas dados "
+                              "de projeto, e-mail e WhatsApp pedem a senha ou "
+                              "a voz do dono.")
+                try:
+                    self.ui.write_log(
+                        f"SYS: cadastro de visitante concluído — {stored} "
+                        f"amostras, não autorizadas, rótulo interno {owner}.")
+                except Exception:
+                    pass
+                return True
+            if choice == "replace":
+                result = self._speaker.replace_samples(
+                    owner, buffered, authorized=True, device=device)
+            else:
+                # First enrollment: nothing to replace, just create it.
+                result = self._speaker.enroll(
+                    owner, buffered, authorized=True, device=device) or {}
+            stored = int(result.get("samples") or len(buffered))
+            backup = str(result.get("backup") or "")
+            self._refresh_voice_cohorts("cadastro guiado")
+        except Exception as e:
+            try:
+                self.ui.write_log(
+                    "SYS: cadastro de voz — não consegui substituir as "
+                    f"amostras: {str(e)[:80]}.")
+            except Exception:
+                pass
+            self._say_now("Não consegui gravar as amostras novas. As antigas "
+                          "continuam como estavam.")
+            return True
+        if session.get("gray_trigger") and choice != "visitor":
+            # Aberto pela cinza: dizer em voz alta que o perfil velho, que
+            # rejeitava o próprio dono, foi de fato substituído.
+            self._say_now("Seu perfil antigo estava contaminado e não te "
+                          "reconhecia; ele foi substituído pela sua voz "
+                          "nova destas cinco frases coerentes.")
+            try:
+                self.ui.write_log(
+                    "SYS: cadastro de voz concluído por faixa cinzenta — "
+                    "perfil velho substituído pelas 5 novas amostras.")
+            except Exception:
+                pass
+        # Enrollment finished: the temporary window closes and the
+        # owner-only trigger is restored automatically.
+        self._voice_bootstrap_close("concluído")
+        if choice != "visitor":
+            if choice == "replace":
+                self._say_now(
+                    f"Pronto, {owner}. Substituí as amostras antigas por "
+                    f"{stored} novas da sua voz. Agora eu devo te reconhecer "
+                    "mesmo quando você fala baixo ou está com o nariz "
+                    "entupido.")
+            else:
+                self._say_now(
+                    f"Pronto, {owner}. Registrei {stored} amostras da sua "
+                    "voz. Agora eu devo te reconhecer mesmo quando você fala "
+                    "baixo ou está com o nariz entupido.")
+        try:
+            self.ui.write_log(
+                f"SYS: voz de {owner} "
+                + ("substituída" if choice == "replace" else "gravada")
+                + f" ({choice}) — "
+                f"{len(buffered)} frases aceitas, {stored} amostras no índice"
+                + (f", backup {Path(backup).name}" if backup else "")
+                + ".")
+        except Exception:
+            pass
+        return True
+
+    def _voice_enroll_add(self, buffered: list) -> tuple[int, str]:
+        """Rota ADICIONAR: reusa o +1 do auto-enroll (``SpeakerId.auto_enroll``).
+
+        Nenhum gravador novo: cada embeddings vai para o conjunto expandido
+        da voz casada, exatamente como a fala aceita do dia a dia. Amostra
+        recusada (duplicada, fora do piso) não substitui nada.
+        """
+        added = 0
+        blocked = ""
+        try:
+            enabled = bool(getattr(self._speaker, "auto_enroll_enabled", False))
+        except Exception:
+            enabled = False
+        if not enabled:
+            return 0, "auto-enroll desativado"
+        for emb in buffered:
+            try:
+                result = self._speaker.auto_enroll(embedding=emb)
+            except Exception as e:
+                blocked = str(e)[:60]
+                break
+            if result.get("enrolled"):
+                added += 1
+            else:
+                blocked = str(result.get("reason") or "recusada")
+        return added, blocked
 
     # ── Voz por aparelho: janela do perfil "celular" ────────────────────────
     @staticmethod
@@ -10443,6 +10686,12 @@ class JarvisLive:
             return False
         if self._voice_train is not None:
             return self._voice_train_step(text, pcm)
+        # Resposta pendente das perguntas do contrato (2.1 "adicionar ou
+        # substituir", 2.2 "é o dono?") — tratada ANTES de qualquer matcher,
+        # porque a resposta curta ("sim", "adicionar") não é frase de pedido.
+        if getattr(self, "_voice_enroll_ask", None):
+            if self._voice_enroll_answer(text, pcm):
+                return True
         line = str(text or "")
         if not line or not _VOICE_TRAIN_RE.search(line):
             return False
@@ -10466,6 +10715,13 @@ class JarvisLive:
                 pass
             return False
         ok, score, detail = self._voice_train_owner_ok(line, pcm)
+        if ok and "primeira voz" in detail and not self._voice_bootstrap_active():
+            # Ramificação 2.2 do contrato: a primeira voz do sistema NÃO abre
+            # o cadastro sozinha. O pedido vira a pergunta "é o dono?"; o
+            # caminho digitado (senha/abrir cadastro de voz) continua abrindo
+            # direto, como antes — foi a porta de partida do app.
+            ok = False
+            detail = f"sem cadastro de voz neste microfone ({detail})"
         if not ok and self._voice_bootstrap_active():
             # Temporary window (armed by typed text): the trigger no longer
             # needs the voiceprint, because the old profile may be too thin to
@@ -10484,13 +10740,9 @@ class JarvisLive:
             # microfone que ainda não tem cadastro. Bloquear o pedido aqui era
             # o ciclo vicioso (04/11 23:22: o aviso manda dizer "cadastra minha
             # voz" e o pedido chegava a ser ignorado por não haver perfil).
-            try:
-                self.ui.write_log(
-                    "SYS: cadastro de voz — iniciando sem perfil salvo neste "
-                    f"microfone ({detail}); as 5 frases criam o perfil.")
-            except Exception:
-                pass
-            ok = True
+            # A saída agora é o passo do contrato (2.2 / 6): PERGUNTAR "É O
+            # DONO?" em vez de abrir às cegas — nada é gravado sem resposta.
+            return self._voice_enroll_ask_owner(line, score, detail)
         if not ok:
             try:
                 self.ui.write_log(
@@ -10511,6 +10763,347 @@ class JarvisLive:
             self._voice_train["gray_trigger"] = True
         self._voice_train_gray_open = False
         return True
+
+    # ── Perguntas do contrato (FLUXOS.md 2.1 "adicionar/substituir",
+    #                        2.2/5/6 "é o dono?") ───────────────────────────
+    @staticmethod
+    def _voice_answer_words(text: str) -> set:
+        return set(re.findall(
+            r"[a-záàâãéêíóôõúüç]+", str(text or "").lower()))
+
+    def _voice_enroll_ask_owner(self, line: str, score: float,
+                                detail: str) -> bool:
+        """Pergunta "É O DONO?" para voz sem cadastro (ramificações 2.2 / 5).
+
+        LINHA-LEI DO CÓDIGO: o "sim" falado NÃO é credencial e nunca abre
+        portão nenhum sozinho — ele apenas ROTEIA entre (i) o caminho já
+        existente da senha escrita/voz do dono (janela aberta por texto ou
+        orientação do `_voice_train_refusal_hint`) e (ii) seguir para o
+        cadastro com credencial de VISITANTE. Sem resposta em
+        ``_VOICE_OWNER_ASK_TIMEOUT_S`` nada acontece; o pedido morreu, não a
+        segurança.
+        """
+        now = time.monotonic()
+        self._voice_enroll_ask = {
+            "kind": "owner", "until": now + _VOICE_OWNER_ASK_TIMEOUT_S,
+            "asked_at": now, "reprompted": False,
+        }
+        try:
+            origin = _voice_identity.origin_from_detail(detail)
+            self.ui.write_log(
+                f"SYS: cadastro de voz — voz sem cadastro (score="
+                f"{float(score or 0.0):.2f}, origem={origin}, {detail}); "
+                "perguntando 'é o dono?' (o sim sozinho não autoriza).")
+        except Exception:
+            pass
+        try:
+            self._log_heard(line)
+        except Exception:
+            pass
+        self._say_now("Essa voz não tem cadastro aqui. É o dono? Responda "
+                      "'sim' ou 'não'. Se não responder, nada acontece.")
+        return True
+
+    def _voice_enroll_answer(self, text: str, pcm: bytes | None) -> bool:
+        """Oura a resposta curta da pergunta pendente. True = consumiu a fala.
+
+        Resposta incompreendida: re-pergunta uma única vez; a fala seguinte
+        já vale como "sem resposta" (modo: não grava nada; dono: nada é
+        iniciado) e segue normal para o cérebro.
+        """
+        ask = getattr(self, "_voice_enroll_ask", None)
+        if not isinstance(ask, dict):
+            return False
+        now = time.monotonic()
+        if now > float(ask.get("until") or 0.0):
+            self._voice_enroll_ask = None
+            if ask.get("kind") == "mode":
+                # 2.1: sem resposta = NÃO GRAVA NADA — nunca substituir em
+                # silêncio; as amostras coletadas ficam só na memória e somem.
+                try:
+                    self.ui.write_log("SYS: cadastro de voz — sem resposta "
+                                      "para adicionar ou substituir; nada "
+                                      "foi gravado.")
+                except Exception:
+                    pass
+                self._say_now("Fiquei sem resposta e não gravei nada. Seu "
+                              "perfil continua como estava.")
+            return False
+        kind = str(ask.get("kind") or "")
+        words = self._voice_answer_words(text)
+        if kind == "owner" and _VOICE_TRAIN_RE.search(str(text or "")):
+            # Re-pedir o cadastro com a pergunta no ar equivale a "sim":
+            # rota (i), nunca credencial.
+            return self._voice_enroll_yes_owner(ask, pcm)
+        if kind == "mode":
+            return self._voice_enroll_mode_answer(ask, words, text)
+        if words & _VOICE_OWNER_YES_WORDS:
+            return self._voice_enroll_yes_owner(ask, pcm)
+        if words & {"nao", "não", "nunca", "estranho", "visitante", "convidado"}:
+            # NÃO do próprio locutor: cadastro sugerido e permitido como
+            # VISITANTE (2.2.2 / 6.2) — credencial de leitura, sem acesso a
+            # projeto, e-mail ou WhatsApp; as 5 frases coerentes viram um
+            # perfil NÃO autorizado no índice. O "não" precisa ser fala
+            # humana de verdade: sem o mínimo de voz (TV/eco/ruido não
+            # viram pedido de cadastro) nada começa, com o motivo no log.
+            voiced = None
+            if pcm:
+                try:
+                    voiced = float(self._voiced_seconds(pcm) or 0.0)
+                except Exception:
+                    voiced = None
+            if voiced is not None and voiced < _VISITOR_ENROLL_MIN_VOICED_S:
+                self._voice_enroll_ask = None
+                try:
+                    self.ui.write_log(
+                        "SYS: cadastro de voz — 'não' falado sem fala humana "
+                        f"suficiente para virar cadastro de visitante "
+                        f"(motivo=transitorio origem="
+                        f"{_voice_identity.ORIGIN_TRANSIENT}; "
+                        f"voz={voiced:.1f}s < "
+                        f"{_VISITOR_ENROLL_MIN_VOICED_S:.0f}s); nada iniciado.")
+                except Exception:
+                    pass
+                self._say_now("Não ouvi uma fala sua suficiente para te "
+                              "cadastrar. Se quiser, diga 'cadastra minha "
+                              "voz' de perto do microfone.")
+                return True
+            self._voice_enroll_ask = None
+            self._start_voice_training("resposta 'não' do locutor",
+                                       kind="visitor")
+            return True
+        return self._voice_enroll_unparsed(ask, text)
+
+    def _voice_enroll_yes_owner(self, ask: dict,
+                                pcm: bytes | None) -> bool:
+        """O "sim" escolhe apenas a rota — nunca é credencial (linha-lei)."""
+        self._voice_enroll_ask = None
+        if self._voice_bootstrap_active():
+            # Caminho (i) JÁ percorrido: a senha escrita/abertura por texto
+            # abriu a janela; o cadastro segue com as 5 frases autoconsistentes.
+            self._start_voice_training(
+                "sim do locutor com janela de cadastro aberta por texto")
+            return True
+        # Caminho (i) ainda NÃO percorrido: pedir a senha escrita/voz do dono
+        # pelo portão existente — o "sim" falado não pula esta etapa.
+        try:
+            self.ui.write_log("SYS: cadastro de voz — 'sim' falado sem "
+                              "credencial; orientando senha/voz do dono "
+                              "(caminho existente).")
+        except Exception:
+            pass
+        self._voice_train_refusal_hint("(resposta 'sim' à pergunta é o dono?)",
+                                       0.0, "sim falado não é credencial")
+        return True
+
+    def _voice_enroll_mode_answer(self, ask: dict, words: set,
+                                  text: str) -> bool:
+        """Rota ADICIONAR ou SUBSTITUIR (ramificação 2.1) com as frases gravadas."""
+        samples = list(ask.get("samples") or [])
+        session = {"owner": str(ask.get("owner") or ""),
+                   "gray_trigger": bool(ask.get("gray_trigger"))}
+        if words & _VOICE_ENROLL_REPLACE_WORDS:
+            self._voice_enroll_ask = None
+            return self._voice_enroll_commit(session, samples, "replace")
+        if words & _VOICE_ENROLL_ADD_WORDS or "novamente" in words:
+            self._voice_enroll_ask = None
+            return self._voice_enroll_commit(session, samples, "add")
+        if words & {"nenhuma", "ninguma", "desiste", "abandonar"}:
+            self._voice_enroll_ask = None
+            self._say_now("Certo, não gravo nada. Seu perfil continua como "
+                          "estava.")
+            try:
+                self.ui.write_log("SYS: cadastro de voz — dono recusou a "
+                                  "gravação; nada foi gravado.")
+            except Exception:
+                pass
+            return True
+        return self._voice_enroll_unparsed(ask, text)
+
+    def _voice_enroll_unparsed(self, ask: dict, text: str) -> bool:
+        """Fala que não é resposta: re-pergunta uma vez, depois solta o turno."""
+        if ask.get("reprompted"):
+            self._voice_enroll_ask = None
+            if ask.get("kind") == "mode":
+                # Ambíguo NÃO é resposta: não grava nada (padrão do contrato).
+                ask["samples"] = []
+                self._say_now("Não entendi a resposta e não gravei nada.")
+                try:
+                    self.ui.write_log("SYS: cadastro de voz — resposta "
+                                      "incompreendida; nada foi gravado.")
+                except Exception:
+                    pass
+            return False
+        ask["reprompted"] = True
+        ask["until"] = max(ask.get("until") or time.monotonic(),
+                           time.monotonic() + 15.0)
+        if ask.get("kind") == "mode":
+            self._say_now("Não entendi. Adicionar às amostras atuais ou "
+                          "substituir as antigas? Sem resposta clara, não "
+                          "gravo nada.")
+        else:
+            self._say_now("Não entendi. Responda 'sim' ou 'não' para "
+                          "'é o dono?'.")
+        return True
+
+    def _voice_grant_store(self):
+        """Store de grants do processo (lazy: os doubles de teste não o têm)."""
+        store = getattr(self, "_voice_grants_store", None)
+        if store is None:
+            store = _voice_grants.GrantStore()
+            self._voice_grants_store = store
+        return store
+
+    def _voice_grant_evidence(self, text: str,
+                              pcm: bytes | None) -> tuple[bool, str, str]:
+        """(owner_ok, confirmed_by, detail) — a prova dura por trás do grant.
+
+        Só duas origens valem: voiceprint do dono na fala (veredito
+        privilegiado do ``owner_decision``) OU senha digitada correta agora
+        (sessão aberta pelo portão de texto). Qualquer outra voz — inclusive
+        uma já autorizada a SER RESPONDIDA — não cria nem revoga grant.
+        """
+        if pcm:
+            # Veredito PRIVILEGIADO do owner_decision — a única prova de voz
+            # que cria grant. Nem indulgência, nem "autorizada a responder".
+            verdict, error = self._owner_verdict(
+                pcm, device=None, privileged=True, transcript=str(text or ""))
+            if verdict is not None and verdict.privileged:
+                return True, "voiceprint_owner", verdict.reason
+            return False, "", (verdict.reason if verdict is not None
+                               else str(error or "sem veredito"))
+        if self._owner_text_active():
+            return True, "senha_digitada", "sessão de texto aberta por senha"
+        return False, "", "sem senha digitada na sessão de texto"
+
+    def _voice_grant_gate(self, text: str, pcm: bytes | None = None) -> bool:
+        """Frases de elevação do contrato (ramificação "*"): grants por pessoa.
+
+        "dê acesso total a FULANO", "pode responder e executar tudo que o
+        usuário FULANO pedir no projeto SITE2", revogação falada. O parser
+        está em core/voice_grants; a criação exige veredito privilegiado do
+        dono (``_voice_grant_evidence``) e o padrão dos gates continua
+        NEGAÇÃO. Nada aqui toca o perfil de voz. O log usa só o rótulo
+        nominal da pessoa — nunca ids, nunca dados.
+        """
+        line = str(text or "")
+        plan = _voice_grants.parse_grant_phrase(line)
+        if plan is None:
+            return False
+        if self._voice_train is not None:
+            # Dentro do cadastro guiado a fala é tentativa de frase, não lei.
+            return False
+        owner_ok, confirmed_by, detail = self._voice_grant_evidence(line, pcm)
+        if not owner_ok:
+            try:
+                self.ui.write_log(
+                    "SYS: elevação de acesso recusada — sem prova de dono "
+                    f"({detail}); grant não criado nem revogado.")
+            except Exception:
+                pass
+            self._say_now("Isso é uma decisão do dono: só sua voz confirmada "
+                          "ou senha digitada criam ou revogam acesso. Nada "
+                          "foi alterado.", log=False, origin="aviso")
+            return True
+        result = _voice_grants.grant_from_phrase(
+            line, owner_ok=True, confirmed_by=confirmed_by,
+            store=self._voice_grant_store())
+        if not result or not result.get("handled"):
+            return False
+        label = str(result.get("label") or "")[:40]
+        if result.get("action") in ("revoke", "revoke_all"):
+            n = int(result.get("removed") or 0)
+            self._say_now(f"Acessos revogados ({n} grant{'es' if n != 1 else ''} "
+                          f"retirados" + (f" de {label}" if label else "")
+                          + ").")
+            try:
+                self.ui.write_log(
+                    f"SYS: grants revogados por frase do dono — {n} "
+                    f"removido(s){f' de {label}' if label else ''}.")
+            except Exception:
+                pass
+            return True
+        if result.get("granted"):
+            desc = self._voice_grant_store().describe(result.get("person"))
+            self._say_now(f"Acesso concedido a {label}: {desc}.")
+            try:
+                self.ui.write_log(
+                    f"SYS: grant concedido por frase do dono ({confirmed_by}) "
+                    f"— {desc}; escopo nominal, expira sozinho, revogável "
+                    "por frase.")
+            except Exception:
+                pass
+        else:
+            why = str(result.get("why") or "recusado")[:80]
+            self._say_now(f"Não consegui conceder esse acesso: {why}.")
+            try:
+                self.ui.write_log(f"SYS: grant recusado — {why}.")
+            except Exception:
+                pass
+        return True
+
+    def _voice_grant_scope_for_tool(self, name: str,
+                                    args: dict | None):
+        """Categoria nominal do pedido de ferramenta, para a consulta Grant.
+
+        Projeto exige NOME explícito nos args — sem nome não existe escopo
+        e a consulta devolve None (negação). E-mail/WhatsApp são categorias
+        próprias; nada daqui cobre escrita de perfil de voz.
+        """
+        low = str(name or "").lower()
+        args = args if isinstance(args, dict) else {}
+        if "whatsapp" in low:
+            return _voice_grants.Scope(_voice_grants.SCOPE_WHATSAPP)
+        if "email" in low or "imap" in low or "smtp" in low:
+            return _voice_grants.Scope(_voice_grants.SCOPE_EMAIL)
+        project = ""
+        for key in ("project", "project_path", "repo", "projeto"):
+            value = str(args.get(key) or "").strip()
+            if value:
+                project = value
+                break
+        if project and (low in ("qoder_control", "task_start", "terminal")
+                        or "project" in low or "qoder" in low):
+            target = project.replace("\\", "/").rstrip("/").split("/")[-1]
+            return _voice_grants.Scope(_voice_grants.SCOPE_PROJECT,
+                                       target.lower())
+        return None
+
+    def _voice_grant_allows(self, name: str, args: dict | None) -> bool:
+        """Consulta de grants ANTES da recusa: pessoa nominal + escopo.
+
+        A pessoa é o RÓTULO que o próprio ``owner_decision`` devolve
+        (``speaker``) para a fala em curso — nunca um id de voz. Padrão:
+        NEGA (False). Só True com grant ativo cobrindo o escopo do pedido.
+        """
+        try:
+            scope = self._voice_grant_scope_for_tool(name, args)
+            if scope is None:
+                return False
+            pcm = getattr(self, "_current_pcm", None)
+            if not pcm:
+                return False
+            verdict, _error = self._owner_verdict(pcm, device=None,
+                                                  privileged=False)
+            if verdict is None:
+                return False
+            if verdict.who is _owner_decision.Who.OWNER:
+                # O dono não passa por grant: para ele valem as janelas de
+                # sempre (voiceprint/senha). Grant é ampliação de VISITANTE.
+                return False
+            person = str(verdict.speaker or "").strip()
+            if not person:
+                return False
+            if self._voice_grant_store().allows(person, scope):
+                self.ui.write_log(
+                    f"SYS: grant ativo cobriu o pedido — "
+                    f"{scope.kind}{f'/{scope.target}' if scope.target else ''} "
+                    f"para a pessoa cadastrada; negação suspensa por grant, "
+                    "janelas de risco continuam valendo.")
+                return True
+        except Exception:
+            return False
+        return False
 
     def _voice_training_hint(self) -> None:
         """One short request per run when the owner profile is still thin."""
@@ -10826,6 +11419,19 @@ class JarvisLive:
                 self._no_profile_notice(verdict.device)
             except Exception:
                 pass
+        # Espelho da fala corrente para diagnóstico e para a trilha dos
+        # grants (core/voice_identity). NÃO é autorização: é só o registro
+        # de quem o veredito acabou de dizer que falou, em RÓTULO NOMINAL.
+        try:
+            _voice_identity.set_recent(
+                who=str(verdict.who.value or ""),
+                person=str(verdict.speaker or ""),
+                privileged=bool(verdict.privileged),
+                confirmed_by=("voiceprint_owner" if verdict.privileged else ""),
+                score=float(verdict.score or 0.0),
+                device=str(verdict.device or ""))
+        except Exception:
+            pass
         return verdict
 
     def _owner_verdict(self, pcm: bytes | None,
@@ -13371,6 +13977,11 @@ class JarvisLive:
             return
         if self._voice_bootstrap_gate(text, None, "ui"):
             return
+        # Elevação de acesso digitada: só com a sessão de texto aberta por
+        # senha correta (evidência em _voice_grant_evidence); voz não prova
+        # nada por aqui.
+        if self._voice_grant_gate(text, None):
+            return
         # Respect wake-word sleep by WAKING her: a typed command is deliberate,
         # so it opens the conversation instead of being refused at the door.
         # Digitar é um ato tão deliberado quanto tocar em WAKE NOW: o texto
@@ -14047,6 +14658,11 @@ class JarvisLive:
         # "cadastra minha voz do celular" também casa com _VOICE_TRAIN_RE.
         if self._device_enroll_gate(text, pcm):
             self._note_owner_speech("cadastro de voz do celular")
+            return
+        # Frases de elevação de acesso do contrato (ramificação "*): antes
+        # do cadastro guiado e antes do cérebro — é lei local, não pergunta.
+        if self._voice_grant_gate(text, pcm):
+            self._note_owner_speech("elevacao de acesso")
             return
         if self._voice_train_gate(text, pcm):
             self._note_owner_speech("cadastro de voz")

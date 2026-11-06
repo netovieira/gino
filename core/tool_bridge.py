@@ -390,7 +390,9 @@ class ToolBridge:
         Optional ``preauthorize(name, args) -> bool``. Checked before the
         confirmation gate for medium/high calls; True means a separate, narrow
         grant already authorises this exact call (the autonomous WhatsApp
-        reply in core/actiongate.py). Exceptions count as False, so a broken
+        reply in core/actiongate.py, or — through the application's hook — an
+        active per-person grant in core/voice_grants.py, whose default answer
+        is DENIAL). Exceptions count as False, so a broken
         hook never approves anything.
     authorized:
         Optional ``authorized() -> bool`` telling whether a spoken consent

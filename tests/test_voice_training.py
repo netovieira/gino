@@ -88,6 +88,16 @@ class VoiceTrainingTest(unittest.TestCase):
     def _start(self, obj, text="cadastra minha voz"):
         self.assertTrue(main.JarvisLive._voice_train_gate(
             obj, text, self._sample()))
+        # 2.2 do contrato: com o caminho só-dono ainda fechado (nenhuma
+        # janela aberta por texto, nenhum dono confirmável — FakeSpeaker
+        # sem cadastros) o pedido pergunta "É O DONO?" em vez de abrir.
+        # O "sim" sem credencial não abre nada; aqui abrimos a janela por
+        # texto como o dono faria e respondemos — o fluxo guiado começa.
+        ask = getattr(obj, "_voice_enroll_ask", None)
+        if ask is not None and str(ask.get("kind") or "") == "owner":
+            obj._voice_bootstrap_until = time.monotonic() + 600.0
+            self.assertTrue(main.JarvisLive._voice_train_gate(
+                obj, "sim", self._sample()))
         self.assertIsNotNone(obj._voice_train)
 
     def test_trigger_starts_the_guided_flow(self):
@@ -135,6 +145,11 @@ class VoiceTrainingTest(unittest.TestCase):
         for prompt in main._VOICE_TRAIN_PROMPTS:
             self.assertTrue(main.JarvisLive._voice_train_gate(
                 obj, prompt, self._sample()))
+        # 2.1 do contrato: com cadastro já existente, o fim das 5 frases
+        # pergunta ADICIONAR ou SUBSTITUIR; aqui o dono responde "substituir".
+        self.assertTrue(getattr(obj, "_voice_enroll_ask", None))
+        self.assertTrue(main.JarvisLive._voice_train_gate(
+            obj, "substituir", self._sample()))
         self.assertIsNone(obj._voice_train)
         # 5/5 substitutes the old set: nothing is appended to the store.
         self.assertEqual(obj._speaker.enrolled, [])
@@ -229,6 +244,10 @@ class VoiceTrainingTest(unittest.TestCase):
             heard = main._voice_phrase_content(prompt)
             self.assertTrue(main.JarvisLive._voice_train_gate(
                 obj, heard, self._sample()), heard)
+        # Resposta à pergunta 2.1 (adicionar/substituir): substituir.
+        self.assertTrue(getattr(obj, "_voice_enroll_ask", None))
+        self.assertTrue(main.JarvisLive._voice_train_gate(
+            obj, "substituir", self._sample()))
         self.assertIsNone(obj._voice_train)
         self.assertEqual(len(obj._speaker.replaced), 1)
         self.assertEqual(obj._speaker.records[0]["samples"], 5)
