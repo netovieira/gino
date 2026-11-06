@@ -11432,6 +11432,16 @@ class JarvisLive:
                 device=str(verdict.device or ""))
         except Exception:
             pass
+        if verdict.who is _owner_decision.Who.OWNER:
+            # Rastro do passo 5.1.1 do contrato (IDENTIFICACAO DO DONO):
+            # voiceprint POSITIVO do dono, uma linha por identificação.
+            # Só o papel e o perfil do microfone — nunca amostra de voz,
+            # nome de terceiro, telefone ou id de contato.
+            try:
+                print(f"[Voz] dono confirmado — identidade registrada em "
+                      f"memória perfil={verdict.device or '?'}")
+            except Exception:
+                pass          # o rastro nunca derruba o fluxo
         return verdict
 
     def _owner_verdict(self, pcm: bytes | None,

@@ -402,6 +402,30 @@ def match_filter(item: dict, rules: list[dict]) -> dict | None:
     return None
 
 
+def _filter_trace(acct, item: dict, rule: dict | None, action: str) -> None:
+    """Rastro de toda decisão de filtro (passos 2-4 do fluxo do dono).
+
+    Linha de log interna pelo MESMO ``_log`` da camada — nunca aviso, nunca
+    fala, nunca turno: o passo ``ignora`` continua silêncio por projeto.
+    Guarda o identificador interno (uid), a conta, a ação resultante e o
+    MOTIVO do match (posição e campo da regra que casou, ou fora-do-filtro).
+    Nunca padrão de regra, remetente, assunto ou corpo — nada pessoal.
+    """
+    try:
+        if rule is None:
+            motivo = "fora-do-filtro"
+        else:
+            try:
+                pos = (acct.filters or []).index(rule) + 1
+            except ValueError:
+                pos = 0
+            motivo = f"regra{pos}-{rule.get('field') or '?'}"
+        _log(f"filtro {acct.name}: uid={item.get('uid') or '?'} "
+             f"acao={action} motivo={motivo}")
+    except Exception:
+        pass          # o rastro nunca derruba a varredura
+
+
 class MailAccount:
     """Uma conta de e-mail: metadados, caminhos e estado de conexão."""
 
@@ -2007,8 +2031,13 @@ def poll_once(hook=None) -> list[dict]:
                     rule = (match_filter(item, acct.filters)
                             if acct.filters else None)
                     if acct.filters and rule is None:
+                        _filter_trace(acct, item, None, "ignora")
                         continue          # fora do filtro: nenhum aviso
                     action = str((rule or {}).get("action") or "avisa")
+                    if acct.filters:
+                        # Rastro de cada decisão de filtro (passos 2-4 do
+                        # dono); conta sem regra não tem decisão de filtro.
+                        _filter_trace(acct, item, rule, action)
                     if action == "ignora":
                         continue
                     if action == "classificar" and (rule or {}).get("body"):

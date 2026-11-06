@@ -294,6 +294,12 @@ def save_plan_file(job: "Job", plan: str = "", plans_dir=None) -> str:
         tmp = path.with_name(f"{path.name}.part")
         tmp.write_text(plan_markdown(job, plan), encoding="utf-8")
         tmp.replace(path)
+        try:
+            # Rastro de sucesso no mesmo formato do marcador de falha: o
+            # passo existe no log quando aconteceu (FLUXO TRABALHO, passo 2).
+            print(f"[QoderJob] plano em arquivo gravado: {path.name}")
+        except Exception:
+            pass
         return str(path)
     except Exception as e:
         print(f"[QoderJob] plano em arquivo falhou: {e}")
@@ -494,6 +500,11 @@ def _run_once(job: Job) -> None:
                 job.state = "waiting_approval"
             _emit("approval", job, plan=plan[:6000], text=plan[:800],
                   plan_path=plan_path)
+            try:
+                # Rastro do passo 3 do dono: o plano foi informado à boca.
+                print(f"[QoderJob] plano informado à boca: {job.id[:6]}")
+            except Exception:
+                pass
             return
 
         prepared = qa.prepare_job(job)

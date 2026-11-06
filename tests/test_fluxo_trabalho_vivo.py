@@ -23,7 +23,9 @@ Cobre os quatro furos provados pela auditoria de 05/11:
 """
 from __future__ import annotations
 
+import contextlib
 import inspect
+import io
 import os
 import tempfile
 import time
@@ -93,6 +95,44 @@ class PlanFileTests(unittest.TestCase):
                          "o evento approval só sai com o plano já em arquivo")
         self.assertEqual(job.state, "waiting_approval")
         self.assertTrue(job.plan_path)
+
+    def test_save_plan_file_success_leaves_qoderjob_trace(self):
+        # Rastro do passo 2 no mesmo formato do marcador de falha existente
+        # ("[QoderJob] plano em arquivo falhou: ..."); só o id interno vaza.
+        job = self._job()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            path = qoder_jobs.save_plan_file(job, "passos aqui",
+                                             plans_dir=self.dir)
+        self.assertTrue(path)
+        self.assertIn(f"[QoderJob] plano em arquivo gravado: {job.id}.md",
+                      buf.getvalue())
+
+    def test_run_once_traces_plan_file_and_plan_to_the_mouth(self):
+        # Passos 2 e 3 agora com rastro: a fiação é a mesma do teste de cima
+        # (prepare_job/parse_question/_ask_qoder são a borda externa — o
+        # mecanismo julgado, save_plan_file + emissão do pedido, é real).
+        job = self._job()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), \
+             mock.patch.object(qoder_jobs, "_default_plans_dir",
+                               lambda: __import__("pathlib").Path(self.dir)), \
+             mock.patch("actions.qoder_agent.prepare_job",
+                        lambda j, **kw: {"st": None, "prompt": "", "model": "m",
+                                         "system": "", "proxy_system": "",
+                                         "root": __import__("pathlib").Path(".")}), \
+             mock.patch("actions.qoder_agent.parse_question", lambda r: None), \
+             mock.patch.object(qoder_jobs, "_ask_qoder",
+                               lambda j, prepared, on_progress:
+                               ("Passo 1: editar o helper.", False)), \
+             mock.patch.object(qoder_jobs, "_SINK", lambda ev: None):
+            qoder_jobs._run_once(job)
+        out = buf.getvalue()
+        self.assertIn(f"[QoderJob] plano em arquivo gravado: {job.id}.md",
+                      out)
+        self.assertIn(f"[QoderJob] plano informado à boca: {job.id[:6]}",
+                      out)
+        self.assertEqual(job.state, "waiting_approval")
 
 
 class JobGrantTests(unittest.TestCase):

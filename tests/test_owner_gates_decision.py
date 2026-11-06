@@ -16,6 +16,8 @@ the calibrated limit. What is fixed here:
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -184,6 +186,41 @@ class PrivilegedGateTest(unittest.TestCase):
         obj = _obj(speaker, self.registry)
         self.assertFalse(main.JarvisLive._owner_voice_ok(obj, None))
         self.assertEqual(speaker.embeddings, 0)
+
+    def test_positive_owner_match_leaves_identification_trace(self):
+        # Passo 5.1.1 com rastro: voiceprint POSITIVO do dono imprime o
+        # marcador com o papel e o perfil do microfone — nunca amostra,
+        # telefone ou id de contato. O caminho é o real: _owner_voice_ok →
+        # _owner_verdict → _owner_decision_for_match.
+        obj = _obj(FakeSpeaker(score=0.72, device=HW_C920), self.registry)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertTrue(main.JarvisLive._owner_voice_ok(
+                obj, b"owner-voice", device=HW_C920))
+        out = buf.getvalue()
+        self.assertIn("[Voz] dono confirmado — identidade registrada em "
+                      f"memória perfil={HW_C920}", out)
+        self.assertNotIn(OWNER, out)     # nem o nome do dono sai no rastro
+
+    def test_refusal_never_leaves_the_positive_trace(self):
+        # Só o match positivo imprime: voz conhecida não-dono e recusa
+        # continuam sem o marcador (contraprova do rastro).
+        obj = _obj(FakeSpeaker(name="Eloisa", score=0.95, device=HW_C920),
+                   self.registry)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertFalse(main.JarvisLive._owner_voice_ok(
+                obj, b"guest-voice", device=HW_C920))
+        self.assertNotIn("dono confirmado", buf.getvalue())
+
+    def test_no_profile_never_leaves_the_positive_trace(self):
+        speaker = _no_profile_speaker()
+        obj = _obj(speaker, self.registry)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertFalse(main.JarvisLive._owner_voice_ok(
+                obj, b"ghost-voice", device=HW_EDIFIER))
+        self.assertNotIn("dono confirmado", buf.getvalue())
 
 
 class SharedStateTest(unittest.TestCase):
