@@ -104,6 +104,10 @@ def fluxo(tmp_path, monkeypatch):
     monkeypatch.setattr(owner_auth, "is_configured", lambda: True)
     monkeypatch.setattr(owner_auth, "verify",
                         lambda p: p == _SENHA_TESTE)
+    # Fator pleno agora confirma também um envio de e-mail pendente; aqui o
+    # portão de e-mail é mockado — nenhum SMTP é tocado neste teste.
+    from core import email as _mailmod
+    monkeypatch.setattr(_mailmod, "pending_send", lambda: None)
     clock = _Clock()
     monkeypatch.setattr(actiongate, "time", clock)
     actiongate.close()
@@ -206,7 +210,7 @@ def test_voz_desconhecida_sem_grant_e_negada(fluxo):
         obj, "senha: valor-errado-qualquer", "whatsapp",
         account="principal", chat="5511") is True
     assert actiongate.authorized() is False
-    assert rootgate.authorized() is False   # senha nunca abriu sudo/root
+    assert rootgate.authorized() is False   # senha ERRADA não abre nada
 
 
 def test_senha_nao_vaza_em_lugar_nenhum(fluxo):
@@ -240,13 +244,14 @@ def test_senha_nao_vaza_em_lugar_nenhum(fluxo):
     inbox_file.unlink()
 
 
-def test_whatsapp_control_e_reinicio_continua_como_estao(fluxo):
+def test_whatsapp_control_e_janelas_por_senha(fluxo):
     """Sem enfraquecer: whatsapp_control honra a janela como antes; a senha
-    NÃO abre o rootgate (reinício/energia/sudo continuam só com a voz)."""
+    é fator PLENO (decisão do dono, 06/11/2026) e abre também a janela de
+    sudo/root — não existe mais classe em que a senha seja banida."""
     obj, clock, chamar_send, enviados, logs = fluxo
     _armar_senha(obj)
     clock.advance(actiongate.WINDOW_SECONDS + 60.0)
     # whatsapp_control segue dentro da janela de envio (comportamento antigo):
     assert actiongate.confirm("Confirm 'whatsapp_control'", "x") is True
-    # nada de sudo/reinício pela senha:
-    assert rootgate.authorized() is False
+    # fator pleno: a janela de sudo foi aberta pela mesma senha:
+    assert rootgate.authorized() is True

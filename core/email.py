@@ -2157,7 +2157,7 @@ def reset() -> None:
         _pending = None
 
 
-# ── envio: pedido estacionado, confirmação só pela VOZ do dono ──────────────
+# ── envio: pedido estacionado, confirmação pelo fator do dono (voz ou senha) ──
 
 _pending_lock = threading.Lock()
 _pending: dict | None = None
@@ -2267,12 +2267,15 @@ def cancel_send() -> str:
 
 
 def confirm_send(voice_ok: bool = False) -> tuple[bool, str]:
-    """Executa o envio estacionado. Só com a voz do dono reconhecida.
+    """Executa o envio estacionado. Só com autorização do dono.
 
-    ``voice_ok`` é o resultado do portão de voz do main.py
-    (``_speaker_order_identity``): sem áudio do dono, ou com a voz de outra
-    pessoa, isto recusa e o pedido continua parado. Texto digitado nunca chega
-    aqui com True.
+    ``voice_ok`` é o veredito do portão do dono: verdadeiro quando a fala
+    foi confirmada pelo voiceprint (main._speaker_order_identity) OU
+    quando a senha digitada correta foi verificada — desde a decisão do
+    dono de 06/11/2026 os dois fatores são plenos e iguais
+    (core/owner_auth.authorized_factor). Sem áudio do dono, sem senha,
+    ou com a voz de outra pessoa, isto recusa e o pedido continua parado.
+    Texto digitado comum (sem senha) nunca chega aqui com True.
     """
     if not voice_ok:
         return False, "envio de e-mail exige a sua voz confirmando; nada foi enviado"

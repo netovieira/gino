@@ -226,8 +226,12 @@ class OwnerIdentityWiringTests(unittest.TestCase):
         self.assertIn('_arm_job_grant("voz do dono")', src)
 
     def test_owner_password_path_calls_the_arm(self):
-        src = inspect.getsource(main.JarvisLive._owner_text_gate)
-        self.assertIn('_arm_job_grant("senha digitada")', src)
+        # O fator senha abre agora TODAS as janelas num único ponto
+        # (_owner_password_grant, chamado pelo portão de senha).
+        src = inspect.getsource(main.JarvisLive._owner_password_grant)
+        self.assertIn("_arm_job_grant(_owner_auth.FACTOR_TEXT)", src)
+        gate = inspect.getsource(main.JarvisLive._owner_text_gate)
+        self.assertIn("_owner_password_grant()", gate)
 
     def test_restart_power_send_gates_untouched(self):
         # Segurança inegociável: o relay do job não afrouxa os portões.

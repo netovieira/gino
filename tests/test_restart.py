@@ -66,7 +66,7 @@ def test_request_assistant_parks_and_asks_for_spoken_confirmation(manager):
     assert "[CONFIRMATION_PENDING]" in result
     assert "confirmo reiniciar o assistente" in result
     assert "Nothing has restarted" in result
-    assert "voice-only" in result
+    assert "owner-factor-only" in result
     assert "action='confirm'" not in result
 
     p = manager.pending()
@@ -601,7 +601,7 @@ def test_action_request_then_confirm_with_phrase(manager, no_popen):
     assert "awaiting" in status
 
     rejected = action.restart_assistant({"action": "confirm", "phrase": "sim"})
-    assert "voice-only" in rejected.lower()
+    assert "owner-factor-only" in rejected.lower()
 
     # The pending request survives a wrong phrase.
     assert manager.pending() is not None
@@ -626,7 +626,7 @@ def test_action_pc_cancel_and_no_false_claim(manager, no_popen):
     assert manager.pending() is None
 
     result = action.restart_assistant({"action": "confirm", "phrase": "confirmo reiniciar"})
-    assert "voice-only" in result.lower()
+    assert "owner-factor-only" in result.lower()
     assert "no restart awaiting confirmation" in manager.confirm(
         "confirmo reiniciar").lower()
     no_popen.assert_not_called()

@@ -1,4 +1,6 @@
-"""A short window in which the user has authorised a risky common action, opened by voice.
+"""A short window in which the user has authorised a risky common action,
+opened by his voice or by his typed password (the two full factors of
+core/owner_auth.py — decision of the owner, 06/11/2026).
 
 WHY THIS EXISTS
     The tool bridge refuses medium/high actions unless a confirm callback says
@@ -28,8 +30,10 @@ WHY TIME, NOT A USE COUNT
 
 SEPARATE FROM ROOT
     This window authorises ordinary risky actions (sending a message, remote
-    device control). It never authorises sudo or root — core/rootgate.py owns
-    that, with its own window. Opening one does not open the other.
+    device control). Sudo and root belong to core/rootgate.py, with its own
+    window: neither window substitutes for the other. Both modules accept
+    the same two factors — the owner's voice and his verified typed
+    password (decision of the owner, 06/11/2026).
 
 AUTONOMOUS WHATSAPP REPLIES
     A narrower grant, checked by the bridge's preauthorize hook rather than by
@@ -50,17 +54,21 @@ CONSENT SPOKEN BEFORE THE REQUEST IS PARKED
     honours it only for whatsapp_control. It is a bounded window, never a
     standing grant, and it does not open the sudo window.
 
-THE FACTOR THAT OPENED THE WINDOW (lei do dono, 13/11/2026)
+THE FACTOR THAT OPENED THE WINDOW (lei do dono, 13/11/2026; fator pleno
+por decisão do dono em 06/11/2026)
     The accepted factors are the owner's VOICE and his TYPED PASSWORD — the
     same verdict core/job_grant.py and core/owner_auth.py speak (FACTOR_VOICE
-    / FACTOR_TEXT). A password typed by the owner (app text or his direct
-    WhatsApp chat) is full owner authorisation, so the 15-minute send window
-    it armed covers the whole sending scope: whatsapp_control AND send_message
-    — same scope, same TTL, no per-action exception. The send window armed by
-    an anticipated spoken consent keeps the narrower WhatsApp scope it was
-    created with on 02/11/2026: a stray "pode enviar" caught off the mic must
-    not reach other platforms. Neither factor ever opens the sudo window;
-    unknown voices, personas, subagents and third-party text open nothing.
+    / FACTOR_TEXT, decided in one place by owner_auth.authorized_factor). A
+    password typed by the owner (app text or his direct WhatsApp chat) is
+    FULL owner authorisation, so the 15-minute send window it armed covers
+    the whole sending scope: whatsapp_control AND send_message — same scope,
+    same TTL, no per-action exception. The send window armed by an
+    anticipated spoken consent keeps the narrower WhatsApp scope it was
+    created with on 02/11/2026: a stray "pode enviar" caught off the mic
+    must not reach other platforms. No window of this module grants sudo by
+    itself — core/rootgate.py owns that, and since 06/11/2026 BOTH factors
+    open it there as well (main._owner_password_grant). Unknown voices,
+    personas, subagents and third-party text open nothing.
 """
 from __future__ import annotations
 
@@ -185,7 +193,9 @@ def open_window(seconds: float = WINDOW_SECONDS,
 
     ``factor`` records WHO opened it (voz do dono / senha digitada — the two
     labels core/owner_auth.py defines). It never widens the window: the same
-    bounded time, and never the sudo window.
+    bounded time. Like every other privileged class, both factors also open
+    the sudo window where sudo is owned (core/rootgate.py) — this module's
+    windows themselves stay separate from it.
     """
     global _until, _window_factor
     with _lock:
@@ -278,7 +288,9 @@ def send_window_factor() -> str:
 # Escopo da janela de envio: o CLASS-DE-AÇÕES "mandar mensagem" — nunca uma
 # exceção por ferramenta. whatsapp_control é o envio conectado (regra de
 # 02/11/2026); send_message é o mesmo envio dirigido por janela de app.
-# E-mail NÃO entra aqui: mail_control tem portão próprio só-voz.
+# E-mail NÃO entra aqui: mail_control tem portão próprio, liberado pelos
+# DOIS fatores do dono (voz ou senha digitada verificada) — decisão dele
+# de 06/11/2026.
 _SEND_TITLES = ("whatsapp_control", "send_message")
 
 
