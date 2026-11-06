@@ -188,18 +188,43 @@ class DirectChatTest(unittest.TestCase):
         obj._memory_record_user.assert_not_called()
         self.assertEqual(obj.ui.logs, [])
 
-    def test_owner_echo_with_the_name_is_never_an_order_in_that_chat(self):
+    def test_owner_echo_naming_the_assistant_is_an_order_in_that_chat(self):
+        """Regra 5 do SKILL (04/11/2026): eco do dono COM o nome no chat de
+        um terceiro é ordem e é respondida no MESMO chat. Incidente
+        05/11/2026 22:59: o ramo antigo de ``main._whatsapp_autoreply``
+        engolia todo eco de terceiro, com ou sem nome — comportamento que
+        o teste anterior registrava e que a lei do dono cancelou."""
         obj = self._obj()
         item = {"chat": "5511888888888", "name": "Carol",
                 "text": "Gino, fala pra Carol como você se sente",
                 "from_me": True}
+        prev = whatsapp_watch.trigger_name()
+        self.addCleanup(whatsapp_watch.set_assistant_name, prev)
+        whatsapp_watch.set_assistant_name("Gino")
+        with mock.patch.object(whatsapp_watch, "is_direct", return_value=False):
+            self.assertTrue(obj._whatsapp_autoreply("trabalho", item))
+        obj._qoder_turn.assert_called_once()
+        instruction = obj._qoder_turn.call_args[0][0]
+        self.assertIn("ORDEM DO DONO NO CHAT DE UM TERCEIRO", instruction)
+        kwargs = obj._qoder_turn.call_args[1]
+        self.assertEqual(kwargs["wa_chat"], "5511888888888")  # o MESMO chat
+        self.assertEqual(kwargs["media_type"], "text")
+        self.assertFalse(kwargs["speak"])
+
+    def test_owner_echo_without_the_name_is_still_silence(self):
+        """Sem o nome, eco continua eco: nada de turno, nada de envio."""
+        obj = self._obj()
+        item = {"chat": "5511888888888", "name": "Carol",
+                "text": "boa noite, já chega por hoje",
+                "from_me": True}
+        prev = whatsapp_watch.trigger_name()
+        self.addCleanup(whatsapp_watch.set_assistant_name, prev)
+        whatsapp_watch.set_assistant_name("Gino")
         with mock.patch.object(whatsapp_watch, "is_direct", return_value=False):
             self.assertFalse(obj._whatsapp_autoreply("trabalho", item))
-        obj._memory_record_user.assert_not_called()
-        self.assertEqual(obj._chat_memory.turns, [])
         obj._qoder_turn.assert_not_called()
         obj._qoder_hold.assert_not_called()
-        self.assertEqual(obj.ui.logs, [])
+        self.assertEqual(obj._chat_memory.turns, [])
 
 
 class TranscribeWaitTest(unittest.TestCase):
