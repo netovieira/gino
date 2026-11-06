@@ -108,6 +108,7 @@ ACTION_TIERS: dict[str, str] = {
     "email_control": TIER_MEDIUM,
     "mail_control": TIER_MEDIUM,
     "whatsapp_control": TIER_MEDIUM,
+    "linkedin_control": TIER_MEDIUM,
     "trello_control": TIER_MEDIUM,
     "cakto_sales": TIER_MEDIUM,
     "android_control": TIER_MEDIUM,
