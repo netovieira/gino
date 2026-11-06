@@ -42,8 +42,6 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from core import tool_receipts as _receipts
-
 # ── risk tiers ───────────────────────────────────────────────────────────────
 #
 # safe   — reads, status, search. No side effects worth asking about.
@@ -435,8 +433,7 @@ class ToolBridge:
                  timeout: float = _DEFAULT_TIMEOUT, preauthorize=None,
                  authorized=None, pending_path=None, pending_ttl: Optional[float] = None,
                  pending_denial_limit: Optional[int] = None,
-                 clock: Optional[Callable[[], float]] = None,
-                 receipts_path=None):
+                 clock: Optional[Callable[[], float]] = None):
         if not isinstance(token, str) or not token:
             raise ValueError("ToolBridge requires a non-empty bearer token")
         self._registry = registry
@@ -473,20 +470,6 @@ class ToolBridge:
         self._denials: dict[str, dict[str, Any]] = {}
         self._denials_lock = threading.RLock()
         self._load_pending()
-
-        # ── tool receipts (HMAC) ──────────────────────────────────────────
-        if receipts_path:
-            self._receipts_path: Optional[Path] = Path(receipts_path)
-        elif self._audit_path is not None:
-            self._receipts_path = self._audit_path.parent / "tool_receipts.jsonl"
-        else:
-            self._receipts_path = None
-        self._receipts_key: Optional[bytes] = None
-        if self._receipts_path is not None:
-            try:
-                self._receipts_key = _receipts._resolve_key(self._receipts_path)
-            except Exception:
-                self._receipts_key = None
 
         self._server = None
         self._thread: Optional[threading.Thread] = None
@@ -777,7 +760,6 @@ class ToolBridge:
 
         text = result if isinstance(result, str) else str(result)
         self._audit_action(name, args, tier, approved=approved, result=text, status="ok")
-        self._issue_receipt(name, args, result)
         return {"status": "ok", "action": name, "tier": tier,
                 "approved": True, "result": text}
 
@@ -1315,26 +1297,6 @@ class ToolBridge:
                     fh.write(line + "\n")
         except Exception as exc:  # auditing must never break a call
             self._log(f"[ToolBridge] Could not write audit record: {exc}")
-
-    # ── tool receipts (HMAC) ──────────────────────────────────────────────
-
-    def _issue_receipt(self, tool: str, args: dict, result: Any) -> None:
-        """Gera e persiste um recibo HMAC para o tool call.
-
-        Falhas sao silenciadas — recibos nao podem quebrar um call.
-        A chave nunca e logada; apenas o HMAC resultante vai ao disco.
-        """
-        path = self._receipts_path
-        if path is None:
-            return
-        try:
-            receipt = _receipts.make_receipt(
-                tool, args if isinstance(args, dict) else {}, result,
-                key=self._receipts_key, receipts_path=path,
-            )
-            _receipts.append_receipt(receipt, path)
-        except Exception as exc:
-            self._log(f"[ToolBridge] could not issue receipt: {exc}")
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
