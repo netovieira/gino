@@ -86,8 +86,7 @@ def person_key(label: Any) -> str:
 
 
 def _valid_person(person: Any) -> bool:
-    key = _fold(person)
-    return bool(key) and _SLUG_RE.fullmatch(key) is not None
+    return bool(person_key(person))
 
 
 def _valid_scope(scope: Any) -> bool:
@@ -205,7 +204,7 @@ class GrantStore:
 
     # ── consulta (o padrão é NEGAR) ─────────────────────────────────────────
     def active(self, person: Any, now: float | None = None) -> list[dict[str, Any]]:
-        key = _fold(person)
+        key = person_key(person)
         if not key:
             return []
         moment = time.monotonic() if now is None else float(now)
@@ -244,7 +243,7 @@ class GrantStore:
     def revoke(self, person: Any, scope: Any = None, *,
                now: float | None = None) -> int:
         """Revoga grants falados. scope None = todos da pessoa."""
-        key = _fold(person)
+        key = person_key(person)
         if not key:
             return 0
         want = None if scope is None or not str(scope) else _as_scope(scope)
@@ -270,7 +269,7 @@ class GrantStore:
 
     # ── fala/log: só rótulo e escopo nominal ────────────────────────────────
     def describe(self, person: Any, now: float | None = None) -> str:
-        key = _fold(person)
+        key = person_key(person)
         items = self.active(key, now=now)
         if not items:
             return ""
