@@ -37,6 +37,7 @@ from typing import Any, Callable, Iterable
 import numpy as np
 
 from . import mic_compare
+from .echo import EchoGuard
 
 
 @dataclass(slots=True)
@@ -47,6 +48,8 @@ class Decision:
     when ``verdict`` is ``near``, the loudest one otherwise (so the
     transcription gate still receives the best signal). ``block`` is that
     microphone's whole block — always one stream's data, never a mix.
+    ``aec_clean`` is True when the chosen channel's EchoGuard classified the
+    block as not-echo (user speech or no output playing).
     """
 
     verdict: str = mic_compare.AMBIGUOUS
@@ -56,6 +59,7 @@ class Decision:
     votes: tuple[int, ...] = ()
     pairs: int = 0
     compared: int = 0
+    aec_clean: bool = True
 
 
 class MultiMic:
@@ -76,6 +80,7 @@ class MultiMic:
         tolerance_ms: float = 60.0,
         comparator_factory: Callable[..., Any] = mic_compare.PairComparator,
         clock: Callable[[], float] = time.monotonic,
+        aec: bool = True,
     ) -> None:
         entries = list(sources)
         if not entries:
@@ -104,6 +109,15 @@ class MultiMic:
         ]
         self.decision = Decision(name="", pairs=len(self._comparators))
         self.cycles = 0
+        # ── AEC por canal: um EchoGuard independente por microfone ──────────
+        # Cada canal tem seu próprio guard para que o eco seja cancelado
+        # individualmente antes da comparação pairwise. Isso é necessário porque
+        # microfones em posições diferentes captam o eco do alto-falante com
+        # intensidades e delays diferentes.
+        self._aec_enabled = bool(aec)
+        self._echo_guards: list[EchoGuard] = (
+            [EchoGuard() for _ in self.sources] if self._aec_enabled else []
+        )
         # Hysteresis latch: the chosen stream is pinned per phrase. A new
         # source only wins after proving itself on ``latch_wins`` consecutive
         # cycles; an unproven cycle never falls back to argmax (that argmax
@@ -182,6 +196,16 @@ class MultiMic:
             # The new microphone has not paid for the switch yet; for the
             # gate this cycle is not the owner's speech on the latched source.
             verdict = mic_compare.AMBIGUOUS
+        # ── AEC por canal: o bloco do canal escolhido é voz humana? ────────
+        aec_clean = True
+        if (self._aec_enabled and chosen is not None
+                and chosen < len(self._latest)
+                and self._latest[chosen] is not None):
+            sample, whole, stamp = self._latest[chosen]
+            rms = float(np.sqrt(max(0.0,
+                np.dot(sample, sample) / max(sample.size, 1))))
+            aec_clean = self.is_user_speech(chosen, sample, self.sample_rate,
+                                            rms, when=stamp)
         return Decision(
             verdict=verdict,
             source=chosen,
@@ -190,6 +214,7 @@ class MultiMic:
             votes=tuple(votes),
             pairs=len(self._comparators),
             compared=compared,
+            aec_clean=aec_clean,
         )
 
     # ── latch histerético: a fonte é travada por frase ──────────────────────
@@ -243,6 +268,57 @@ class MultiMic:
         """Unpin after the speech turn: the silence reopens the election."""
         with self._lock:
             self._held = False
+
+    # ── AEC por canal ────────────────────────────────────────────────────────
+    def note_output(self, pcm, sr: int, level: float,
+                    when: float | None = None) -> None:
+        """Feed the assistant's output to EVERY per-channel EchoGuard.
+
+        Each microphone hears the speaker differently (distance, angle, room
+        reflections), so each guard learns its own echo gain and floor.
+        """
+        if not self._aec_enabled:
+            return
+        for guard in self._echo_guards:
+            try:
+                guard.note_output(pcm, sr, level, when=when)
+            except Exception:
+                pass
+
+    def is_user_speech(self, index: int, pcm, sr: int, level: float,
+                       when: float | None = None) -> bool:
+        """Check one channel's EchoGuard: is this block a human voice?"""
+        if not self._aec_enabled or not (0 <= int(index) < len(self._echo_guards)):
+            return True
+        try:
+            return self._echo_guards[int(index)].is_user_speech(
+                pcm, sr, level, when=when)
+        except Exception:
+            return False
+
+    def reset_aec(self) -> None:
+        """Drop the echo history on every channel (playback stopped)."""
+        for guard in self._echo_guards:
+            try:
+                guard.reset()
+            except Exception:
+                pass
+
+    @property
+    def aec_enabled(self) -> bool:
+        return self._aec_enabled
+
+    def aec_calibrated(self, index: int) -> bool:
+        """True once the channel's guard has enough echo data to be trusted."""
+        if not self._aec_enabled or not (0 <= int(index) < len(self._echo_guards)):
+            return False
+        return self._echo_guards[int(index)].calibrated
+
+    def aec_reliable(self, index: int) -> bool:
+        """False when the channel's room acoustics are too poor to judge."""
+        if not self._aec_enabled or not (0 <= int(index) < len(self._echo_guards)):
+            return False
+        return self._echo_guards[int(index)].reliable
 
     # ── introspection ───────────────────────────────────────────────────────
     @property
