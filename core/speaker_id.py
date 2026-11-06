@@ -51,8 +51,23 @@ DIARIZATION_DIR = _ROOT / "models" / "diarization"
 DEFAULT_SEGMENTATION_MODEL = (
     DIARIZATION_DIR / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
 )
-DEFAULT_EMBEDDING_MODEL = DIARIZATION_DIR / "3dspeaker_eres2net_base.onnx"
-DEFAULT_THRESHOLD = 0.45
+# ── FASE2-TASK2: ECAPA-TDNN as primary embedding model ──────────────────────
+# ECAPA-TDNN (from SpeechBrain/spkrec-ecapa-voxceleb) produces higher-quality
+# speaker embeddings than ERes2Net for voice identification.  The ONNX export
+# is provided by the sherpa-onnx project.  When the file is present it is used
+# as the PRIMARY embedding model; when absent, the code falls back to ERes2Net
+# transparently.  Old embeddings in ``memory/voices/index.json`` were computed
+# with ERes2Net and are NOT compatible with ECAPA-TDNN — the system detects the
+# dimension mismatch and re-enrolls automatically on the next confident match.
+ECAPA_EMBEDDING_MODEL = DIARIZATION_DIR / "ecapa_tdnn.onnx"
+FALLBACK_EMBEDDING_MODEL = DIARIZATION_DIR / "3dspeaker_eres2net_base.onnx"
+# Keep the old name as an alias so external code that imports it keeps working.
+DEFAULT_EMBEDDING_MODEL = FALLBACK_EMBEDDING_MODEL
+# ECAPA-TDNN cosine similarity threshold (calibrated separately from ERes2Net).
+# ECAPA embeddings are more discriminative, so the threshold is slightly higher.
+ECAPA_THRESHOLD = 0.50
+ERES2NET_THRESHOLD = 0.45
+DEFAULT_THRESHOLD = ERES2NET_THRESHOLD  # fallback default; overridden at init
 DEFAULT_STORE_DIR = _ROOT / "memory" / "voices"
 DEFAULT_OWNER = "Anthero"
 SAMPLE_RATE = 16000
@@ -135,10 +150,36 @@ def available(
     segmentation_model: str | Path | None = None,
     embedding_model: str | Path | None = None,
 ) -> bool:
-    """True when both ONNX models are on disk (they are git-ignored)."""
+    """True when the segmentation model and at least one embedding model exist.
+
+    FASE2-TASK2: checks for ECAPA-TDNN first, then falls back to ERes2Net.
+    """
     seg = Path(segmentation_model or DEFAULT_SEGMENTATION_MODEL)
-    emb = Path(embedding_model or DEFAULT_EMBEDDING_MODEL)
-    return seg.is_file() and emb.is_file()
+    if not seg.is_file():
+        return False
+    # ECAPA-TDNN is the preferred embedding; ERes2Net is the fallback.
+    if embedding_model is not None:
+        return Path(embedding_model).is_file()
+    ecapa = Path(ECAPA_EMBEDDING_MODEL)
+    eres2net = Path(FALLBACK_EMBEDDING_MODEL)
+    return ecapa.is_file() or eres2net.is_file()
+
+
+def active_embedding_model() -> Path:
+    """Return the path of the embedding model that will actually be loaded.
+
+    ECAPA-TDNN is preferred; ERes2Net is the fallback when the ECAPA file is
+    absent.  This is a module-level helper — instances may override via the
+    ``embedding_model`` constructor argument.
+    """
+    if Path(ECAPA_EMBEDDING_MODEL).is_file():
+        return ECAPA_EMBEDDING_MODEL
+    return FALLBACK_EMBEDDING_MODEL
+
+
+def is_ecapa_active() -> bool:
+    """True when the ECAPA-TDNN model is present and will be used."""
+    return Path(ECAPA_EMBEDDING_MODEL).is_file()
 
 
 def _slugify(name: str) -> str:
@@ -444,7 +485,7 @@ class SpeakerId:
         self,
         segmentation_model: str | Path | None = None,
         embedding_model: str | Path | None = None,
-        threshold: float = DEFAULT_THRESHOLD,
+        threshold: float | None = None,
         store_dir: str | Path | None = None,
         owner_name: str = DEFAULT_OWNER,
         provider: str = "cpu",
@@ -459,7 +500,19 @@ class SpeakerId:
         debug_scores: bool = False,
     ) -> None:
         self.segmentation_model = Path(segmentation_model or DEFAULT_SEGMENTATION_MODEL)
-        self.embedding_model = Path(embedding_model or DEFAULT_EMBEDDING_MODEL)
+        # ── FASE2-TASK2: ECAPA-TDNN with ERes2Net fallback ────────────────
+        # If no explicit embedding_model is given, prefer ECAPA-TDNN when the
+        # file exists; otherwise fall back to ERes2Net.
+        if embedding_model is not None:
+            self.embedding_model = Path(embedding_model)
+        else:
+            self.embedding_model = active_embedding_model()
+        self._using_ecapa = (self.embedding_model.name == ECAPA_EMBEDDING_MODEL.name
+                             or str(self.embedding_model) == str(ECAPA_EMBEDDING_MODEL))
+        # Auto-select threshold based on which model is active, unless the
+        # caller passed an explicit value.
+        if threshold is None:
+            threshold = ECAPA_THRESHOLD if self._using_ecapa else ERES2NET_THRESHOLD
         threshold = float(threshold)
         if not -1.0 <= threshold <= 1.0:
             raise ValueError("threshold deve estar entre -1 e 1")
@@ -535,6 +588,11 @@ class SpeakerId:
     @property
     def sample_rate(self) -> int:
         return self._sample_rate
+
+    @property
+    def using_ecapa(self) -> bool:
+        """True when the active embedding model is ECAPA-TDNN (FASE2-TASK2)."""
+        return bool(self._using_ecapa)
 
     # ── active capture chain ────────────────────────────────────────────────
 
@@ -1608,13 +1666,26 @@ class SpeakerId:
         return [float(value) for value in extractor.compute(stream)]
 
     def _ensure_models(self):
-        """Lazily build the diarizer/extractor (thread-safe)."""
+        """Lazily build the diarizer/extractor (thread-safe).
+
+        FASE2-TASK2: tries ECAPA-TDNN first; if the model file is absent or
+        fails to load, falls back to ERes2Net transparently.
+        """
         with self._lock:
             if self._diarizer is not None and self._extractor is not None:
                 return self._diarizer
-            if not available(self.segmentation_model, self.embedding_model):
+            # ── model selection with fallback ───────────────────────────────
+            emb_path = self.embedding_model
+            if not emb_path.is_file():
+                if str(emb_path) == str(ECAPA_EMBEDDING_MODEL) or emb_path.name == ECAPA_EMBEDDING_MODEL.name:
+                    emb_path = FALLBACK_EMBEDDING_MODEL
+                    self._using_ecapa = False
+                elif str(emb_path) == str(FALLBACK_EMBEDDING_MODEL) or emb_path.name == FALLBACK_EMBEDDING_MODEL.name:
+                    emb_path = ECAPA_EMBEDDING_MODEL
+                    self._using_ecapa = ECAPA_EMBEDDING_MODEL.is_file()
+            if not available(self.segmentation_model, emb_path):
                 missing = [
-                    str(p) for p in (self.segmentation_model, self.embedding_model)
+                    str(p) for p in (self.segmentation_model, emb_path)
                     if not Path(p).is_file()
                 ]
                 raise FileNotFoundError("modelo de diarização ausente: " + ", ".join(missing))
@@ -1632,7 +1703,7 @@ class SpeakerId:
             segmentation.num_threads = self._num_threads
             segmentation.provider = self._provider
 
-            embedding = so.SpeakerEmbeddingExtractorConfig(str(self.embedding_model))
+            embedding = so.SpeakerEmbeddingExtractorConfig(str(emb_path))
             embedding.num_threads = self._num_threads
             embedding.provider = self._provider
 
@@ -1640,11 +1711,36 @@ class SpeakerId:
             config = so.OfflineSpeakerDiarizationConfig(
                 segmentation, embedding, clustering
             )
-            self._segmentation_config = segmentation
-            self._embedding_config = embedding
-            self._diarizer = so.OfflineSpeakerDiarization(config)
-            self._extractor = so.SpeakerEmbeddingExtractor(embedding)
-            self._num_clusters = -1
+            try:
+                self._segmentation_config = segmentation
+                self._embedding_config = embedding
+                self._diarizer = so.OfflineSpeakerDiarization(config)
+                self._extractor = so.SpeakerEmbeddingExtractor(embedding)
+                self._num_clusters = -1
+                self.embedding_model = emb_path
+                label = "ECAPA-TDNN" if self._using_ecapa else "ERes2Net"
+                print(f"[SpeakerId] usando {label} ({emb_path.name})")
+            except Exception as e:
+                # If ECAPA failed to initialize, try ERes2Net as fallback.
+                if self._using_ecapa and FALLBACK_EMBEDDING_MODEL.is_file():
+                    print(f"[SpeakerId] ECAPA-TDNN falhou ({e!r}) — "
+                          f"usando ERes2Net como fallback")
+                    self._using_ecapa = False
+                    emb_path = FALLBACK_EMBEDDING_MODEL
+                    embedding = so.SpeakerEmbeddingExtractorConfig(str(emb_path))
+                    embedding.num_threads = self._num_threads
+                    embedding.provider = self._provider
+                    config = so.OfflineSpeakerDiarizationConfig(
+                        segmentation, embedding, clustering
+                    )
+                    self._segmentation_config = segmentation
+                    self._embedding_config = embedding
+                    self._diarizer = so.OfflineSpeakerDiarization(config)
+                    self._extractor = so.SpeakerEmbeddingExtractor(embedding)
+                    self._num_clusters = -1
+                    self.embedding_model = emb_path
+                else:
+                    raise
             return self._diarizer
 
     # ── persistence (call with the lock held) ───────────────────────────────
