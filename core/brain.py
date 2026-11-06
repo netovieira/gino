@@ -182,9 +182,17 @@ EDGE_VOICES = ("pt-BR-AntonioNeural", "pt-BR-FranciscaNeural", "pt-BR-ThalitaNeu
 # Which service reads the replies aloud. "edge" is free (Microsoft); "fish" is
 # Fish Audio (fish.audio), paid per character, any voice from its library or a
 # clone of your own — this is how the assistant gets a specific voice.
-TTS_ENGINES = ("edge", "fish")
+# "qwen3" is Qwen3-TTS local (offline, GPU recommended, ~2 GB VRAM).
+TTS_ENGINES = ("edge", "fish", "qwen3")
 FISH_BASE = "https://api.fish.audio"
 FISH_MODELS = ("s2.1-pro-free", "s2-pro", "s1")
+
+# Qwen3-TTS local model (FASE3-TASK1).  The 0.6B-CustomVoice variant fits in
+# 2 GB of VRAM and supports Portuguese natively.  The model is downloaded from
+# HuggingFace on first use and cached locally for offline operation afterwards.
+QWEN3_TTS_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+QWEN3_TTS_SPEAKER = "Ryan"          # dynamic male voice, good Portuguese
+QWEN3_TTS_LANGUAGE = "Portuguese"
 
 # Tools that only make sense when the model can receive an image.
 _VISION_TOOLS = {"screen_process", "close_camera"}
@@ -220,6 +228,9 @@ def settings(get_plugin_config: Callable[[str], dict]) -> dict:
         "fish_api_key": str(cfg.get("fish_api_key") or "").strip(),
         "fish_voice_id": fish_voice_id(cfg.get("fish_voice_id")),
         "fish_model": fish_model if fish_model in FISH_MODELS else FISH_MODELS[0],
+        "qwen3_tts_model": str(cfg.get("qwen3_tts_model") or QWEN3_TTS_MODEL).strip(),
+        "qwen3_tts_speaker": str(cfg.get("qwen3_tts_speaker") or QWEN3_TTS_SPEAKER).strip(),
+        "qwen3_tts_language": str(cfg.get("qwen3_tts_language") or QWEN3_TTS_LANGUAGE).strip(),
     }
     st.update(_vision_settings(cfg))
     st["chain"] = build_chain(st, cfg, get_plugin_config)
@@ -409,6 +420,11 @@ def fish_voice_id(raw) -> str:
 def voice_label(st: dict) -> str:
     if st.get("tts_engine") == "fish":
         return f"Fish Audio {st.get('fish_model')} voice {st.get('fish_voice_id') or '(default)'}"
+    if st.get("tts_engine") == "qwen3":
+        model = st.get("qwen3_tts_model") or QWEN3_TTS_MODEL
+        speaker = st.get("qwen3_tts_speaker") or QWEN3_TTS_SPEAKER
+        short = model.split("/")[-1] if "/" in model else model
+        return f"Qwen3-TTS {short} speaker {speaker} (local)"
     return f"Edge TTS {st.get('tts_voice')}"
 
 
@@ -1447,6 +1463,96 @@ def tts_fish_pcm24k(text: str, st: dict, style: str | None = None) -> bytes:
     return bytes(dec.samples)
 
 
+# ── voice: Qwen3-TTS local (FASE3-TASK1) → 24 kHz int16 PCM ────────────────
+
+# Module-level cache: the model is loaded once and reused for all subsequent
+# calls.  Loading takes ~4s from HuggingFace cache on GPU.  The lock prevents
+# concurrent loads when multiple threads call speak() at startup.
+_QWEN3_MODEL_CACHE: dict[str, Any] = {"model": None, "lock": threading.Lock()}
+
+
+def _get_qwen3_model(st: dict):
+    """Return the cached Qwen3-TTS model, loading it on first call.
+
+    Uses GPU (bfloat16) when available, falls back to CPU (float32).  The model
+    is downloaded from HuggingFace on first use (~1.2 GB) and cached locally.
+    """
+    if _QWEN3_MODEL_CACHE["model"] is not None:
+        return _QWEN3_MODEL_CACHE["model"]
+
+    with _QWEN3_MODEL_CACHE["lock"]:
+        # Double-check after acquiring lock (another thread may have loaded it)
+        if _QWEN3_MODEL_CACHE["model"] is not None:
+            return _QWEN3_MODEL_CACHE["model"]
+
+        import torch
+        from qwen_tts import Qwen3TTSModel
+
+        model_name = st.get("qwen3_tts_model") or QWEN3_TTS_MODEL
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+        print(f"[TTS] Qwen3-TTS loading {model_name} on {device} ({dtype})...")
+        model = Qwen3TTSModel.from_pretrained(
+            model_name,
+            device_map=device,
+            dtype=dtype,
+        )
+        _QWEN3_MODEL_CACHE["model"] = model
+        print(f"[TTS] Qwen3-TTS ready.")
+        return model
+
+
+def tts_qwen3_pcm24k(text: str, st: dict) -> bytes:
+    """Synthesise `text` with Qwen3-TTS local model and return mono int16 PCM
+    at 24 kHz.  The model runs offline after first download from HuggingFace.
+
+    This is the FASE3-TASK1 integration: Qwen3-TTS as a local TTS option,
+    positioned between Fish Audio (cloud, paid) and Edge TTS (cloud, free) in
+    the fallback chain.  Priority: Fish > Qwen3 > Edge.
+
+    The model is cached at module level — first call loads it (~4s on GPU),
+    subsequent calls reuse the loaded model.  GPU memory: ~2 GB (bfloat16).
+    """
+    import numpy as np
+
+    text = str(text or "").strip()
+    if not text:
+        return b""
+
+    model = _get_qwen3_model(st)
+    speaker = st.get("qwen3_tts_speaker") or QWEN3_TTS_SPEAKER
+    language = st.get("qwen3_tts_language") or QWEN3_TTS_LANGUAGE
+
+    # Synthesise: returns (wavs, sample_rate) where wavs is a list of numpy arrays
+    wavs, sr = model.generate_custom_voice(
+        text=text,
+        language=language,
+        speaker=speaker,
+    )
+
+    if not wavs or len(wavs) == 0:
+        return b""
+
+    # Convert float32 numpy array to int16 PCM bytes at 24 kHz
+    audio = wavs[0]
+    if hasattr(audio, "detach"):  # PyTorch tensor
+        audio = audio.detach().cpu().numpy()
+
+    # Ensure 24 kHz (the model outputs 24 kHz by default, but verify)
+    if sr != 24000:
+        # Resample if needed (shouldn't happen with Qwen3-TTS-12Hz models)
+        import scipy.signal
+        num_samples = int(len(audio) * 24000 / sr)
+        audio = scipy.signal.resample(audio, num_samples)
+
+    # Convert float32 [-1, 1] to int16
+    audio_int16 = np.clip(audio, -1.0, 1.0)
+    audio_int16 = (audio_int16 * 32767).astype(np.int16)
+
+    return audio_int16.tobytes()
+
+
 _FISH_SPLIT = re.compile(r"(?<=[,;:])\s+")
 # 05/11/2026: o `_FISH_GAP` de 220 ms de zeros entre peças foi medido no áudio
 # enviado do WhatsApp (28,7 s, 24 buracos internos > 120 ms, soma de 5,9 s) e
@@ -1842,9 +1948,51 @@ def synth_pcm24k(text: str, st: dict, voice_id: str | None = None,
     of every piece, so each request keeps the tone instead of only the first.
     Edge ignores it and the tag is stripped before synthesis: an Edge voice
     would otherwise pronounce "calm" out loud.
+
+    Fallback chain (FASE3-TASK1): if the configured engine fails, the next
+    engine in the chain is tried automatically.  Priority: Fish > Qwen3 > Edge.
+    FishCreditsExhausted is NOT caught here — the caller handles it to switch
+    the whole session away from Fish (see main.py _fish_out logic).
     """
     tag = str(style or "").strip()
-    if st.get("tts_engine") == "fish":
+    engine = st.get("tts_engine") or "edge"
+
+    # Build the fallback chain: configured engine first, then the rest.
+    # FishCreditsExhausted propagates (caller handles session switch).
+    chain = _tts_fallback_chain(engine)
+
+    last_exc: Exception | None = None
+    for rung in chain:
+        try:
+            return _synth_one_engine(text, st, rung, voice_id=voice_id, style=style)
+        except FishCreditsExhausted:
+            raise  # caller handles this
+        except Exception as exc:
+            last_exc = exc
+            print(f"[TTS] {rung} failed: {exc} — trying next engine")
+            continue
+
+    # All engines failed
+    if last_exc is not None:
+        raise last_exc
+    return b""
+
+
+def _tts_fallback_chain(primary: str) -> list[str]:
+    """Return the TTS engine fallback order.  Priority: Fish > Qwen3 > Edge."""
+    order = ["fish", "qwen3", "edge"]
+    if primary in order:
+        # Move primary to front, keep the rest in order
+        return [primary] + [e for e in order if e != primary]
+    return order
+
+
+def _synth_one_engine(text: str, st: dict, engine: str,
+                      voice_id: str | None = None,
+                      style: str | None = None) -> bytes:
+    """Synthesise with one specific engine.  Raises on failure."""
+    tag = str(style or "").strip()
+    if engine == "fish":
         override = bool(voice_id)
         state = dict(st) if override else st
         refresh_fish_voice(state, voice_id=voice_id, override=override)
@@ -1862,11 +2010,12 @@ def synth_pcm24k(text: str, st: dict, voice_id: str | None = None,
                 out.extend(tts_fish_pcm24k(piece, state, style=tag))
             else:
                 out.extend(tts_fish_pcm24k(piece, state))
-        # Sem gap artificial: o padding natural de cada peça é cortado na
-        # junção (e o resto vira texto — nunca um áudio cheio de buraco).
         return smooth_pcm_silence(bytes(out))
+    if engine == "qwen3":
+        return tts_qwen3_pcm24k(strip_style_tags(text), st)
+    # edge (default fallback)
     SPEECH_STATS.note_http()
-    return tts_pcm24k(strip_style_tags(text), st["tts_voice"])
+    return tts_pcm24k(strip_style_tags(text), st.get("tts_voice") or DEFAULT_VOICE)
 
 
 def fish_balance(key: str) -> float | None:
@@ -1891,8 +2040,11 @@ def fish_credits(key: str) -> str:
 def missing_packages(st: dict | None = None) -> list[str]:
     out = []
     need = [("miniaudio", "miniaudio")]
-    if not st or st.get("tts_engine") != "fish":
+    engine = (st or {}).get("tts_engine") or "edge"
+    if engine != "fish":
         need.insert(0, ("edge_tts", "edge-tts"))
+    if engine == "qwen3":
+        need.append(("qwen_tts", "qwen-tts"))
     for mod, pkg in need:
         try:
             __import__(mod)
@@ -1925,6 +2077,14 @@ def test_connection(values: dict):
                                  + (f", {bal}" if bal else "") + ")")
             except Exception as e:
                 return False, f"Fish Audio voice failed: {e}"
+    if st["tts_engine"] == "qwen3":
+        if not missing:
+            try:
+                pcm = tts_qwen3_pcm24k("Teste de voz.", st)
+                secs = len(pcm) / 48000.0
+                notes.append(f"Qwen3-TTS voice OK ({secs:.1f} s of audio, local)")
+            except Exception as e:
+                return False, f"Qwen3-TTS voice failed: {e}"
     # Every rung, in the order the brain will use them — so a green button here
     # means "the chain works", not just "the first one does".
     lines: list[str] = []
