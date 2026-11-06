@@ -73,6 +73,7 @@ class RepeatedPlaybackBatchesTest(unittest.TestCase):
             on_status=lambda _m: None,
             sample_rate=16000,
             transcribe_fn=lambda _pcm: "",
+            use_vad=False,  # tests use synthetic audio, not real speech
         )
         self.block = voice_block(9000)
 

@@ -162,6 +162,7 @@ class SttErrorPathTest(unittest.TestCase):
             on_status=lambda _m: None,
             sample_rate=16000,
             transcribe_fn=lambda _pcm: "abre o editor de texto agora",
+            use_vad=False,  # tests use synthetic audio, not real speech
         )
 
     def test_handler_exception_libera_o_duck(self):
@@ -219,6 +220,7 @@ class UserSpeechEndTest(unittest.TestCase):
             on_status=lambda _m: None,
             sample_rate=16000,
             transcribe_fn=lambda _pcm: "abre o editor de texto agora",
+            use_vad=False,  # tests use synthetic audio, not real speech
         )
 
     def test_close_da_fala_solta_o_duck_sem_esperar_o_watchdog(self):

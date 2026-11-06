@@ -40,6 +40,7 @@ import numpy as np
 import requests
 
 from core import duck as _duck
+from core import silero_vad
 
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 MODELS = ("whisper-large-v3-turbo", "whisper-large-v3")
@@ -577,7 +578,8 @@ class GroqListener:
                  on_lost: Callable[[str, str, float], None] | None = None,
                  on_gate_drop: Callable[[str, float], None] | None = None,
                  preroll_s: float | None = None,
-                 max_utterance_s: float | None = None) -> None:
+                 max_utterance_s: float | None = None,
+                 use_vad: bool | None = None) -> None:
         self._key, self._model, self._lang = api_key, model, language
         self.prompt = prompt
         # Optional local transcriber (core.local_stt): same segmentation and
@@ -701,6 +703,20 @@ class GroqListener:
         # Score do "fim de turno" da última pausa medida; alimenta a cauda
         # adaptativa (`continue_window_for`). None = ainda não medido.
         self._endpoint_probability: float | None = None
+        # ── Silero VAD: detecção de fala por modelo, não só por RMS ─────────
+        # When the ONNX model is present, is_speech() replaces the RMS threshold
+        # for start/end-of-utterance decisions.  When absent, the existing
+        # level > thresh logic is the fallback — same behaviour as before.
+        # `use_vad=False` forces the RMS path (for tests with synthetic audio).
+        self._vad: silero_vad.SileroVAD | None = None
+        self._vad_available = False
+        if use_vad is not False and silero_vad.available():
+            try:
+                self._vad = silero_vad.SileroVAD()
+                self._vad_available = True
+            except Exception as _vad_err:
+                print(f"[{engine_label}] Silero VAD indisponível "
+                      f"({_vad_err.__class__.__name__}) — usando RMS puro")
 
     @property
     def local(self) -> bool:
@@ -955,26 +971,52 @@ class GroqListener:
             self._peak, self._peak_t = 0.0, now
 
         if not self._active:
-            if level > thresh:
+            # Determine if this block contains speech: Silero VAD when the
+            # model is loaded, RMS threshold as fallback.
+            if self._vad_available:
+                _speech = self._vad.is_speech(raw)
+            else:
+                _speech = level > thresh
+            if _speech:
                 self._above += 1
                 # Energy is not voice. Every candidate frame is measured by the
                 # transient gate; only frames that pass count towards opening
                 # the turn, so a key/click/impact cannot manufacture one.
+                # With VAD the gate still runs for the voice_proven flag, but
+                # the START decision uses VAD-positive blocks directly.
                 if self._probe_voice(raw).ok:
                     self._above_voice += 1
-                if (self._above_voice >= _START_BLOCKS
-                        or self._above >= _VOICE_BYPASS_BLOCKS):
-                    self._open_segment()
+                if self._vad_available:
+                    # VAD replaces both RMS and voice-proof for START: 3
+                    # consecutive VAD-positive blocks open the turn.
+                    if self._above >= _START_BLOCKS:
+                        self._open_segment()
+                else:
+                    # Fallback: original RMS + voice-proof logic.
+                    if (self._above_voice >= _START_BLOCKS
+                            or self._above >= _VOICE_BYPASS_BLOCKS):
+                        self._open_segment()
             else:
                 self._above = 0
                 self._above_voice = 0
                 # A real pause ends the proof window: a click after silence
                 # must not borrow the spectrum of the sentence before it.
                 self._proof_buf.clear()
+                # Reset VAD state on silence so the next utterance starts clean.
+                if self._vad is not None:
+                    self._vad.reset()
             return
 
         self._seg.append(raw)
-        if level > thresh:
+        # Determine if this block contains speech: Silero VAD when the model
+        # is loaded, RMS threshold as fallback.  This is the same criterion
+        # used for START — the segment closes when VAD (or RMS) says "no
+        # speech" for `_end_blocks` consecutive blocks.
+        if self._vad_available:
+            _speech = self._vad.is_speech(raw)
+        else:
+            _speech = level > thresh
+        if _speech:
             self._voiced += 1
             self._below = 0
             if self._probe_voice(raw).ok:

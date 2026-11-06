@@ -7,6 +7,85 @@ Vosk     – offline streaming transcription (lighter)
 import json
 import numpy as np
 
+from core import silero_vad as _silero_vad
+
+
+# ── Silero VAD pre-filter ────────────────────────────────────────────────────
+# Before sending accumulated audio to Whisper, run Silero VAD to strip silence
+# and keep only speech segments.  Falls back to RMS-based detection when the
+# ONNX model is absent.
+
+_VAD_BLOCK_SAMPLES = 16000  # 1 second at 16 kHz
+_VAD_RMS_THRESHOLD = 0.01   # fallback RMS threshold for speech detection
+
+
+def vad_filter_audio(audio: np.ndarray, sample_rate: int = 16000) -> np.ndarray:
+    """Filter audio using Silero VAD (or RMS fallback).
+
+    Returns the audio with silence stripped from the beginning and end.
+    If Silero VAD is available, uses it for accurate speech detection.
+    Otherwise, falls back to RMS-based detection.
+
+    Args:
+        audio: float32 mono audio array at sample_rate Hz
+        sample_rate: audio sample rate (default 16000)
+
+    Returns:
+        Filtered audio array (silence stripped)
+    """
+    if audio.size == 0:
+        return audio
+
+    block_size = int(sample_rate * 0.032)  # 32 ms blocks for VAD
+
+    if _silero_vad.available():
+        # Use Silero VAD for accurate speech detection
+        try:
+            vad = _silero_vad.SileroVAD(threshold=0.5)
+            # Find first and last speech blocks
+            first_speech = 0
+            last_speech = audio.size
+            for i in range(0, audio.size, block_size):
+                block = audio[i:i + block_size]
+                if block.size < block_size // 2:
+                    break
+                if vad.is_speech(block):
+                    if first_speech == 0 and i > 0:
+                        first_speech = max(0, i - block_size)
+                    last_speech = min(audio.size, i + block_size + block_size)
+            return audio[first_speech:last_speech]
+        except Exception:
+            # VAD failed, fall back to RMS
+            pass
+
+    # RMS fallback: strip silence from beginning and end
+    rms_threshold = _VAD_RMS_THRESHOLD
+    first_speech = 0
+    last_speech = audio.size
+
+    for i in range(0, audio.size, block_size):
+        block = audio[i:i + block_size]
+        if block.size == 0:
+            break
+        rms = float(np.sqrt(np.mean(block * block)))
+        if rms >= rms_threshold:
+            if first_speech == 0 and i > 0:
+                first_speech = max(0, i - block_size)
+            last_speech = min(audio.size, i + block_size + block_size)
+            break
+
+    # Find last speech block
+    for i in range(audio.size - block_size, 0, -block_size):
+        block = audio[i:i + block_size]
+        if block.size == 0:
+            continue
+        rms = float(np.sqrt(np.mean(block * block)))
+        if rms >= rms_threshold:
+            last_speech = min(audio.size, i + block_size + block_size)
+            break
+
+    return audio[first_speech:last_speech]
+
 
 class WhisperSTT:
     """Offline transcription using faster-whisper."""
@@ -55,6 +134,12 @@ class WhisperSTT:
     def transcribe(self, audio: np.ndarray) -> str:
         """Transcribe a float32 mono 16 kHz numpy array. Returns transcript string."""
         try:
+            # Pre-filter with Silero VAD (or RMS fallback) to strip silence
+            # before sending to Whisper.  This reduces hallucinations on
+            # room noise and improves transcription accuracy.
+            audio = vad_filter_audio(audio)
+            if audio.size == 0:
+                return ""
             segments, _ = self._model.transcribe(
                 audio,
                 language=self._language,

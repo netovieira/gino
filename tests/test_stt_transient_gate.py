@@ -99,6 +99,7 @@ class _Harness(unittest.TestCase):
             on_gate_drop=_gate_drop,
             sample_rate=_SR,
             transcribe_fn=_transcribe,
+            use_vad=False,  # tests use synthetic audio, not real speech
             **kwargs,
         )
         # Endpointing é um modelo à parte: o corte fixo de silêncio basta.

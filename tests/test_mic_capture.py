@@ -56,6 +56,7 @@ class SpeakingCapTest(unittest.TestCase):
             on_status=lambda _m: None,
             sample_rate=16000,
             transcribe_fn=lambda _pcm: "",
+            use_vad=False,  # tests use synthetic audio, not real speech
         )
 
     def test_reply_cuts_self_audio_instead_of_38_seconds(self):

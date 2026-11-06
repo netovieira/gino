@@ -59,6 +59,7 @@ class SegmentCapTest(unittest.TestCase):
             on_status=lambda _m: None,
             sample_rate=_SR,
             transcribe_fn=_transcribe,
+            use_vad=False,  # tests use synthetic audio, not real speech
             **kwargs,
         )
         # Endpointing é um modelo à parte: aqui o corte fixo de silêncio basta.
