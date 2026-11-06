@@ -103,6 +103,13 @@ noisereduce>=3.0,<4              # RNNoise pre-filter (FASE2-TASK1)
 speechbrain>=1.0,<2              # ECAPA-TDNN speaker ID (FASE2-TASK2)
 qwen-tts>=0.1,<1                 # Qwen3-TTS local offline TTS (FASE3-TASK1)
 sentence-transformers>=3.0,<4    # semantic embeddings na busca de memória (FASE3-TASK2)
+faiss-cpu>=1.7,<2                # índice vetorial FAISS para busca semântica rápida (FASE4-TASK2)
+pipecat-ai>=1.15,<2              # avaliacao de pipeline de voz (FASE4-TASK3) — audio chain only
+
+# ── Architecture evaluation (FASE4-TASK1) ────────────────────────────────────
+# NATS como bus de mensagens entre nós. Instalado para a POC; a migração
+# completa foi ADIADA (ver core/nats_bus.py e tests/test_nats_poc.py).
+nats-py>=2.0,<3
 
 # ── Opt-in voice unlock (Secret Service / keyring) ───────────────────────────
 keyring>=25
