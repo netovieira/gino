@@ -25,6 +25,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from . import guard as _guard
@@ -421,3 +422,168 @@ class Mouth:
             return {"text": "", "ttft_ms": 0.0, "first_sentence_ms": 0.0,
                     "end_ms": 0.0, "error": f"{type(exc).__name__}: {exc}",
                     "aborted": False}
+
+
+# ── medição de latência (FASE1-TASK4) ──────────────────────────────────────
+
+_CEILING_MS = 30_000  # teto de 30s para resposta ponta-a-ponta
+
+_LOG_PATH = Path(__file__).resolve().parents[2] / "logs" / "activity.log"
+
+
+def _log_activity(line: str) -> None:
+    """Acrescenta uma linha no activity.log (logs/activity.log).
+
+    Formato canônico: ``[YYYY-MM-DD HH:MM:SS] texto``. Falha silenciosa: a
+    medição nunca pode quebrar por causa de disco cheio ou diretório ausente.
+    """
+    try:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(f"[{stamp}] {line}\n")
+    except Exception:
+        pass
+
+
+def measure_latency(*, config: FlowsConfig | None = None,
+                    caller: Callable[..., dict[str, Any]] | None = None,
+                    verbose: bool = True) -> dict[str, Any]:
+    """Mede o tempo de cada etapa da boca e verifica o teto de 30s.
+
+    Executa três chamadas sintéticas (brief, chat, complement) usando o caller
+    injetado — ou o ``stream_ollama`` real quando nenhum caller é fornecido.
+    Cada etapa é cronometrada separadamente (TTFT, primeira frase, total). Os
+    resultados vão para o activity.log e também são devolvidos como dict para
+    inspeção em testes.
+
+    Parâmetros
+    ----------
+    config : FlowsConfig, opcional
+        Configuração usada na medição. Padrão: ``FlowsConfig.load()``.
+    caller : callable, opcional
+        Substituto do ``stream_ollama`` (testes injetam fake).
+    verbose : bool
+        Imprime resumo no stdout quando True.
+
+    Retorna
+    -------
+    dict com ``stages`` (lista de medições por chamada), ``ceiling_ms`` (30000),
+    ``all_within_ceiling`` (bool) e ``bottleneck`` (estágio mais lento).
+    """
+    cfg = config or FlowsConfig.load()
+    mouth = Mouth(cfg, caller=caller) if caller is not None else Mouth(cfg)
+
+    stages: list[dict[str, Any]] = []
+    ceiling_ms = _CEILING_MS
+
+    # ── 1. warm (carregamento do modelo) ──────────────────────────────────
+    t0 = time.monotonic()
+    warm_result = mouth.warm()
+    warm_ms = (time.monotonic() - t0) * 1000
+    stages.append({
+        "kind": "warm",
+        "total_ms": round(warm_ms, 1),
+        "error": warm_result.get("error"),
+    })
+
+    # ── 2. brief (pedido com intenção de ferramenta) ──────────────────────
+    from .router import Router
+    router = Router()
+    decision_brief = router.parse("tocar Queen")
+    t0 = time.monotonic()
+    brief_result = mouth.brief("tocar Queen", decision_brief)
+    brief_total_ms = (time.monotonic() - t0) * 1000
+    stages.append({
+        "kind": "brief",
+        "total_ms": round(brief_total_ms, 1),
+        "ttft_ms": round(brief_result.ttft_ms, 1),
+        "first_sentence_ms": round(brief_result.ms, 1),
+        "sentence": brief_result.sentence,
+        "fixed": brief_result.fixed,
+        "error": brief_result.error,
+    })
+
+    # ── 3. answer (conversa curta, rota livre) ────────────────────────────
+    decision_chat = router.parse("como você está?")
+    t0 = time.monotonic()
+    chat_result = mouth.answer("como você está?", decision_chat)
+    chat_total_ms = (time.monotonic() - t0) * 1000
+    stages.append({
+        "kind": "chat",
+        "total_ms": round(chat_total_ms, 1),
+        "ttft_ms": round(chat_result.ttft_ms, 1),
+        "first_sentence_ms": round(chat_result.ms, 1),
+        "sentence": chat_result.sentence,
+        "fixed": chat_result.fixed,
+        "error": chat_result.error,
+    })
+
+    # ── 4. complement (frase de resultado com fatos) ──────────────────────
+    decision_compl = router.parse("abrir o Spotify")
+    facts = [{"spoken": "Spotify aberto", "assertion": True}]
+    t0 = time.monotonic()
+    compl_result = mouth.complement("abrir o Spotify", decision_compl, facts)
+    compl_total_ms = (time.monotonic() - t0) * 1000
+    stages.append({
+        "kind": "complement",
+        "total_ms": round(compl_total_ms, 1),
+        "ttft_ms": round(compl_result.ttft_ms, 1),
+        "first_sentence_ms": round(compl_result.ms, 1),
+        "sentence": compl_result.sentence,
+        "fixed": compl_result.fixed,
+        "error": compl_result.error,
+    })
+
+    # ── análise ───────────────────────────────────────────────────────────
+    model_stages = [s for s in stages if s["kind"] != "warm"]
+    slowest = max(model_stages, key=lambda s: s["total_ms"]) if model_stages else {}
+    all_within = all(s["total_ms"] <= ceiling_ms for s in model_stages)
+
+    report: dict[str, Any] = {
+        "ceiling_ms": ceiling_ms,
+        "mouth_timeout_s": cfg.mouth_timeout_s,
+        "mouth_model": cfg.mouth_model,
+        "stages": stages,
+        "bottleneck": {
+            "kind": slowest.get("kind", ""),
+            "total_ms": slowest.get("total_ms", 0),
+        },
+        "all_within_ceiling": all_within,
+    }
+
+    # ── registro no activity.log ──────────────────────────────────────────
+    for s in stages:
+        kind = s["kind"]
+        total = s["total_ms"]
+        err = s.get("error") or ""
+        sentence = s.get("sentence", "")
+        _log_activity(
+            f"[Fluxos] latencia {kind}: {total:.0f}ms"
+            + (f" sentence={sentence!r}" if sentence else "")
+            + (f" error={err}" if err else "")
+        )
+    status = "OK" if all_within else "ACIMA_DO_TETO"
+    _log_activity(
+        f"[Fluxos] latencia teto={ceiling_ms}ms gargalo="
+        f"{report['bottleneck']['kind']}:{report['bottleneck']['total_ms']:.0f}ms"
+        f" status={status}"
+    )
+
+    # ── saída no console ──────────────────────────────────────────────────
+    if verbose:
+        print(f"=== Medição de latência da boca (teto {ceiling_ms}ms) ===")
+        print(f"Modelo: {cfg.mouth_model} | timeout HTTP: {cfg.mouth_timeout_s}s")
+        for s in stages:
+            flag = "FIXO" if s.get("fixed") else "MODELO"
+            err = f" ERRO={s['error']}" if s.get("error") else ""
+            print(
+                f"  {s['kind']:12s}  {s['total_ms']:7.0f}ms  [{flag}]"
+                f"  {s.get('sentence', '')!r}{err}"
+            )
+        print(f"Gargalo: {report['bottleneck']['kind']} "
+              f"({report['bottleneck']['total_ms']:.0f}ms)")
+        print(f"Teto respeitado: {'sim' if all_within else 'NAO'}")
+        print(f"Registro gravado em: {_LOG_PATH}")
+
+    return report
