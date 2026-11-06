@@ -316,6 +316,8 @@ def test_single_loop_reads_the_otp_mailbox_once(legacy_email, monkeypatch,
     código NÃO é anunciada de novo como "chegou um e-mail".
     """
     mail.migrate_legacy()
+    mail.update_account("principal", filters=[
+        {"subject": "Reuniao", "action": "avisa"}])
     from core import email_otp_watch as otp_watch
     otp_watch.reset(store_path=tmp_path / "seen.json")
     try:
@@ -353,7 +355,7 @@ def test_mailboxes_without_otp_are_swept_without_reading_bodies(vault,
                                                                 monkeypatch):
     """`notify` vale para toda conta; o corpo só é baixado onde há `otp`."""
     mail.add_account("trabalho", "eu@empresa.com", provider="outlook",
-                     notify=True)
+                     notify=True, filters=[{"subject": "Reuniao", "action": "avisa"}])
     mail.set_app_password("trabalho", "senha")
     fake = FakeIMAP({b"5": _header("Reuniao de segunda")})
     attempted: list[str] = []

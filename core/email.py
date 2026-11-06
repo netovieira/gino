@@ -2028,11 +2028,11 @@ def poll_once(hook=None) -> list[dict]:
                 for item in fresh:
                     if str(item.get("uid") or "") in code_uids:
                         continue          # já foi falado como código
-                    rule = (match_filter(item, acct.filters)
-                            if acct.filters else None)
-                    if acct.filters and rule is None:
-                        _filter_trace(acct, item, None, "ignora")
-                        continue          # fora do filtro: nenhum aviso
+                    rule = match_filter(item, acct.filters)
+                    if rule is None:
+                        if acct.filters:
+                            _filter_trace(acct, item, None, "ignora")
+                        continue
                     action = str((rule or {}).get("action") or "avisa")
                     if acct.filters:
                         # Rastro de cada decisão de filtro (passos 2-4 do

@@ -108,13 +108,13 @@ def _three_mailbox():
     })
 
 
-def test_no_rules_keeps_today_behaviour(vault, monkeypatch):
-    """Sem regra nenhuma o filtro não pode piorar nem melhorar nada: 3 avisos."""
+def test_no_filters_notifies_nothing(vault, monkeypatch):
+    """Sem filtros definidos, NENHUM email é notificado — silêncio total."""
     mail.add_account("gmail", "eu@gmail.com", notify=True)
     _connect(monkeypatch, _three_mailbox())
     seen: list[dict] = []
     new = mail.poll_once(hook=seen.append)
-    assert len(new) == 3 and len(seen) == 3
+    assert len(new) == 0 and len(seen) == 0
 
 
 def test_outside_the_filter_does_not_alert_at_all(vault, monkeypatch):
@@ -318,7 +318,8 @@ def test_login_gets_a_bigger_read_timeout_than_the_handshake(vault, monkeypatch)
 
 def test_slow_login_reconnects_in_the_same_sweep(vault, monkeypatch):
     """Timeout no login = UMA nova janela imediata; a varredura não é perdida."""
-    mail.add_account("gmail", "eu@gmail.com", notify=True)
+    mail.add_account("gmail", "eu@gmail.com", notify=True, filters=[
+        {"subject": "farmacia", "action": "avisa"}])
     mail.set_app_password("gmail", "senha")
     fake = FakeIMAP({b"9": _header("Nota da farmacia", message_id="<t1>")})
     calls: list[int] = []
@@ -340,7 +341,8 @@ def test_slow_login_reconnects_in_the_same_sweep(vault, monkeypatch):
 
 def test_timeout_that_persists_never_loses_the_mail(vault, monkeypatch):
     """Falhou as duas janelas: o e-mail continua não lido e chega depois, 1 vez."""
-    mail.add_account("gmail", "eu@gmail.com", notify=True)
+    mail.add_account("gmail", "eu@gmail.com", notify=True, filters=[
+        {"subject": "farmacia", "action": "avisa"}])
     mail.set_app_password("gmail", "senha")
     fake = FakeIMAP({b"9": _header("Nota da farmacia", message_id="<t2>")})
     monkeypatch.setattr(mail, "_imap_open",
