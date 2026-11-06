@@ -334,12 +334,12 @@ _SCOPED_GRANT_RE = re.compile(
     r"(?:o\s+)?(?:projeto\s+)?(?P<projeto>[\w\u00c0-\u017f][\w \u00c0-\u017f.-]{1,40}))?",
     re.IGNORECASE)
 _REVOKE_RE = re.compile(
-    r"(?:revog[ae]|cancel[ae]|retir[ae]|tire(?:\s+(?:o|a)\s+(?:acesso|permiss[ãa]o))?)"
+    r"(?:revog(?:a|ue)|cancel[ae]|retir[ae]|tire(?:\s+(?:o|a)\s+(?:acesso|permiss[ãa]o))?)"
     r"\s+(?:o\s+)?(?:acesso|permiss[ãa]o|grant)?\s*(?:de|do|da|para|pra|da\s)?"
     r"(?P<pessoa>[\w\u00c0-\u017f][\w \u00c0-\u017f-]{1,40})",
     re.IGNORECASE)
 _REVOKE_ALL_RE = re.compile(
-    r"(?:revog[ae]|cancel[ae]|retir[ae])\s+todos\s+os\s+acessos", re.IGNORECASE)
+    r"(?:revog(?:a|ue)|cancel[ae]|retir[ae])\s+todos\s+os\s+acessos", re.IGNORECASE)
 
 _STOPWORDS = {"usuario", "usuaria", "pessoa", "o", "a", "de", "do", "da",
               "projeto", "acesso", "total", "que", "pedir", "solicitar"}
