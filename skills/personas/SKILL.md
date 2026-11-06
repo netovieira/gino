@@ -22,7 +22,8 @@ description: Como criar, escolher e moderar personas especialistas (Fulana do fr
 - Nunca escreva segredos na personalidade.
 
 ## Escolher
-- Se o dono nomear a persona (“Fulana, verifica X”), use essa persona.
+- Se o dono nomear a persona (“Fulana, verifica X”), use essa persona — em QUALQUER canal (voz, tela, WhatsApp), pois ele exigiu "quero poder chamar qualquer persona pelo nome" (02/11/2026 15:43:52).
+- **Rotação de trabalho definida pelo dono (02/11/2026 15:43:52: "comece a rotacionar atividades de dev para o Arnaldo e de Interface para a Aline")**: trabalho de dev/código → Arnaldo (engenheiro sênior 20+ anos, stack TheroTV); trabalho de interface/UI/UX → Aline (arquiteta com domínio em interfaces). Ao pedir algo a eles, o dono quer ouvir as personas conversando quando pedir.
 - Se for trabalho de projeto, descubra a stack com `personas action=for_project path=<...>`; se houver uma persona única, use-a.
 - Se houver empate, pergunte uma vez qual usar. Se não houver persona, responda como o assistente principal.
 - A deixa (“Vou pedir pra Fulana ver.”) é falada pelo sistema; não a repita.
