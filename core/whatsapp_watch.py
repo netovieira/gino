@@ -18,10 +18,13 @@ ECO DO DONO COMO ORDEM
     assistente — "Gino, fala pra Carol...". Sem o nome continua sendo eco e é
     ignorado. O eco de um envio DESTE processo também é reconhecido pelo ID e
     pela assinatura "Gino:" (segunda barreira quando o ID não está mais em
-    memória). ÁUDIO é a exceção: uma nota de voz gravada no chat de um terceiro
+    memória). ÁUDIO é a exceção: uma nota de voz — do dono ou de terceiro —
     não tem como "nomear" ninguém antes de ser transcrita, então ela é
-    candidata sempre — quem decide é o voiceprint do dono em main.py, e a
-    resposta vai para o chat do DONO, nunca para o terceiro.
+    candidata sempre; quem decide é o transcript no handler (main.py):
+    ouvindo o nome, a resposta sai no MESMO chat, em áudio (em texto quando a
+    síntese falha); sem o nome, silêncio total. Nota de voz em chat de
+    terceiro nunca abriu portão privilegiado (dono, 03/11/2026) — e o texto
+    de terceiro continua sendo só conteúdo.
 
 DEDUPE E LIMITE
     Cada id de mensagem aceito é lembrado uma única vez: o mesmo evento pode
@@ -472,6 +475,8 @@ def is_candidate(item: dict, account: str = "") -> bool:
     - Chat direto do dono: qualquer mensagem (inclusive ``from_me=True``).
     - Individual de terceiro: nome/menção. Eco com ``from_me=True`` só vale
       como ORDEM quando nomeia o assistente; sem o nome é resposta própria.
+      Nota de voz (eco ou recebida) é candidata sempre: o nome é ouvido no
+      transcript pelo handler, que decide turno ou silêncio.
     """
     if not isinstance(item, dict):
         return False
@@ -517,6 +522,14 @@ def is_candidate(item: dict, account: str = "") -> bool:
     if _is_own_account(chat):
         return False
     if calls_assistant(item, account):
+        return True
+    # Nota de voz RECEBIDA de terceiro: não existe texto para nomear ninguém
+    # antes da transcrição, então a nota é candidata sempre — quem decide é o
+    # transcript no handler, que só abre turno quando ouve o nome (ou a
+    # menção @) e responde no MESMO chat, em áudio (regra 3 do SKILL do
+    # WhatsApp). Nota sem nome morre em silêncio total lá, antes de qualquer
+    # turno; grupo nunca chega aqui (recusado acima).
+    if is_voice_item(item):
         return True
     # Passo 1 do FLUXO MAPEAMENTO WHATSAPP: a mensagem individual também é
     # candidata quando se dirige a uma persona cadastrada — pelo vocativo

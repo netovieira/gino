@@ -1,0 +1,285 @@
+"""Camada de dados do painel GUIA — o espelho das regras, lido do disco.
+
+O painel GUIA (ui.GuideOverlay) é SOMENTE LEITURA e nunca duplica texto de
+regra no código: cada seção é montada em tempo de render a partir dos
+arquivos-fonte listados abaixo. Mudar o arquivo muda o painel.
+
+Duas obrigações vivem aqui, no ponto de leitura:
+
+* REDAÇÃO — se um arquivo de regra contiver padrão de chave/token/senha,
+  CPF ou telefone, o valor é trocado por ``[retido]`` antes de sair do
+  módulo. A redação acontece na leitura, nunca na renderização, para que
+  nenhum caminho de exibição (texto, cópia, teste) consiga vazar o valor.
+* ORIGEM — cada item carrega ``arquivo:linha`` e, quando o texto da regra
+  tem data, a data da lei.
+
+Sem Qt, sem ``main.py``: o módulo é puro para poder ser testado e
+reutilizado.
+"""
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Iterable
+
+REDACTED = "[retido]"
+
+# ── redação: segredo e dado pessoal nunca saem do arquivo ────────────────────
+#
+# Ordem importa: primeiro os pares chave=valor (que podem conter qualquer
+# caractere), depois os formatos numéricos. Todo padrão é conservador no
+# sentido de NÃO vazar: um falso positivo mostra [retido]; um vazamento não.
+_PATTERNS: tuple[re.Pattern, ...] = (
+    # api_key: xyz / token = xyz / senha: xyz / secret="xyz" / chave=...
+    # O valor usa o alfabeto típico de chave (letra/dígito/_-+/=:.), o que já
+    # descarta código como ``{token: math.log(...)}`` — ``(`` não é caractere
+    # de chave.
+    re.compile(
+        r"(?i)\b(api[ _-]?key|access[ _-]?key|secret(?:[ _-]?key)?|token|"
+        r"password|senha|chave|client[ _-]?secret)(\s*[:=]\s*)"
+        r"[\"']?([A-Za-z0-9_\-+/=:.@]{10,})"
+    ),
+    # sk-... / ghp_... / xoxb-... (chaves de fornecedor já conhecidas)
+    re.compile(r"\b(?:sk|ghp|xoxb|ya29)-[A-Za-z0-9_\-]{8,}"),
+    # Bearer <token>
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]{10,}={0,2}"),
+    # blobs longos de base64/hex (32+ chars) com dígito — sha256, keys soltas.
+    # Exigir dígito descarta caminhos e palavras compostas sem segredo.
+    re.compile(r"\b(?=[A-Za-z0-9+/]{32,}[=]{0,2}\b)(?=[A-Za-z0-9+/]*\d)[A-Za-z0-9+/]{32,}={0,2}"),
+    # CPF: 123.456.789-01 (e variantes sem pontuação)
+    re.compile(r"(?<!\d)\d{3}\.\d{3}\.\d{3}-?\d{2}(?!\d)"),
+    # telefone BR: +55 (11) 91234-5678, 55 11 91234 5678, (11) 1234-5678
+    re.compile(
+        r"(?<!\d)(?:\+?55[\s.\-]?)?\(?\d{2}\)?[\s.\-]?\d{4,5}[\s.\-]?\d{4}(?!\d)"
+    ),
+)
+
+
+def _value_redact(m: re.Match) -> str:
+    """Do par chave=valor só o VALOR é retido: ``api_key: [retido]``.
+
+    group(1) é a chave como escrita, group(2) o separador ``:``/``=`` e o
+    resto é o valor suspeito."""
+    return m.group(1) + m.group(2) + REDACTED
+
+
+def redact(text: str) -> str:
+    """Troca segredo/dado pessoal por ``[retido]`` preservando o resto."""
+    out = _PATTERNS[0].sub(_value_redact, text)
+    for pat in _PATTERNS[1:]:
+        out = pat.sub(REDACTED, out)
+    return out
+
+
+# ── leitura ──────────────────────────────────────────────────────────────────
+
+_MISSING = "(arquivo ausente — a regra no disco não está onde este painel aponta)"
+
+
+def read_redacted(path: Path) -> tuple[str, bool]:
+    """Lê o arquivo e aplica a redação AQUI, no ponto de leitura.
+
+    Retorna (texto, existia). Ausência não é exceção: o painel espelha o
+    disco como ele é, e uma regra que sumiu aparece como ausente.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return _MISSING, False
+    return redact(raw), True
+
+
+def _first_content_line(text: str) -> int:
+    """Linha da primeira linha de conteúdo (pula front-matter YAML e vazias)."""
+    lines = text.splitlines()
+    in_front = bool(lines) and lines[0].strip() == "---"
+    for idx, line in enumerate(lines, start=1):
+        s = line.strip()
+        if in_front:
+            if idx == 1:
+                continue
+            if s == "---":
+                in_front = False
+            continue
+        if s:
+            return idx
+    return 1
+
+
+_DATE_RE = re.compile(r"\b(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})\b")
+
+
+def law_date(text: str) -> str | None:
+    """Data da lei, se o texto do próprio arquivo a traz (ex.: '05/11/2026')."""
+    m = _DATE_RE.search(text)
+    return m.group(1) if m else None
+
+
+def md_block(text: str, title_regex: str) -> tuple[str, int]:
+    """Recorta um bloco ``#… TÍTULO`` de um Markdown, com sua linha inicial.
+
+    Usado para o contrato: o bloco FALA e o bloco TRABALHO de FLUXOS.md
+    aparecem na seção de quem os cumpre, lidos do mesmo arquivo — nada é
+    copiado para o código.
+    """
+    lines = text.splitlines(keepends=True)
+    pat = re.compile(rf"^#+\s*{title_regex}\s*$")
+    start = None
+    level = 0
+    for idx, line in enumerate(lines):
+        m = pat.match(line)
+        if m:
+            start = idx
+            level = len(line) - len(line.lstrip("#"))
+            break
+    if start is None:
+        return "", 0
+    end = len(lines)
+    for idx in range(start + 1, len(lines)):
+        m = re.match(r"^(#+)\s", lines[idx])
+        if m and len(m.group(1)) <= level:
+            end = idx
+            break
+    return "".join(lines[start:end]).rstrip(), start + 1
+
+
+# ── as seções fixas, cada uma apontando para seu arquivo ────────────────────
+
+def _vault_dirs() -> list[Path]:
+    dirs = []
+    try:
+        from core.obsidian import VAULT
+        dirs.append(Path(VAULT).expanduser())
+    except Exception:
+        pass
+    dirs.append(Path.home() / "Documentos" / "Obsidian Vault")
+    return dirs
+
+
+def find_vault_doc(filename: str) -> Path | None:
+    """Achou o documento do vault? Procura os cofres conhecidos (sem varrer o disco)."""
+    for base in _vault_dirs():
+        hit = base / filename
+        if hit.exists():
+            return hit
+        hits = sorted(base.glob(f"*/{filename}"))
+        if hits:
+            return hits[0]
+    return None
+
+
+def _item(base_dir: Path, label: str, rel: str) -> dict:
+    path = base_dir / rel
+    text, existed = read_redacted(path)
+    origin = f"{rel}:1"
+    date = None
+    if existed:
+        origin = f"{rel}:{_first_content_line(text)}"
+        date = law_date(text)
+    return {"label": label, "path": str(path), "origin": origin,
+            "date": date, "text": text, "missing": not existed}
+
+
+def _contract_item(base_dir: Path, label: str, title_regex: str) -> dict:
+    """Um bloco do contrato FLUXOS.md, recortado do arquivo na render."""
+    rel = "skills/fluxos/FLUXOS.md"
+    path = base_dir / rel
+    raw, existed = read_redacted(path)
+    if not existed:
+        return {"label": label, "path": str(path), "origin": f"{rel}:?",
+                "date": None, "text": raw, "missing": True}
+    block, line = md_block(raw, title_regex)
+    return {"label": label, "path": str(path), "origin": f"{rel}:{line or '?'}",
+            "date": law_date(block), "text": block or raw, "missing": False}
+
+
+def _link(label: str, path: Path | str, exists: bool | None = None) -> dict:
+    p = Path(path)
+    ok = p.exists() if exists is None else exists
+    return {"label": label, "path": str(p), "exists": ok}
+
+
+def sections(base_dir: Path) -> list[dict]:
+    """As seis seções fixas do GUIA, montadas do disco, agora."""
+    base = Path(base_dir)
+
+    minhas = [
+        _item(base, "Conversa — o que responder e quando", "skills/conversation/SKILL.md"),
+        _item(base, "Execução — como trabalhar em ordem", "skills/execution/SKILL.md"),
+        _item(base, "Ações — o menu de ferramentas", "skills/actions/SKILL.md"),
+        _item(base, "Voz — como falar", "skills/voice/SKILL.md"),
+        _item(base, "Personas — quem é cada um", "skills/personas/SKILL.md"),
+        _item(base, "Fluxos — o contrato do dono, vale como lei", "skills/fluxos/SKILL.md"),
+        _item(base, "WhatsApp — a rota das mensagens", "skills/whatsapp/SKILL.md"),
+        _item(base, "Memória — o que guardar", "skills/memory/SKILL.md"),
+    ]
+
+    boca = [
+        _item(base, "Guarda da boca — leis de asserção, número, vazamento", "core/flows/guard.py"),
+        _item(base, "Boca — quem atende e responde", "core/flows/mouth.py"),
+        _item(base, "Config da boca — contexto de 15 min, modelo local", "core/flows/config.py"),
+        _contract_item(base, "Contrato — bloco FLUXO FALA", r"FLUXO\s+FALA"),
+    ]
+
+    cerebro = [
+        _item(base, "Live — a boca nunca é esperada", "core/flows/live.py"),
+        _item(base, "Roteador — o que vai pra boca, o que vai pro cérebro", "core/flows/router.py"),
+        _item(base, "Orquestrador de fluxos", "core/flows/orchestrator.py"),
+        _item(base, "Política de modelos gratuitos", "core/free_models.py"),
+    ]
+
+    gates = [
+        _item(base, "Rootgate — o portão da raiz", "core/rootgate.py"),
+        _item(base, "Actiongate — o portão de ação", "core/actiongate.py"),
+        _item(base, "Job grant — a autorização de trabalho", "core/job_grant.py"),
+        _item(base, "Owner decision — decisão que é só do dono", "core/owner_decision.py"),
+        _item(base, "Restart — o que só abre por fala do dono", "core/restart.py"),
+        _contract_item(base, "Contrato — bloco FLUXO TRABALHO", r"FLUXO\s+TRABALHO"),
+    ]
+
+    memoria = [
+        _item(base, "Memória de chat — o que é coletado e indexado", "core/chat_memory.py"),
+        _item(base, "Índice de memória — como se busca", "core/memory_index.py"),
+    ]
+
+    links: list[dict] = []
+    for sec in (minhas, boca, cerebro, gates, memoria):
+        for it in sec:
+            links.append(_link(it["label"], it["path"], exists=not it["missing"]))
+    fluxos_repo = base / "skills" / "fluxos" / "FLUXOS.md"
+    links.append(_link("Contrato (cópia literal no projeto)", fluxos_repo))
+    for fname, label in (
+        ("FLUXOS.md", "Contrato do dono no vault"),
+        ("ORDENS-DO-DONO-2026-11-05.md", "Ordens do dono"),
+        ("TAREFAS-UNIFICADAS.md", "Tarefas unificadas"),
+    ):
+        found = find_vault_doc(fname)
+        links.append(_link(label, found if found else f"(ausente no vault: {fname})",
+                           exists=found is not None))
+
+    return [
+        {"title": "MINHAS REGRAS (o assistente/orquestador)",
+         "short": "MINHAS",
+         "note": "As skills que dizem o que responder, como responder e quando responder — é o guia que este painel espelha.",
+         "items": minhas},
+        {"title": "REGRAS DA BOCA",
+         "short": "BOCA",
+         "note": "O que está em código: as leis de anúncio/asserção/número/vazamento, o contexto de 15 minutos, o modelo local e o contrato do bloco FALA.",
+         "items": boca},
+        {"title": "REGRAS DO CÉREBRO",
+         "short": "CÉREBRO",
+         "note": "A boca nunca é esperada; o roteador decide o caminho; o cérebro usa os modelos gratuitos da política.",
+         "items": cerebro},
+        {"title": "REGRAS DO ORQUESTRADOR / GATES",
+         "short": "GATES",
+         "note": "Os portões (root, ação, grant, decisão do dono, restart — o que só abre por fala do dono) e o bloco TRABALHO do contrato.",
+         "items": gates},
+        {"title": "MEMÓRIA",
+         "short": "MEMÓRIA",
+         "note": "O que deve ser coletado/indexado e o que não entra — a fronteira está nos próprios módulos.",
+         "items": memoria},
+        {"title": "LINKS",
+         "short": "LINKS",
+         "note": "Cada regra acima aponta para o arquivo-fonte; os documentos do vault ficam por último.",
+         "items": links},
+    ]

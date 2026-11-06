@@ -1,4 +1,6 @@
-"""A short window in which the user has authorised a risky common action, opened by voice.
+"""A short window in which the user has authorised a risky common action,
+opened by his voice or by his typed password (the two full factors of
+core/owner_auth.py — decision of the owner, 06/11/2026).
 
 WHY THIS EXISTS
     The tool bridge refuses medium/high actions unless a confirm callback says
@@ -28,8 +30,10 @@ WHY TIME, NOT A USE COUNT
 
 SEPARATE FROM ROOT
     This window authorises ordinary risky actions (sending a message, remote
-    device control). It never authorises sudo or root — core/rootgate.py owns
-    that, with its own window. Opening one does not open the other.
+    device control). Sudo and root belong to core/rootgate.py, with its own
+    window: neither window substitutes for the other. Both modules accept
+    the same two factors — the owner's voice and his verified typed
+    password (decision of the owner, 06/11/2026).
 
 SEPARATE FROM STANDING PERSON-GRANTS
     Everything here is a WINDOW: it opens on a spoken consent and dies on a
@@ -56,6 +60,22 @@ CONSENT SPOKEN BEFORE THE REQUEST IS PARKED
     keeps that consent alive for CONSENT_TTL_SECONDS (15 min) and confirm()
     honours it only for whatsapp_control. It is a bounded window, never a
     standing grant, and it does not open the sudo window.
+
+THE FACTOR THAT OPENED THE WINDOW (lei do dono, 13/11/2026; fator pleno
+por decisão do dono em 06/11/2026)
+    The accepted factors are the owner's VOICE and his TYPED PASSWORD — the
+    same verdict core/job_grant.py and core/owner_auth.py speak (FACTOR_VOICE
+    / FACTOR_TEXT, decided in one place by owner_auth.authorized_factor). A
+    password typed by the owner (app text or his direct WhatsApp chat) is
+    FULL owner authorisation, so the 15-minute send window it armed covers
+    the whole sending scope: whatsapp_control AND send_message — same scope,
+    same TTL, no per-action exception. The send window armed by an
+    anticipated spoken consent keeps the narrower WhatsApp scope it was
+    created with on 02/11/2026: a stray "pode enviar" caught off the mic
+    must not reach other platforms. No window of this module grants sudo by
+    itself — core/rootgate.py owns that, and since 06/11/2026 BOTH factors
+    open it there as well (main._owner_password_grant). Unknown voices,
+    personas, subagents and third-party text open nothing.
 """
 from __future__ import annotations
 
@@ -66,6 +86,7 @@ import unicodedata
 import weakref
 
 from core import rootgate
+from core.owner_auth import FACTOR_TEXT, FACTOR_VOICE  # veredito único de fatores
 
 # How long a spoken consent for a pending bridge request lasts once accepted.
 WINDOW_SECONDS = 120.0
@@ -89,6 +110,11 @@ AUTO_REPLY_SECONDS = 600.0
 _lock = threading.Lock()
 _until = 0.0
 _send_until = 0.0
+# Qual fator abriu cada janela ("" = nada aberto). Só muda a decisão de
+# escopo do confirm(): FACTOR_TEXT (senha do dono verificada por PBKDF2) é
+# autorização plena de envio; FACTOR_VOICE mantém o escopo de 02/11/2026.
+_window_factor = ""
+_send_factor = ""
 _pending: dict | None = None
 # (account, chat) -> {"account": folded, "name": contact, "until": monotonic}
 _replies: dict[tuple[str, str], dict] = {}
@@ -168,18 +194,28 @@ def clear_pending() -> None:
         _pending = None
 
 
-def open_window(seconds: float = WINDOW_SECONDS) -> float:
-    """Start the window after a spoken consent. Returns how long it lasts."""
-    global _until
+def open_window(seconds: float = WINDOW_SECONDS,
+                factor: str = FACTOR_VOICE) -> float:
+    """Start the window after an authorisation. Returns how long it lasts.
+
+    ``factor`` records WHO opened it (voz do dono / senha digitada — the two
+    labels core/owner_auth.py defines). It never widens the window: the same
+    bounded time. Like every other privileged class, both factors also open
+    the sudo window where sudo is owned (core/rootgate.py) — this module's
+    windows themselves stay separate from it.
+    """
+    global _until, _window_factor
     with _lock:
         _until = time.monotonic() + max(5.0, float(seconds))
+        _window_factor = str(factor or FACTOR_VOICE)
     # A new consent renews everything that had been refused: the bridge
     # forgets the calls it had marked as "already denied".
     _notify_grant()
     return max(5.0, float(seconds))
 
 
-def arm_send_window(seconds: float = CONSENT_TTL_SECONDS) -> float:
+def arm_send_window(seconds: float = CONSENT_TTL_SECONDS,
+                    factor: str = FACTOR_VOICE) -> float:
     """Remember a consent spoken BEFORE the bridge parked its request.
 
     The live failure of 02/11/2026: the owner answered "Pode enviar" at
@@ -187,12 +223,18 @@ def arm_send_window(seconds: float = CONSENT_TTL_SECONDS) -> float:
     request at 16:04:33 and 16:12:27 — after the words. ``confirm()`` then
     found no pending request at the moment of the utterance and the consent
     was lost. This armed window is checked when the call finally arrives and
-    authorises only a WhatsApp send, for a bounded time. It is not a standing
+    authorises a bounded send, for a bounded time. It is not a standing
     grant and it never opens the sudo window.
+
+    ``factor`` decides the send scope (see this module's header): a window
+    armed by the owner's verified TYPED PASSWORD covers the whole sending
+    class — whatsapp_control and send_message — with the same TTL; a window
+    armed by an anticipated spoken consent keeps the WhatsApp-only scope.
     """
-    global _send_until
+    global _send_until, _send_factor
     with _lock:
         _send_until = time.monotonic() + max(5.0, float(seconds))
+        _send_factor = str(factor or FACTOR_VOICE)
     _notify_grant()
     return max(5.0, float(seconds))
 
@@ -214,13 +256,13 @@ def remaining() -> float:
 
 
 def authorized() -> bool:
-    """True while the user's spoken authorisation is still in force.
+    """True while an owner authorisation window is still in force.
 
     Includes the 15-minute window armed by a "pode enviar" that arrived before
     the bridge's request was parked (``arm_send_window``). The bridge uses
     this probe to reopen a previously refused request; ``confirm`` scopes that
-    armed window to whatsapp_control, so an unrelated risky action still needs
-    the ordinary 120 s pending window.
+    armed window to the send class (see ``_send_window_allows``), so an
+    unrelated risky action still needs the ordinary 120 s pending window.
     """
     with _lock:
         now = time.monotonic()
@@ -228,32 +270,75 @@ def authorized() -> bool:
 
 
 def close() -> None:
-    global _until, _send_until, _pending
+    global _until, _send_until, _window_factor, _send_factor, _pending
     with _lock:
         _until = 0.0
         _send_until = 0.0
+        _window_factor = ""
+        _send_factor = ""
         _pending = None
         _replies.clear()
 
 
-def confirm(title: str, message: str) -> bool:
-    """The bridge's confirmation channel — voice-only, bounded by time.
+def window_factor() -> str:
+    """Qual fator abriu a janela de ação hoje vigente ('' se nenhuma)."""
+    with _lock:
+        return _window_factor if time.monotonic() < _until else ""
 
-    Returns True while the owner's spoken consent window is open, or while the
-    armed send window is open and the call is a whatsapp_control action. The
-    window is not spent here: the bridge asks before the action runs, and a
-    handler that aborts to ask for a missing argument (whatsapp_control without
-    a contact answers "para quem?") would otherwise burn the consent on a
-    question. The deadline is the lock. Outside it the request is parked as
-    pending (so the next short "pode" is understood as the answer) and this
-    returns False, which the bridge turns into "was not confirmed". A model can
-    never reach True here by itself: only the utterance matcher can open the
-    window.
+
+def send_window_factor() -> str:
+    """Qual fator abriu a janela de envio vigente ('' se nenhuma)."""
+    with _lock:
+        return _send_factor if time.monotonic() < _send_until else ""
+
+
+# Escopo da janela de envio: o CLASS-DE-AÇÕES "mandar mensagem" — nunca uma
+# exceção por ferramenta. whatsapp_control é o envio conectado (regra de
+# 02/11/2026); send_message é o mesmo envio dirigido por janela de app.
+# E-mail NÃO entra aqui: mail_control tem portão próprio, liberado pelos
+# DOIS fatores do dono (voz ou senha digitada verificada) — decisão dele
+# de 06/11/2026.
+_SEND_TITLES = ("whatsapp_control", "send_message")
+
+
+def _send_window_allows(title: str) -> bool:
+    """True when the armed send window covers this confirmation title."""
+    with _lock:
+        open_now = time.monotonic() < _send_until
+        factor = _send_factor if open_now else ""
+    if not open_now:
+        return False
+    low = str(title or "").lower()
+    if "whatsapp_control" in low:
+        return True
+    # Fator senha-digitada (dono verificado por PBKDF2): mesmo escopo e mesmo
+    # TTL das demais ações privilegiadas da janela — cobre o envio por
+    # send_message também. Fator voz antecipada: escopo de WhatsApp de origem.
+    if factor == FACTOR_TEXT and "send_message" in low:
+        return True
+    return False
+
+
+def confirm(title: str, message: str) -> bool:
+    """The bridge's confirmation channel — owner factor, bounded by time.
+
+    Returns True while the owner's authorisation window is open (voice or
+    typed password — the two factors core/owner_auth.py defines), or while the
+    armed send window is open and the call is a send in that window's scope
+    (see _send_window_allows). The window is not spent here: the bridge asks
+    before the action runs, and a handler that aborts to ask for a missing
+    argument (whatsapp_control without a contact answers "para quem?") would
+    otherwise burn the consent on a question. The deadline is the lock.
+    Outside it the request is parked as pending (so the next short "pode" is
+    understood as the answer) and this returns False, which the bridge turns
+    into "was not confirmed". A model can never reach True here by itself:
+    only the utterance matcher (owner's voice) or a verified typed password
+    can open the windows.
     """
     if _window_open():
         clear_pending()
         return True
-    if _send_window_open() and "whatsapp_control" in str(title or "").lower():
+    if _send_window_allows(title):
         clear_pending()
         return True
     mark_pending(title, message)

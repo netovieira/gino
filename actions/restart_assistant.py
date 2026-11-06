@@ -70,11 +70,13 @@ def restart_assistant(parameters: dict, player=None, speak=None,
     if action in _PC_ACTIONS:
         return _manager.request_pc(reason=reason)
     if action in _CONFIRM_ACTIONS:
-        # Confirmation belongs to the owner's voice, not to the model. The
-        # voice gate calls RestartManager.confirm directly; this tool never
-        # confirms on the user's behalf.
-        return ("Restart confirmation is voice-only: the owner must say the "
-                "phrase out loud. Nothing was confirmed.")
+        # Confirmation belongs to the owner's factors, not to the model.
+        # The voice gate and the verified typed password call
+        # RestartManager.confirm (directly or through main's password
+        # grant); this tool never confirms on the user's behalf.
+        return ("Restart confirmation is owner-factor-only: the owner must "
+                "say the phrase out loud or type his password. Nothing was "
+                "confirmed.")
     if action in _CANCEL_ACTIONS:
         return _manager.cancel()
     if action in _STATUS_ACTIONS:
@@ -89,8 +91,10 @@ TOOL = {
     "description": (
         "Restart the assistant itself or the computer. Never happens on the "
         "first call: action='assistant' or action='pc' only parks a request and "
-        "asks the owner to say the phrase out loud ('confirmo reiniciar'). The "
-        "confirmation is voice-only; you cannot confirm it yourself. Never "
+        "asks the owner to say the phrase out loud ('confirmo reiniciar') or "
+        "to type his password. The confirmation is owner-factor-only (voice "
+        "or verified typed password — decision of 06/11/2026); you cannot "
+        "confirm it yourself. Never "
         "claim a restart happened before the owner speaks the phrase. "
         "action='cancel' drops a pending request; action='status' reports one. "
         "Never use the PC restart as part of an automatic improvement."

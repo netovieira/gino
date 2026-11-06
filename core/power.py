@@ -1,4 +1,4 @@
-"""Power actions with a spoken, owner-only confirmation.
+"""Power actions with an owner-confirmed gate (spoken phrase or typed password).
 
 Kinds:
     shutdown  systemctl poweroff / shutdown -h now

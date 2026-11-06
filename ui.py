@@ -34,7 +34,7 @@ from PyQt6.QtCore import (
     QUrl, pyqtSignal, pyqtSlot, Q_ARG,
 )
 from PyQt6.QtGui import (
-    QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
+    QBrush, QColor, QConicalGradient, QDesktopServices, QDragEnterEvent, QDropEvent, QFont,
     QFontDatabase, QIcon, QKeySequence, QLinearGradient, QPainter, QPainterPath,
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
@@ -55,7 +55,7 @@ from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QGraphicsScene, QGraphicsView, QMenu, QSystemTrayIcon,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
+    QStackedWidget, QTabWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QPlainTextEdit, QMessageBox, QCheckBox,
 )
@@ -2558,6 +2558,235 @@ class MemoryOverlay(_HudOverlay):
         # Qt is entitled to touch the sender after a slot returns; tearing it
         # down mid-emission is how a widget ends up half-alive on screen.
         QTimer.singleShot(0, self._rebuild)
+
+
+class GuideOverlay(_HudOverlay):
+    """GUIA — o espelho SOMENTE LEITURA das regras do sistema.
+
+    Ordem do dono: ver num painel as regras do assistente, da boca, do
+    cérebro, do orquestrador/gates e da memória, com link para o arquivo de
+    cada uma. O painel não guarda texto nenhum: cada aba é montada do disco
+    em tempo de render (core.guide_panel), então mudar o arquivo muda o
+    painel. A redação de segredo/dado pessoal acontece na leitura, antes de
+    qualquer widget ver o texto.
+
+    Só existem três ações, nenhuma delas escreve: copiar, abrir o arquivo
+    (Obsidian/editor via xdg-open) e recarregar do disco. Não há campo de
+    entrada, checkbox ou botão salvar — edição de regra se faz no arquivo,
+    pelo dono.
+    """
+
+    _OW = 880
+
+    def __init__(self, parent=None, base_dir=None):
+        super().__init__(parent)
+        self._base = Path(base_dir) if base_dir else BASE_DIR
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            GuideOverlay {{
+                background: rgba(0, 6, 10, 248);
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+        self.setFixedWidth(self._OW)
+
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(18, 14, 18, 12)
+        self._lay.setSpacing(6)
+
+        hdr = QLabel("📖  GUIA — AS REGRAS, SOMENTE LEITURA")
+        hdr.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        self._lay.addWidget(hdr)
+
+        sub = QLabel("A regra mora no arquivo; este painel é o espelho. "
+                     "Mudar o arquivo muda o painel — aqui nada se edita.")
+        sub.setFont(QFont("Courier New", 7))
+        sub.setWordWrap(True)
+        sub.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        self._lay.addWidget(sub)
+
+        bar = QHBoxLayout(); bar.setSpacing(8)
+        copy_all = self._small_btn("⧉  COPIAR TUDO", self._copy_all)
+        reload_btn = self._small_btn("⟳  RECARREGAR DO DISCO", self._reload)
+        close_btn = self._small_btn("FECHAR", self.hide)
+        for b in (copy_all, reload_btn, close_btn):
+            bar.addWidget(b)
+        bar.addStretch(1)
+        self._lay.addLayout(bar)
+
+        self._tabs = QTabWidget()
+        self._tabs.setStyleSheet(f"""
+            QTabWidget::pane {{ border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QTabBar::tab {{ background: {C.PANEL2}; color: {C.TEXT_DIM};
+                border: 1px solid {C.BORDER}; padding: 4px 10px;
+                font-family: 'Courier New'; font-size: 8pt; }}
+            QTabBar::tab:selected {{ color: {C.PRI}; border-bottom-color: {C.PRI}; }}
+        """)
+        self._tabs.setFixedHeight(min(620, max(420, self._base_height())))
+        self._lay.addWidget(self._tabs)
+        self._build_tabs()
+
+    def _base_height(self) -> int:
+        p = self.parentWidget()
+        return (p.height() - 120) if p is not None else 560
+
+    # ── construção ──────────────────────────────────────────────────────
+
+    def _small_btn(self, text: str, slot) -> QPushButton:
+        b = QPushButton(text)
+        b.setFixedHeight(24)
+        b.setFont(QFont("Courier New", 7))
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 0 8px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+        """)
+        b.clicked.connect(slot)
+        return b
+
+    def _build_tabs(self):
+        from core.guide_panel import sections
+        self._sections = sections(self._base)
+        while self._tabs.count():
+            w = self._tabs.widget(0)
+            self._tabs.removeTab(0)
+            w.deleteLater()
+        for sec in self._sections:
+            self._tabs.addTab(self._section_page(sec), sec["short"])
+            self._tabs.widget(self._tabs.count() - 1).setObjectName(
+                sec["title"])   # identidade estável p/ teste e p/ alguém achar
+
+    def _section_page(self, sec: dict) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        ilay = QVBoxLayout(inner)
+        ilay.setContentsMargins(8, 8, 8, 8)
+        ilay.setSpacing(6)
+
+        title = QLabel(sec["title"])
+        title.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        ilay.addWidget(title)
+
+        note = QLabel(sec["note"])
+        note.setWordWrap(True)
+        note.setFont(QFont("Courier New", 7))
+        note.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        ilay.addWidget(note)
+
+        if sec["title"].startswith("LINKS"):
+            for it in sec["items"]:
+                ilay.addWidget(self._link_row(it))
+        else:
+            for it in sec["items"]:
+                ilay.addWidget(self._rule_block(it))
+        ilay.addStretch(1)
+        scroll.setWidget(inner)
+        return scroll
+
+    def _origin_line(self, it: dict) -> str:
+        parts = [f"origem: {it['origin']}"]
+        if it.get("date"):
+            parts.append(f"data da lei: {it['date']}")
+        if it.get("missing"):
+            parts.append("AUSENTE DO DISCO")
+        return "  ·  ".join(parts)
+
+    def _rule_block(self, it: dict) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 2, 0, 2)
+        v.setSpacing(3)
+
+        head = QHBoxLayout(); head.setSpacing(6)
+        name = QLabel(f"📄 {it['label']}")
+        name.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        name.setStyleSheet(f"color: {C.WHITE}; background: transparent;")
+        head.addWidget(name, 1)
+        org = QLabel(self._origin_line(it))
+        org.setFont(QFont("Courier New", 7))
+        org.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        head.addWidget(org)
+        cp = self._small_btn("⧉", self._copy_of(it))
+        cp.setToolTip("Copiar o texto desta regra (o que o painel vê, já redigido)")
+        op = self._small_btn("📂", self._open_of(it))
+        op.setToolTip("Abrir o arquivo no Obsidian/editor padrão")
+        head.addWidget(cp); head.addWidget(op)
+        v.addLayout(head)
+
+        body = QTextEdit()
+        body.setReadOnly(True)                       # leitor, não editor
+        body.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        body.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse |
+            Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        body.setFont(QFont("Courier New", 8))
+        body.setStyleSheet(f"""
+            QTextEdit {{ background: #000a10; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+        """)
+        body.setPlainText(it["text"])
+        # Altura proporcional ao conteúdo, com teto: arquivos de regra são
+        # longos; o scroll da página faz o resto.
+        lines = it["text"].count("\n") + 1
+        body.setFixedHeight(min(320, max(60, 16 * min(lines, 20))))
+        v.addWidget(body)
+        return w
+
+    def _link_row(self, it: dict) -> QWidget:
+        w = QWidget()
+        h = QHBoxLayout(w); h.setContentsMargins(2, 1, 2, 1); h.setSpacing(6)
+        ok = bool(it.get("exists"))
+        name = QLabel(("●  " if ok else "○  ") + it["label"])
+        name.setFont(QFont("Courier New", 8))
+        name.setStyleSheet(f"color: {C.TEXT if ok else C.TEXT_DIM}; background: transparent;")
+        h.addWidget(name)
+        path = QLabel(it["path"] if ok else f"{it['path']}  (ausente)")
+        path.setFont(QFont("Courier New", 7))
+        path.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        h.addWidget(path, 1)
+        if ok:
+            op = self._small_btn("📂", lambda _=False, p=it["path"]: self._open_path(p))
+            h.addWidget(op)
+        return w
+
+    # ── as três únicas ações do painel ──────────────────────────────────
+
+    def _open_path(self, path: str):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _open_of(self, it: dict):
+        def _go(_checked: bool = False):
+            if not it.get("missing"):
+                self._open_path(it["path"])
+        return _go
+
+    def _copy_of(self, it: dict):
+        def _go(_checked: bool = False):
+            QApplication.clipboard().setText(it["text"])
+        return _go
+
+    def _copy_all(self):
+        chunks = []
+        for sec in self._sections:
+            chunks.append(f"===== {sec['title']} =====")
+            for it in sec["items"]:
+                if "text" in it:
+                    chunks.append(f"--- {it['label']} [{self._origin_line(it)}] ---")
+                    chunks.append(it["text"])
+                else:
+                    chunks.append(f"LINK {it['label']}: {it['path']}")
+        QApplication.clipboard().setText("\n".join(chunks))
+
+    def _reload(self):
+        """Joga fora as abas e lê o disco de novo — a prova de que o painel
+        é espelho: nada é cacheado além do instante do render."""
+        self._build_tabs()
 
 
 class ClipboardPanel(QWidget):
@@ -6471,6 +6700,17 @@ class MainWindow(QMainWindow):
         mail_btn.clicked.connect(self._open_mail_settings)
         lay.addWidget(mail_btn)
 
+        guide_btn = QPushButton("📖  GUIA — REGRAS (leitura)")
+        guide_btn.setFixedHeight(26)
+        guide_btn.setFont(QFont("Courier New", 7))
+        guide_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        guide_btn.setStyleSheet(_BTN_STYLE_DIM)
+        guide_btn.setToolTip("As regras do assistente, da boca, do cérebro, dos gates e da "
+                             "memória, lidas do disco em tempo de render. Somente leitura: "
+                             "só copiar, abrir o arquivo e recarregar.")
+        guide_btn.clicked.connect(self._open_guide_panel)
+        lay.addWidget(guide_btn)
+
         w.adjustSize()
         return w
 
@@ -8118,6 +8358,18 @@ class MainWindow(QMainWindow):
         ov.show()
         ov.raise_()
         self._persona_overlay = ov
+
+    def _open_guide_panel(self):
+        """GUIA — painel somente-leitura das regras, montado do disco."""
+        cw = self.centralWidget()
+        ov = GuideOverlay(parent=cw)
+        ow = min(GuideOverlay._OW, cw.width() - 16)
+        oh = min(760, cw.height() - 16)
+        ov.setGeometry((cw.width() - ow) // 2,
+                       (cw.height() - oh) // 2, ow, oh)
+        ov.show()
+        ov.raise_()
+        self._guide_overlay = ov   # referência: sem ela o painel é coletado
 
     # ── Clipboard intelligence ───────────────────────────────────────────────────
 

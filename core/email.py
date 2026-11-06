@@ -42,6 +42,20 @@ PRIVACIDADE (regra dura, não é preferência)
     jsonl guarda ``has_body`` (existe corpo lá no servidor) sem o texto. Só
     ``fetch_body()`` — chamado quando o dono pede "lê o e-mail do banco" —
     baixa o corpo, e ele não entra em nenhuma frase falada por este módulo.
+    Com FILTROS configurados, uma regra ``classificar`` com ``body: true``
+    pode pedir um TRECHO do corpo (``FILTER_BODY_CHARS``) para o gancho do
+    cérebro — sempre pelo MESMO ``BODY.PEEK`` somente leitura, nunca falado
+    pelo aviso, nunca gravado no jsonl, e entregue como DADO: corpo de e-mail
+    não é ordem e nunca autoriza nada.
+
+FILTRO POR CONTA (FLUXO MAPEAMENTO EMAIL, passos 2 e 4)
+    Regras em ``plugin_config.mail.accounts[].filters`` (ao lado de
+    ``notify``/``otp``; sem store paralelo). Sem regra = comportamento de
+    sempre. Com regras: a primeira que casa decide ``avisa`` / ``ignora`` /
+    ``classificar``; fora de todas as regras = NENHUM aviso (nem fala, nem
+    SYS). ``match``: contains | exact | regex simples; campos: from, subject.
+    Quem quer "avisa tudo MENOS marketing" acrescenta no fim uma regra
+    apanhadora (``match: regex``, ``pattern: ".+"``, ``action: avisa``).
 
 ENVIO É IRREVERSÍVEL
     ``request_send()`` só estaciona o pedido; ``confirm_send(voice_ok=True)``
@@ -107,6 +121,19 @@ POLL_S            = 180.0      # intervalo da varredura de não lidos
 OTP_POLL_S        = 60.0       # cadência do passo de códigos (a mesma de antes)
 SCAN              = 60         # quantos não lidos recentes uma varredura olha
 BODY_CHARS        = 4000       # teto de corpo devolvido a quem pedir
+# Timeout de leitura APÓS a janela TCP/TLS aberta: o teto de 12 s valia para o
+# login também, e o Gmail sob carga respondeu a autenticação em 12,5-13 s — o
+# socket cortava antes do "OK". A conexão continua limitada a CONNECT_TIMEOUT_S;
+# depois de aberta, a leitura (login/select/FETCH) ganha este teto maior.
+IMAP_READ_TIMEOUT_S = 30.0
+# Filtro por conta (FLUXO MAPEAMENTO EMAIL, passos 2 e 4): regras gravadas no
+# MESMO registro da conta em plugin_config.mail (ao lado de notify/otp).
+# Sem regra nenhuma o comportamento é o de sempre; com regras, e-mail que
+# NÃO casa com nenhuma NÃO gera aviso nenhum (nem fala, nem SYS).
+FILTER_ACTIONS    = ("avisa", "ignora", "classificar")
+FILTER_MATCHES    = ("contains", "exact", "regex")
+FILTER_MAX_RULES  = 40         # teto de regras por conta (config do dono)
+FILTER_BODY_CHARS = 1200       # trecho do corpo entregue ao cérebro por regra
 PENDING_PATH      = _MEMORY_DIR / "mail_send_pending.json"
 CONFIRM_MARKER    = "confirmo enviar"
 CONFIRM_TIMEOUT_S = 1800.0     # 30 min: o mesmo prazo do pedido de reinício
@@ -286,6 +313,95 @@ def set_app_password(name_or_uuid: str, password: str | None) -> bool:
 
 # ── a conta ──────────────────────────────────────────────────────────────────
 
+def _clean_rule(entry: object) -> dict | None:
+    """Uma regra de filtro validada, ou None se for descartável.
+
+    Chaves: ``from`` e/ou ``subject`` (padrão), ``match`` (contains | exact |
+    regex simples), ``action`` (avisa | ignora | classificar) e ``body``
+    (bool: a regra de classificar pede também um TRECHO do corpo — dado,
+    nunca ordem). regex passa por compilação e teto de tamanho; padrão
+    inválido derruba a regra inteira (a gente não adivinha regra do dono).
+    """
+    if not isinstance(entry, dict):
+        return None
+    field = str(entry.get("field") or "").strip().lower()
+    pattern = str(entry.get("pattern") or "").strip()
+    if field not in ("from", "subject") or not pattern:
+        # Forma do dono no config: {"from": "banco"} / {"subject": "nota"}.
+        field, pattern = "", ""
+        for key in ("from", "subject"):
+            value = str(entry.get(key) or "").strip()
+            if value:
+                field, pattern = key, value
+                break
+    if not field or len(pattern) > 200:
+        return None
+    action = str(entry.get("action") or "").strip().lower()
+    if action not in FILTER_ACTIONS:
+        return None
+    match = str(entry.get("match") or "contains").strip().lower()
+    if match not in FILTER_MATCHES:
+        return None
+    if match == "regex":
+        try:
+            re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            return None
+    return {"field": field, "pattern": pattern, "match": match,
+            "action": action, "body": bool(entry.get("body")),
+            "label": _one_line(entry.get("label") or "", 60)}
+
+
+def _clean_filters(entries: object) -> list[dict]:
+    if not isinstance(entries, list):
+        return []
+    out: list[dict] = []
+    for entry in entries[:FILTER_MAX_RULES]:
+        rule = _clean_rule(entry)
+        if rule is None:
+            _log("regra de filtro de e-mail inválida ignorada")
+            continue
+        out.append(rule)
+    return out
+
+
+def _rule_hits(rule: dict, item: dict) -> bool:
+    """A regra casa com o cabeçalho? Só campos do cabeçalho, nunca o corpo."""
+    if rule.get("field") == "from":
+        haystacks = (str(item.get("from") or ""), str(item.get("sender") or ""))
+    else:
+        haystacks = (str(item.get("subject") or ""),)
+    pattern = str(rule.get("pattern") or "")
+    match = rule.get("match") or "contains"
+    for text in haystacks:
+        if not text:
+            continue
+        if match == "exact":
+            if text.strip().casefold() == pattern.strip().casefold():
+                return True
+        elif match == "regex":
+            try:
+                if re.search(pattern, text, re.IGNORECASE):
+                    return True
+            except re.error:
+                return False
+        else:
+            if pattern.casefold() in text.casefold():
+                return True
+    return False
+
+
+def match_filter(item: dict, rules: list[dict]) -> dict | None:
+    """A PRIMEIRA regra que casa (ordem = prioridade), ou None."""
+    for rule in rules or []:
+        try:
+            if _rule_hits(rule, item):
+                return rule
+        except Exception:
+            continue
+    return None
+
+
 class MailAccount:
     """Uma conta de e-mail: metadados, caminhos e estado de conexão."""
 
@@ -295,7 +411,8 @@ class MailAccount:
                  imap_ssl: bool = True, smtp_host: str = "",
                  smtp_port: int = 587, smtp_security: str = "starttls",
                  default: bool = False, auto_start: bool = True,
-                 notify: bool = False, otp: bool = False):
+                 notify: bool = False, otp: bool = False,
+                 filters: list | None = None):
         self.name         = name
         self.uuid         = uuid
         self.address      = address
@@ -315,6 +432,9 @@ class MailAccount:
         # é a política); a flag decide em quais caixas vale pagar o custo de
         # baixar o corpo das mensagens novas.
         self.otp          = otp
+        # Regras de filtro (passos 2/4 do fluxo do dono): lista validada de
+        # {field, pattern, match, action, body}. Vazia = comportamento antigo.
+        self.filters      = _clean_filters(filters)
         # caminhos (convenção do WhatsApp: um diretório por conta + inbox jsonl)
         self.dir          = _STATE_ROOT / uuid
         self.state_file   = self.dir / "state.json"
@@ -352,6 +472,7 @@ class MailAccount:
             "smtp_port": self.smtp_port, "smtp_security": self.smtp_security,
             "default": self.default, "auto_start": self.auto_start,
             "notify": self.notify, "otp": self.otp,
+            "filters": [dict(r) for r in self.filters],
             "has_password": has_password(self.uuid),
             "connected": self.connected, "state": self.state,
             "error": self.error, "detail": self.detail,
@@ -412,6 +533,7 @@ def _entry_to_account(entry: dict) -> MailAccount:
         auto_start=bool(entry.get("auto_start", True)),
         notify=bool(entry.get("notify", False)),
         otp=bool(entry.get("otp", False)),
+        filters=entry.get("filters"),
         **defaults,
     )
 
@@ -457,7 +579,8 @@ def _save_accounts() -> None:
                  "imap_ssl": a.imap_ssl, "smtp_host": a.smtp_host,
                  "smtp_port": a.smtp_port, "smtp_security": a.smtp_security,
                  "default": a.default, "auto_start": a.auto_start,
-                 "notify": a.notify, "otp": a.otp}
+                 "notify": a.notify, "otp": a.otp,
+                 "filters": [dict(r) for r in a.filters]}
                 for a in _accounts.values()
             ],
             "default_account": chosen,
@@ -555,7 +678,7 @@ def add_account(name: str, address: str = "", provider: str = DEFAULT_PROVIDER,
                 smtp_host: str = "", smtp_port: int | None = None,
                 smtp_security: str = "", default: bool = False,
                 auto_start: bool = True, notify: bool = False,
-                otp: bool = False,
+                otp: bool = False, filters: list | None = None,
                 app_password_value: str = "") -> MailAccount:
     """Cria uma conta e persiste os METADADOS (a senha, se veio, vai ao cofre)."""
     _ensure_accounts()
@@ -574,7 +697,7 @@ def add_account(name: str, address: str = "", provider: str = DEFAULT_PROVIDER,
                     display_name=str(display_name or "").strip(),
                     provider=provider, default=bool(default),
                     auto_start=bool(auto_start), notify=bool(notify),
-                    otp=bool(otp), **defaults)
+                    otp=bool(otp), filters=filters, **defaults)
     a.ensure_dir()
     if default:
         for other in _accounts.values():
@@ -598,6 +721,7 @@ def update_account(name_or_uuid: str, new_name: str | None = None,
                    auto_start: bool | None = None,
                    notify: bool | None = None,
                    otp: bool | None = None,
+                   filters: list | None = None,
                    default: bool | None = None) -> bool:
     """Edita uma conta. False = não achou, nome repetido ou entrada inválida.
 
@@ -661,6 +785,11 @@ def update_account(name_or_uuid: str, new_name: str | None = None,
         target.notify = bool(notify)
     if otp is not None:
         target.otp = bool(otp)
+    if filters is not None:
+        cleaned = _clean_filters(filters)
+        if filters and len(cleaned) != len(filters):
+            return False          # regra inválida: nada é gravado pela metade
+        target.filters = cleaned
     if default is True:
         for other in _accounts.values():
             other.default = other is target
@@ -886,10 +1015,35 @@ def _imap_open(acct: MailAccount):
             conn.starttls(ssl_context=ssl.create_default_context())
         except Exception:
             pass
+    # Janela aberta: a leitura do login/select/FETCH ganha teto próprio (30 s).
+    # O teto de 12 s da conexão derrubava LOGIN lento do Gmail aos 12,5 s —
+    # o servidor estava respondendo, não recusando; era o socket cortando.
+    try:
+        conn.socket().settimeout(IMAP_READ_TIMEOUT_S)
+    except Exception:
+        pass
     acct._stage = "login"
     conn.login(acct.address, password)
     acct._stage = "ready"
     return conn
+
+
+def _imap_open_renewed(acct: MailAccount):
+    """`_imap_open` com UMA segunda janela quando o servidor atrasou.
+
+    Timeout de leitura não é recusa: a conexão antiga é descartada e tenta-se
+    uma nova imediatamente, dentro da MESMA varredura. O que espera entre
+    ciclos é o backoff que já existe (815a307); isto aqui só evita perder a
+    rodada atual por um única resposta lenta.
+    """
+    try:
+        return _imap_open(acct)
+    except (TimeoutError, socket.timeout) as e:
+        _log(f"{acct.name}: o servidor demorou ({type(e).__name__}) — "
+             "abrindo uma nova janela antes de dar a tentativa por falha")
+        conn = _imap_open(acct)
+        _log(f"{acct.name}: reconectou na segunda janela")
+        return conn
 
 
 def _smtp_open(acct: MailAccount):
@@ -1125,7 +1279,7 @@ def _attempt(acct: MailAccount) -> dict:
             state, detail = "auth", "falta a senha de app"
         else:
             stage = "connect"
-            conn = _imap_open(acct)
+            conn = _imap_open_renewed(acct)
             stage = "select"
             acct._stage = "select"
             conn.select("INBOX", readonly=True)
@@ -1499,7 +1653,7 @@ def refresh(name_or_uuid: str | None = None, limit: int = SCAN) -> list[dict]:
             continue
         conn = None
         try:
-            conn = _imap_open(acct)
+            conn = _imap_open_renewed(acct)
             conn.select("INBOX", readonly=True)
             fresh.extend(_collect_unseen(acct, conn, limit))
         except imaplib.IMAP4.error as e:
@@ -1794,6 +1948,19 @@ def _otp_covered_addresses() -> set[str]:
             if a.address and a.otp and has_password(a.uuid)}
 
 
+def _hook_wants_rule(hook) -> bool:
+    """O gancho aceita a regra como 2º argumento? (hooks antigos: 1 só)."""
+    try:
+        import inspect
+        sig = inspect.signature(hook)
+        positional = [p for p in sig.parameters.values()
+                      if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        return len(positional) >= 2 or any(
+            p.kind == p.VAR_POSITIONAL for p in sig.parameters.values())
+    except (TypeError, ValueError):
+        return False
+
+
 def poll_once(hook=None) -> list[dict]:
     """Uma varredura de todas as contas habilitadas; devolve o que é novo.
 
@@ -1802,10 +1969,18 @@ def poll_once(hook=None) -> list[dict]:
     processador registrado) e só então avisa "chegou um e-mail" — mensagem que
     virou código não é avisada duas vezes. Conta com ``notify`` desligado entra
     no inbox mas não chama o gancho: o aviso em voz é decisão do dono.
+
+    FILTRO (passos 2/4 do fluxo do dono): a conta sem regras se comporta como
+    sempre. Com regras, a PRIMEIRA que casa decide: ``avisa`` fala, ``ignora``
+    não gera aviso nenhum, ``classificar`` entrega ao gancho a regra junto (e,
+    se a regra pedir ``body``, um TRECHO do corpo como DADO — nunca ordem,
+    nunca por padrão, nunca no jsonl). E-mail fora de todas as regras não
+    gera aviso nenhum: nem fala, nem SYS.
     """
     _ensure_accounts()
     hook = hook if hook is not None else _watch_hook
     processor = _otp_processor
+    wants_rule = callable(hook) and _hook_wants_rule(hook)
     delivered: list[dict] = []
     for acct in list(_accounts.values()):
         if not acct.auto_start and not acct.notify and not acct.otp:
@@ -1815,7 +1990,7 @@ def poll_once(hook=None) -> list[dict]:
         n = _begin_attempt(acct)
         acct._stage = "connect"
         try:
-            conn = _imap_open(acct)
+            conn = _imap_open_renewed(acct)
             acct._stage = "select"
             conn.select("INBOX", readonly=True)
             fresh = _collect_unseen(acct, conn)
@@ -1829,8 +2004,28 @@ def poll_once(hook=None) -> list[dict]:
                 for item in fresh:
                     if str(item.get("uid") or "") in code_uids:
                         continue          # já foi falado como código
+                    rule = (match_filter(item, acct.filters)
+                            if acct.filters else None)
+                    if acct.filters and rule is None:
+                        continue          # fora do filtro: nenhum aviso
+                    action = str((rule or {}).get("action") or "avisa")
+                    if action == "ignora":
+                        continue
+                    if action == "classificar" and (rule or {}).get("body"):
+                        # O trecho sai DAQUI, da conexão já aberta e somente
+                        # leitura; vai só na cópia do gancho — o jsonl fica
+                        # cabeçalho puro.
+                        try:
+                            item["body_excerpt"] = peek_body(
+                                conn, str(item.get("uid") or ""),
+                                FILTER_BODY_CHARS)
+                        except Exception as e:
+                            _log(f"o trecho do corpo de {acct.name} falhou: {e}")
                     try:
-                        hook(dict(item))
+                        if wants_rule:
+                            hook(dict(item), dict(rule) if rule else None)
+                        else:
+                            hook(dict(item))
                     except Exception as e:
                         _log(f"aviso de e-mail novo não entregue: {e}")
                     else:
@@ -1962,7 +2157,7 @@ def reset() -> None:
         _pending = None
 
 
-# ── envio: pedido estacionado, confirmação só pela VOZ do dono ──────────────
+# ── envio: pedido estacionado, confirmação pelo fator do dono (voz ou senha) ──
 
 _pending_lock = threading.Lock()
 _pending: dict | None = None
@@ -2072,12 +2267,15 @@ def cancel_send() -> str:
 
 
 def confirm_send(voice_ok: bool = False) -> tuple[bool, str]:
-    """Executa o envio estacionado. Só com a voz do dono reconhecida.
+    """Executa o envio estacionado. Só com autorização do dono.
 
-    ``voice_ok`` é o resultado do portão de voz do main.py
-    (``_speaker_order_identity``): sem áudio do dono, ou com a voz de outra
-    pessoa, isto recusa e o pedido continua parado. Texto digitado nunca chega
-    aqui com True.
+    ``voice_ok`` é o veredito do portão do dono: verdadeiro quando a fala
+    foi confirmada pelo voiceprint (main._speaker_order_identity) OU
+    quando a senha digitada correta foi verificada — desde a decisão do
+    dono de 06/11/2026 os dois fatores são plenos e iguais
+    (core/owner_auth.authorized_factor). Sem áudio do dono, sem senha,
+    ou com a voz de outra pessoa, isto recusa e o pedido continua parado.
+    Texto digitado comum (sem senha) nunca chega aqui com True.
     """
     if not voice_ok:
         return False, "envio de e-mail exige a sua voz confirmando; nada foi enviado"

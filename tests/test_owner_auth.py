@@ -54,7 +54,14 @@ def _isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(main._actiongate, "open_window", lambda *a, **k: 120.0)
     monkeypatch.setattr(main._actiongate, "arm_send_window",
                         lambda *a, **k: 900.0)
+    # Fator pleno confirma também e-mail pendente: o portão de e-mail é
+    # mockado aqui — nenhum estado real nem SMTP é tocado.
+    from core import email as _mailmod
+    monkeypatch.setattr(_mailmod, "pending_send", lambda: None)
+    from core import rootgate
+    rootgate.close()
     yield
+    rootgate.close()
 
 
 def _set_password(password: str) -> None:

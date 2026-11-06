@@ -1,20 +1,29 @@
-"""A short window in which the user has authorised root, opened by voice.
+"""A short window in which the user has authorised root, opened by his
+voice or by his verified typed password.
 
 WHY THIS EXISTS
-    The user does not want to type a password to let the assistant install
-    something — they want to say "pode usar sudo" and have it happen. That means
-    sudo must be passwordless (see autorizar-sudo.sh) and the authorisation has
-    to live HERE: a window that opens only when the user says so, expires on its
-    own, and closes again after use.
+    The user wanted to say "pode usar sudo" and have it happen (see
+    autorizar-sudo.sh for why sudo is passwordless), and the authorisation
+    therefore lives HERE: a window that opens only when the user says so —
+    by his voice or, since his decision of 06/11/2026 ("eu posso liberar
+    QUALQUER coisa com a senha ou com a minha voz"), also by his typed
+    password — expires on its own, and closes again after use. Both factors
+    are full owner factors, decided in one place (core/owner_auth.
+    authorized_factor); the password grant is applied by
+    main._owner_password_grant, which opens this window the same way the
+    spoken privilege phrase does.
 
 THE RISK, STATED PLAINLY
     With passwordless sudo, the ONLY gate is this window plus whatever the
-    router decided to run. The microphone hears the room, and the room includes
-    music and TV — a lyric has already become a turn once. So the window is:
+    router decided to run. The microphone hears the room, and the room
+    includes music and TV — a lyric has already become a turn once. So the
+    window is:
 
       • opened by an explicit privilege phrase ("pode usar sudo", "autorizo o
         sudo", "pode usar root"), matched as its own intent before any model
-        sees the text — the model cannot open it;
+        sees the text and confirmed by the OWNER's voiceprint — or opened by
+        the owner's password typed in his own app/WhatsApp text and verified
+        against the PBKDF2 hash. The model cannot open it either way;
       • short-lived (two minutes by default), so an accidental phrase does not
         leave root hanging around for the rest of the day;
       • single-use by default: a successful privileged command consumes it,
@@ -92,7 +101,8 @@ def remaining() -> float:
 
 
 def authorized() -> bool:
-    """True while the user's spoken authorisation is still in force."""
+    """True while the user's authorisation (voice or typed password) is in
+    force."""
     with _lock:
         return (not _consumed) and time.monotonic() < _until
 

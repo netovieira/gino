@@ -28,8 +28,15 @@ from __future__ import annotations
 import threading
 import time
 
-# Fatores aceitos — os únicos que a lei do dono prevê para aprovação.
-FACTORS = ("voz do dono", "senha digitada")
+from core.owner_auth import FACTORS  # veredito único: voz do dono OU senha digitada
+
+# Fatores aceitos — os únicos que a lei do dono prevê: as MESMAS constantes
+# que core/actiongate.py e core/owner_auth.py usam, para que todas as
+# janelas privilegiadas falem do mesmo veredito de fator (decisão do dono,
+# voz, 06/11/2026: "eu posso liberar QUALQUER coisa com a senha ou com a
+# minha voz"). Não há classe em que a senha seja banida — job, ação, envio,
+# sudo, reinício, energia e e-mail aceitam os dois fatores; o que continua
+# valendo é que só o DONO os fornece (voiceprint ou PBKDF2), nunca o modelo.
 
 # Mesma duração da janela de ação do actiongate: quem abriu uma abriu a outra.
 WINDOW_S = 120.0

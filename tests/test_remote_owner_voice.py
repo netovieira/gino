@@ -13,9 +13,12 @@ These tests pin the fix at the three seams that matter:
       the SAME privileged voiceprint decides (positive => owner; negative =>
       nothing is authorised and an anomaly is logged);
   (b) typed "pode" — from any channel — still opens nothing;
-  (c) an owner voice note inside a third-party chat is NEVER an order — even
-      when the transcript names the assistant — and is ignored in total
-      silence: no turn, no memory, no reply, no narration (dono, 03/11/2026).
+  (c) an owner voice note inside a third-party chat is transcribed ONLY to
+      hear the name trigger (SKILL do WhatsApp, regras 1/3/5, 04/11/2026):
+      without the name it dies in total silence; WITH the name it is an
+      ORDER answered in that same chat — but nothing there ever runs the
+      privileged voiceprint, decodes PCM for the gates or records an owner
+      turn. Text typed anywhere never is privileged either.
 
 No network, no real audio, no real speaker model: decoding and speaker-id are
 fakes; the gates themselves are the real code.
@@ -244,7 +247,11 @@ class RemoteOwnerVoiceArmsTests(unittest.TestCase):
         self.assertFalse(actiongate.authorized())
 
 
-class ThirdPartyEchoIsNeverAnOrderTests(unittest.TestCase):
+class ThirdPartyEchoNameGateTests(unittest.TestCase):
+    """Regra 5 do SKILL: eco no chat de terceiro é silêncio SEM o nome e
+    ORDEM respondida no mesmo chat COM o nome — e nunca abre portão
+    privilegiado (voiceprint/consentimento só no chat direto do dono)."""
+
     def setUp(self):
         actiongate.close()
         self.addCleanup(actiongate.close)
@@ -269,18 +276,22 @@ class ThirdPartyEchoIsNeverAnOrderTests(unittest.TestCase):
             {"action": "send", "to": THIRD_CHAT, "account": ACCOUNT}),
             "responder ao terceiro nunca é autorizado por esta nota")
 
-    def test_owner_typed_text_in_third_party_chat_is_ignored_in_silence(self):
+    def test_owner_typed_text_without_the_name_in_third_party_chat_is_silence(self):
+        """Regra 5: eco SEM nome continua eco — silêncio, nada de turno."""
         obj = _obj()
         item = {"ts": 0, "chat": THIRD_CHAT, "name": THIRD_NAME,
                 "from_me": True, "group": False,
-                "text": "Gino, fala pra Carol como você se sente",
+                "text": "fala pra Carol como você se sente",
                 "media": None, "id": "typed-third"}
+        prev = whatsapp_watch.trigger_name()
+        whatsapp_watch.set_assistant_name("Gino")
+        self.addCleanup(whatsapp_watch.set_assistant_name, prev)
         actiongate.allow_whatsapp_reply(ACCOUNT, THIRD_CHAT, THIRD_NAME)
         self.assertFalse(_autoreply(obj, item, direct=False))
 
         obj._memory_record_user.assert_not_called()
         self.assertEqual(obj._chat_memory.turns, [],
-                         "texto do dono em chat de terceiro não vira turno")
+                         "eco sem nome não vira turno")
         obj._qoder_turn.assert_not_called()
         obj._qoder_hold.assert_not_called()
         self.assertEqual(obj.ui.logs, [])
@@ -288,16 +299,77 @@ class ThirdPartyEchoIsNeverAnOrderTests(unittest.TestCase):
             "whatsapp_control",
             {"action": "send", "to": THIRD_CHAT, "account": ACCOUNT}))
 
-    def test_any_voice_in_third_party_chat_is_never_decoded_or_transcribed(self):
+    def test_owner_typed_text_naming_the_assistant_is_an_order_in_that_chat(self):
+        """Regra 5 (incidente 05/11/2026 22:59): eco do dono COM o nome no
+        chat de um terceiro é ordem e é respondida no MESMO chat — texto
+        digitado, porém, nunca abre portão privilegiado algum."""
+        obj = _obj()
+        item = {"ts": 0, "chat": THIRD_CHAT, "name": THIRD_NAME,
+                "from_me": True, "group": False,
+                "text": "Gino, fala pra Carol como você se sente",
+                "media": None, "id": "typed-third-named"}
+        prev = whatsapp_watch.trigger_name()
+        whatsapp_watch.set_assistant_name("Gino")
+        self.addCleanup(whatsapp_watch.set_assistant_name, prev)
+        actiongate.allow_whatsapp_reply(ACCOUNT, THIRD_CHAT, THIRD_NAME)
+        self.assertTrue(_autoreply(obj, item, direct=False))
+
+        obj._qoder_turn.assert_called_once()
+        instruction = obj._qoder_turn.call_args[0][0]
+        self.assertIn("ORDEM DO DONO NO CHAT DE UM TERCEIRO", instruction)
+        _, kwargs = obj._qoder_turn.call_args
+        self.assertEqual(kwargs["wa_chat"], THIRD_CHAT)  # o MESMO chat
+        self.assertFalse(kwargs["owner_voice"],
+                         "texto digitado nunca é voz privilegiada")
+        self.assertIsNone(kwargs["gate_text"],
+                          "nada de transcript/ordem nos portões privilegiados")
+        obj._memory_record_user.assert_not_called()
+        obj._decode_whatsapp_pcm.assert_not_called()
+
+    def test_unnamed_voice_echo_is_transcribed_only_for_the_name_then_silent(self):
+        """A nota é lida SÓ para ouvir o gatilho; sem o nome, silêncio e
+        nenhum PCM, nenhum turno, nenhuma autorização viva."""
         obj = _obj(speaker=guest_speaker())
         item = _voice_item(chat=THIRD_CHAT, from_me=True, name=THIRD_NAME)
+        prev = whatsapp_watch.trigger_name()
+        whatsapp_watch.set_assistant_name("Gino")
+        self.addCleanup(whatsapp_watch.set_assistant_name, prev)
+        actiongate.allow_whatsapp_reply(ACCOUNT, THIRD_CHAT, THIRD_NAME)
         self.assertFalse(_autoreply(obj, item, direct=False))
-        obj._transcribe_whatsapp_audio.assert_not_called()
+        obj._transcribe_whatsapp_audio.assert_called_once()
         obj._decode_whatsapp_pcm.assert_not_called()
         obj._qoder_turn.assert_not_called()
         obj._qoder_hold.assert_not_called()
         self.assertEqual(obj._chat_memory.turns, [])
         self.assertEqual(obj.ui.logs, [])
+        self.assertFalse(actiongate.whatsapp_reply_allowed(
+            "whatsapp_control",
+            {"action": "send", "to": THIRD_CHAT, "account": ACCOUNT}),
+            "nota sem nome não deixa grant de resposta vivo")
+
+    def test_named_voice_echo_answers_in_the_chat_without_any_privilege(self):
+        """Com o nome no transcript, a nota do dono vira ordem no MESMO
+        chat — mas em chat de terceiro nada decodifica PCM para os portões
+        nem vira turno 'owner'."""
+        obj = _obj(speaker=FakeSpeaker())
+        obj._transcribe_whatsapp_audio = mock.Mock(
+            return_value="Gino, responde aquela dúvida dela")
+        item = _voice_item(chat=THIRD_CHAT, from_me=True, name=THIRD_NAME)
+        prev = whatsapp_watch.trigger_name()
+        whatsapp_watch.set_assistant_name("Gino")
+        self.addCleanup(whatsapp_watch.set_assistant_name, prev)
+        actiongate.allow_whatsapp_reply(ACCOUNT, THIRD_CHAT, THIRD_NAME)
+        self.assertTrue(_autoreply(obj, item, direct=False))
+
+        obj._decode_whatsapp_pcm.assert_not_called()
+        obj._qoder_turn.assert_called_once()
+        _, kwargs = obj._qoder_turn.call_args
+        self.assertEqual(kwargs["wa_chat"], THIRD_CHAT)
+        self.assertEqual(kwargs["media_type"], "audio",
+                         "espelho: nota de voz responde em áudio")
+        self.assertFalse(kwargs["owner_voice"])
+        self.assertIsNone(kwargs["gate_text"])
+        self.assertEqual(kwargs["source"], "whatsapp")
 
     def test_no_direct_chat_resolved_still_sends_nothing_anywhere(self):
         obj = _obj()

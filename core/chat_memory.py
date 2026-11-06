@@ -210,7 +210,51 @@ def _role_label(role) -> str:
 
 
 def _truncate(text: str, max_chars: int) -> str:
-    return text if len(text) <= max_chars else text[:max_chars]
+    return _clip_line(text, max_chars)
+
+
+def _clip_line(text, max_chars: int) -> str:
+    """Corta uma linha no último ponto de frase (ou palavra) que caiba no teto.
+
+    O corte puro por caractere devolvia frase no meio e o dono lia memória
+    "podada" na tela; aqui a linha sempre termina em frase fechada ou, quando
+    não há frase fechada dentro do teto, no fim da última palavra inteira.
+    """
+    text = str(text or "")
+    try:
+        max_chars = int(max_chars)
+    except (TypeError, ValueError):
+        return text
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    head = text[:max_chars]
+    cut = max((head.rfind(e) + 1 for e in (". ", "! ", "? ", ".\n", "!\n",
+                                          "?\n", "…")), default=0)
+    if cut >= max(1, int(max_chars * 0.5)):
+        return head[:cut].rstrip()
+    sp = head.rfind(" ")
+    if sp > 0:
+        return head[:sp]
+    return head
+
+
+def _cost(lines) -> int:
+    """Custo aproximado de juntar linhas com "\\n" (1 newline por linha)."""
+    return sum(len(line) + 1 for line in lines)
+
+
+def _fit_lines(lines, max_chars: int) -> list:
+    """Do início: mantém linhas inteiras que cabem no teto — nunca fatia."""
+    kept, used = [], 0
+    for line in lines:
+        cost = len(line) + (1 if kept else 0)
+        if used + cost > max_chars:
+            break
+        kept.append(line)
+        used += cost
+    return kept
 
 
 def _tail_lines(text: str, max_chars: int) -> str:
@@ -225,6 +269,70 @@ def _tail_lines(text: str, max_chars: int) -> str:
         used += cost
     kept.reverse()
     return "\n".join(kept)
+
+
+def _render_section(lines, prefer, quota):
+    """Render one section within its quota — whole lines only, or nothing."""
+    body = lines[1:]
+    room = quota - len(lines[0]) - 1
+    if not body or room <= 0:
+        return [], 0
+    if prefer == "tail":
+        kept_text = _tail_lines("\n".join(body), room)
+    else:
+        kept_text = "\n".join(_fit_lines(body, room))
+    if not kept_text:
+        return [], 0
+    out = [lines[0]] + kept_text.splitlines()
+    return out, _cost(out)
+
+
+def _quota_sections(top, sections, max_chars):
+    """Divide the budget across level sections, each with its own quota.
+
+    O corte anterior fatiava o índice no meio da frase e deixava nível 1 com
+    uma linha podada no boot. Aqui hot, state e tópicos recebem quota
+    proporcional ao próprio tamanho — o que não cabe sai como linha inteira
+    removida, nunca como frase pela metade — e a fatia que uma seção não usa
+    (cabe inteira, ou não cabe nem uma linha) volta para as demais.
+    """
+    budget = max_chars - _cost(top) - 1
+    full = [_cost(lines) for lines, _ in sections]
+    total = sum(full) or 1
+    if budget <= 0:
+        return list(top)
+    if total <= budget:
+        out = list(top)
+        for lines, _ in sections:
+            out.extend(lines)
+        return out
+    quotas = [max(0, int(budget * f / total)) for f in full]
+    rendered = []
+    for _ in range(len(sections) + 1):
+        rendered = [_render_section(sections[i][0], sections[i][1], quotas[i])
+                    for i in range(len(sections))]
+        used = sum(cost for _, cost in rendered)
+        slack = budget - used
+        if slack <= 0:
+            break
+        need = [(i, full[i] - quotas[i]) for i in range(len(sections))
+                if full[i] - quotas[i] > 0]
+        if not need:
+            break
+        need_total = sum(n for _, n in need)
+        for i, n in need:
+            add = min(n, max(1, int(slack * n / need_total)))
+            quotas[i] += add
+        while sum(quotas) > budget:  # arredondamento do max(1, ...) estourou
+            for i in range(len(quotas) - 1, -1, -1):
+                if sum(quotas) <= budget:
+                    break
+                if quotas[i] > 0:
+                    quotas[i] -= 1
+    out = list(top)
+    for lines, _cost_done in rendered:
+        out.extend(lines)
+    return out
 
 
 def _human_gap(hours: float) -> str:
@@ -679,7 +787,8 @@ class ChatMemory:
     def _render_hot(self, now: datetime) -> str:
         start = now - timedelta(hours=HOT_HOURS)
         turns = self._turns_between(start, now)
-        body = [f"- {dt:%H:%M} {label}: {text[:280]}" for dt, label, text in turns]
+        body = [f"- {dt:%H:%M} {label}: {_clip_line(text, 280)}"
+                for dt, label, text in turns]
         if not body:
             body = [f"- (sem falas nas últimas {HOT_HOURS} h)"]
         topic_lines = self._topic_links()
@@ -1331,12 +1440,22 @@ class ChatMemory:
                             at = n.get("at", "")
                             lines.append(f"- {at[11:16] if len(at) >= 16 else at} "
                                          f"[{n.get('kind', 'note')}] "
-                                         f"{n.get('text', '')[:160]}")
+                                         f"{_clip_line(n.get('text', ''), 160)}")
                 lines.append("Use apenas o que está escrito aqui e nos tópicos. "
                              "Se algo não estiver registrado, diga que não lembra; "
                              "não invente detalhes.")
                 text = "\n".join(lines)
-                return text if len(text) <= max_chars else text[:max_chars]
+                if len(text) > max_chars:
+                    # a linha de fechamento (regra dura) tem quota reservada;
+                    # o corpo sai em linhas inteiras, nunca fatiado no meio.
+                    tail_line = lines[-1]
+                    if len(tail_line) + 1 > max_chars:
+                        text = _clip_line(tail_line, max_chars)
+                    else:
+                        body = _fit_lines(lines[:-1],
+                                          max_chars - len(tail_line) - 1)
+                        text = "\n".join(body + [tail_line])
+                return text
         except Exception as e:
             print(f"[ChatMemory] prompt_block failed: {e}")
             return ""
@@ -1365,60 +1484,63 @@ class ChatMemory:
                 lines = ["# Índice da conversa (níveis)",
                          f"Agora: {current:%d/%m/%Y %H:%M}."]
 
-                lines.append("## Nível 0 — sessão viva")
+                sec0 = ["## Nível 0 — sessão viva"]
                 if resumed:
-                    lines.append("- Sessão Qoder retomada; o histórico acima já "
-                                 "está no contexto. Use-o antes de buscar arquivos.")
+                    sec0.append("- Sessão Qoder retomada; o histórico acima já "
+                                "está no contexto. Use-o antes de buscar arquivos.")
                 else:
-                    lines.append("- Sessão nova: use o índice e os últimos turnos "
-                                 "abaixo para esquentar a conversa.")
-                lines.append(f"- {len(recent)} falas nas últimas {HOT_HOURS} h.")
+                    sec0.append("- Sessão nova: use o índice e os últimos turnos "
+                                "abaixo para esquentar a conversa.")
+                sec0.append(f"- {len(recent)} falas nas últimas {HOT_HOURS} h.")
 
-                lines.append("## Nível 1 — últimas horas (hot.md)")
+                sec1 = ["## Nível 1 — últimas horas (hot.md)"]
                 if gap["long"]:
-                    lines.append(f"- {gap['prompt']}")
+                    sec1.append(f"- {gap['prompt']}")
                 elif recent:
                     hot = _tail_lines(self._render_hot(current), 1200)
-                    lines.append(hot)
+                    sec1.extend(hot.splitlines())
                 else:
-                    lines.append("- (sem falas recentes)")
+                    sec1.append("- (sem falas recentes)")
 
-                lines.append("## Nível 2 — fio atual (state.md)")
+                sec2 = ["## Nível 2 — fio atual (state.md)"]
                 if state.get("current_topic"):
-                    lines.append(f"- Assunto atual: [[topics/{state['current_topic']}]]")
+                    sec2.append(f"- Assunto atual: [[topics/{state['current_topic']}]]")
                 if state.get("open_threads"):
-                    lines.append("- Threads abertas: "
-                                 + "; ".join(state["open_threads"][:8]) + ".")
+                    sec2.append("- Threads abertas: "
+                                + "; ".join(state["open_threads"][:8]) + ".")
                 notes = state.get("notes") or []
                 for note in notes[-4:]:
                     at = str(note.get("at") or "")
-                    lines.append(f"- Nota {at[11:16] if len(at) >= 16 else at} "
-                                 f"[{note.get('kind', 'note')}] "
-                                 f"{str(note.get('text') or '')[:160]}")
+                    sec2.append(f"- Nota {at[11:16] if len(at) >= 16 else at} "
+                                f"[{note.get('kind', 'note')}] "
+                                f"{_clip_line(str(note.get('text') or ''), 160)}")
                 if not (state.get("current_topic") or state.get("open_threads") or notes):
-                    lines.append("- (sem assunto aberto registrado)")
+                    sec2.append("- (sem assunto aberto registrado)")
 
-                lines.append("## Nível 3 — horas, dias e tópicos (memory_search/read)")
+                sec3 = ["## Nível 3 — horas, dias e tópicos (memory_search/read)"]
                 days = sorted(self.days_dir.glob("*/index.md"),
                               key=lambda p: p.parent.name, reverse=True)[:5]
                 for path in days:
-                    lines.append(f"- [[days/{path.parent.name}/index]]")
+                    sec3.append(f"- [[days/{path.parent.name}/index]]")
                 topics = self._topic_links()
-                if topics:
-                    lines.extend(topics)
-                else:
-                    lines.append("- (nenhum tópico gravado ainda)")
+                sec3.extend(topics)
+                if not topics and not days:
+                    sec3.append("- (nenhum tópico gravado ainda)")
 
-                lines.append("## Nível 4 — longo prazo")
-                lines.append("- `memory/long_term.json` via recall_memory, só "
-                             "quando os níveis acima não bastarem.")
-                lines.append("## Nível 5 — não existe")
-                lines.append("- Se não estiver registrado, diga que não lembra; "
-                             "nunca reconstrua um detalhe por dedução.")
+                sec4 = ["## Nível 4 — longo prazo",
+                        "- `memory/long_term.json` via recall_memory, só "
+                        "quando os níveis acima não bastarem."]
+                sec5 = ["## Nível 5 — não existe",
+                        "- Se não estiver registrado, diga que não lembra; "
+                        "nunca reconstrua um detalhe por dedução."]
 
-                text = "\n".join(lines)
+                sections = [(sec0, "head"), (sec1, "tail"), (sec2, "head"),
+                            (sec3, "head"), (sec4, "head"), (sec5, "head")]
+                text = "\n".join(_quota_sections(lines, sections, max_chars))
                 if len(text) > max_chars:
-                    text = text[:max_chars]
+                    # emergência: teto apertado demais até para as seções
+                    # montadas; corta em linha inteira, nunca na metade da frase.
+                    text = "\n".join(_fit_lines(text.splitlines(), max_chars))
                 _atomic_write(self.index_path, text + "\n")
                 return text
         except Exception as e:
@@ -1447,29 +1569,71 @@ class ChatMemory:
         except (TypeError, ValueError):
             index_max = 2600
         try:
-            index = self.index_block(max_chars=index_max, now=now,
-                                     resumed=resumed)
+            if max_chars >= 2000:
+                head = ["[WARM-UP DA CONVERSA — leia antes de responder]",
+                        "Esta é a continuação da MESMA conversa. O índice abaixo "
+                        "diz o que existe e em que nível; os últimos turnos são as "
+                        "palavras exatas do fio recente. Não comece como se fosse "
+                        "a primeira mensagem e não pergunte o que já está aqui."]
+                footer = ("Se precisar de um detalhe que não está aqui, use "
+                          "memory_search/memory_read antes de dizer que não lembra.")
+            else:
+                # No teto curto do boot cada caractere dos fixos sai da conta
+                # dos turnos: cabeçalho e rodapé viram uma linha e o resto
+                # vira quota de memória, não de prosa.
+                head = ["[WARM-UP DA CONVERSA — leia antes de responder]",
+                        "Continuação da MESMA conversa: o índice dá os níveis, "
+                        "os turnos abaixo dão as palavras exatas. Não pergunte "
+                        "o que já está aqui."]
+                footer = ("Detalhe ausente? Use memory_search/memory_read antes "
+                          "de dizer que não lembra.")
             turns = self.recent_turns(hours=HOT_HOURS, now=now)
             if recent_turns:
                 turns = turns[-recent_turns:]
-            lines = ["[WARM-UP DA CONVERSA — leia antes de responder]",
-                     "Esta é a continuação da MESMA conversa. O índice abaixo "
-                     "diz o que existe e em que nível; os últimos turnos são as "
-                     "palavras exatas do fio recente. Não comece como se fosse "
-                     "a primeira mensagem e não pergunte o que já está aqui."]
+            turn_lines = []
+            for turn in turns:
+                at = str(turn.get("at") or "")
+                stamp = at[11:16] if len(at) >= 16 else at
+                turn_lines.append(f"- {stamp} {turn.get('role', '?')}: "
+                                  f"{_clip_line(str(turn.get('text') or ''), 500)}")
+            # Quota própria: no teto curto do boot o índice não pode engolir os
+            # turnos exatos — era isso que deixava "Últimos turnos" com uma
+            # linha fatiada no meio da frase. Metade da sala para o índice, o
+            # resto para as palavras exatas; o que o índice não usa volta.
+            room = max_chars - _cost(head) - len(footer) - 2
+            index_cap = min(index_max, max(200, room // 2))
+            index = ""
+            if room > 0:
+                index = self.index_block(max_chars=index_cap, now=now,
+                                         resumed=resumed)
+            lines = list(head)
             if index:
-                lines.append(index)
-            if turns:
-                lines.append("## Últimos turnos (palavras exatas, nível 0/1)")
-                for turn in turns:
-                    at = str(turn.get("at") or "")
-                    stamp = at[11:16] if len(at) >= 16 else at
-                    lines.append(f"- {stamp} {turn.get('role', '?')}: "
-                                 f"{str(turn.get('text') or '')[:500]}")
-            lines.append("Se precisar de um detalhe que não está aqui, use "
-                         "memory_search/memory_read antes de dizer que não lembra.")
+                idx_room = room - _cost(index.splitlines()) - 1
+                if idx_room < 0:
+                    index = "\n".join(_fit_lines(index.splitlines(),
+                                                 room - 1))
+                idx_lines = [l for l in index.splitlines() if l]
+                if idx_lines:
+                    lines.extend(idx_lines)
+                    room = max_chars - _cost(lines) - len(footer) - 2
+            if turn_lines and room > 0:
+                hdr = "## Últimos turnos (palavras exatas, nível 0/1)"
+                body_room = room - len(hdr) - 1
+                kept = _tail_lines("\n".join(turn_lines), body_room)
+                if not kept and body_room > 0:
+                    # O turno mais novo sozinho não cabe na sala: entra podado
+                    # em frase/palavra inteira — seção vazia no boot é o
+                    # sintoma que o dono chamou de "memória não carrega".
+                    kept = _clip_line(turn_lines[-1], body_room)
+                if kept:
+                    lines.append(hdr)
+                    lines.extend(kept.splitlines())
+            lines.append(footer)
             text = "\n".join(lines)
-            return text if len(text) <= max_chars else text[:max_chars]
+            if len(text) > max_chars:
+                # emergência: teto menor que os fixos; linha inteira, nunca frase.
+                text = "\n".join(_fit_lines(lines, max_chars))
+            return text
         except Exception as e:
             print(f"[ChatMemory] warmup_block failed: {e}")
             return ""

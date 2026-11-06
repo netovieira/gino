@@ -88,7 +88,7 @@ class EdgeNeverHearsTheTagTest(unittest.TestCase):
 
 
 class FishTagOnEveryPieceTest(unittest.TestCase):
-    def test_tag_goes_to_each_piece_and_gap_is_kept(self):
+    def test_tag_goes_to_each_piece_and_pieces_join_without_gap(self):
         st = {"tts_engine": "fish"}
         calls = []
 
@@ -104,7 +104,10 @@ class FishTagOnEveryPieceTest(unittest.TestCase):
 
         self.assertEqual(calls, [("peça um", "[calm]"),
                                  ("peça dois", "[calm]")])
-        self.assertEqual(len(pcm), 4 + len(brain._FISH_GAP))
+        # 05/11/2026: o gap de 220 ms de zeros entre peças foi derrubado —
+        # a emenda não soma silêncio artificial (áudio medido com 24 buracos
+        # > 120 ms). Fixtures abaixo de 200 ms passam intocadas.
+        self.assertEqual(len(pcm), 4)
 
     def test_old_two_argument_call_shape_still_works(self):
         st = {"tts_engine": "fish"}

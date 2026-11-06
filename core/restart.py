@@ -16,7 +16,10 @@ WHY A SECOND CONFIRMATION MODULE
 
     The phrase is a gate, not a proof of identity: the voiceprint check belongs
     to the audio layer, which is why this module stays small and does not try to
-    listen. What it guarantees is that *nothing irreversible happens in the same
+    listen. Since the owner's decision of 06/11/2026 the typed password is the
+    equal second factor: main's password grant confirms a pending request here
+    by calling ``confirm`` with the parked phrase — never a model tool call.
+    What it guarantees is that *nothing irreversible happens in the same
     call that asks for it*.
 
 WHY THE HELPER IS DETACHED — AND NOT ONLY DETACHED
@@ -601,9 +604,11 @@ class RestartManager:
         return (
             f"[CONFIRMATION_PENDING] A spoken confirmation is needed to restart "
             f"the {kind}. Nothing has restarted. Tell the owner to say exactly "
-            f"'{request.phrase}' out loud. The confirmation is voice-only: the "
-            f"assistant applies it when the owner speaks, and no tool call can "
-            f"confirm it for them. Until then, do not claim it happened."
+            f"'{request.phrase}' out loud, or to type his password in the app "
+            f"or his own WhatsApp. The confirmation is owner-factor-only (the "
+            f"owner's voice or his verified typed password — decision of "
+            f"06/11/2026): no tool call can confirm it for him. Until then, "
+            f"do not claim it happened."
         )
 
     def confirm_owner(self, kind: str = "assistant",
