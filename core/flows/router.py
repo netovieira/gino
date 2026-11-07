@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -232,6 +233,44 @@ class Router:
         self.fallback_decisions = 0
         self.fallback_calls = 0
         self.fallback_last: dict[str, Any] = {}
+        # UV-1 (métrica "nunca ignorar"): perguntas do dono ainda sem
+        # resposta. Cada pergunta roteada incrementa; cada resposta
+        # entregue decrementa. O conjunto por turno garante no máximo uma
+        # contagem e uma baixa por turno — o valor nunca é inventado: é o
+        # tamanho real da dívida. Quem liga os pontos é o orquestrador
+        # (``begin``/``mark_answered``/``cancel``) e a ponte viva (resposta
+        # da boca); o valor vai ao activity.log a cada janela (6 h) na linha
+        # ``[Fluxos] metrica perguntas_sem_resposta valor=N``.
+        self.questions_without_answer = 0
+        self._qwa_lock = threading.Lock()
+        self._qwa_pending: set[str] = set()
+
+    def note_question(self, turn_id: str) -> None:
+        """Conta a pergunta deste turno como aberta (aguarda resposta).
+
+        Recomeço do mesmo turno (parcial que vira final, re-begin) não
+        duplica: o conjunto é chaveado pelo ``turn_id``.
+        """
+        key = str(turn_id or "")
+        if not key:
+            return
+        with self._qwa_lock:
+            self._qwa_pending.add(key)
+            self.questions_without_answer = len(self._qwa_pending)
+
+    def note_answer(self, turn_id: str) -> None:
+        """Baixa a dívida do turno quando a resposta foi entregue.
+
+        Turno nunca contado (fonte tarefa, cancelamento assumido pela boca,
+        ou já baixado antes) não toca o contador: decremento sem pergunta
+        registrada é no-op, e o valor não pode descer de zero.
+        """
+        key = str(turn_id or "")
+        if not key:
+            return
+        with self._qwa_lock:
+            self._qwa_pending.discard(key)
+            self.questions_without_answer = len(self._qwa_pending)
 
     def route(self, text: str, trust: str = TRUST_OWNER) -> Decision:
         if str(trust or TRUST_OWNER) != TRUST_OWNER:

@@ -270,6 +270,12 @@ class Orchestrator:
             state.cancel_event.set()
             state.cancelled = True
 
+        # UV-1 (métrica "nunca ignorar"): toda fala do dono que a rota aceitou
+        # é uma pergunta em dívida até a resposta sair. O cancelamento dito
+        # ("deixa quieto") não é pergunta: retira a dívida, não abre uma.
+        if plan.active and not plan.blocked and not decision.cancel:
+            self.router.note_question(plan.turn_id)
+
         if any(a.tool == "media_control" for a in decision.actions):
             self.supervisor.register(CHAT_MEDIA, KIND_MEDIA_MONITOR,
                                      self.config.media_monitor)
@@ -587,6 +593,9 @@ class Orchestrator:
             state = self._turns.get(str(turn_id))
             if state is not None:
                 state.answered = True
+        # UV-1: a resposta do cérebro chegou — a pergunta deste turno deixa
+        # de dever. Turno nunca contado (tarefa, cancelamento) é no-op.
+        self.router.note_answer(str(turn_id))
 
     # ── boca ────────────────────────────────────────────────────────────────
     def brief(self, plan: TurnPlan,
@@ -736,6 +745,12 @@ class Orchestrator:
 
     # ── cancelamento ────────────────────────────────────────────────────────
     def cancel(self, turn_id: str, reason: str = "cancelado") -> bool:
+        # UV-1: turno cancelado não deixa pergunta sem resposta no contador:
+        # pelo contrato "nada morre em silêncio" a fala preemptada vira
+        # contexto do turno seguinte (carryover do processo vivo) ou foi o
+        # dono que retirou o pedido. A baixa é keyed por turno e idempotente
+        # no roteador, por isso acontece antes dos retornos antecipados.
+        self.router.note_answer(str(turn_id))
         with self._lock:
             state = self._turns.get(str(turn_id))
             if state is None:
@@ -781,6 +796,9 @@ class Orchestrator:
                 "fallback_decisions": self.router.fallback_decisions,
                 "fallback_calls": self.router.fallback_calls,
                 "fallback_last": dict(self.router.fallback_last),
+                # UV-1: perguntas do dono ainda sem resposta neste processo.
+                "questions_without_answer":
+                    self.router.questions_without_answer,
             },
             "mouth": {"calls": self.mouth.calls,
                       "guard_trips": self.mouth.guard_trips,

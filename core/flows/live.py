@@ -25,6 +25,12 @@ from .orchestrator import Orchestrator, TurnPlan
 from .router import TRUST_OWNER
 from .supervisor import Supervisor
 
+# UV-1 (métrica "nunca ignorar"): janela de gravação do contador
+# ``questions_without_answer`` no activity.log — a cada 6 h, uma linha
+# ``[Fluxos] metrica perguntas_sem_resposta valor=N``. É a prova que o dono
+# pode grepar depois de 24 h de uso normal.
+QWA_LOG_INTERVAL_S = 6 * 3600.0
+
 
 @dataclass
 class _LiveTurn:
@@ -80,7 +86,8 @@ class FlowsRuntime:
                  interim_ack_ms: float | None = None,
                  latency_log: Callable[[str], None] | None = None,
                  attention: Any | None = None,
-                 attention_log: Callable[[str], None] | None = None):
+                 attention_log: Callable[[str], None] | None = None,
+                 qwa_log_interval_s: float | None = None):
         self.config = config
         self.speak = speak
         self.log = log or (lambda _msg: None)
@@ -118,6 +125,13 @@ class FlowsRuntime:
         self._turns: dict[str, _LiveTurn] = {}
         self._lock = threading.RLock()
         self._closed = False
+        # UV-1: relógio da janela de 6 h do contador de perguntas sem
+        # resposta. O primeiro registro sai uma janela depois de criado;
+        # testes encurtam via ``qwa_log_interval_s``.
+        self._qwa_interval_s = float(
+            QWA_LOG_INTERVAL_S if qwa_log_interval_s is None
+            else max(0.0, float(qwa_log_interval_s)))
+        self._qwa_last = self.clock()
         self._expiry_stop = threading.Event()
         self._expiry_thread: threading.Thread | None = None
         self._warm_thread: threading.Thread | None = None
@@ -594,12 +608,44 @@ class FlowsRuntime:
             self._log(f"[Fluxos] supervisor matou {chat}: {reason}")
         return killed
 
+    def qa_metric_tick(self, now: float | None = None) -> bool:
+        """UV-1: grava o contador de perguntas sem resposta na janela vencida.
+
+        Uma linha por janela (6 h no vivo; encurtável para medir em teste) no
+        log dos fluxos — no processo vivo, o ``log`` injetado é o
+        activity.log. Devolve True quando gravou. Nunca quebra o turno: só
+        lê e escreve log.
+        """
+        with self._lock:
+            instante = self.clock() if now is None else float(now)
+            if instante - self._qwa_last < self._qwa_interval_s:
+                return False
+            self._qwa_last = instante
+            valor = int(self.orchestrator.router.questions_without_answer)
+        self._log(f"[Fluxos] metrica perguntas_sem_resposta valor={valor} "
+                  f"janela_s={int(self._qwa_interval_s)}")
+        try:
+            # Espelho no painel interno de métricas (core/metrics.py): o
+            # valor observado é o mesmo do log, não uma segunda conta.
+            from core import metrics as _metrics
+            _metrics.observe("questions_without_answer", float(valor))
+        except Exception:
+            pass
+        return True
+
     def _expiry_loop(self) -> None:
         while not self._expiry_stop.is_set():
             try:
                 self.expire()
             except Exception as exc:
                 self._log(f"[Fluxos] expire falhou: {exc!r}")
+            try:
+                # UV-1: a mesma batida de 5 s do supervisor decide se a
+                # janela de 6 h do contador venceu; sem janela vencida, o
+                # custo é uma subtração de relógio.
+                self.qa_metric_tick()
+            except Exception as exc:
+                self._log(f"[Fluxos] metrica qwa falhou: {exc!r}")
             self._expiry_stop.wait(5.0)
 
     def close(self) -> None:
@@ -718,6 +764,12 @@ class FlowsRuntime:
         except Exception as exc:
             self._log(f"[Fluxos] fala {kind} falhou: {exc!r}")
             return
+        if kind in ("chat", "partial"):
+            # UV-1: resposta da boca (conversa curta) ou conteúdo solto do
+            # parcial é resposta ENTREGUE deste turno — baixa a dívida da
+            # pergunta. Brief e intermediária não baixam: são ack, não
+            # resposta (a resposta real ainda vem do cérebro).
+            self.orchestrator.router.note_answer(live.plan.turn_id)
         if kind == "chat" and self.on_chat_route is not None:
             # Mediação do dono (passo 2): no instante em que a resposta
             # superficial SAI, não quando foi decidida. O processo vivo registra
