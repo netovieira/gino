@@ -90,6 +90,7 @@ from core import mic_route as _mic_route
 from core import voice_device_enroll as _device_enroll
 from core import series_gate as _series_gate_mod
 from core import silence_gate as _silence_gate_mod
+from core import silence_code as _silence_code_mod
 from core import chat_memory as _chat_memory
 from core import personas as _personas
 from core import memory_index as _memory_index
@@ -1596,7 +1597,10 @@ CINEMA_STATE_PATH = BASE_DIR / "memory" / "cinema_mode.json"
 SILENCE_STATE_PATH = BASE_DIR / "memory" / "silence_mode.json"
 SILENCE_QUEUE_PATH = BASE_DIR / "memory" / "silence_queue.json"
 SILENCE_RELEASE_PAUSE_S = _silence_gate_mod.DEFAULT_PAUSE_S
+# UC-4: palavra-código — estado próprio, fila compartilhada com o gate.
+SILENCE_CODE_STATE_PATH = BASE_DIR / "memory" / "silence_code.json"
 _SILENCE_GATE_LOCK = threading.Lock()
+_SILENCE_CODE_LOCK = threading.Lock()
 # Conclusão de tarefa também vai por TEXTO no WhatsApp do dono: ele pode estar
 # longe da mesa. É canal extra — o anúncio falado não muda. O texto vai
 # INTEIRO, sem teto nem reticências: só caminho/telefone/ferramenta são
@@ -12366,6 +12370,48 @@ class JarvisLive:
                 self._silence_mode = gate
         return gate
 
+    def _silence_code(self):
+        """UC-4: palavra-código — lazy init, compartilha a fila com o gate.
+
+        A palavra-código vem de ``config/api_keys.json`` na chave
+        ``silence_code_word`` (vazio = desabilitado, até o dono escolher).
+        Quando ativo, o on_retain escreve na fila do gate real, para que
+        SilenceGate.take() e SilenceCode.deactivate() usem a mesma fila.
+        """
+        sc = getattr(self, "_silence_code_mode", None)
+        if sc is not None:
+            return sc
+        with _SILENCE_CODE_LOCK:
+            sc = getattr(self, "_silence_code_mode", None)
+            if sc is None:
+                cw = self._silence_code_word()
+                gate = self._silence_gate()
+
+                def _retain_in_gate(text: str, subject: str,
+                                    slug: str) -> None:
+                    try:
+                        gate.retain(text, subject=subject or slug)
+                    except Exception as e:
+                        print(f"[PalavraCodigo] retain no gate falhou: {e}")
+
+                sc = _silence_code_mod.SilenceCode(
+                    code_word=cw,
+                    state_path=getattr(self, "_silence_code_state_file",
+                                       SILENCE_CODE_STATE_PATH),
+                    on_retain=_retain_in_gate,
+                    logger=self._silence_gate_log,
+                )
+                self._silence_code_mode = sc
+        return sc
+
+    def _silence_code_word(self) -> str:
+        """Palavra-código configurada pelo dono (vazio = UC-4 desabilitada)."""
+        try:
+            with open(API_CONFIG_PATH, encoding="utf-8") as fh:
+                return str(json.load(fh).get("silence_code_word") or "").strip()
+        except Exception:
+            return ""
+
     def _silence_gate_log(self, message: str) -> None:
         text = str(message or "").strip()
         if not text:
@@ -12417,7 +12463,20 @@ class JarvisLive:
         Returns ``{"muted": bool, "subject": str}``. ``muted`` means: do not
         synthesise, write the text to the owner (screen + WhatsApp) and keep
         the line for the release. Nothing here closes the microphone.
+
+        UC-4: alem do SilenceGate ("silêncio"), consulta o SilenceCode
+        (palavra-código configurável). Ambos escrevem na MESMA fila: a
+        retenção é chamada pelo caller (não aqui), mas o mute vem dos dois.
         """
+        resolved = self._speech_subject(text, subject)
+        # UC-4: palavra-código — checa antes, sem depender de gate.active.
+        try:
+            sc = self._silence_code()
+            if sc.active and sc.is_active_for(project=resolved, text=text):
+                return {"muted": True, "subject": resolved}
+        except Exception as e:
+            print(f"[PalavraCodigo] decisao de fala falhou: {e}")
+        # SilenceGate ("silêncio") — comportamento original preservado.
         try:
             gate = self._silence_gate()
         except Exception as e:
@@ -12425,7 +12484,6 @@ class JarvisLive:
             return {"muted": False, "subject": ""}
         if not gate.active:
             return {"muted": False, "subject": ""}
-        resolved = self._speech_subject(text, subject)
         try:
             muted = bool(gate.is_muted(subject=resolved, text=text))
         except Exception as e:
@@ -12445,6 +12503,45 @@ class JarvisLive:
         raw = " ".join(str(text or "").split()).strip()
         if not raw:
             return False
+        # UC-4: a palavra-código é tratada antes do "silêncio".
+        # Se for ordem de palavra-código, o SilenceCode resolve e retorna.
+        sc = self._silence_code()
+        if sc.code_word:
+            cw_result = sc.handle_transcription(raw)
+            if cw_result is not None:
+                # Só a voz do dono autoriza (mesma regra do gate).
+                if not pcm:
+                    return False
+                if not self._silence_owner_ok(pcm, device=device):
+                    try:
+                        self.ui.write_log(
+                            "SYS: palavra-código — ordem ignorada "
+                            "(voz nao reconhecida como o dono).")
+                    except Exception:
+                        pass
+                    return True
+                if log_heard:
+                    try:
+                        self._log_heard(raw)
+                    except Exception:
+                        pass
+                act = str(cw_result.get("action") or "")
+                if act in ("deactivate", "deactivate_all"):
+                    self._silence_code_release(cw_result)
+                else:
+                    proj = str(cw_result.get("project") or "tudo")
+                    try:
+                        self.ui.write_log(
+                            f"SYS: palavra-código «{sc.code_word}» — "
+                            f"silêncio para «{proj}». Sigo ouvindo.")
+                    except Exception:
+                        pass
+                    if act == "activate":
+                        try:
+                            self.interrupt()
+                        except Exception:
+                            pass
+                return True
         order = _silence_gate_mod.parse_order(
             raw, addresses=(getattr(self, "_asst_name", "") or "",))
         if not order.get("triggered"):
@@ -12501,6 +12598,39 @@ class JarvisLive:
         if action in ("release_all", "release_subject"):
             self._silence_release(action, subject)
         return True
+
+    def _silence_code_release(self, cw_result: dict) -> None:
+        """UC-4: ao liberar palavra-código, produz e fala o resumo retido.
+
+        Usa as linhas que já estão na fila do gate (mesmo storage) e também
+        as entries locais do SilenceCode. Depois de falar o resumo, limpa
+        a fila local do SilenceCode (as linhas do gate já foram tomadas
+        pelo take no gate, se necessário).
+        """
+        sc = self._silence_code()
+        slug = cw_result.get("slug") or None
+        if cw_result.get("action") == "deactivate_all":
+            slug = None
+        try:
+            release = sc.deactivate(slug if slug else None)
+        except Exception as e:
+            print(f"[PalavraCodigo] liberação falhou: {e}")
+            release = {"entries": [], "dropped": 0, "summary_lines": []}
+        lines = list(release.get("summary_lines") or [])
+        if not lines:
+            lines = ["Palavra-código liberada. Nada ficou guardado."]
+        try:
+            self.ui.write_log(
+                "SYS: palavra-código liberada — resumo: "
+                + " ".join(lines))
+        except Exception:
+            pass
+        entries = list(release.get("entries") or [])
+        thread = threading.Thread(
+            target=self._silence_release_worker,
+            args=(lines, entries),
+            daemon=True, name="silence-code-release")
+        thread.start()
 
     def _silence_release(self, action: str, subject: dict | None = None) -> None:
         """Hand back the per-subject summary and the retained speech."""
