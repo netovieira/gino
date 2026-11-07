@@ -14,6 +14,18 @@ FAILURE POLICY
     unchanged plan is not rewritten, so Obsidian's file watcher stays quiet.
     No Qt and no ``main.py`` imports.
 
+VAULT FILE NAMES (owner's REGRA, 2026-11-07)
+    Every new ``.md`` in the vault follows ``TIPO-AAAA-MM-DD-slug.md`` with
+    TIPO inside the closed list ``NOTE_TYPES``. ``build_name``/``check_name``
+    validate, ``normalize_name`` repairs, and ``_gate_name`` sits on the real
+    write path (``write_note``, ``mirror_plan``, ``open_path``). The policy is
+    ``JARVIS_VAULT_NAME_POLICY`` = ``registrar`` (default: write and log the
+    offense) | ``normalizar`` | ``rejeitar``; asking for a name explicitly
+    (``tipo=``) is always strict. ``Indices/Teia.md`` and ``Grafo.json`` are a
+    code-locked exception (``CODE_OWNED_NAMES``): ``mirror_index`` rewrites
+    them under the fixed names ``memory_index`` and ``guide_panel`` expect.
+    Rule text: ``~/Jarvis/REGRA-2026-11-07-padro-de-nomes-de-arquivo.md``.
+
 UP-7 (FLUXO TRABALHO, passo 4)
     Besides mirroring, this module is now the single place that records an
     Obsidian opening: every successful open writes ``event=obsidian_opened``
@@ -26,6 +38,7 @@ UP-7 (FLUXO TRABALHO, passo 4)
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import re
@@ -33,6 +46,7 @@ import shutil
 import subprocess
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from urllib.parse import quote
 
@@ -167,10 +181,313 @@ def _slug(value, limit: int = 80) -> str:
     ``\\w`` é unicode aqui: ``ação`` continua ``ação``. Só o que não cabe num
     nome de arquivo (separador de caminho, controle, símbolo estranho) vira
     ``_``; o espaço é legítimo no Obsidian e fica.
+
+    NÃO é o padrão do cofre: o padrão é :func:`build_name`. Este ``_slug``
+    legado continua servindo os chamadores antigos (``task_mirror`` escreve
+    ``Plano de ação — <título>.md`` e os testes dele contam com isso) e por
+    isso ele fica intacto. O que muda é o portão depois dele:
+    :func:`_gate_name`.
     """
     text = re.sub(r"\s+", " ", str(value or ""))
     text = re.sub(r"[^\w .()—–-]+", "_", text)
     return text.strip(" ._")[:limit] or "nota"
+
+
+# ── padrão de nome do cofre (REGRA do dono, 2026-11-07) ─────────────────────
+#
+# Texto da regra: ``~/Jarvis/REGRA-2026-11-07-padro-de-nomes-de-arquivo.md``.
+# Padrão:  TIPO-AAAA-MM-DD-slug.md
+#   TIPO  ∈ lista fechada abaixo, caixa-alta;
+#   data  = data real do conteúdo (a do arquivo, não a do rename);
+#   slug  = minúsculo, sem acento, sem espaço, hífens simples, <= 50 chars.
+#
+# Vocabulário fechado porque vocabulário aberto vira cada um inventando um
+# prefixo: é exatamente o que a tabela de migração desta regra corrige.
+NOTE_TYPES = ("PLANO", "REGRA", "TAREFA", "AUDITORIA", "RELATORIO", "NOTA")
+SLUG_MAX_CHARS = 50
+NAME_MAX_CHARS = 80
+
+#: Pasta que o código já conhece -> TIPO. É isto que torna a normalização
+#: inequívoca em vez de adivinhação. ``Indices`` fica fora de propósito:
+#: ver :data:`CODE_OWNED_NAMES`.
+FOLDER_TYPES = {
+    "Planos": "PLANO",
+    "Projetos": "NOTA",
+    "Personas": "NOTA",
+    "Topicos": "NOTA",
+}
+
+#: Exceção travada em código: a Teia e o Grafo são reescritos pela aranha de
+#: memória com nome fixo (:func:`mirror_index`) e :mod:`core.memory_index` /
+#: ``guide_panel`` os procuram por esse nome. Renomeá-los é mudança de
+#: contrato, não de nomenclatura, então não passam pelo portão.
+CODE_OWNED_NAMES = ("Teia.md", "Grafo.json")
+
+#: Políticas do portão (env ``JARVIS_VAULT_NAME_POLICY``):
+#:   ``registrar``  -> escreve como está e loga a infração (default de hoje);
+#:   ``normalizar`` -> reescreve para o padrão quando não há ambiguidade;
+#:   ``rejeitar``   -> levanta ValueError com a mensagem útil.
+NAME_POLICIES = ("registrar", "normalizar", "rejeitar")
+NAME_POLICY_DEFAULT = "registrar"
+
+_NAME_RE = re.compile(
+    r"^(?P<tipo>[A-Z]+)-(?P<ano>\d{4})-(?P<mes>\d{2})-(?P<dia>\d{2})-"
+    r"(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*)\.md$")
+_MD_SUFFIX_RE = re.compile(r"(?:\.md)+$", re.IGNORECASE)
+_DATE_IN_TEXT_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+
+
+def name_policy() -> str:
+    """Política vigente do portão; valor desconhecido volta ao default."""
+    raw = os.environ.get("JARVIS_VAULT_NAME_POLICY", "").strip().lower()
+    return raw if raw in NAME_POLICIES else NAME_POLICY_DEFAULT
+
+
+def ascii_slug(value, limit: int = SLUG_MAX_CHARS) -> str:
+    """Slug do padrão: minúsculo, ASCII, sem acento, hífens simples.
+
+    Corta no hífen mais próximo do limite para nunca deixar ``-`` sobrando
+    nem palavra partida ao meio. Devolve "" quando não sobra nada (o chamador
+    decide o que fazer com o vazio; nunca virar "nota" silencioso aqui).
+    """
+    folded = unicodedata.normalize("NFKD", str(value or ""))
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    folded = folded.lower()
+    folded = re.sub(r"[^a-z0-9]+", "-", folded).strip("-")
+    if len(folded) > limit:
+        head = folded[:limit]
+        folded = head.rsplit("-", 1)[0] if "-" in head else head
+        folded = folded.strip("-")
+    return folded
+
+
+def name_errors(name) -> list[str]:
+    """Lista os problemas do nome contra o padrão; [] quando está dentro.
+
+    Diagnóstico, não só veredito: quem recebe a lista é o dono ou o
+    assistente, então cada linha diz o que refazer.
+    """
+    raw = str(name or "")
+    if "/" in raw or "\\" in raw or raw == "..":
+        return ["o nome não pode carregar caminho (use folder= para a pasta)"]
+    text = Path(raw).name
+    if not text:
+        return ["nome vazio"]
+    if text in CODE_OWNED_NAMES:
+        return []
+
+    errors: list[str] = []
+    if re.search(r"\s", text):
+        errors.append("nome de arquivo não pode ter espaço")
+    suffix = _MD_SUFFIX_RE.search(text)
+    if suffix is None:
+        errors.append("falta a extensão .md")
+    elif suffix.group(0).lower() != ".md":
+        errors.append("extensão .md duplicada")
+
+    full = _NAME_RE.match(text)
+    if full:
+        if full["tipo"] not in NOTE_TYPES:
+            errors.append(f"tipo {full['tipo']!r} fora da lista fechada "
+                          f"{'/'.join(NOTE_TYPES)}")
+        try:
+            dt.date(int(full["ano"]), int(full["mes"]), int(full["dia"]))
+        except ValueError:
+            errors.append(
+                f"data {full['ano']}-{full['mes']}-{full['dia']} "
+                "não existe no calendário")
+        if len(full["slug"]) > SLUG_MAX_CHARS:
+            errors.append(f"slug com {len(full['slug'])} chars "
+                          f"(máximo {SLUG_MAX_CHARS})")
+        if len(text) > NAME_MAX_CHARS:
+            errors.append(f"nome com {len(text)} chars "
+                          f"(máximo {NAME_MAX_CHARS})")
+        return errors
+
+    if text.lower().endswith(".md") or text.lower().endswith(".md.md"):
+        stem = _MD_SUFFIX_RE.sub("", text)
+    else:
+        stem = text
+    parts = stem.split("-")
+    head = parts[0] if parts else ""
+    if head in NOTE_TYPES:
+        pass
+    elif head.upper() in NOTE_TYPES:
+        errors.append(f"tipo {head!r} precisa ficar em caixa-alta "
+                      f"({head.upper()})")
+    elif re.fullmatch(r"[A-Za-z]+", head or ""):
+        errors.append(f"tipo {head!r} fora da lista fechada "
+                      f"{'/'.join(NOTE_TYPES)}")
+    else:
+        errors.append("o nome não começa com um tipo da lista fechada "
+                      f"{'/'.join(NOTE_TYPES)}; formato "
+                      "TIPO-AAAA-MM-DD-slug.md")
+
+    dates = _DATE_IN_TEXT_RE.search(stem)
+    if dates:
+        try:
+            dt.date.fromisoformat(dates.group(0))
+        except ValueError:
+            errors.append(f"data {dates.group(0)!r} não existe no calendário")
+    elif head in NOTE_TYPES:
+        errors.append("falta a data AAAA-MM-DD depois do tipo")
+    elif re.search(r"\b\d{4}\b", stem):
+        errors.append("a data deve vir completa e logo depois do tipo "
+                      "(AAAA-MM-DD)")
+    else:
+        errors.append("falta a data AAAA-MM-DD no nome")
+
+    tail = stem[dates.end():] if dates else stem
+    tail = tail.strip("-")
+    if not tail:
+        if head in NOTE_TYPES:
+            errors.append("falta o slug depois da data")
+    else:
+        if tail != tail.lower():
+            errors.append("o slug deve ser todo minúsculo")
+        if not tail.isascii():
+            errors.append("o slug não pode ter acento (use forma ASCII)")
+        if "--" in tail:
+            errors.append("o slug não pode ter hífen duplo")
+        if tail.startswith("-") or tail.endswith("-"):
+            errors.append("o slug não pode começar nem terminar com hífen")
+        if len(tail) > SLUG_MAX_CHARS:
+            errors.append(f"o slug tem {len(tail)} chars "
+                          f"(máximo {SLUG_MAX_CHARS})")
+    if len(text) > NAME_MAX_CHARS:
+        errors.append(f"nome com {len(text)} chars (máximo {NAME_MAX_CHARS})")
+    return errors
+
+
+def check_name(name) -> str:
+    """Valida e devolve o nome; levanta ValueError com o diagnóstico."""
+    errors = name_errors(name)
+    if errors:
+        raise ValueError(
+            f"nome {str(name)!r} fora do padrão TIPO-AAAA-MM-DD-slug.md: "
+            + "; ".join(errors))
+    return str(name)
+
+
+def build_name(tipo: str, title, day=None) -> str:
+    """Monta ``TIPO-AAAA-MM-DD-slug.md`` a partir de um tipo + título.
+
+    Rigoroso por definição: tipo fora da lista ou título que não produz slug
+    levanta ValueError em vez de inventar nome.
+    """
+    token = str(tipo or "").strip().upper()
+    if token not in NOTE_TYPES:
+        raise ValueError(f"tipo {tipo!r} fora da lista fechada "
+                         f"{'/'.join(NOTE_TYPES)}")
+    slug = ascii_slug(title)
+    if not slug:
+        raise ValueError(f"o título {str(title)!r} não produz slug; "
+                         "use um título com letras")
+    stamp = str(day or "").strip() or dt.date.today().isoformat()
+    return check_name(f"{token}-{stamp}-{slug}.md")
+
+
+def normalize_name(name, *, tipo: str = "", folder: str = "", day=None) -> str:
+    """Reescreve um nome fora do padrão para dentro dele.
+
+    Recusa quando a normalização NÃO é inequívoca: sem TIPO conhecido (passado
+    ou inferido da pasta) e sem como saber a data, adivinhar seria pior que
+    rejeitar -- a data errada conta uma mentira para sempre.
+    """
+    text = Path(str(name or "")).name
+    stem = _MD_SUFFIX_RE.sub("", text)
+    parts = stem.split("-")
+
+    token = str(tipo or "").strip().upper()
+    if token and token not in NOTE_TYPES:
+        raise ValueError(f"tipo {tipo!r} fora da lista fechada "
+                         f"{'/'.join(NOTE_TYPES)}")
+    if not token:
+        token = parts[0].upper() if parts and parts[0].upper() in NOTE_TYPES \
+            else ""
+    if not token:
+        token = FOLDER_TYPES.get(str(folder or ""), "")
+    if not token:
+        raise ValueError(
+            f"não dá para normalizar {text!r} sem tipo: passe tipo= "
+            f"({'/'.join(NOTE_TYPES)}) ou escreva numa pasta conhecida "
+            f"({', '.join(sorted(FOLDER_TYPES))})")
+
+    stamp = ""
+    found = _DATE_IN_TEXT_RE.search(stem)
+    if found:
+        try:
+            # A data que o próprio nome declara é a data do conteúdo: ela
+            # ganha do mtime, que muda com qualquer cópia.
+            stamp = dt.date.fromisoformat(found.group(0)).isoformat()
+        except ValueError:
+            stamp = ""
+    if not stamp:
+        stamp = str(day or "").strip()
+        if stamp:
+            try:
+                stamp = dt.date.fromisoformat(stamp).isoformat()
+            except ValueError:
+                raise ValueError(f"data {day!r} não é AAAA-MM-DD válida") \
+                    from None
+    if not stamp:
+        stamp = dt.date.today().isoformat()
+
+    residual = "-".join(parts[1:]) if parts and \
+        parts[0].upper() in NOTE_TYPES else stem
+    residual = _DATE_IN_TEXT_RE.sub(" ", residual)
+    slug = ascii_slug(residual) or ascii_slug(stem)
+    return check_name(f"{token}-{stamp}-{slug}.md")
+
+
+def _mtime_day(path: Path) -> str:
+    """Data do conteúdo (mtime) no formato AAAA-MM-DD; hoje se não houver."""
+    try:
+        return dt.date.fromtimestamp(path.stat().st_mtime).isoformat()
+    except (OSError, ValueError):
+        return dt.date.today().isoformat()
+
+
+def _gate_name(destination: Path, *, tipo: str = "", folder: str = "",
+               day: str | None = None) -> Path:
+    """Portão de nome na escrita do cofre. É aqui que a regra vira código.
+
+    - Nome dentro do padrão: passa direto.
+    - Nome fora + política ``registrar`` (default de hoje): escreve como está
+      e loga ``event=vault_name_off_pattern`` com o diagnóstico. Padrão
+      escolhido assim porque normalizar vivo renomearia o que o
+      ``task_mirror`` escreve hoje (e os testes dele contam com o nome
+      legado) antes do dono autorizar a rodada de renomeio.
+    - Política ``normalizar``: troca pelo padrão, usando a data real do
+      arquivo quando ele já existe; se a normalização for ambígua, rejeita.
+    - Política ``rejeitar``: levanta ValueError com a mensagem útil.
+    - Nome pedido explicitamente (``tipo=``): sempre rigoroso -- quem nomeia
+      escolhe, então aqui não há modo "registrar".
+    """
+    errors = name_errors(destination.name)
+    if not errors:
+        return destination
+    if tipo:
+        return destination.with_name(check_name(destination.name))
+
+    policy = name_policy()
+    diagnosis = "; ".join(errors)
+    if policy == "rejeitar":
+        raise ValueError(
+            f"nome {destination.name!r} fora do padrão do cofre: {diagnosis} "
+            f"(padrão TIPO-AAAA-MM-DD-slug.md, tipos: {'/'.join(NOTE_TYPES)})")
+    if policy == "normalizar":
+        stamp = day or (_mtime_day(destination) if destination.exists()
+                        else None)
+        fixed = normalize_name(destination.name, tipo=tipo,
+                               folder=folder or destination.parent.name,
+                               day=stamp)
+        _log_event("vault_name_normalized", src=destination.name, dst=fixed,
+                   motivo=diagnosis)
+        return destination.with_name(fixed)
+    _log_event("vault_name_off_pattern", path=destination, motivo=diagnosis)
+    return destination
+
 
 
 # ── activity.log ────────────────────────────────────────────────────────────
@@ -260,7 +577,8 @@ def mirror_plan(path) -> Path:
     if not (source.is_relative_to(_resolved(_plans()))
             or source.is_relative_to(_resolved(_vault()))):
         raise ValueError(f"Fora de {_plans()} ou do cofre: {source}")
-    destination = ensure_vault() / "Planos" / source.name
+    destination = _gate_name(ensure_vault() / "Planos" / source.name,
+                             folder="Planos", day=_mtime_day(source))
     return _atomic_copy(source, destination)
 
 
@@ -343,22 +661,39 @@ def open_path(path, source: str = "open_in") -> str:
         target = file_source
     else:
         folder = "Planos" if file_source.suffix.lower() == ".md" else "Projetos"
-        target = _atomic_copy(file_source, vault / folder / file_source.name)
+        target = _atomic_copy(
+            file_source,
+            _gate_name(vault / folder / file_source.name, folder=folder,
+                       day=_mtime_day(file_source)),
+        )
     return _open_with_obsidian(target, source=source)
 
 
 # ── notas do espelho de execução (UP-7) ─────────────────────────────────────
 
-def write_note(title: str, body: str, folder: str = "Planos") -> Path:
-    """Grava uma nota Markdown no cofre e devolve o caminho."""
-    name = _slug(title)
-    destination = ensure_vault() / folder / f"{name}.md"
+def write_note(title: str, body: str, folder: str = "Planos",
+               tipo: str = "") -> Path:
+    """Grava uma nota Markdown no cofre e devolve o caminho.
+
+    ``tipo`` é a porta de entrada da REGRA de nomes: passado, o nome é montado
+    como ``TIPO-AAAA-MM-DD-slug.md`` e validado antes de encostar no disco
+    (fora da lista fechada -> ``ValueError``). Sem ``tipo``, o nome sai do
+    ``_slug`` legado e passa pelo :func:`_gate_name`, que hoje registra a
+    infração no activity.log em vez de renomear às escondidas.
+    """
+    if tipo:
+        name = build_name(tipo, title)
+    else:
+        name = f"{_slug(title)}.md"
+    vault = ensure_vault()
+    destination = _gate_name(vault / folder / name, tipo=tipo, folder=folder)
     _atomic_write(destination, str(body or ""))
     return destination
 
 
 def open_note(title: str, body: str, folder: str = "Planos",
-              sync: bool = True, source: str = "task_mirror") -> dict:
+              sync: bool = True, source: str = "task_mirror",
+              tipo: str = "") -> dict:
     """Escreve a nota, espelha no Nextcloud do dono e abre na tela.
 
     Devolve ``{"ok", "path", "nextcloud", "registered", "message"}``. Falha de
@@ -373,7 +708,7 @@ def open_note(title: str, body: str, folder: str = "Planos",
     redefine a rota do vault do dono — isso é decisão dele.
     """
     try:
-        note = write_note(title, body, folder=folder)
+        note = write_note(title, body, folder=folder, tipo=tipo)
     except Exception as exc:  # noqa: BLE001 - o cofre pode estar fora do ar
         return {"ok": False, "path": "", "nextcloud": "", "registered": True,
                 "message": f"Não consegui escrever a nota no cofre: {exc}"}
