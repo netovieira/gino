@@ -2890,6 +2890,16 @@ class JarvisLive:
             _mail.set_filter_decision_hook(self._mail_filter_decision)
         except Exception as e:
             print(f"[E-mail] hook de decisão de filtro indisponível: {e}")
+        # Fluxo de execução por corpo (UP-6, passos 5-6 do contrato): o
+        # dispatcher de `core.email_flows` roda na varredura; aqui entram o
+        # gancho do evento no activity.log e a fala do código (o MESMO
+        # portão do vigia de OTP — sessão pronta, microfone liberto).
+        try:
+            from core import email_flows as _mail_flows
+            _mail_flows.set_event_hook(self._mail_flow_executed)
+            _mail_flows.set_speak_hook(self._announce_otp)
+        except Exception as e:
+            print(f"[E-mail] fluxo de execução por corpo indisponível: {e}")
         try:
             states = _mail.connect_all()
         except Exception as e:
@@ -2965,6 +2975,42 @@ class JarvisLive:
                 self.ui.write_log(line)
             except Exception:
                 pass
+
+    def _mail_flow_executed(self, payload) -> None:
+        """Evento ``email_flow_executed`` no activity.log (UP-6, passos 5-6).
+
+        Roda na thread da varredura de e-mail, chamada por
+        ``core.email_flows.dispatch_flow``. Uma linha por decisão de fluxo:
+        conta, uid, nome/tipo do fluxo, ação e motivo — nunca corpo,
+        remetente, assunto ou o dígito do código (mesma régua do rastro de
+        filtro). O orquestrador recebe o QUE rodou como evento não-confiável
+        de monitor; a execução em si já foi roteada pelo dispatcher.
+        """
+        ev = payload if isinstance(payload, dict) else {}
+        acct = " ".join(str(ev.get("account") or "").split())[:40] or "?"
+        uid = str(ev.get("uid") or "?")[:20]
+        flow = " ".join(str(ev.get("flow") or "?").split())[:40]
+        ftype = str(ev.get("type") or "?")[:20]
+        act = str(ev.get("action") or "?")[:16]
+        ok = "sim" if ev.get("ok") else "nao"
+        mot = str(ev.get("motivo") or "?")[:30]
+        line = (f"[fluxos] email_flow_executed conta={acct} uid={uid} "
+                f"fluxo={flow} tipo={ftype} acao={act} ok={ok} motivo={mot}")
+        try:
+            meta = _activity.make_meta(chan="sistema", origin="email_flow")
+            self.ui.write_log(_activity.with_meta(line, meta))
+        except Exception:
+            try:
+                self.ui.write_log(line)
+            except Exception:
+                pass
+        try:
+            self._flows_monitor_event(
+                "email_flow",
+                f"fluxo de e-mail «{flow}» avaliado (tipo {ftype}, "
+                f"motivo {mot})")
+        except Exception:
+            pass
 
     def _mail_startup_notice(self, states) -> list[str]:
         """Fala no boot só a conta que precisa de mão humana. Resto = silêncio.

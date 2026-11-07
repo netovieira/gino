@@ -323,7 +323,7 @@ def _clean_rule(entry: object) -> dict | None:
     Chaves: ``from`` e/ou ``subject`` (padrão), ``match`` (contains | exact |
     regex simples), ``action`` (avisa | ignora | classificar) e ``body``
     (bool: a regra de classificar pede também um TRECHO do corpo — dado,
-    nunca ordem). regex passa por compilação e teto de tamanho; padrão
+    nunca ordem). ``dispatch`` (bool, UP-6): depois da decisão de filtro, o corpo deste e-mail passa pelo fluxo de execução de ``core/email_flows.py`` (passos 5-6 do contrato). regex passa por compilação e teto de tamanho; padrão
     inválido derruba a regra inteira (a gente não adivinha regra do dono).
     """
     if not isinstance(entry, dict):
@@ -353,6 +353,7 @@ def _clean_rule(entry: object) -> dict | None:
             return None
     return {"field": field, "pattern": pattern, "match": match,
             "action": action, "body": bool(entry.get("body")),
+            "dispatch": bool(entry.get("dispatch")),
             "label": _one_line(entry.get("label") or "", 60)}
 
 
@@ -439,6 +440,41 @@ def _filter_trace(acct, item: dict, rule: dict | None, action: str) -> None:
                 pass          # o hook nunca derruba a varredura
     except Exception:
         pass          # o rastro nunca derruba a varredura
+
+
+def _dispatch_email_flow(acct, item: dict, rule: dict | None,
+                         conn=None) -> dict | None:
+    """Passos 5-6 do FLUXO EMAIL (UP-6): corpo -> fluxo -> execução.
+
+    Chamado pela varredura DEPOIS da decisão de filtro, só para regra com
+    ``dispatch: true``. O corpo é buscado pelo MESMO ``BODY.PEEK`` somente
+    leitura (teto ``FILTER_BODY_CHARS``), usado como DADO pelo parser de
+    ``core/email_flows.py``: nunca vai para o jsonl, nunca vira frase do
+    aviso, nunca autoriza envio. O evento ``email_flow_executed`` sai pelo
+    gancho registrado em main.py. Nunca levanta: erro de fluxo é linha de
+    log interna e a varredura segue.
+    """
+    try:
+        from core import email_flows
+    except Exception as e:
+        _log(f"fluxo de execução de e-mail indisponível: {e}")
+        return None
+    body = str(item.get("body_excerpt") or "")
+    if not body and conn is not None:
+        try:
+            body = peek_body(conn, str(item.get("uid") or ""),
+                             FILTER_BODY_CHARS)
+        except Exception as e:
+            _log(f"o corpo para o fluxo de {acct.name} não foi lido: {e}")
+            return None
+    if not body:
+        return None
+    try:
+        return email_flows.dispatch_flow(acct.public(), item,
+                                         dict(rule or {}), body)
+    except Exception as e:
+        _log(f"dispatch de fluxo de e-mail falhou: {type(e).__name__}")
+        return None
 
 
 class MailAccount:
@@ -2084,7 +2120,9 @@ def poll_once(hook=None) -> list[dict]:
     não gera aviso nenhum, ``classificar`` entrega ao gancho a regra junto (e,
     se a regra pedir ``body``, um TRECHO do corpo como DADO — nunca ordem,
     nunca por padrão, nunca no jsonl). E-mail fora de todas as regras não
-    gera aviso nenhum: nem fala, nem SYS.
+    gera aviso nenhum: nem fala, nem SYS. Regra com ``dispatch: true``
+    ainda passa o corpo pelo fluxo de execução (passos 5-6, UP-6:
+    ``_dispatch_email_flow``).
     """
     _ensure_accounts()
     hook = hook if hook is not None else _watch_hook
@@ -2157,6 +2195,10 @@ def poll_once(hook=None) -> list[dict]:
                         _filter_metrics.record(
                             acct.name, received=1, notified=1,
                             processing_ms=(time.monotonic() - item_start) * 1000)
+                    if (rule or {}).get("dispatch"):
+                        # Passos 5-6 do contrato (UP-6): o corpo decide o
+                        # fluxo a executar. Só com opt-in explícito da regra.
+                        _dispatch_email_flow(acct, item, rule, conn)
             elif acct.notify:
                 # Conta com notify mas sem hook: ainda registra métricas
                 for item in fresh:
@@ -2179,6 +2221,8 @@ def poll_once(hook=None) -> list[dict]:
                         _filter_metrics.record(
                             acct.name, received=1, notified=1,
                             processing_ms=(time.monotonic() - item_start) * 1000)
+                        if (rule or {}).get("dispatch"):
+                            _dispatch_email_flow(acct, item, rule, conn)
             if not acct.connected or acct.fail_streak:
                 # A varredura voltou a abrir a caixa: registra a recuperação
                 # (e é isto que limpa a contagem de falhas consecutivas).
@@ -2305,6 +2349,13 @@ def reset() -> None:
     set_retry_notice(None)
     with _pending_lock:
         _pending = None
+    try:
+        # UP-6: os ganchos e o cache de fluxos executados vivem no módulo
+        # próprio; ao zerar as contas, zero o resto junto.
+        from core import email_flows
+        email_flows.reset()
+    except Exception:
+        pass
 
 
 # ── envio: pedido estacionado, confirmação pelo fator do dono (voz ou senha) ──
