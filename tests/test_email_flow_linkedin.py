@@ -4,22 +4,26 @@ Decisão do dono (07/11/2026): "o linkedin, nao precisa de algo especifico,
 ele precisa apenas ser um filtro no novo fluxo de leitura dos emails". Não
 existe plugin nem rota própria: a notificação chega pelo `core/email.py`, a
 regra de filtro tem ``dispatch: true`` + ``tipo: linkedin_notification`` e
-``core/email_flows.py`` decide o que fazer do corpo.
+``core/email_flows.py`` é o ÚNICO ponto que produz o aviso do e-mail.
 
 O que o teste vigia, e por quê:
   * parser: convite de conexão, mensagem privada, vaga e update de empresa
     viram tipos diferentes, com quem enviou, link e resumo;
-  * defaults conservadores: convite e mensagem avisam; vaga e update de
-    empresa são silentos até o assunto bater na regex ``watch``;
+  * defaults conservadores: convite e mensagem saem na frase rica; vaga e
+    update de empresa sem ``watch`` não ganham frase rica — mas nenhum e-mail
+    que passou do filtro fica mudo: o mesmo ponto degrada para a frase de
+    chegada (``notificado_chegada``), que é o passo 3 do contrato;
   * portão de remetente: corpo que não veio de @linkedin.com não vira aviso
-    nenhum (``remetente_invalido``) — nome bonito no cabeçalho não basta;
+    rico nenhum, só o de chegada;
   * a regra do LinkedIn NUNCA engole código de verificação: código no corpo
     continua no caminho do ``leitura_codigo`` (mesmo gancho de fala);
   * regra de filtro: ``tipo``/``watch`` sobrevivem à validação de
     ``core/email.py``; tipo inexistente é limpo (nada de adivinhação);
-  * dispatcher chama o parser certo (``linkedin_notification``);
-  * mensagem privada guardada como texto: nota ``NOTA-<data>-linkedin-
-    msg-<slug>.md`` no vault, senão linha em ``logs/``;
+  * dispatcher chama o parser certo (``linkedin_notification``) e NÃO há
+    ramal embutido na DSL: a regra do config é a única porta do LinkedIn;
+  * mensagem privada guardada como texto: UMA nota ``NOTA-<data>-linkedin-
+    msg-<slug>.md`` pela API do cofre (nome validado pela REGRA de nomes),
+    senão UMA linha em ``logs/linkedin-notifications.log`` — nunca os dois;
   * nada abre navegador, nada roda OAuth, nada de corpo no evento nem no
     jsonl; um recibo, uma execução (transiente de aviso tenta de novo).
 
@@ -39,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import main                                          # noqa: F401
 from core import email as mail
 from core import email_flows as flows
+from core import obsidian
 from tests.test_email import (FakeIMAP, FakeUI, _full_message, _header,
                               vault)  # noqa: F401  (vault = fixture emprestado)
 
@@ -71,16 +76,30 @@ CORPO_CODIGO = (
 
 @pytest.fixture()
 def store(monkeypatch, tmp_path):
-    """Histórico de vistos, vault e log de LinkedIn em disco temporário.
+    """Histórico de vistos, cofre e log de LinkedIn em disco temporário.
 
-    O reset já veio do `vault` (via `mail.reset`); aqui só redirecionamos os
-    caminhos — escrever no repositório real ou no vault do dono está fora.
+    A nota da mensagem privada sai pela API do cofre, entao o que tem de ir
+    para tmp e o ``obsidian.VAULT`` (com o ``ACTIVITY_LOG`` do portao de
+    nomes junto — registrar nome fora do padrao escreve la). O reset ja veio
+    do `vault` (via `mail.reset`); escrever no repositorio real ou no cofre do
+    dono esta fora.
     """
     monkeypatch.setattr(flows, "_seen_path", tmp_path / "email_flow_seen.json")
-    monkeypatch.setattr(flows, "_LINKEDIN_VAULT", tmp_path / "vault")
     monkeypatch.setattr(flows, "_LINKEDIN_LOG",
                         tmp_path / "logs" / "linkedin-notifications.log")
+    monkeypatch.setattr(obsidian, "VAULT", tmp_path / "vault")
+    monkeypatch.setattr(obsidian, "PLANS_DIR", tmp_path / "qoder" / "plans")
+    monkeypatch.setattr(obsidian, "ACTIVITY_LOG", tmp_path / "activity.log")
+    monkeypatch.setattr(obsidian, "NEXTCLOUD_DIR", tmp_path / "Nextcloud")
+    monkeypatch.delenv("JARVIS_VAULT_NAME_POLICY", raising=False)
+    monkeypatch.delenv("JARVIS_OBSIDIAN_VAULT", raising=False)
     yield tmp_path
+
+
+def _notas(tmp_path: Path) -> list[str]:
+    """Os nomes de nota gravados no cofre temporario (em qualquer pasta)."""
+    root = tmp_path / "vault"
+    return sorted(p.name for p in root.rglob("*.md")) if root.is_dir() else []
 
 
 @pytest.fixture()
@@ -151,15 +170,23 @@ def test_parser_vaga_e_empresa_sao_silenciosos_sem_watch():
 
 # ── 4: portão de remetente ──────────────────────────────────────────────────
 
-def test_corpo_sem_remetente_valido_nada_aciona(hooks):
+def test_corpo_sem_remetente_valido_nao_ganha_aviso_rico(hooks):
+    """Nome bonito no cabeçalho não basta: sem domínio, nada de frase rica.
+
+    O e-mail continua sendo avisado — mas pelo PISO de chegada, do mesmo ponto
+    que produz o aviso rico. Um aviso, uma frase, um produtor.
+    """
     spoof = {"uid": "2", "from": "loja@exemplo.com", "sender": "Beatriz Lima",
              "subject": "Convite de conexão"}
     assert flows.is_linkedin_sender(spoof) is False
     ev = _dispatch(spoof, CORPO_CONVITE)
     assert ev["type"] == "linkedin_notification"
-    assert ev["action"] == "nenhuma" and ev["ok"] is True
-    assert ev["motivo"] == "remetente_invalido"
-    assert hooks["warned"] == [] and hooks["spoken"] == []
+    assert ev["action"] == "aviso" and ev["ok"] is True
+    assert ev["motivo"] == "notificado_chegada"
+    assert hooks["spoken"] == []
+    assert len(hooks["warned"]) == 1
+    texto = str(hooks["warned"][0].get("text") or "")
+    assert texto.startswith("Chegou um e-mail")
 
 
 def test_marca_desconhecida_sem_linkedin_devolve_none():
@@ -236,6 +263,9 @@ def test_email_linkedin_chega_pela_varredura_e_avisa(vault, monkeypatch, hooks):
     seen: list[dict] = []
     delivered = mail.poll_once(hook=seen.append)
     assert [m["subject"] for m in delivered] == ["Convite de conexao para sua rede"]
+    # O gancho de chegada fica CALADO: com tipo que avisa por si, a frase é só
+    # a do fluxo. Duas frases para um e-mail é o defeito que este teste proíbe.
+    assert seen == []
     assert len(hooks["events"]) == 1
     ev = hooks["events"][0]
     assert ev["type"] == "linkedin_notification" and ev["motivo"] == "notificado_convite_conexao"
@@ -245,53 +275,71 @@ def test_email_linkedin_chega_pela_varredura_e_avisa(vault, monkeypatch, hooks):
     assert "mngprm" not in stored and "Beatriz" not in stored
 
 
-def test_ramal_embutido_funciona_sem_fluxo_configurado(vault, monkeypatch, hooks):
-    """Nada de plugin: mesmo sem DSL no config, o LinkedIn tem ramal próprio."""
-    flows.set_event_hook(lambda p: hooks["events"].append(p))
-    assert flows.load_flows()[0]["type"] == "linkedin_notification"
+def test_sem_ramal_embutido_a_regra_e_a_unica_porta(vault, hooks, store):
+    """Nada de segunda porta: a DSL nao traz LinkedIn embutido.
+
+    Um ramal ``linkedin`` na lista de fluxos seria um segundo produtor do
+    mesmo aviso (a regra do config fala, o ramal casa de novo pelo remetente),
+    e aviso duplicado e exatamente o defeito que o dono mandou extinguir.
+    """
+    assert flows.load_flows()[0]["type"] == "leitura_codigo"
+    assert not any(f["type"] == "linkedin_notification"
+                   for f in flows.load_flows())
+    # Sem ``tipo`` na regra, um e-mail do LinkedIn cai no fluxo comum: nada de
+    # aviso rico — e o aviso continua sendo UM so, porque nao ha segunda porta.
+    ev = flows.dispatch_flow({"name": "principal", "address": "eu@gmail.com"},
+                             dict(LINKEDIN_ITEM, uid="44"),
+                             {"action": "avisa", "dispatch": True},
+                             CORPO_CONVITE)
+    assert ev is not None and ev["type"] == "leitura_codigo"
+    assert hooks["warned"] == []
     vault.setdefault("mail", {})["flows"] = [
         {"name": "acoes", "type": "acao_automatica", "when": {"from": "escola"}},
     ]
-    nomes = [f["type"] for f in flows.load_flows()]
-    assert nomes == ["linkedin_notification", "acao_automatica"]
+    assert [f["type"] for f in flows.load_flows()] == ["acao_automatica"]
 
 
 # ── 8-9: mensagem privada guardada como texto ───────────────────────────────
 
 def test_mensagem_privada_vira_nota_no_vault(vault, hooks, store):
-    vault_dir = store / "vault"
-    vault_dir.mkdir()
+    """Um registro: a nota existe, a linha de log não — e o nome obedece à REGRA."""
     ev = _dispatch(dict(LINKEDIN_ITEM, uid="20"), CORPO_MENSAGEM)
     assert ev["motivo"] == "notificado_mensagem"
-    notas = sorted(p.name for p in vault_dir.iterdir())
+    notas = _notas(store)
     assert len(notas) == 1
     assert notas[0].startswith("NOTA-") and "-linkedin-msg-beatriz-lima" in notas[0]
-    texto = (vault_dir / notas[0]).read_text(encoding="utf-8")
+    assert obsidian.name_errors(notas[0]) == []
+    texto = next(iter((store / "vault").rglob("*.md"))).read_text(encoding="utf-8")
     assert "tudo bem com aquele projeto" in texto
     assert "linkedin.com/messaging" in texto
+    assert not (store / "logs" / "linkedin-notifications.log").exists()
 
 
 def test_aviso_transiente_nao_duplica_a_nota(vault, store):
     """Fala indisponível tenta de novo: a nota sai uma vez só, não duas."""
     item = dict(LINKEDIN_ITEM, uid="26")
-    vault_dir = store / "vault"
-    vault_dir.mkdir()
     flows.set_notify_hook(lambda p: False)
     assert _dispatch(item, CORPO_MENSAGEM)["motivo"] == "aviso_indisponivel"
-    assert list(vault_dir.iterdir()) == []
+    assert _notas(store) == []
+    assert not (store / "logs" / "linkedin-notifications.log").exists()
     flows.set_notify_hook(lambda p: True)
     assert _dispatch(item, CORPO_MENSAGEM)["motivo"] == "notificado_mensagem"
-    assert len(list(vault_dir.iterdir())) == 1
+    assert len(_notas(store)) == 1
 
 
-def test_sem_vault_a_nota_vai_para_o_log(vault, store):
-    log = store / "logs" / "linkedin-notifications.log"
+def test_sem_cofre_a_nota_vai_para_o_log(vault, store, monkeypatch):
+    """Cofre indisponível: o registro único passa a ser UMA linha com aviso + texto."""
+    def sem_cofre(*a, **k):
+        raise OSError("sem cofre")
+
+    monkeypatch.setattr(obsidian, "write_note", sem_cofre)
     ev = _dispatch(dict(LINKEDIN_ITEM, uid="21"), CORPO_MENSAGEM)
     assert ev["ok"] is True
-    linhas = log.read_text(encoding="utf-8").splitlines()
-    assert any("NOTA" in ln and "Beatriz Lima" in ln for ln in linhas)
-    assert any("AVISO" in ln and "LinkedIn:" in ln for ln in linhas)
-    assert not (store / "vault").exists()
+    assert _notas(store) == []
+    linhas = (store / "logs" / "linkedin-notifications.log").read_text(
+        encoding="utf-8").splitlines()
+    assert len(linhas) == 1
+    assert "AVISO" in linhas[0] and "NOTA Beatriz Lima" in linhas[0]
 
 
 def test_sem_gancho_de_aviso_o_texto_sai_em_disc(vault, store):
@@ -328,13 +376,21 @@ def test_recibo_unico_e_transiente_de_aviso(hooks, store):
     assert len(hooks["warned"]) == 1
 
 
-def test_vaga_nao_gasta_aviso_e_fica_muda(hooks, store):
+def test_vaga_nao_ganha_frase_rica_mas_nao_fica_muda(hooks, store):
+    """Vaga sem ``watch`` não tem frase rica — e o contrato não permite e-mail mudo.
+
+    O piso de chegada sai do MESMO ponto que produz a frase rica: uma frase,
+    um registro (nenhum, aqui: sem mensagem privada e com a boca entregue).
+    """
     ev = _dispatch(dict(LINKEDIN_ITEM, uid="25", subject="Vagas para você"),
                    CORPO_VAGA)
-    assert ev["ok"] is True and ev["action"] == "nenhuma"
-    assert ev["motivo"] == "silenciado_vaga"
-    assert hooks["warned"] == []
+    assert ev["ok"] is True and ev["action"] == "aviso"
+    assert ev["motivo"] == "notificado_chegada"
+    assert len(hooks["warned"]) == 1
+    texto = str(hooks["warned"][0].get("text") or "")
+    assert texto.startswith("Chegou um e-mail") and "LinkedIn:" not in texto
     assert not (store / "logs" / "linkedin-notifications.log").exists()
+    assert _notas(store) == []
 
 
 # ── 12: nada de navegador, nada de OAuth ────────────────────────────────────

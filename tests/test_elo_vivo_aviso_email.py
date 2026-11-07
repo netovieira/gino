@@ -23,9 +23,10 @@ que a thread de boot chama em ``main.py:2761``):
 4. sessao sem boca (boot antes do audio) NAO gasta o recibo: a varredura
    seguinte tenta de novo;
 5. ISOLAMENTO: nada desta suite escreve no ``logs/activity.log`` do dono, no
-   ``memory/email_flow_seen.json`` real ou em ``logs/linkedin-notifications.log``
-   — comprovado por conteudo/marcador, porque servico vivo escreve nesses
-   arquivos em paralelo e comparar tamanho seria falso negativo.
+   ``memory/email_flow_seen.json`` real, em ``logs/linkedin-notifications.log``
+   nem no cofre (``~/Jarvis``) — comprovado por conteudo/marcador, porque
+   servico vivo escreve nesses arquivos em paralelo e comparar tamanho seria
+   falso negativo.
 
 Rede e thread de varredura tambem ficam de fora: ``connect_all`` e ``start`` de
 ``core.email`` sao substituidos por stubs.
@@ -42,6 +43,7 @@ import pytest
 import main
 from core import email as mail
 from core import email_flows as flows
+from core import obsidian
 
 BASE = Path(main.__file__).resolve().parent
 REAL_ACTIVITY = BASE / "logs" / "activity.log"
@@ -72,6 +74,11 @@ def _sem_escrita_no_dono(tmp_path, monkeypatch):
     de fluxos; se a ponte for construida "de raspao" durante o teste, ela traz
     junto o log de acao do executor, a medicao de latencia da boca e o
     espelho de tarefas. Os tres caminhos vao para tmp.
+
+    A nota da mensagem privada nao e mais `open()` no cofre do dono: ela sai
+    pela API do cofre (``obsidian.write_note``), entao o que tem de ir para tmp
+    e o ``VAULT`` do modulo — junto com o ``ACTIVITY_LOG`` do portao de nomes,
+    os planos e o espelho Nextcloud. Copiado de `tests/test_vault_names.py`.
     """
     from core import task_mirror
     from core.flows import executor as exe
@@ -80,6 +87,12 @@ def _sem_escrita_no_dono(tmp_path, monkeypatch):
     monkeypatch.setattr(exe, "_ACTIVITY_LOG_PATH", tmp_path / "activity.log")
     monkeypatch.setattr(mouth_mod, "_LOG_PATH", tmp_path / "latencia.log")
     monkeypatch.setattr(task_mirror, "MIRROR_DIR", tmp_path / "logs" / "mirror")
+    monkeypatch.setattr(obsidian, "VAULT", tmp_path / "vault")
+    monkeypatch.setattr(obsidian, "PLANS_DIR", tmp_path / "qoder" / "plans")
+    monkeypatch.setattr(obsidian, "ACTIVITY_LOG", tmp_path / "obsidian_activity.log")
+    monkeypatch.setattr(obsidian, "NEXTCLOUD_DIR", tmp_path / "Nextcloud")
+    monkeypatch.delenv("JARVIS_VAULT_NAME_POLICY", raising=False)
+    monkeypatch.delenv("JARVIS_OBSIDIAN_VAULT", raising=False)
     task_mirror.reset()
     yield
     task_mirror.reset()
@@ -120,7 +133,6 @@ def vivo(tmp_path, monkeypatch):
     mail.reset()
 
     monkeypatch.setattr(flows, "_seen_path", tmp_path / "email_flow_seen.json")
-    monkeypatch.setattr(flows, "_LINKEDIN_VAULT", tmp_path / "vault")
     monkeypatch.setattr(flows, "_LINKEDIN_LOG",
                         tmp_path / "linkedin-notifications.log")
     monkeypatch.setattr(flows, "_logger", lambda _msg: None)
@@ -367,16 +379,17 @@ def test_suite_nao_escreve_nos_arquivos_do_dono(vivo):
     # 2. o recibo deste teste nao entrou no historico real de fluxos
     assert marcador_uid not in vistos
     # 3. nenhum aviso deste teste foi escrito no log real do LinkedIn nem no
-    #    cofre do dono
+    #    cofre do dono (a nota da mensagem privada sai pela API do cofre, na
+    #    pasta ``Topicos`` — por isso o rglob, nao o glob na raiz)
     assert QUEM not in linkedin_disco
-    notas_reais = (list(REAL_VAULT.glob("NOTA-*linkedin-msg*"))
+    notas_reais = (list(REAL_VAULT.rglob("NOTA-*linkedin-msg*"))
                    if REAL_VAULT.is_dir() else [])
     alcunha = QUEM.casefold().replace(" ", "-")
     assert not any(alcunha in p.name.casefold() for p in notas_reais)
     # 4. os caminhos que estes testes escrevem apontam para o tmp do teste
     assert str(vivo["tmp"]) in str(flows._seen_path)
     assert str(vivo["tmp"]) in str(flows._LINKEDIN_LOG)
-    assert str(vivo["tmp"]) in str(flows._LINKEDIN_VAULT)
+    assert str(vivo["tmp"]) in str(obsidian.VAULT)
     assert str(vivo["tmp"]) in str(main._task_mirror.MIRROR_DIR)
     # nada de rastro novo no repositorio: os arquivos propriamente ditos nao
     # ganharam uma linha nossa

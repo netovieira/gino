@@ -26,6 +26,10 @@ DSL (``plugin_config.mail.flows``, validada por ``clean_flows``)
       ("lembrete: ...", "tarefa: ...", "agendar ...") -> a acao casada com a
       lista ``allow`` do fluxo e roteada para o executor correto
       (``actions.reminder`` / ``actions.tasks``).
+    * ``linkedin_notification`` — AVISO PRODUZIDO AQUI: a frase rica lida do
+      corpo sai pelo gancho de aviso (``set_notify_hook``) e o filtro nao fala
+      mais nada deste e-mail. E o unico tipo em ``NOTICE_TYPES``; os outros
+      tres delegam o aviso de chegada ao filtro, como sempre.
 
     ``when`` filtra por ``from``, ``subject`` e ``body`` (a primeira regra
     que casa vence, como nos filtros). Sem fluxo configurado vale o fluxo
@@ -33,15 +37,20 @@ DSL (``plugin_config.mail.flows``, validada por ``clean_flows``)
     criterio de aceitacao da UP-6.
 
 LINKEDIN E SO UMA REGRA DESTE FLUXO (decisao do dono, 07/11/2026)
-    Nao existe tipo, plugin, rota nem OAuth de LinkedIn aqui: a notificacao
-    do LinkedIn e a INSTANCIA ``linkedin`` de ``aviso_simples`` -- o tipo que
-    a DSL ja tinha para "o aviso aconteceu e nao ha nada a executar". Ela e
-    a primeira regra de ``plugin_config.mail.flows``, casando pelo DOMINIO do
-    remetente (``when.from`` em regex), de modo que um assunto que só menciona
-    "linkedin" vindo de outro remetente nao casa. Sem dispatch de acao: o
-    dono e avisado pelo filtro (``action: avisa``) e o fluxo registra o recibo
-    com ``acao=aviso``. ``core/linkedin.py`` e ``plugins/linkedin_control.py``
-    ficaram inerte (``plugins_enabled.linkedin_control = false``); nada aqui
+    Nao existe plugin, rota nem OAuth de LinkedIn aqui: a notificacao entra por
+    UMA unica regra de filtro da conta (``dispatch: true`` + ``tipo:
+    linkedin_notification``) e este modulo e o UNICO ponto que produz o aviso
+    dela -- exatamente uma frase falada e um registro por e-mail. A regra cujo
+    ``tipo`` tem aviso proprio (``NOTICE_TYPES``) DELEGA o aviso: la no
+    ``core/email.py`` o aviso simples de chegada nao e falado para esse e-mail
+    (ha uma linha de decisao no ponto de despacho). Quando o corpo nao entrega
+    uma notificacao reconhecivel, o mesmo ponto degrada para a frase de chegada
+    (``_arrival_line``), de modo que o passo 3 do contrato continua valendo sem
+    nunca virar segunda frase. Nao ha ramal embutido na DSL: a regra do config e
+    a unica porta, entao a deduplicacao por recibo (``endereco|recibo|fluxo``)
+    nao disputa com um segundo produtor -- varredura repetida do mesmo e-mail
+    nao avisa de novo. ``core/linkedin.py`` e ``plugins/linkedin_control.py``
+    ficaram inertes (``plugins_enabled.linkedin_control = false``); nada aqui
     abre navegador, posta, comenta ou roda OAuth.
 
 CORPO E DADO, NUNCA ORDEM (lei do contrato de e-mail)
@@ -57,12 +66,15 @@ Privacidade
     O evento ``email_flow_executed`` leva conta, uid, nome do fluxo, tipo,
     acao e motivo — nunca remetente, assunto, corpo ou o digito do codigo.
     O historico de execucoes (``memory/email_flow_seen.json``) guarda so a
-    chave ``endereco|uid|fluxo`` para nao executar duas vezes o mesmo recibo.
-    A UNICA excecao escrita em disco e a mensagem privada do LinkedIn: por
-    decisao do dono ela e guardada como texto (nota ``NOTA-<data>-linkedin-
-    msg-<slug>.md`` no vault ``~/Jarvis``, senao linha em
-    ``logs/linkedin-notifications.log``). A frase falada nunca leva corpo,
-    link ou endereco — so quem enviou e o tipo de evento.
+    chave ``endereco|recibo|fluxo`` (recibo = Message-ID, senao o uid) para nao
+    executar duas vezes o mesmo recibo. A UNICA excecao escrita em disco e a
+    mensagem privada do LinkedIn: por decisao do dono ela e guardada como texto,
+    UMA nota por e-mail, pela API do cofre (``core.obsidian.write_note`` com
+    ``tipo="NOTA"`` — o nome sai no padrao TIPO-AAAA-MM-DD-slug.md e passa pelo
+    validador da REGRA do dono; sem cofre disponivel, uma linha em
+    ``logs/linkedin-notifications.log``). Nota E linha de log nunca: um e-mail
+    tem um registro. A frase falada nunca leva corpo, link ou endereco — so
+    quem enviou e o tipo de evento.
 """
 from __future__ import annotations
 
@@ -76,6 +88,11 @@ _DEFAULT_SEEN_PATH = _BASE / "memory" / "email_flow_seen.json"
 
 FLOW_TYPES = ("leitura_codigo", "aviso_simples", "acao_automatica",
               "linkedin_notification")
+#: Tipos de fluxo que PRODUZEM o proprio aviso falado. A regra de filtro cujo
+#: ``tipo`` esta aqui delega o aviso a este modulo: o ``core/email.py`` nao
+#: fala o aviso simples de chegada nesse e-mail (um aviso por e-mail, decidido
+#: em um ponto so — ver o comentario no despacho de ``core/email.py``).
+NOTICE_TYPES = ("linkedin_notification",)
 ACTION_ROUTES = ("lembrete", "tarefa", "agendamento")
 _WHEN_FIELDS = ("from", "subject", "body")
 _MAX_FLOWS = 12
@@ -89,8 +106,11 @@ _WATCH_LIMIT = 200
 _LINKEDIN_FLAT_LIMIT = 3000
 _LINKEDIN_RESUMO_LIMIT = 160
 _LINKEDIN_NOTE_LIMIT = 2000
-_VAULT_NOTE_PREFIX = "NOTA-"
-_LINKEDIN_VAULT = Path.home() / "Jarvis"
+#: Pasta do cofre onde a mensagem privada vira nota (o vocabulario de tipos da
+#: REGRA do dono nao tem tipo "mensagem": NOTA e a ultima opcao, nunca a
+#: primeira — skills/vault/SKILL.md).
+_LINKEDIN_NOTE_FOLDER = "Topicos"
+_LINKEDIN_NOTE_TYPE = "NOTA"
 _LINKEDIN_LOG = _BASE / "logs" / "linkedin-notifications.log"
 
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -100,7 +120,6 @@ _seen: dict[str, None] | None = None
 _seen_path = _DEFAULT_SEEN_PATH
 _event_hook = None          # fn(payload: dict) -> None (activity.log)
 _speak_hook = None          # fn(payload: dict) -> bool  (leitura_codigo)
-_notify_hook = None         # fn(payload: dict) -> bool  (linkedin_notification)
 _notify_hook = None         # fn(payload: dict) -> bool  (linkedin_notification)
 _executor = None            # fn(action, params, item, acct) -> bool
 _logger = None
@@ -174,12 +193,13 @@ _LI_NAME_FROM_RE = re.compile(
     re.UNICODE)
 
 # ── LinkedIn: nada de codigo proprio (decisao do dono, 07/11/2026) ───────────
-# O reconhecimento do LinkedIn mora na CONFIG deste fluxo, nao aqui: a regra
-# ``linkedin`` e um ``aviso_simples`` com ``when.from`` em regex ancorada no
-# dominio do remetente -- ``@(...\.)?linkedin\.com$``. O dominio e o criterio
-# (assunto "linkedin" vindo de outro remetente e falso positivo e nao casa);
-# os e-mails reais do LinkedIn chegam de messages-noreply/news-noreply/
-# emissions@linkedin.com, todos terminados em linkedin.com. Nada de plugin,
+# O reconhecimento do LinkedIn mora na CONFIG da conta, nao aqui: a regra do
+# filtro ``linkedin`` tem ``dispatch: true``, ``tipo: linkedin_notification`` e
+# ``pattern`` ancorada no dominio do remetente -- ``@(...\.)?linkedin\.com$``.
+# O dominio e o criterio (assunto "linkedin" vindo de outro remetente e falso
+# positivo e nao casa); os e-mails reais do LinkedIn chegam de
+# messages-noreply/news-noreply/emissions@linkedin.com, todos terminados em
+# linkedin.com. A regra e a UNICA porta: nao ha ramal na DSL, nao ha plugin,
 # OAuth, post ou navegador: ver ``plugins_enabled.linkedin_control``.
 
 
@@ -238,20 +258,22 @@ def set_notify_hook(handler=None) -> None:
     assistente vivo) o aviso é escrito em disco por padrão: nada é falado e
     nada é inventado. Devolver False (sessão não pronta) NÃO gasta o recibo:
     a varredura seguinte tenta de novo.
+
+    Este é o ÚNICO gancho de aviso dos tipos que avisam por si (``NOTICE_TYPES``):
+    a frase sai pronta daqui, nunca do aviso simples do filtro.
     """
     global _notify_hook
     _notify_hook = handler if callable(handler) else None
 
 
-def set_notify_hook(handler=None) -> None:
-    """Registra ``handler(payload) -> bool`` para ``linkedin_notification``.
+def type_owns_notice(tipo: object) -> bool:
+    """O tipo de fluxo produz o próprio aviso falado?
 
-    O payload e ``{"text", "source", "event_kind", "from_name", "link",
-    "account", "uid"}``. Sem gancho o aviso vai para disco: nada e falado e
-    nada e inventado. Devolver False (sessao nao pronta) NAO gasta o recibo.
+    É a pergunta que decide quem fala de um e-mail do LinkedIn: ``core/email.py``
+    pergunta isto à regra e, quando a resposta é sim, nao emite o aviso simples
+    de chegada — um e-mail, uma frase, um ponto de decisao.
     """
-    global _notify_hook
-    _notify_hook = handler if callable(handler) else None
+    return str(tipo or "").strip().lower() in NOTICE_TYPES
 
 
 def reset() -> None:
@@ -346,14 +368,13 @@ def clean_flows(entries: object) -> list[dict]:
 
 
 def load_flows() -> list[dict]:
-    """Fluxos do dono (``plugin_config.mail.flows``) + o ramal do LinkedIn.
+    """Fluxos do dono (``plugin_config.mail.flows``); sem nada, ``DEFAULT_FLOWS``.
 
-    Sem fluxo configurado vale ``DEFAULT_FLOWS``. Com fluxo configurado, o
-    ramal embutido do LinkedIn (``_BUILTIN_FLOWS``) entra na frente do que o
-    dono escreveu: e por ele que a UP-4 roda hoje — notificacao de LinkedIn
-    nao tem plugin proprio, e uma regra deste fluxo. O disparo continua sob o
-    portao da regra ``dispatch: true`` do filtro, entao nada roda por conta
-    propria.
+    Nao existe ramal embutido do LinkedIn: a unica porta de entrada dele e a
+    regra do filtro no config da conta (``dispatch: true`` + ``tipo``). Um
+    ramal aqui seria um SEGUNDO produtor do mesmo aviso — a regra casada pela
+    conta e o fluxo casando de novo pelo remetente, e o dono ouviria duas
+    frases. O disparo continua sob o portao da regra ``dispatch: true``.
     """
     try:
         from memory.config_manager import get_plugin_config
@@ -362,21 +383,13 @@ def load_flows() -> list[dict]:
     except Exception:
         entries = None
     flows = clean_flows(entries)
-    if flows:
-        known = {flow["name"] for flow in flows}
-        flows = [f for f in _BUILTIN_FLOWS if f["name"] not in known] + flows
     return flows if flows else list(DEFAULT_FLOWS)
 
 
 DEFAULT_FLOWS: list[dict] = [
-    {"name": "linkedin_aviso", "type": "linkedin_notification",
-     "when": {"from": "linkedin"}, "allow": [], "match": "contains",
-     "watch": ""},
     {"name": "leitura_codigo", "type": "leitura_codigo",
      "when": {}, "allow": [], "match": "contains", "watch": ""},
 ]
-
-_BUILTIN_FLOWS: list[dict] = [DEFAULT_FLOWS[0]]
 
 
 # ── parser do corpo ──────────────────────────────────────────────────────────
@@ -603,32 +616,73 @@ def _slug(value: object) -> str:
     return (text[:40] or "desconhecido")
 
 
-def _write_note(who: str, message: str, link: str) -> None:
-    """Mensagem privada guardada como texto: vault Jarvis, senão logs/."""
-    import time as _time
-    import datetime as _dt
-    stamp = _dt.datetime.now().strftime("%Y-%m-%d")
+def _receipt(item: dict) -> str:
+    """O recibo do e-mail: o Message-ID quando existir, senao o uid da caixa.
+
+    E por este recibo (nunca por janela de tempo) que o dispatcher sabe que o
+    mesmo e-mail ja produziu aviso — varredura repetida nao avisa de novo.
+    """
+    if not isinstance(item, dict):
+        return ""
+    message_id = _flatten(item.get("message_id") or "", 80).strip()
+    if message_id:
+        return message_id
+    return str(item.get("uid") or "")[:20]
+
+
+def _note_title(who: str, receipt: str) -> str:
+    """Titulo da nota no padrao do cofre: quem enviou + o recibo da mensagem.
+
+    O recibo entra no titulo porque duas mensagens da mesma pessoa no mesmo dia
+    precisam de duas notas: ``obsidian.write_note`` nao renomeia por cima, ele
+    escreve onde o nome manda.
+    """
+    tag = _slug(receipt)[:16] or "sem-recibo"
+    return f"linkedin msg {_flatten(who, 40)} {tag}"
+
+
+def _write_note(who: str, message: str, link: str,
+                receipt: str = "", notice: str = "") -> str:
+    """Mensagem privada guardada como texto: UMA nota, pela API do cofre.
+
+    Nada de ``open()`` solto na vault: ``core.obsidian.write_note`` monta o nome
+    no padrao da REGRA do dono (``TIPO-AAAA-MM-DD-slug.md``), valida contra o
+    vocabulario fechado (``tipo="NOTA"``) e so depois encosta no disco. Sem
+    cofre ou sem API, devolve "" — quem chama decide o outro registro (uma
+    linha no log), nunca os dois.
+    """
     body_text = _flatten(message, _LINKEDIN_NOTE_LIMIT)
-    vault = _LINKEDIN_VAULT
-    if isinstance(vault, Path) and vault.is_dir():
-        stem = f"{_VAULT_NOTE_PREFIX}{stamp}-linkedin-msg-{_slug(who)}"
-        target = vault / f"{stem}.md"
-        n = 2
-        while target.exists() and n <= 20:
-            target = vault / f"{stem}-{n}.md"
-            n += 1
-        text = (f"# Mensagem do LinkedIn — {who}\n\n"
-                f"- chegada: {_time.strftime('%Y-%m-%d %H:%M')}\n"
-                f"- origem: e-mail de notificação (fluxo UP-6)\n"
-                f"- link: {link or 'não informado'}\n\n"
-                f"{body_text}\n")
-        try:
-            target.write_text(text, encoding="utf-8")
-            _log(f"mensagem do LinkedIn guardada em {target.name}")
-        except Exception as e:
-            _log(f"não consegui guardar a mensagem do LinkedIn: {e}")
-        return
-    _append_linkedin_log(f"NOTA {stamp} {who}: {body_text}", link)
+    text = (f"# Mensagem do LinkedIn — {_flatten(who, 60)}\n\n"
+            f"- chegada: {_dt_now()}\n"
+            f"- origem: e-mail de notificacao (fluxo de leitura de e-mails)\n"
+            + (f"- aviso falado: {_flatten(notice, 200)}\n" if notice else "")
+            + f"- link: {_flatten(link, 300) or 'nao informado'}\n\n"
+            f"{body_text}\n")
+    try:
+        from core import obsidian
+        path = obsidian.write_note(_note_title(who, receipt), text,
+                                   folder=_LINKEDIN_NOTE_FOLDER,
+                                   tipo=_LINKEDIN_NOTE_TYPE)
+    except Exception as e:
+        _log(f"não consegui guardar a mensagem do LinkedIn no cofre: "
+             f"{type(e).__name__}")
+        return ""
+    _log(f"mensagem do LinkedIn guardada em {getattr(path, 'name', '?')}")
+    return str(getattr(path, "name", "") or "")
+
+
+def _notice_line(payload: dict) -> str:
+    """A linha de registro quando nada foi falado: uma linha, nunca duas.
+
+    Cabem nela a frase do aviso e — quando o cofre nao estava disponivel — o
+    texto da mensagem privada, para o aviso continuar com UM registro so.
+    """
+    line = f"AVISO: {_flatten(payload.get('text') or '', _TEXT_LIMIT)}"
+    message = _flatten(payload.get("message") or "", _LINKEDIN_NOTE_LIMIT)
+    if message:
+        who = _flatten(payload.get("from_name") or "", _LI_NAME_LIMIT)
+        line += f" | NOTA {who}: {message}"
+    return line
 
 
 def _append_linkedin_log(line: str, link: str = "") -> None:
@@ -778,21 +832,43 @@ def _speak(payload: dict) -> bool | None:
         return False
 
 
-def _notify(payload: dict) -> bool:
-    """Aviso do LinkedIn: pelo gancho registrado, senão registrado em disco.
+def _notify(payload: dict) -> str:
+    """Entrega a frase do aviso pelo gancho registrado. 'boca' | 'disco' | 'recusado'.
 
     Sem gancho (nenhum processo vivo escutando) nada é falado e nada é
-    inventado — a linha vai para ``logs/linkedin-notifications.log``. O
-    retorno False é transiente de fala: o recibo NÃO é gasto.
+    inventado: devolve ``'disco'`` e quem chama grava o aviso como UMA linha em
+    ``logs/linkedin-notifications.log``. ``'recusado'`` é transiente de fala
+    (sessão não pronta): o recibo NÃO é gasto e a varredura seguinte tenta de
+    novo — é por isso que a gravação também não acontece aqui.
     """
-    if _notify_hook is not None:
-        try:
-            return bool(_notify_hook(dict(payload)))
-        except Exception as e:
-            _log(f"o aviso do LinkedIn falhou: {type(e).__name__}")
-            return False
-    _append_linkedin_log(f"AVISO: {payload.get('text') or ''}")
-    return True
+    if _notify_hook is None:
+        return "disco"
+    try:
+        return "boca" if _notify_hook(dict(payload)) else "recusado"
+    except Exception as e:
+        _log(f"o aviso do LinkedIn falhou: {type(e).__name__}")
+        return "recusado"
+
+
+def _arrival_line(item: dict) -> str:
+    """O piso do aviso: a frase de chegada lida do CABECALHO, nunca do corpo.
+
+    Quando o corpo nao entrega uma notificacao reconhecivel (ou o portao do
+    remetente nao bate, ou o tipo e silencioso sem ``watch``), o passo 3 do
+    contrato continua valendo — e sai daqui, do mesmo ponto que produz o aviso
+    rico, para nunca virar uma segunda frase vindado filtro.
+    """
+    try:
+        from core import email as _mail
+        line = str(_mail.alert_line(item if isinstance(item, dict) else {})
+                   or "")
+        if line:
+            return _safe_spoken(line)
+    except Exception:
+        pass
+    sender = _flatten((item or {}).get("sender")
+                      or (item or {}).get("from") or "alguem", 60)
+    return _safe_spoken(f"Chegou um e-mail de {sender}.")
 
 
 # ── histórico de vistos: um recibo, uma execução ────────────────────────────
@@ -858,43 +934,74 @@ def _handle_code(body: str, item: dict, name: str) -> tuple[str, bool, str]:
 
 def _handle_linkedin(body: str, item: dict, flow: dict,
                      name: str, acct: dict) -> tuple[str, bool, str]:
-    """Notificacao do LinkedIn lida do corpo -> aviso (ou silencio). (acao, ok, motivo)
+    """UNICO ponto que produz o aviso de um e-mail do LinkedIn. (acao, ok, motivo)
 
-    Ordem de seguranca: primeiro o portao do remetente (so dominio
-    linkedin.com), depois o codigo (a regra do LinkedIn NUNCA engole um
-    codigo de verificacao), depois a marca de evento. Vaga e update de
-    empresa sao silentos por default — só voltam a avisar se o assunto bater
-    na regex ``watch``. Mensagem privada e guardada como texto (vault Jarvis,
-    senao logs/) DEPOIS do aviso entregue: transiente de fala nao pode gerar
-    nota duplicada na varredura seguinte. Nada aqui abre navegador nem roda
-    OAuth.
+    Uma frase e um registro por e-mail. Ordem de seguranca: portao do remetente
+    (so dominio linkedin.com), codigo de verificacao (a regra do LinkedIn NUNCA
+    engole um codigo — ele pertence ao ``leitura_codigo``), marca de evento no
+    corpo. Achou evento que avisa, a frase e a rica ("LinkedIn: Fulana te
+    mandou uma mensagem"); nao achou — corpo que nao e notificacao, remetente
+    fora do dominio, ou tipo silencioso (vaga, update de empresa) sem assunto
+    batendo na regex ``watch`` — a frase e o piso de chegada, lido do
+    cabecalho. AS DUAS SAEM DO MESMO PONTO E DO MESMO GANCHO: por isso nao
+    existe caminho que fala duas vezes, e o recibo do dispatcher (e nao o teto
+    de 40 s da boca) que segura a varredura repetida.
+
+    Registro: mensagem privada vira UMA nota no cofre; sem cofre, uma linha no
+    log. Nada foi falado (sem gancho), o aviso inteiro cabe numa linha. Nota E
+    linha, nunca. Transiente de fala nao gasta o recibo e nao grava nada, para
+    a varredura seguinte tentar de novo sem duplicar. Nada aqui abre navegador
+    nem roda OAuth.
     """
     if not is_linkedin_sender(item):
-        return ("nenhuma", True, "remetente_invalido")
+        # Regra mais larga que o portao (ou remetente disfarcado): nada de
+        # frase rica, mas o e-mail nao pode ficar mudo — o piso sai daqui.
+        return _announce(item, {}, "", "", body, name, acct)
     action, ok, motivo = _handle_code(body, item, name)
     if action == "codigo":
         return (action, ok, motivo)
     info = parse_linkedin(body, subject=item.get("subject") or "",
-                          watch=flow.get("watch") or "", item=item)
-    if info is None:
+                          watch=flow.get("watch") or "", item=item) or {}
+    kind = str(info.get("event_kind") or "")
+    text = linkedin_phrase(info) if info.get("announce") else ""
+    return _announce(item, info, kind, text, body, name, acct)
+
+
+def _announce(item: dict, info: dict, kind: str, text: str, body: str,
+              name: str, acct: dict) -> tuple[str, bool, str]:
+    """A entrega do aviso do LinkedIn: uma frase (ganco ou disco) e um registro.
+
+    ``text`` vazio = nenhuma frase rica; o piso e ``_arrival_line`` (cabecalho).
+    Devolve ``(acao, ok, motivo)`` no mesmo molde do resto do dispatcher.
+    """
+    rich = bool(text)
+    phrase = text or _arrival_line(item)
+    if not phrase:
         return ("nenhuma", True, "sem_notificacao")
-    kind = str(info.get("event_kind") or "notificacao")
-    if not info.get("announce"):
-        return ("nenhuma", True, f"silenciado_{kind}")
-    text = linkedin_phrase(info)
-    if not text:
-        return ("nenhuma", True, "sem_notificacao")
-    warned = _notify({"text": text, "source": "linkedin", "event_kind": kind,
-                      "from_name": info.get("from_name") or "",
-                      "link": info.get("link_principal") or "",
-                      "account": name, "uid": str(item.get("uid") or "")[:20],
-                      "address": str(acct.get("address") or "")[:60]})
-    if not warned:
+    private = (_flatten(body, _LINKEDIN_NOTE_LIMIT)
+               if kind == "mensagem" else "")
+    payload = {"text": phrase, "source": "linkedin", "event_kind": kind,
+               "from_name": str(info.get("from_name") or ""),
+               "link": str(info.get("link_principal") or ""),
+               "account": name, "uid": str(item.get("uid") or "")[:20],
+               "address": str(acct.get("address") or "")[:60]}
+    if private:
+        payload["message"] = private
+    delivered = _notify(payload)
+    if delivered == "recusado":
         return ("aviso", False, "aviso_indisponivel")
-    if kind == "mensagem":
-        _write_note(info.get("from_name") or "", body,
-                    info.get("link_principal") or "")
-    return ("aviso", True, f"notificado_{kind}")
+    if private:
+        # A nota E o registro do e-mail; so cai para a linha de log se o
+        # cofre nao existiu. Com o aviso gravado em disco a linha ja leva a
+        # mensagem inteira — um registro, sempre um.
+        if not _write_note(str(info.get("from_name") or ""), private,
+                           str(info.get("link_principal") or ""),
+                           _receipt(item), notice=phrase):
+            _append_linkedin_log(_notice_line(payload), payload["link"])
+    elif delivered == "disco":
+        _append_linkedin_log(_notice_line(payload), payload["link"])
+    return ("aviso", True,
+            f"notificado_{kind}" if (rich and kind) else "notificado_chegada")
 
 
 # ── dispatcher ───────────────────────────────────────────────────────────────
@@ -905,7 +1012,9 @@ def dispatch_flow(acct: dict, item: dict, rule: dict | None,
 
     Chama só para e-mail cuja regra de filtro tem ``dispatch: true`` (o
     portão é do ``core/email.py``). A regra pode ainda FORÇAR o tipo pelo
-    campo ``tipo`` (é como o LinkedIn entra: ``tipo: linkedin_notification``).
+    campo ``tipo`` (é como o LinkedIn entra: ``tipo: linkedin_notification``)
+    — e quando esse tipo tem aviso próprio (``NOTICE_TYPES``) o aviso deste
+    e-mail é PRODUZIDO AQUI, nunca no filtro: um ponto, uma frase, um registro.
     Devolve o evento ``email_flow_executed``
     (dict seguro: conta, uid, nome/tipo do fluxo, ação e motivo — nunca
     corpo, remetente, assunto ou o dígito do código) ou None quando nenhum
@@ -924,8 +1033,11 @@ def dispatch_flow(acct: dict, item: dict, rule: dict | None,
         flow = forced or select_flow(flows, item, str(body or ""))
         if flow is None:
             return None
-        key = (f"{str(acct.get('address') or name).casefold()}|{uid}"
-               f"|{flow['name']}")
+        # Dedup por RECIBO da mensagem (Message-ID, senao o uid), nunca por
+        # janela de tempo: a mesma mensagem ja avisada nao volta a avisar,
+        # varredura que rode quantas vezes rodar.
+        key = (f"{str(acct.get('address') or name).casefold()}"
+               f"|{_receipt(item)}|{flow['name']}")
         if key in _load_seen():
             return None
         action = "nenhuma"
@@ -959,6 +1071,12 @@ def dispatch_flow(acct: dict, item: dict, rule: dict | None,
         event = {"account": name, "uid": uid, "flow": flow["name"],
                  "type": flow["type"], "action": action, "ok": ok,
                  "motivo": motivo,
+                 # Contrato do retry: ``retry`` True diz a quem nos chamou que
+                 # a decisao ainda NAO foi tomada (transiente de fala) e que a
+                 # mesma mensagem precisa voltar — quem guarda rastro do
+                 # e-mail (o jsonl de cabecalhos, em ``core/email.py``) apaga
+                 # o seu, senao o recibo livre nunca e testado de novo.
+                 "retry": bool(not ok and motivo in _RETRY_MOTIVOS),
                  "rule_action": str((rule or {}).get("action") or "")}
         # Transiente de fala (sessão não pronta) NÃO gasta o recibo: a
         # varredura seguinte tenta de novo. Todo resto é decisão tomada.

@@ -1,20 +1,28 @@
-"""LinkedIn como REGRA do fluxo de corpo de e-mail (decisao do dono, 07/11/2026).
+"""A REGRA do LinkedIn na camada de filtro (decisao do dono, 07/11/2026).
 
 O dono decidiu que LinkedIn NAO tem plugin, rota propria nem OAuth: e so mais
 uma regra dentro do fluxo de leitura de e-mails (UP-6, core/email_flows.py).
-O que este teste vigia, e por que:
+Este arquivo cuida do que o FILTRO enxerga: casar remetente, nao casar estranho
+e decidir QUEM avisa. O conteudo do aviso (frase rica, piso de chegada, nota no
+cofre, recibo) esta em test_email_flow_linkedin.py, e a proibicao da dupla frase
+em test_email_linkedin_aviso_unico.py. Este recorte existe porque duas copias do
+mesmo comportamento — a regra de filtro de um lado, o dispatcher do outro —
+acabaram afirmando comportamentos contraditorios.
 
-  * e-mail do LinkedIn (dominio linkedin.com) -> fluxo ``linkedin_notification``
-    -> SOMENTE um aviso ao dono: nenhum executor de acao e chamado;
-  * e-mail normal (banco, sem codigo) -> NAO vira aviso do LinkedIn;
-  * falso positivo obvio: a palavra "linkedin" no ASSUNTO vindo de outro
-    remetente nao casa com a regra, que e ancorada no dominio do remetente;
-  * a rota antiga esta desligada: ``plugins_enabled.linkedin_control`` e False
+O que aqui se prova, e por que:
+  * a regra ancora no DOMINIO do remetente (nunca no assunto) e aceita
+    subdominio (messages-noreply@, news-noreply@, emissions@);
+  * falso positivo obvio: a palavra "linkedin" no assunto vindo de outro
+    remetente nao casa com a regra;
+  * DELEGCANDO O AVISO: regra com ``dispatch`` + ``tipo`` de fluxo que avisa por
+    si (NOTICE_TYPES) faz o gancho de chegada do poll_once ficar calado. A
+    decisao e da REGRA, nunca do resultado do despacho — e o que impede a
+    segunda frase do mesmo e-mail;
+  * a rota antiga esta desligada: plugins_enabled.linkedin_control e False
     (o modulo continua no repo por historico — core/linkedin.py nao e chamado).
 
-Nada aqui fala com a rede, com o vault do dono ou com o config real de
-segredos: historico vai para tmp_path, aviso e executor sao coletores em
-memoria, e o unico valor lido do cofre e um booleano de ligar/desligar.
+Nada aqui fala com a rede, com o cofre do dono ou com o config real de
+segredos: o unico valor lido do cofre e um booleano de ligar/desligar.
 """
 from __future__ import annotations
 
@@ -39,24 +47,13 @@ LI_RULE = {
     "tipo": "linkedin_notification",
     "label": "linkedin",
 }
-ACCT = {"name": "principal", "address": "eu@gmail.com"}
 
 
-@pytest.fixture()
-def collectors(monkeypatch, tmp_path):
-    """Recibo em disco temporario + ganchos coletores (nada de fala real)."""
-    monkeypatch.setattr(flows, "_seen_path", tmp_path / "email_flow_seen.json")
-    notices: list[dict] = []
-    events: list[dict] = []
-    execed: list[tuple] = []
+@pytest.fixture(autouse=True)
+def _ganchos_zerados():
+    """Nenhum gancho global deste arquivo vaza para o teste vizinho."""
     flows.reset()
-    flows.set_notify_hook(lambda p: (notices.append(p), True)[1])
-    flows.set_event_hook(events.append)
-    flows.set_executor(lambda a, p, i, c: (execed.append((a, p)), True)[1])
-    # O texto da mensagem privada nunca cai no vault do dono em teste.
-    monkeypatch.setattr(flows, "_write_note",
-                        lambda *a, **k: notices.append({"note": a}))
-    yield {"notices": notices, "events": events, "execed": execed}
+    yield
     flows.reset()
 
 
@@ -65,83 +62,59 @@ def _item(subject: str, sender: str, from_: str) -> dict:
             "sender": sender, "from": from_}
 
 
-# ── 1. bate: notificacao do LinkedIn vira SO aviso ───────────────────────────
+# ── 1. a regra casa o dominio, e so o dominio ────────────────────────────────
 
-def test_linkedin_invitation_is_a_simple_notice(collectors):
-    item = _item("Maria Souza quer conectar-se com você",
-                 "LinkedIn", "messages-noreply@linkedin.com")
-    ev = flows.dispatch_flow(ACCT, item, LI_RULE,
-                             "Maria Souza quer conectar-se com você. "
-                             "Aceitar o convite: https://www.linkedin.com/feed")
-    assert ev is not None
-    assert ev["type"] == "linkedin_notification"
-    assert ev["action"] == "aviso"
-    assert ev["ok"] is True
-    # so um aviso, nunca despacho de acao automatica
-    assert collectors["execed"] == [], "LinkedIn nao pode executar acao"
-    assert len(collectors["notices"]) == 1
-    text = str(collectors["notices"][0].get("text") or "")
-    assert text.startswith("LinkedIn:")
-    # privacidade: corpo/link nao vao para o evento
-    assert "linkedin.com/feed" not in str(ev)
-
-
-def test_linkedin_message_is_noticed_once_per_receipt(collectors):
-    item = _item("João Lima enviou uma nova mensagem", "LinkedIn",
-                 "messages-noreply@linkedin.com")
-    body = ("João Lima enviou uma nova mensagem. "
-            "Veja: https://www.linkedin.com/messaging")
-    ev = flows.dispatch_flow(ACCT, item, LI_RULE, body)
-    assert ev is not None and ev["action"] == "aviso"
-    assert collectors["execed"] == []
-    # um recibo, uma execucao
-    assert flows.dispatch_flow(ACCT, item, LI_RULE, body) is None
-
-
-# ── 2. nao bate: e-mail comum nao vira aviso do LinkedIn ─────────────────────
-
-def test_plain_bank_email_is_not_a_linkedin_notice(collectors):
-    item = _item("Extrato de outubro", "Banco Bom", "no-reply@bancobom.com")
-    ev = flows.dispatch_flow(ACCT, item, {"action": "avisa",
-                                         "dispatch": True},
-                             "Olá, seu extrato de outubro está disponível.")
-    assert ev is not None
-    assert ev["type"] != "linkedin_notification"
-    assert collectors["notices"] == []
-
-
-def test_filter_rule_never_matches_other_senders():
-    assert mail.match_filter(_item("Boas-vindas", "Amigo",
-                                   "amigo@exemplo.com"),
-                             [LI_RULE]) is None
-    assert mail.match_filter(_item("Extrato", "Banco", "no-reply@banco.com"),
-                             [LI_RULE]) is None
+def test_a_regra_casa_linkedin_em_subdominio_e_recusa_o_resto():
+    """A regra do LinkedIn ancora no remetente: subdominio vale, estranho nao."""
     hit = mail.match_filter(_item("Convite", "LinkedIn",
                                   "news-noreply@linkedin.com"), [LI_RULE])
     assert hit is not None and hit.get("dispatch") is True
+    assert mail.match_filter(_item("Boas-vindas", "Amigo",
+                                   "amigo@exemplo.com"), [LI_RULE]) is None
+    assert mail.match_filter(_item("Extrato", "Banco", "no-reply@banco.com"),
+                             [LI_RULE]) is None
 
 
-# ── 3. falso positivo obvio: "linkedin" no assunto, remetente outro ───────────
-
-def test_linkedin_word_in_subject_from_stranger_is_not_notified(collectors):
+def test_linkedin_no_assunto_de_desconhecido_nao_casa_na_regra():
+    """"linkedin" escrito no assunto por quem nao e o LinkedIn nao vira nada."""
     item = _item("Como aparecer no linkedin: 10 dicas", "Curso de Marketing",
                  "news@cursomarketing.com.br")
     assert mail.match_filter(item, [LI_RULE]) is None
-    ev = flows.dispatch_flow(ACCT, item, {"action": "avisa",
-                                         "dispatch": True},
-                             "10 dicas para seu perfil no linkedin crescer.")
-    assert ev is None or ev["type"] != "linkedin_notification"
-    assert collectors["notices"] == []
 
 
-# ── 4. DSL nao inventa tipo, e a rota antiga esta desligada ──────────────────
+# ── 2. quem avisa: a delegacao decide no filtro, uma frase por e-mail ────────
 
-def test_unknown_tipo_forces_nothing():
-    assert flows.flow_from_rule({"tipo": "linkedin"}) is None
-    assert flows.flow_from_rule({}) is None
-    got = flows.flow_from_rule(dict(LI_RULE))
-    assert got is not None and got["type"] == "linkedin_notification"
+def test_regra_com_tipo_que_avisa_por_si_delega_o_aviso_ao_fluxo():
+    """O unico ponto que decide quem fala: a REGRA, nunca o resultado do despacho.
 
+    Se a decisao dependesse do que ``dispatch_flow`` devolve, um recibo ja gasto
+    (que devolve None) faria o filtro falar de novo — e o mesmo e-mail teria
+    duas frases em duas varreduras.
+    """
+    assert mail._notice_is_delegated(LI_RULE) is True
+    # Sem ``tipo``, ou com tipo que NAO produz aviso proprio, o filtro continua
+    # avisando a chegada (e o fluxo roda depois, sem falar de aviso).
+    assert mail._notice_is_delegated({"action": "avisa",
+                                      "dispatch": True}) is False
+    assert mail._notice_is_delegated({"action": "avisa", "dispatch": True,
+                                      "tipo": "leitura_codigo"}) is False
+    # ``tipo`` sem ``dispatch`` nao e despacho nenhum: quem avisa e o filtro.
+    assert mail._notice_is_delegated({"action": "avisa",
+                                      "tipo": "linkedin_notification"}) is False
+    assert mail._notice_is_delegated(None) is False
+    assert mail._notice_is_delegated({}) is False
+
+
+def test_o_tipo_que_avisa_por_si_vem_da_lista_fechada():
+    """Quem possui aviso proprio e lista fechada do modulo de fluxos — nada de
+    adivinhar pelo nome do tipo ou pelo remetente."""
+    assert flows.type_owns_notice("linkedin_notification") is True
+    assert flows.type_owns_notice("LEITURA_CODIGO") is False
+    assert flows.type_owns_notice("") is False
+    assert flows.type_owns_notice(None) is False
+
+
+# ── 3. a rota antiga esta desligada ─────────────────────────────────────────
 
 def test_old_linkedin_route_is_disabled():
     """LinkedIn deixou de ser caminho proprio (plugin inerte)."""

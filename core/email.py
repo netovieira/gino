@@ -56,6 +56,10 @@ FILTRO POR CONTA (FLUXO MAPEAMENTO EMAIL, passos 2 e 4)
     SYS). ``match``: contains | exact | regex simples; campos: from, subject.
     Quem quer "avisa tudo MENOS marketing" acrescenta no fim uma regra
     apanhadora (``match: regex``, ``pattern: ".+"``, ``action: avisa``).
+    Uma regra com ``dispatch: true`` cujo ``tipo`` produz o proprio aviso
+    (hoje so ``linkedin_notification``) DELEGA o aviso: aqui nao se fala a
+    frase de chegada, fala o ``core/email_flows`` — um aviso por e-mail,
+    decidido em um ponto so.
 
 ENVIO É IRREVERSÍVEL
     ``request_send()`` só estaciona o pedido; ``confirm_send(voice_ok=True)``
@@ -477,6 +481,25 @@ def _filter_trace(acct, item: dict, rule: dict | None, action: str) -> None:
         pass          # o rastro nunca derruba a varredura
 
 
+def _notice_is_delegated(rule: dict | None) -> bool:
+    """A regra delegou o aviso deste e-mail ao fluxo de corpo? True = o fluxo fala.
+
+    UNICO ponto que decide quem avisa: uma regra com ``dispatch: true`` cujo
+    ``tipo`` produz o proprio aviso (``email_flows.NOTICE_TYPES`` — hoje so
+    ``linkedin_notification``) NAO gera aviso simples aqui. A decisao e da
+    REGRA, nunca do resultado do despacho: assim uma varredura repetida do
+    mesmo e-mail tambem nao fala duas vezes (o recibo do fluxo e o outro lado
+    da mesma moeda). O import e tardio; sem o modulo, nada e delegado.
+    """
+    if not rule or not rule.get("dispatch") or not rule.get("tipo"):
+        return False
+    try:
+        from core import email_flows
+        return bool(email_flows.type_owns_notice(rule.get("tipo")))
+    except Exception:
+        return False
+
+
 def _dispatch_email_flow(acct, item: dict, rule: dict | None,
                          conn=None) -> dict | None:
     """Passos 5-6 do FLUXO EMAIL (UP-6): corpo -> fluxo -> execução.
@@ -488,12 +511,19 @@ def _dispatch_email_flow(acct, item: dict, rule: dict | None,
     aviso, nunca autoriza envio. O evento ``email_flow_executed`` sai pelo
     gancho registrado em main.py. Nunca levanta: erro de fluxo é linha de
     log interna e a varredura segue.
+
+    Quando a regra DELEGOU o aviso para aqui, o fluxo roda mesmo sem corpo
+    lido: o ``linkedin_notification`` tem piso de frase (chegada, lida do
+    cabeçalho) e um e-mail do dono não pode ficar mudo porque a leitura do
+    corpo falhou — e continuar mudo é o que duplica aviso na varredura
+    seguinte.
     """
     try:
         from core import email_flows
     except Exception as e:
         _log(f"fluxo de execução de e-mail indisponível: {e}")
         return None
+    delegated = _notice_is_delegated(rule)
     body = str(item.get("body_excerpt") or "")
     if not body and conn is not None:
         try:
@@ -501,8 +531,9 @@ def _dispatch_email_flow(acct, item: dict, rule: dict | None,
                              FILTER_BODY_CHARS)
         except Exception as e:
             _log(f"o corpo para o fluxo de {acct.name} não foi lido: {e}")
-            return None
-    if not body:
+            if not delegated:
+                return None
+    if not body and not delegated:
         return None
     try:
         return email_flows.dispatch_flow(acct.public(), item,
@@ -1699,6 +1730,45 @@ def _item_key(item: dict) -> str:
             f"|{item.get('subject') or ''}|{item.get('date') or ''}")
 
 
+def _forget_inbox(acct: MailAccount, item: dict) -> bool:
+    """Tira UM cabeçalho do rastro: o e-mail volta a parecer novo na caixa.
+
+    Só para aviso não entregue (transiente de fala — ``retry`` do fluxo). Sem
+    isto o recibo fica livre em ``email_flows``, mas o jsonl de cabeçalhos
+    esconde o e-mail da varredura seguinte e a notificação se perde: quem
+    decide gastar o recibo é o fluxo, quem decide se a mensagem volta a
+    aparecer é este rastro — os dois têm de dizer a mesma coisa. Reescreve sob
+    o mesmo ``_lock`` do append; erro é silêncio, a varredura nunca cai por
+    causa de rastro.
+    """
+    key = _item_key(item if isinstance(item, dict) else {})
+    if not key:
+        return False
+    try:
+        with _lock:
+            if not acct.inbox_file.exists():
+                return False
+            rows = [ln for ln in acct.inbox_file.read_text(
+                encoding="utf-8").splitlines() if ln.strip()]
+            keep: list[str] = []
+            for ln in rows:
+                try:
+                    row = json.loads(ln)
+                except Exception:
+                    keep.append(ln)
+                    continue
+                if isinstance(row, dict) and _item_key(row) == key:
+                    continue
+                keep.append(ln)
+            if len(keep) == len(rows):
+                return False
+            acct.inbox_file.write_text(
+                ("\n".join(keep) + "\n") if keep else "", encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
 def _header_item(acct: MailAccount, uid: str, raw: bytes) -> dict:
     """Um cabeçalho → o item do inbox. NUNCA traz o corpo."""
     msg = email.message_from_bytes(raw)
@@ -2157,7 +2227,10 @@ def poll_once(hook=None) -> list[dict]:
     nunca por padrão, nunca no jsonl). E-mail fora de todas as regras não
     gera aviso nenhum: nem fala, nem SYS. Regra com ``dispatch: true``
     ainda passa o corpo pelo fluxo de execução (passos 5-6, UP-6:
-    ``_dispatch_email_flow``).
+    ``_dispatch_email_flow``) — e quando o ``tipo`` dessa regra tem aviso
+    próprio (LinkedIn), o fluxo é o dono do aviso e o gancho de chegada fica
+    calado: exatamente UMA frase por e-mail, decidida em um ponto só
+    (``_notice_is_delegated``).
     """
     _ensure_accounts()
     hook = hook if hook is not None else _watch_hook
@@ -2203,6 +2276,27 @@ def poll_once(hook=None) -> list[dict]:
                     if action == "ignora":
                         _filter_metrics.record(
                             acct.name, received=1, filtered=1,
+                            processing_ms=(time.monotonic() - item_start) * 1000)
+                        continue
+                    if _notice_is_delegated(rule):
+                        # UM aviso por e-mail, decidido AQUI em uma linha: a
+                        # regra tem tipo de fluxo com aviso proprio (LinkedIn),
+                        # entao o gancho de chegada NAO fala — o ponto unico que
+                        # produz a frase e `core/email_flows._handle_linkedin`.
+                        # Sem fallback de proposito: recibo gasto tambem devolve
+                        # None, e cair no aviso simples seria o segundo aviso.
+                        event = _dispatch_email_flow(acct, item, rule, conn)
+                        if event is not None:
+                            delivered.append(item)
+                        if (event or {}).get("retry"):
+                            # O aviso não saiu (boca indisponível): o recibo
+                            # não foi gasto no fluxo, e o rastro de cabeçalhos
+                            # tem de ser desfeito para a varredura seguinte
+                            # tentar de novo — nunca por janela de tempo.
+                            _forget_inbox(acct, item)
+                        _filter_metrics.record(
+                            acct.name, received=1,
+                            notified=1 if (event or {}).get("ok") else 0,
                             processing_ms=(time.monotonic() - item_start) * 1000)
                         continue
                     if action == "classificar" and (rule or {}).get("body"):
