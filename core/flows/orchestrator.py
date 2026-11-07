@@ -803,6 +803,25 @@ class Orchestrator:
                     failures=sum(1 for r in results if not r.ok),
                     total_ms=total_ms)
 
+    def notify_execution_complete(self, plan: TurnPlan,
+                                  actions: list[Any],
+                                  results: list[ExecutorResult],
+                                  started: float) -> None:
+        """Porta pública do ``execution_complete`` (UP-10).
+
+        ``run_plan`` é o caminho de referência que os testes exercitam, mas a
+        runtime do processo vivo é ``core/flows/live.py``: ela despacha as
+        ações no ``_gate_worker`` e nunca chamou ``run_plan`` — por isso o
+        evento existia no código e o activity.log inteiro não tinha uma linha
+        dele. A ponte chama esta porta; ``_notify_execution_complete`` é
+        privado e não é contrato de módulo irmão. Payload e canal são os
+        mesmos (``_event`` → activity.log + ``on_event``), então emitir daqui
+        e de ``run_plan`` no mesmo turno seria duplicar o mesmo fato — a
+        ponte tem a marca idempotente por turno e os dois caminhos não
+        coexistem numa execução viva.
+        """
+        self._notify_execution_complete(plan, actions, results, started)
+
     # ── cancelamento ────────────────────────────────────────────────────────
     def cancel(self, turn_id: str, reason: str = "cancelado") -> bool:
         # UV-1: turno cancelado não deixa pergunta sem resposta no contador:

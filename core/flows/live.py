@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .config import FlowsConfig
-from .executor import Executor
+from .executor import Executor, ExecutorResult
 from . import mouth as _mouth
 from .orchestrator import Orchestrator, TurnPlan
 from .router import TRUST_OWNER
@@ -68,6 +68,11 @@ class _LiveTurn:
     # dono deixa de esperar em silêncio pelos 30-44 s do cérebro.
     interim_timer: threading.Timer | None = None
     interim_spoken: bool = False
+    # UP-10 (EXECUCAO passo 3): marca de que este turno já notificou o cérebro
+    # com ``execution_complete``. A notificação é UMA por execução, e o
+    # ``_gate_worker`` pode ser relido mais de uma vez no mesmo turno — o
+    # flag torna a emissão idempotente.
+    execution_notified: bool = False
 
 
 class FlowsRuntime:
@@ -252,27 +257,65 @@ class FlowsRuntime:
         return True
 
     def _gate_worker(self, turn_id: str) -> None:
-        """Só ações que exigem confirmação; nenhuma ferramenta executa aqui."""
+        """Só ações que exigem confirmação; nenhuma ferramenta executa aqui.
+
+        UP-10 (EXECUCAO passo 3): este é o único despacho real da runtime
+        viva — ``run_plan`` do orquestrador não tem chamador em produção e era
+        o único lugar onde o ``execution_complete`` existia. Terminado o
+        ciclo, a ponte notifica o cérebro pela porta pública do orquestrador,
+        com o que de fato saiu daqui: ações e desfechos. Sem ação despachada
+        não há execução nenhuma, portanto nenhum evento (a ponte não inventa
+        conclusão de ferramenta que não passou por ela).
+        """
         with self._lock:
             live = self._turns.get(str(turn_id))
         if live is None:
             return
+        dispatched: list[Any] = []
+        results: list[ExecutorResult] = []
+        started = self.clock()
         for index, action in enumerate(live.plan.decision.actions, 1):
             if not action.requires_confirm:
                 continue
+            dispatched.append(action)
             try:
                 result = self.orchestrator.executor.run(
                     f"g{index}", action.tool, action.args,
                     requires_confirm=True)
             except Exception as exc:
                 self._log(f"[Fluxos] portão de {action.tool} falhou: {exc!r}")
+                results.append(ExecutorResult(
+                    task_id=f"g{index}", error=f"{type(exc).__name__}: {exc}"))
                 continue
             phrase = ""
             for fact in result.facts:
                 phrase = str(fact.get("pending_confirm") or phrase)
             live.notes.append(f"gate:{action.tool}:{'pendente' if phrase else result.error}")
+            results.append(result)
             self._log(f"[Fluxos] portão de ferramenta {action.tool}: "
                       f"{phrase or result.error or 'sem resultado'}; nada executado")
+        if dispatched:
+            self._notify_execution(live, dispatched, results, started)
+
+    def _notify_execution(self, live: _LiveTurn, actions: list[Any],
+                          results: list[ExecutorResult], started: float) -> None:
+        """UP-10: ``execution_complete`` UMA vez por turno, sem quebrar o portão.
+
+        A marca vive no turno (``execution_notified``) sob o mesmo lock da
+        ponte: ``_gate_worker`` pode ser relançado para o mesmo ``turn_id`` e
+        ``run_plan`` — se um dia voltar a ser chamado — não entra neste caminho.
+        Erro nenhum aqui sobe para o despacho: notificação é registro, não
+        efeito colateral.
+        """
+        with self._lock:
+            if live.execution_notified:
+                return
+            live.execution_notified = True
+        try:
+            self.orchestrator.notify_execution_complete(
+                live.plan, actions, results, started)
+        except Exception as exc:
+            self._log(f"[Fluxos] execution_complete falhou: {exc!r}")
 
     def _should_brief(self, plan: TurnPlan) -> bool:
         if plan.decision.cancel:
