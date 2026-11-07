@@ -91,6 +91,7 @@ from core import voice_device_enroll as _device_enroll
 from core import series_gate as _series_gate_mod
 from core import silence_gate as _silence_gate_mod
 from core import silence_code as _silence_code_mod
+from core.ghost_filter import GhostFilter as _GhostFilter
 from core import chat_memory as _chat_memory
 from core import personas as _personas
 from core import memory_index as _memory_index
@@ -2471,6 +2472,23 @@ class JarvisLive:
         # Turno fantasma: a transcrição que é o nosso próprio TTS voltando
         # pelo microfone (o AEC do PipeWire falha; ver core/echo_text.py).
         self._echo_text            = EchoTextGuard()
+        # UC-3: filtro de vozes fantasmas (classificação de fonte + repetição).
+        # Evento audio_classified no activity.log a cada transcrição.
+        def _ghost_log(payload: dict) -> None:
+            try:
+                self.ui.write_log(
+                    f"AUDIO_CLASSIFIED: label={payload.get('label','')}"
+                    f" confidence={payload.get('confidence',0):.2f}"
+                    f" action={payload.get('action','')}")
+            except Exception:
+                pass
+
+        self._ghost_filter = _GhostFilter(
+            sample_rate=SEND_SAMPLE_RATE,
+            repeat_window_s=30.0,
+            repeat_min_count=2,
+            on_classify=_ghost_log,
+        )
         # ── Dono com a palavra ──────────────────────────────────────────────
         # O VAD local (core.silero_vad) é a prova de que há voz humana no
         # microfone; o echo guard diz se ela é nossa ou do dono. Carregado
@@ -14844,6 +14862,17 @@ class JarvisLive:
         # text can (see _on_text_command and the WhatsApp owner chat).
         if self._voice_bootstrap_gate(text, pcm, "voice"):
             return
+        # UC-3: filtro de fantasmas. Só o canal de voz (pcm presente) é julgado;
+        # texto digitado nunca passa por aqui. Classificação de fonte + repetição.
+        if pcm is not None:
+            try:
+                _ghost = self._ghost_filter.check(text, pcm=pcm)
+                if _ghost["action"] == "reject":
+                    _lbl = _ghost.get("label") or "fantasma"
+                    print(f"[Ghost] descartado ({_lbl}): {text[:60]!r}")
+                    return
+            except Exception as _ge:
+                print(f"[Ghost] filtro indisponivel: {_ge}")
         # Eco do próprio TTS: o cancelador do PipeWire falhou e o microfone
         # devolveu a nossa fala, que o transcritor entrega como se fosse o
         # dono. Só o canal de voz (com PCM) é julgado — texto digitado nunca
