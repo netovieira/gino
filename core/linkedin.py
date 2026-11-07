@@ -34,6 +34,14 @@ RECIBOS HMAC:
     linkedin.post("Olá rede!")              # publica
     linkedin.get_profile()                  # dados do dono
 """
+# Rota atual do dono (2026-11-07): notificacoes por email. OAuth desligado — ver skills/actions/SKILL.md e UP-4 no vault.
+#
+# Nada aqui foi desativado nem deletado: o fluxo OAuth 2.0 (configure,
+# get_authorization_url, handle_callback, refresh_access_token) e as acoes de
+# API continuam inteiros, prontos para uma futura ativacao se o dono mudar de
+# rota. O que muda e a decisao de caminho: o monitoramento de LinkedIn roda
+# pelos e-mails de notificacao do proprio LinkedIn, recebidos por
+# core/email.py (cabeçalho em refresh()/recent(), aviso por remetente+assunto).
 from __future__ import annotations
 
 import json
