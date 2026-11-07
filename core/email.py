@@ -315,6 +315,36 @@ def set_app_password(name_or_uuid: str, password: str | None) -> bool:
         return False
 
 
+def _clean_tipo(value: object) -> str:
+    """O tipo de fluxo que a regra força no dispatcher (UP-6), vazio = nenhum.
+
+    ``tipo`` so e aceito se existir em ``core/email_flows.FLOW_TYPES`` — um
+    typo nao pode virar regra muda no config do dono. O import e tardio
+    (``email_flows`` importa ``email`` so por dentro de funcoes); se o modulo
+    nao carregar, a regra continua valida so que sem forcar fluxo nenhum.
+    """
+    tipo = _one_line(value or "", 40).strip().lower().replace(" ", "_")
+    if not tipo:
+        return ""
+    try:
+        from core import email_flows
+        return tipo if tipo in email_flows.FLOW_TYPES else ""
+    except Exception:
+        return ""
+
+
+def _clean_watch(value: object) -> str:
+    """Regex de assunto que reativa os tipos silentos (vaga/empresa)."""
+    watch = _one_line(value or "", 200).strip()
+    if not watch:
+        return ""
+    try:
+        re.compile(watch, re.IGNORECASE)
+    except re.error:
+        return ""
+    return watch
+
+
 # ── a conta ──────────────────────────────────────────────────────────────────
 
 def _clean_rule(entry: object) -> dict | None:
@@ -323,7 +353,10 @@ def _clean_rule(entry: object) -> dict | None:
     Chaves: ``from`` e/ou ``subject`` (padrão), ``match`` (contains | exact |
     regex simples), ``action`` (avisa | ignora | classificar) e ``body``
     (bool: a regra de classificar pede também um TRECHO do corpo — dado,
-    nunca ordem). ``dispatch`` (bool, UP-6): depois da decisão de filtro, o corpo deste e-mail passa pelo fluxo de execução de ``core/email_flows.py`` (passos 5-6 do contrato). regex passa por compilação e teto de tamanho; padrão
+    nunca ordem). ``dispatch`` (bool, UP-6): depois da decisão de filtro, o corpo deste e-mail passa pelo fluxo de execução de ``core/email_flows.py`` (passos 5-6 do contrato). Com ``dispatch``, ``tipo`` escolhe o
+    fluxo (ex.: ``linkedin_notification`` — a rota do LinkedIn decidida em
+    07/11/2026: filtro do fluxo de e-mail, sem plugin nem OAuth) e ``watch``
+    é a regex de assunto que reativa os tipos silenciosos. regex passa por compilação e teto de tamanho; padrão
     inválido derruba a regra inteira (a gente não adivinha regra do dono).
     """
     if not isinstance(entry, dict):
@@ -354,6 +387,8 @@ def _clean_rule(entry: object) -> dict | None:
     return {"field": field, "pattern": pattern, "match": match,
             "action": action, "body": bool(entry.get("body")),
             "dispatch": bool(entry.get("dispatch")),
+            "tipo": _clean_tipo(entry.get("tipo")),
+            "watch": _clean_watch(entry.get("watch")),
             "label": _one_line(entry.get("label") or "", 60)}
 
 
