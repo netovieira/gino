@@ -241,12 +241,493 @@ def progress_facts(text: str, stage: str = "") -> list[dict[str, Any]]:
              "detail": str(stage or ""), "assertion": False}]
 
 
+# ── UV-2: a boca não fala inglês nem jargão técnico ────────────────────────
+#
+# Lei do dono (31/10/2026 23:34, escrita em skills/conversation/SKILL.md):
+# "nunca vaze palavra em inglês na fala; termo técnico inglês sem equivalente
+# sai em português corrido ou não sai". O ``clean_sentence`` de antes só tirava
+# aspas, quebra de linha e o rótulo do falante — o inglês passava inteiro. No
+# activity.log de 07/11/2026 a saída de voz ainda registrava "Extract final
+# suite counts", "Identify test at ~10% position via collection order" e
+# "a leitura _check_material_proof implementation".
+#
+# O portão tem três peças, nesta ordem:
+#   1. TECH_TERMS_PT  dá nome em português ao termo técnico, com o artigo e a
+#      contração certos ("no commit" -> "na entrega", "os builds" -> "as
+#      compilações");
+#   2. ALLOWED_ENGLISH_NAMES  nome próprio em inglês que o dono pronuncia assim
+#      mesmo (Spotify, Queen, WhatsApp) passa intacto e não conta como
+#      vazamento;
+#   3. o que sobrar em inglês (léxico, terminação -ing/-ed/-tion..., bandeira de
+#      comando, snake_case, caminho de arquivo) CALA a frase: ``clean_sentence``
+#      devolve string vazia e o template determinístico do chamador fala no
+#      lugar. Recitar código ou inglês no ouvido do dono nunca é melhor que
+#      silêncio.
+#
+# Os léxicos são deliberadamente conservadores: palavra ambígua com o
+# português ("a", "as", "no", "do", "data", "status", "final", "volume") fica
+# FORA da lista de inglês, porque derrubaria fala limpa; termo sem equivalente
+# português silencia a frase em vez de inventar tradução.
+
+# Termo técnico em inglês -> como se diz em português (com o artigo). Só nomes
+# e formas cujo equivalente é curto o bastante para caber numa fala da boca.
+TECH_TERMS_PT: dict[str, str] = {
+    # código e versão
+    "commit": "a entrega", "commits": "as entregas",
+    "push": "o envio", "pushes": "os envios",
+    "pull": "a retirada", "merge": "a integração", "merges": "as integrações",
+    "build": "a compilação", "builds": "as compilações",
+    "deploy": "a publicação", "deploys": "as publicações",
+    "release": "a versão publicada", "releases": "as versões publicadas",
+    "repo": "o repositório", "repos": "os repositórios",
+    "repository": "o repositório", "branch": "o ramo", "branches": "os ramos",
+    "version": "a versão", "versions": "as versões",
+    "diff": "a diferença", "diffs": "as diferenças",
+    "stats": "as estatísticas", "count": "a contagem", "counts": "as contagens",
+    "suite": "a bateria de testes", "suites": "as baterias de testes",
+    "summary": "o resumo", "summaries": "os resumos",
+    "test": "o teste", "tests": "os testes", "testing": "o teste",
+    "pytest": "os testes", "unitest": "o teste unitário",
+    "check": "a conferência", "checks": "as conferências",
+    "checking": "a conferência", "verification": "a conferência",
+    "bug": "o defeito", "bugs": "os defeitos", "debug": "a depuração",
+    "debugging": "a depuração", "fix": "o conserto", "fixes": "os consertos",
+    "fixing": "o conserto", "workaround": "o jeitinho",
+    "script": "o programa", "scripts": "os programas",
+    "command": "o comando", "commands": "os comandos",
+    "workflow": "o fluxo", "workflows": "os fluxos",
+    "pipeline": "o fluxo", "runtime": "a execução", "thread": "a fila de execução",
+    "threads": "as filas de execução", "process": "o processo",
+    "queue": "a fila", "queues": "as filas",
+    "cache": "a memória temporária", "backup": "a cópia de segurança",
+    "backups": "as cópias de segurança",
+    "config": "a configuração", "configs": "as configurações",
+    "configuration": "a configuração", "settings": "as configurações",
+    "setup": "a preparação", "default": "o padrão", "defaults": "os padrões",
+    "template": "o modelo", "templates": "os modelos",
+    "install": "a instalação", "installation": "a instalação",
+    "installing": "a instalação", "update": "a atualização",
+    "updates": "as atualizações", "updating": "a atualização",
+    "upgrade": "a atualização", "patch": "o correctivo",
+    # máquina e voz
+    "error": "o erro", "errors": "os erros", "warning": "o aviso",
+    "warnings": "os avisos", "fail": "a falha", "fails": "as falhas",
+    "failed": "a falha", "failing": "a falha", "failure": "a falha",
+    "output": "a saída", "inputs": "as entradas", "input": "a entrada",
+    "result": "o resultado", "results": "os resultados",
+    "response": "a resposta", "responses": "as respostas",
+    "request": "o pedido", "requests": "os pedidos",
+    "file": "o arquivo", "files": "os arquivos",
+    "folder": "a pasta", "folders": "as pastas", "directory": "a pasta",
+    "path": "o endereço", "paths": "os endereços",
+    "line": "a linha", "lines": "as linhas",
+    "page": "a página", "pages": "as páginas",
+    "window": "a janela",
+    "screen": "a tela", "screenshot": "a captura de tela",
+    "browser": "o navegador", "server": "o servidor", "servers": "os servidores",
+    "network": "a rede", "device": "o aparelho", "devices": "os aparelhos",
+    "printer": "a impressora", "speaker": "o alto-falante",
+    "microphone": "o microfone", "battery": "a bateria",
+    "camera": "a câmera", "player": "o reprodutor",
+    "playlist": "a lista de reprodução", "download": "a transferência",
+    "downloads": "as transferências", "upload": "o envio", "uploads": "os envios",
+    # conta e pessoa
+    "account": "a conta", "accounts": "as contas", "user": "o usuário",
+    "users": "os usuários", "username": "o usuário", "password": "a senha",
+    "passwords": "as senhas", "token": "o código de acesso",
+    "tokens": "os códigos de acesso",
+    "session": "a sessão", "sessions": "as sessões",
+    "memory": "a memória", "note": "a nota", "notes": "as notas",
+    "message": "a mensagem", "messages": "as mensagens",
+    "task": "a tarefa", "tasks": "as tarefas",
+    "tool": "a ferramenta", "tools": "as ferramentas",
+    "agent": "o ajudante", "agents": "os ajudantes",
+    "subagent": "o ajudante", "model": "o modelo", "models": "os modelos",
+    "prompt": "a instrução", "prompts": "as instruções",
+    "step": "a etapa", "steps": "as etapas", "stage": "a etapa",
+    "stages": "as etapas", "progress": "o andamento",
+    "report": "o relatório", "reports": "os relatórios",
+    "dashboard": "o painel", "notification": "a notificação",
+    "notifications": "as notificações", "schedule": "a agenda",
+    "calendar": "a agenda", "reminder": "o lembrete", "reminders": "os lembretes",
+    "meeting": "a reunião", "meetings": "as reuniões",
+    # mídia e rotina
+    "song": "a música", "songs": "as músicas", "track": "a faixa",
+    "tracks": "as faixas", "album": "o álbum", "albums": "os álbuns",
+    "artist": "o artista", "artists": "os artistas",
+    "movie": "o filme", "movies": "os filmes", "video": "o vídeo",
+    "videos": "os vídeos", "episode": "o episódio", "episodes": "os episódios",
+    "season": "a temporada", "series": "a série",
+    "weather": "o tempo", "news": "as notícias", "search": "a busca",
+    "searching": "a busca", "query": "a consulta", "queries": "as consultas",
+    "price": "o preço", "prices": "os preços", "product": "o produto",
+    "products": "os produtos", "cart": "o carrinho", "checkout": "o pagamento",
+    "payment": "o pagamento", "invoice": "a fatura", "purchase": "a compra",
+    "shopping": "as compras", "delivery": "a entrega", "address": "o endereço",
+    "flight": "o voo", "flights": "os voos", "hotel": "a hospedagem",
+    "working": "o trabalho", "work": "o trabalho", "loading": "o carregamento",
+    "processing": "o processamento",
+    "sending": "o envio", "opening": "a abertura", "closing": "o fechamento",
+    "reading": "a leitura", "writing": "a escrita", "finding": "a busca",
+    "summarizing": "o resumo", "showing": "a exibição",
+}
+
+# Nomes próprios em inglês que o dono pronuncia assim mesmo: serviço, app,
+# artista, marca. Entram na lista quando o dono os nomeia numa ordem falada —
+# não porque o modelo quis. Nada aqui é termo técnico com equivalente português.
+ALLOWED_ENGLISH_NAMES: frozenset[str] = frozenset({
+    "Spotify", "WhatsApp", "Youtube", "YouTube", "Netflix", "Instagram",
+    "Telegram", "Gmail", "Google", "Chrome", "Firefox", "Edge", "Safari",
+    "Android", "Iphone", "Ipod", "Ipad", "Ios", "Windows", "Linux", "Ubuntu",
+    "Macos", "Mac", "Bluetooth", "Airpods", "Alexa", "Siri", "Obsidian",
+    "Nextcloud", "Ollama", "Whisper", "Qoder", "Qwen", "Github", "Gitlab",
+    "Trello", "Asana", "Notion", "Slack", "Discord", "Hub", "Docker",
+    "Queen", "Beatles", "Pink", "Floyd", "Genesis", "Radiohead", "Nirvana",
+    "Coldplay", "Imagine", "Dragons", "Eminem", "Rihanna", "Beyonce", "U2",
+    "Globo", "Play", "Playstation", "Xbox", "Nintendo", "Pokemon", "Minecraft",
+    "Steam", "Timeshift", "Home Assistant", "Google Assistant", "Copilot",
+    "Activity Log", "Activity", "Project", "Silero", "VAD", "Pipewire",
+})
+
+# Inglês que não tem equivalente falável curto — a frase cala em vez de sair
+# em inglês. Só palavras que NÃO existem em português: nada de "a", "as", "in",
+# "on", "no", "do", "data", "status", "final", "volume", "note", "item".
+ENGLISH_WORDS: frozenset[str] = frozenset({
+    # função
+    "the", "this", "that", "these", "those", "there", "their", "them", "they",
+    "your", "yours", "you", "yourself", "we", "us", "our", "ours", "his",
+    "hers", "her", "him", "its", "it", "he", "she", "i", "me", "my", "mine",
+    "and", "or", "but", "nor", "yet", "because", "although", "though", "unless",
+    "with", "without", "within", "from", "into", "onto", "upon", "about",
+    "above", "below", "under", "over", "between", "against", "during", "since",
+    "while", "where", "when", "which", "who", "whom", "whose", "why", "how",
+    "what", "is", "are", "was", "were", "be", "been", "being", "am",
+    "does", "did", "doing", "done", "donee", "had", "has", "have", "having",
+    "will", "would", "shall", "should", "can", "cannot", "could", "may",
+    "might", "must", "need", "dare", "not", "yes", "okay", "please", "thanks",
+    "thank", "sorry", "hello", "hi", "bye", "welcome", "dear",
+    "some", "any", "many", "much", "more", "most", "less", "least", "all",
+    "each", "every", "both", "either", "neither", "other", "others", "another",
+    "such", "very", "too", "just", "only", "even", "also", "still", "already",
+    "always", "never", "often", "rarely", "soon", "later", "now", "then",
+    "here", "near", "far", "again", "almost", "enough", "rather", "perhaps",
+    "maybe", "well", "best", "better", "worst", "worse", "same", "different",
+    "own", "same", "few", "little", "big", "small", "long", "short", "high",
+    "low", "new", "old", "good", "bad", "nice", "great", "fine", "sure",
+    # verbos e gerúndios de ferramenta (a boca não narra ação nem em inglês)
+    "running", "opened", "closed", "created", "deleted", "started", "stopped",
+    "restarted", "sending", "sent", "received", "getting", "got", "putting",
+    "making", "made", "taking", "took", "giving", "given", "knowing", "known",
+    "thinking", "trying", "tried", "waiting", "waited", "looking", "watching",
+    "using", "used", "adding", "added", "removing", "removed", "creating",
+    "reading", "writing", "written", "calling", "called", "checking", "tested",
+    "building", "built", "committing", "committed", "pushed", "pulled",
+    "merged", "deploying", "deployed", "installing", "installed", "updating",
+    "updated", "loading", "loaded", "unloading", "handling", "handled",
+    "fetching", "fetched", "parsing", "parsed", "validating", "validated",
+    "formatting", "formatted", "retrying", "retried", "rerun", "rerunning",
+    "skipping", "skipped", "dropping", "dropped", "killing", "killed",
+    "spawning", "kicking", "hooking", "logging", "queued", "queuing",
+    "flushing", "indexing", "tagging", "marked", "marking", "naming", "named",
+    "messaging", "notifying", "announcing", "acknowledging", "ignoring",
+    "ignored", "passing", "passed", "failing", "printing", "printed",
+    "grabbing", "grabb", "extract", "extracting", "extracted", "identify",
+    "identifying", "identified", "inspect", "inspecting", "inspected",
+    "verify", "verifying", "verified", "ensure", "ensuring", "ensure",
+    "show", "shows", "shown", "hide", "hides", "get", "gets", "set", "sets",
+    "list", "lists", "listed", "listing", "find", "finds", "found",
+    "select", "selected", "filter", "filtered", "sorting", "sorted",
+    "generate", "generated", "generating", "execute", "executed", "executing",
+    "process", "processed", "compute", "computed", "resolve", "resolved",
+    "compare", "compared", "collect", "collected", "collecting", "apply",
+    "applied", "append", "appended", "store", "stored", "save", "saved",
+    "submit", "submitted", "cancel", "canceled", "cancelled", "abort",
+    "aborted", "retry", "continue", "continued", "stop", "stopped", "start",
+    # adjetivos e advérbios que só existem em inglês
+    "unable", "available", "unavailable", "ready", "full", "final",
+    "global", "local", "remote", "current", "latest", "previous", "next",
+    "first", "last", "second", "third", "single", "double", "triple",
+    "whole", "empty", "blank", "clean", "dirty", "stale", "fresh", "busy",
+    "idle", "active", "inactive", "enabled", "disabled", "allowed", "blocked",
+    "missing", "module", "modules", "function", "functions", "variable",
+    "variables", "string", "strings", "number", "numbers", "boolean",
+    "integer", "array", "arrays", "object", "objects", "class", "classes",
+    "method", "methods", "field", "fields", "value", "values", "key", "keys",
+    "type", "types", "size", "sizes", "length", "width", "height", "weight",
+    "order", "orders", "position", "positions", "collection", "collections",
+    "subset", "subsets", "usage", "usages", "implementation", "implementations",
+    "dependency", "dependencies", "documentation", "framework", "libraries",
+    "library", "package", "packages", "module", "interface", "pattern",
+    "feature", "features", "section", "portion", "chunk", "chunks", "batch",
+    "batches", "round", "rounds", "cycle", "cycles", "attempt", "attempts",
+    "sample", "samples", "snippet", "snippets", "payload", "payloads",
+    "header", "headers", "body", "bodies", "marker", "markers", "flag",
+    "flags", "scope", "range", "ranges", "target", "targets", "source",
+    "sources", "origin", "origins", "layer", "layers", "level", "levels",
+    "threshold", "timeouts", "deadline", "deadlines", "latency", "throughput",
+    "backend", "frontend", "fullstack", "website", "websites", "webhook",
+    "webhooks", "endpoint", "endpoints", "database", "databases", "schema",
+    "schemas", "query", "server", "servers", "client", "clients", "socket",
+    "sockets", "protocol", "handshake", "gateway", "browser", "browsers",
+    "keyboard", "mouse", "pointer", "cursor", "folder", "folders", "label",
+    "labels", "icon", "icons", "menu", "menus", "button", "buttons", "panel",
+    "panels", "dialog", "popup", "widget", "widgets", "session", "sessions",
+    "history", "histories", "context", "contexts", "default", "defaults",
+    "placeholder", "prefix", "suffix", "pattern", "patterns", "matcher",
+    "worker", "workers", "foo", "bar", "baz", "qux", "lorem", "ipsum",
+})
+
+# Empréstimos que já têm cidadania na fala do dono (a própria SKILL.md manda
+# dizer "deixa eu ver no log"): valem como prova de português, não como inglês.
+PORTUGUESE_WORDS: frozenset[str] = frozenset({
+    "de", "da", "do", "das", "dos", "em", "no", "na", "nos", "nas", "um",
+    "uma", "uns", "umas", "pra", "pro", "pelo", "pela", "aos", "as",
+    "que", "se", "mas", "sim", "nao", "pode", "posso", "claro", "tao",
+    "isso", "isto", "este", "esta", "esses", "essas", "aqui", "ali", "la",
+    "agora", "hoje", "ontem", "amanha", "depois", "antes", "ainda", "ja",
+    "entao", "tambem", "muito", "pouco", "bem", "bom", "boa", "mau", "mal",
+    "tudo", "nada", "algum", "alguma", "nenhum", "ninguem", "quem", "qual",
+    "quais", "quanto", "quanta", "como", "quando", "onde", "porque", "motivo",
+    "voce", "voces", "eu", "tu", "te", "ti", "me", "mi", "nosso", "nossa",
+    "seu", "sua", "meu", "minha", "criador", "dono", "dona", "gente", "pessoa",
+    "fala", "falou", "falar", "voz", "audio", "som", "casa", "chave", "porta",
+    "janela", "tela", "linha", "parte", "ponto", "conta", "texto", "nota",
+    "lembrete", "tarefa", "teste", "testes", "arquivo", "arquivos", "pasta",
+    "pastas", "log", "logs", "app", "apps", "site", "sites", "web", "ok",
+    "play", "mouse", "email", "fluxo", "fluxos", "ordem", "ordens", "hora",
+    "horas", "minuto", "minutos", "segundo", "segundos", "dia", "dias",
+    "noite", "noites", "tarde", "manha", "feito", "feita", "pronto", "pronta",
+    "certo", "certa", "aberto", "aberta", "ativo", "ativa", "vale",
+    "obrigado", "obrigada", "bora", "beleza", "massa", "legal", "show",
+    "ruim", "erro", "erros", "aviso", "avisos", "falha", "falhas", "busca",
+    "buscas", "lista", "listas", "fila", "filas", "etapa", "etapas", "fase",
+    "fases", "nome", "nomes", "numero", "numeros", "valor", "valores",
+    "resultado", "resultados", "resposta", "respostas", "mensagem",
+    "mensagens", "andamento", "mudanca", "mudancas", "trabalho", "trabalhos",
+    "ajudante", "ajudantes", "ferramenta", "ferramentas", "modelo", "modelos",
+    "instrucao", "instrucoes", "codigo", "programa", "programas", "comando",
+    "comandos", "execucao", "saida", "entrada", "pedido", "pedidos",
+    "conferencia", "conferencias", "comprimento", "largura", "altura",
+    "passo", "passos", "seguinte", "proxima", "proximo", "ultima", "ultimo",
+    "penultima", "penultimo", "inicio", "comeco", "fim", "inicial", "total",
+    "parcial", "novo", "nova", "novos", "novas", "velho", "velha", "antigo",
+    "antiga", "final", "global", "local", "interface", "menu", "cursor",
+    "notebook", "string", "serie", "audio", "video", "base", "caso", "tipo",
+    "modo", "forma", "ideia", "conta", "banco", "rede", "fuso", "show",
+    # palavras portuguesas que o transcritor devolve sem acento
+    "media", "area", "historia", "memoria", "agenda", "senha", "janela",
+    "login", "logins", "logout",
+})
+
+# Prioridade dos léxicos, sem sobreposição: termo com equivalente português é
+# TRADUZIDO; nome próprio autorizado PASSA; o resto do inglês CALA a frase.
+ENGLISH_WORDS = ENGLISH_WORDS - set(TECH_TERMS_PT) - PORTUGUESE_WORDS - frozenset(
+    n.lower() for n in ALLOWED_ENGLISH_NAMES)
+
+# Forma de palavra do português (terminação nossa: desinência, vogal final...).
+_PT_SHAPE_RE = re.compile(
+    r"(?:ando|endo|indo|ado|ada|ados|adas|ido|ida|idos|idas|ao|aos|oes|coes"
+    r"|mente|dade|tude|eza|cao|coes|ista|ismo|eira|eiro|avam|ava|iao|iam|aram"
+    r"|eram|amos|emos|imos|ou|ei|iu|ia|ar|er|ir|or|az|ez|iz|al|ol|ul|il|el"
+    r"|us|os|as|es|is|a|e|i|o|u)$")
+# Forma que só existe em inglês. Deliberadamente estre: nada de "-ar", "-or",
+# "-ente", que são terminações portuguesas (navegador, melhor, vidente).
+_EN_SHAPE_RE = re.compile(
+    r"(?:ing|ied|tion|sion|ness|ment|ous|ive|ful|less|ize|istic)$",
+    re.IGNORECASE)
+_ACCENT_RE = re.compile(r"[ãõçáéíóúâêôàüèìòùá]", re.IGNORECASE)
+_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+# Identificador de código solto: snake_case, dunder, camelCase, bandeira de
+# comando. Nada disso é palavra de nenhuma língua falada pelo dono.
+_SNAKE_RE = re.compile(r"\b\w*_{1,2}\w+\b|\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")
+_CAMEL_RE = re.compile(r"\b[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*")
+_FLAG_RE = re.compile(r"(?<![\w-])--?[A-Za-z][\w-]*")
+_NAME_ALT = "|".join(sorted((re.escape(n) for n in ALLOWED_ENGLISH_NAMES),
+                            key=len, reverse=True))
+_NAME_RE = re.compile(rf"\b(?:{_NAME_ALT})\b", re.IGNORECASE) if _NAME_ALT \
+    else None
+_LEAD_WORDS = ("o|a|os|as|um|uma|no|na|nos|nas|do|da|dos|das|ao|aos|à|às"
+               "|pelo|pela|pelos|pelas|num|numa|de|em|por|para")
+_TECH_ALT = "|".join(sorted((re.escape(k) for k in TECH_TERMS_PT),
+                             key=len, reverse=True))
+_TECH_RE = re.compile(
+    r"(?:(?P<lead>\b(?:" + _LEAD_WORDS + r")\s+))?(?P<term>\b(?:"
+    + _TECH_ALT + r")\b)", re.IGNORECASE)
+# Artigo + preposição -> a forma contraída que a boca precisa pronunciar.
+_LEAD_PREP = {
+    "o": "", "a": "", "os": "", "as": "", "um": "", "uma": "",
+    "no": "em", "na": "em", "nos": "em", "nas": "em", "num": "em",
+    "numa": "em", "em": "em", "do": "de", "da": "de", "dos": "de",
+    "das": "de", "de": "de", "ao": "a", "aos": "a", "à": "a", "às": "a",
+    "pelo": "por", "pela": "por", "pelos": "por", "pelas": "por",
+    "por": "por", "para": "para",
+}
+_CONTRACTION = {
+    ("em", "o"): "no", ("em", "a"): "na", ("em", "os"): "nos",
+    ("em", "as"): "nas", ("em", "um"): "num", ("em", "uma"): "numa",
+    ("de", "o"): "do", ("de", "a"): "da", ("de", "os"): "dos",
+    ("de", "as"): "das", ("de", "um"): "de um", ("de", "uma"): "de uma",
+    ("a", "o"): "ao", ("a", "a"): "à", ("a", "os"): "aos", ("a", "as"): "às",
+    ("por", "o"): "pelo", ("por", "a"): "pela", ("por", "os"): "pelos",
+    ("por", "as"): "pelas",
+}
+
+
+def _hide_names(text: str) -> tuple[str, dict[str, str]]:
+    """Esconde os nomes próprios autorizados; devolve (texto, mapa)."""
+    if _NAME_RE is None:
+        return str(text or ""), {}
+    seen: dict[str, str] = {}
+
+    def repl(match: re.Match) -> str:
+        raw = match.group(0)
+        key = "\x01%d\x01" % len(seen)
+        seen[key] = raw
+        return key
+
+    return _NAME_RE.sub(repl, str(text or "")), seen
+
+
+def _restore_names(text: str, hidden: dict[str, str]) -> str:
+    out = str(text or "")
+    for key, raw in hidden.items():
+        out = out.replace(key, raw)
+    return out
+
+
+def _article_for(lead: str, article: str) -> str:
+    """O artigo que a boca deve pronunciar depois da troca."""
+    if not lead:
+        return article
+    prep = _LEAD_PREP.get(lead.lower())
+    if prep is None or not prep:
+        return article
+    return _CONTRACTION.get((prep, article), f"{prep} {article}")
+
+
+def translate_tech_terms(text: str) -> str:
+    """Termo técnico em inglês -> nome em português, com artigo e contração.
+
+    "no commit" vira "na entrega", "os builds" viram "as compilações". Nome
+    próprio autorizado e trecho de código não são tocados aqui — o portão de
+    vazamento cuida deles.
+    """
+    value = str(text or "")
+    if not value.strip():
+        return value
+    hidden, names = _hide_names(value)
+    out = _TECH_RE.sub(_tech_repl, hidden)
+    out = re.sub(r"\s+", " ", out).strip()
+    return _restore_names(out, names)
+
+
+def _tech_repl(match: re.Match) -> str:
+    """A troca de um termo técnico, com o artigo que a frase pede."""
+    term = str(match.group("term") or "").lower()
+    value = TECH_TERMS_PT.get(term)
+    if not value:
+        return match.group(0)
+    article, _, rest = value.partition(" ")
+    if not rest:                          # valor sem artigo: usa como veio
+        phrase = value
+    else:
+        lead = (match.group("lead") or "").strip()
+        if lead:
+            # veio "o commit", "no commit", "dos builds": artigo trocado ou
+            # contraído com o gênero do nome em português.
+            phrase = f"{_article_for(lead, article)} {rest}"
+        else:
+            # sem artigo antes ("dezoito commits", "sem commit"): o nu vai
+            # sozinho, enfiar "as entregas" ali soaria a robô.
+            phrase = rest
+    head = term if str(match.group("term") or "")[:1].isupper() \
+        else (match.group("lead") or "")[:1]
+    if head[:1].isupper() or (match.start() == 0 and phrase[:1].isalpha()):
+        phrase = phrase[:1].upper() + phrase[1:]
+    return phrase
+
+
+def english_leak(text: str) -> str:
+    """A primeira palavra em inglês que não pode ser falada, ou ''."""
+    value = str(text or "")
+    if not value.strip():
+        return ""
+    hidden, _names = _hide_names(value)
+    english = 0
+    portuguese = 0
+    first = ""
+    for word in _WORD_RE.findall(hidden):
+        low = word.lower()
+        if low in TECH_TERMS_PT or low in PORTUGUESE_WORDS:
+            continue
+        if _ACCENT_RE.search(word):
+            portuguese += 1
+            continue
+        if low in ENGLISH_WORDS or (len(low) >= 5 and _EN_SHAPE_RE.search(low)
+                                    and not _PT_SHAPE_RE.search(low)):
+            english += 1
+            first = first or word
+            continue
+        if _PT_SHAPE_RE.search(low):
+            portuguese += 1
+    if not english:
+        return ""
+    if english >= 2 and not portuguese:
+        return f"frase em ingles: {first!r}"
+    return f"ingles na fala: {first!r}"
+
+
+def jargon_leak(text: str) -> str:
+    """O identificador de código ou caminho que não pode ser falado, ou ''."""
+    value = str(text or "")
+    if not value.strip():
+        return ""
+    hidden, _names = _hide_names(value)
+    if _leaks_path(hidden):
+        found = _CODE_EXT_RE.search(hidden)
+        return f"caminho ou codigo na frase: {(found.group(0) if found else hidden)[:60]!r}"
+    for pattern in (_SNAKE_RE, _CAMEL_RE, _FLAG_RE):
+        match = pattern.search(hidden)
+        if match:
+            return f"jargao tecnico na frase: {match.group(0)!r}"
+    return ""
+
+
+def speech_leak(text: str) -> str:
+    """Por que esta frase NÃO pode sair pela boca; '' quando pode.
+
+    Uma frase já traduzida (:func:`translate_tech_terms`) passa a valer o que
+    sobrou dela: é o portão que os chamadores usam para registrar o motivo de a
+    boca ter ficado muda.
+    """
+    return jargon_leak(text) or english_leak(text)
+
+
 def clean_sentence(text: str) -> str:
+    """A fala da boca: uma linha, sem rótulo, sem inglês e sem código.
+
+    UV-2 (07/11/2026): além da limpeza de sempre, o termo técnico inglês ganha
+    o nome em português (:func:`translate_tech_terms`) e o que não couber aí —
+    frase estrangeira, identificador, caminho de arquivo — devolve string
+    VAZIA. Todo chamador tem um template determinístico para esse caso, e
+    silêncio é melhor que inglês no ouvido do dono.
+    """
     text = str(text or "").strip()
     text = re.split(r"\n", text)[0].strip()
     text = text.strip(" \t\"'“”")
     text = re.sub(r"^(frase|resposta|gino)\s*:\s*", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    if speech_leak(text):
+        return ""
+    text = translate_tech_terms(text)
+    if speech_leak(text):
+        return ""
     return re.sub(r"\s+", " ", text).strip()
+
+
+# ── fim do portão de idioma (UV-2) ─────────────────────────────────────────
 
 
 def stream_ollama(messages: list[dict[str, str]], max_tokens: int,
@@ -412,7 +893,7 @@ class Mouth:
              {"role": "user", "content": user}],
             self.config.mouth_brief_max_tokens, early_sentence=True,
             temperature=0.35, cancel_ev=cancel_ev, fast_ack=True)
-        sentence = result.get("text") or ""
+        sentence = clean_sentence(result.get("text") or "")
         tripped = ""
         if sentence:
             ok, why = _guard.guard(sentence, None, "brief")
@@ -420,6 +901,11 @@ class Mouth:
                 self.guard_trips += 1
                 tripped = why
                 sentence = ""
+        elif speech_leak(result.get("text") or ""):
+            # UV-2: o modelo falou inglês ou código; a frase foi calada antes
+            # do guard. O motivo sai no mesmo campo para a auditoria.
+            self.guard_trips += 1
+            tripped = speech_leak(result.get("text") or "")
         if result.get("error"):
             self.failures += 1
             sentence = ""
@@ -465,6 +951,9 @@ class Mouth:
                 self.guard_trips += 1
                 tripped = why
                 sentence = ""
+        elif speech_leak(result.get("text") or ""):
+            self.guard_trips += 1
+            tripped = speech_leak(result.get("text") or "")
         if result.get("error"):
             self.failures += 1
             sentence = ""
@@ -547,6 +1036,9 @@ class Mouth:
                 self.guard_trips += 1
                 tripped = why
                 sentence = ""
+        elif speech_leak(result.get("text") or ""):
+            self.guard_trips += 1
+            tripped = speech_leak(result.get("text") or "")
         if result.get("error"):
             self.failures += 1
             sentence = ""
@@ -554,7 +1046,13 @@ class Mouth:
             sentence = _guard.template_for(facts, decision.draft)
         missing: list[str] = []
         if sentence:
-            sentence, missing = _guard.ensure_facts(sentence, facts)
+            # UV-2: o fato anexado é texto de trabalhador e pode chegar em
+            # inglês ou com caminho de arquivo. A fala emendada passa pelo
+            # mesmo portão: se vazar, fica o que já era limpo e o fato segue
+            # só no registro de omissão — nunca vira som.
+            joined, missing = _guard.ensure_facts(sentence, facts)
+            if not speech_leak(joined):
+                sentence = joined
         return MouthResult(
             sentence=sentence,
             ms=float(result.get("first_sentence_ms") or 0.0),
@@ -595,6 +1093,7 @@ class Mouth:
             temperature=0.3, cancel_ev=cancel_ev, fast_ack=True)
         sentence = clean_sentence(result.get("text") or "")
         tripped = ""
+        leak = "" if sentence else speech_leak(result.get("text") or "")
         if sentence and _leaks_path(sentence):
             # O modelo obedeceu ao guard léxico e citou o arquivo mesmo assim:
             # path no ouvido do dono é vazamento, não conteúdo.
@@ -607,13 +1106,20 @@ class Mouth:
                 self.guard_trips += 1
                 tripped = why
                 sentence = ""
+        elif leak:
+            # UV-2: o modelo falou inglês ou recitou identificador de código;
+            # o portão de idioma calou a frase antes do guard.
+            self.guard_trips += 1
+            tripped = leak
         if result.get("error"):
             self.failures += 1
             sentence = ""
         fixed = not bool(sentence)
         if fixed:
             for candidate in _progress_templates(stage, clean):
-                if _leaks_path(candidate):
+                # O template embute a linha do espelho: se a linha é inglês ou
+                # código, a candidata não é falável e cede lugar à genérica.
+                if _leaks_path(candidate) or speech_leak(candidate):
                     continue
                 ok, _why = _guard.guard(candidate, facts, "complement")
                 if ok:
