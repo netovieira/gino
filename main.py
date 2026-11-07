@@ -2889,12 +2889,16 @@ class JarvisLive:
             print(f"[E-mail] hook de decisão de filtro indisponível: {e}")
         # Fluxo de execução por corpo (UP-6, passos 5-6 do contrato): o
         # dispatcher de `core.email_flows` roda na varredura; aqui entram o
-        # gancho do evento no activity.log e a fala do código (o MESMO
-        # portão do vigia de OTP — sessão pronta, microfone liberto).
+        # gancho do evento no activity.log, a fala do código (o MESMO portão
+        # do vigia de OTP — sessão pronta, microfone liberto) e o aviso do
+        # LinkedIn. Sem o terceiro gancho o aviso fica mudo: ia só para disco
+        # (`logs/linkedin-notifications.log`) e o dono não ouvia nada — o
+        # mesmo tipo de buraco do UP-8, código pronto e nunca plugado no vivo.
         try:
             from core import email_flows as _mail_flows
             _mail_flows.set_event_hook(self._mail_flow_executed)
             _mail_flows.set_speak_hook(self._announce_otp)
+            _mail_flows.set_notify_hook(self._mail_flow_notice)
         except Exception as e:
             print(f"[E-mail] fluxo de execução por corpo indisponível: {e}")
         try:
@@ -3008,6 +3012,62 @@ class JarvisLive:
                 f"motivo {mot})")
         except Exception:
             pass
+
+    def _mail_flow_notice(self, payload) -> bool:
+        """Aviso do fluxo de corpo (LinkedIn) falado pelo caminho do andamento.
+
+        Roda na thread da varredura, chamada por ``core.email_flows._notify``
+        quando a regra tem ``tipo: linkedin_notification``. A frase ja vem
+        pronta e sanitizada pelo modulo (``linkedin_phrase``): aqui nao
+        montamos texto nem lemos corpo -- so decidimos se sai agora, se fica
+        retido ou se o recibo nao e gasto.
+
+        O audio e o MESMO caminho do andamento vivo (``_live_progress_speech``:
+        teto de 40 s e "nunca nos 5 s depois de o dono falar", por
+        ``_qoder_progress_allowed``) e o mesmo ``origin="aviso"`` da fila de
+        fala. Nao ha TTS nem notificacao reimplementados aqui.
+
+        Mute da interface NAO segura este aviso: o botao fecha o MICROFONE, nao
+        a boca (ordem do dono, 07/11/2026). O que ancora fala e o portao de
+        silencio/palavra-codigo (``_speech_route``): ligado, o aviso e RETIDO
+        como qualquer outra frase (texto na tela e no WhatsApp do dono ja,
+        audio na liberacao) em vez de sumir numa linha SYS.
+
+        ``False`` = sessao ainda nao pronta ou teto ocupado: o recibo NAO e
+        gasto (motivo ``aviso_indisponivel``) e a varredura seguinte tenta de
+        novo. ``True`` = aviso entregue, retido, ou nada a dizer.
+        """
+        ev = payload if isinstance(payload, dict) else {}
+        text = " ".join(str(ev.get("text") or "").split())[:200]
+        if not text:
+            return True
+        if not getattr(self, "_loop", None):
+            return False
+        if getattr(self, "audio_in_queue", None) is None:
+            return False
+        try:
+            route = self._speech_route(text, subject="e-mail", chan="voz",
+                                       origin="aviso")
+        except Exception:
+            route = {"muted": False}
+        if route.get("muted"):
+            try:
+                self._retain_spoken(
+                    text, subject=str(route.get("subject") or "e-mail"),
+                    chan="voz", origin="aviso")
+                return True
+            except Exception as e:
+                print(f"[E-mail] aviso do fluxo nao retido: {e}")
+                return False
+        if not self._qoder_progress_allowed():
+            return False
+        try:
+            print(f"[E-mail] aviso do fluxo falado: {text[:80]}")
+            self._say_now(text, log=True, origin="aviso")
+        except Exception as e:
+            print(f"[E-mail] aviso do fluxo nao falado: {e}")
+            return False
+        return True
 
     def _mail_startup_notice(self, states) -> list[str]:
         """Fala no boot só a conta que precisa de mão humana. Resto = silêncio.
