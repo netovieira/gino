@@ -11,9 +11,12 @@ próprio pactl é falso, então nada toca no áudio real da máquina.
 """
 from __future__ import annotations
 
+import re
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -51,6 +54,13 @@ class WatchdogBase(unittest.TestCase):
         self._orig_stale = duck.DUCK_STALE_S
         self._orig_saved = dict(duck._saved)
         self._orig_probe = duck._probe
+        self._orig_log = duck.ACTIVITY_LOG_PATH
+        # UV-3: o pacto falso tambem registra a prova — SEMPRE no tmp dir.
+        # Sem este redirecionamento os testes despejariam duck_down/duck_up
+        # forjados ("Mozilla Firefox:60->12") no activity.log do dono.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.log_path = Path(self._tmp.name) / "logs" / "activity.log"
+        duck.ACTIVITY_LOG_PATH = self.log_path
         duck._saved.clear()
         duck._probe = None
         duck.DUCK_CHECK_S = 0.05
@@ -66,7 +76,9 @@ class WatchdogBase(unittest.TestCase):
         duck.DUCK_CHECK_S = self._orig_check
         duck.DUCK_STALE_S = self._orig_stale
         duck._probe = self._orig_probe
+        duck.ACTIVITY_LOG_PATH = self._orig_log
         duck._saved.clear()
+        self._tmp.cleanup()
 
 
 class DuckWatchdogTest(WatchdogBase):
@@ -345,6 +357,137 @@ class DrainReleaseTest(unittest.TestCase):
         self.assertFalse(main.JarvisLive._duck_probe_speaking(obj))
         obj._last_play_batch = time.monotonic()
         self.assertTrue(main.JarvisLive._duck_probe_speaking(obj))
+
+
+class Uv3LogProofTest(WatchdogBase):
+    """UV-3 — a prova da sequência completa no log: uma linha ``duck_down`` e
+    uma ``duck_up`` por troca, pareadas por ``seq``, com o gatilho exato
+    (``módulo:função``) e o percentual por app (antes->depois). O log aponta
+    para um diretório temporário: aqui se mede o registro, sem tocar no
+    activity.log da casa (o caminho é lido a cada escrita de propósito)."""
+
+    LINE_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] "
+                         r"(duck_\w+): (.+)$")
+
+    def setUp(self):
+        super().setUp()      # a base já aponta o log para um tmp dir
+        self._orig_seq = duck._seq
+        with duck._SAVED_LOCK:
+            duck._saved_names.clear()
+            duck._saved_targets.clear()
+
+    def tearDown(self):
+        with duck._SAVED_LOCK:
+            duck._seq = self._orig_seq
+            duck._saved.clear()
+            duck._saved_names.clear()
+            duck._saved_targets.clear()
+        super().tearDown()
+
+    def _ducked(self) -> bool:
+        with duck._SAVED_LOCK:
+            return bool(duck._saved)
+
+    def _event_lines(self, event: str) -> list[str]:
+        if not self.log_path.exists():
+            return []
+        return [ln for ln in self.log_path.read_text(encoding="utf-8").splitlines()
+                if f"] {event}: " in ln]
+
+    def _sonda(self) -> bool:
+        return False
+
+    def test_sequencia_completa_fica_pareada_no_log(self):
+        """O critério do dono, medido: música (Firefox a 60%) -> fala -> 20%
+        -> para -> volta, e os DOIS lados da troca aparecem no log com o
+        mesmo ``seq`` e os percentuais exatos da regra."""
+        duck.DUCK_STALE_S = 30.0          # quem fecha a troca aqui é o up()
+        duck.down()
+        self.assertTrue(_wait(lambda: self._event_lines("duck_down")),
+                        "down() não registrou a linha duck_down")
+        duck.up()
+        self.assertTrue(_wait(lambda: self._event_lines("duck_up")),
+                        "up() não registrou a linha duck_up")
+        down_line = self._event_lines("duck_down")[0]
+        up_line = self._event_lines("duck_up")[0]
+        # Uma linha só, no formato canônico do activity.log.
+        self.assertTrue(self.LINE_RE.match(down_line), down_line)
+        self.assertTrue(self.LINE_RE.match(up_line), up_line)
+        seq_down = re.search(r"seq=(\d+)", down_line).group(1)
+        seq_up = re.search(r"seq=(\d+)", up_line).group(1)
+        self.assertEqual(seq_down, seq_up, "as metades da troca não se casam")
+        self.assertEqual(int(seq_down), self._orig_seq + 1)
+        # O gatilho nomeia quem abriu (este teste), não um rótulo genérico.
+        self.assertRegex(down_line,
+                         r'gatilho="tests\.test_duck_watchdog:'
+                         r'test_sequencia_completa')
+        self.assertIn("n=1", down_line)
+        self.assertIn("n=1", up_line)
+        # A regra do dono nos percentuais: 60 -> 20% (=12) -> 60.
+        self.assertIn('apps="Mozilla Firefox:60->12"', down_line)
+        self.assertIn("fator=0.20", down_line)
+        self.assertIn('apps="Mozilla Firefox:12->60"', up_line)
+        self.assertRegex(up_line, r"preso_s=\d+\.\d")
+
+    def test_down_reentrante_registra_uma_linha_somente(self):
+        """Gatilhos sobrepostos (frase + reply) reafirmam o MESMO duck: duas
+        linhas duck_down com o mesmo seq leriam como duas trocas."""
+        duck.DUCK_STALE_S = 30.0
+        duck.down()
+        self.assertTrue(_wait(lambda: self._event_lines("duck_down")))
+        duck.down()                       # reafirma: a troca continua
+        time.sleep(0.4)
+        self.assertEqual(len(self._event_lines("duck_down")), 1,
+                         "down() reentrante registrou um duck fantasma")
+        duck.up()
+        self.assertTrue(_wait(lambda: self._event_lines("duck_up")))
+        self.assertEqual(len(self._event_lines("duck_up")), 1)
+
+    def test_up_sem_duck_nao_registra_nada(self):
+        """Sem duck aberto não há troca a provar: up() ócio fica em silêncio
+        (senão o log encheria de restaurações que nunca aconteceram)."""
+        duck.up()
+        time.sleep(0.4)
+        self.assertEqual(self._event_lines("duck_up"), [])
+
+    def test_watchdog_registra_quem_solta_o_duck(self):
+        """A rede de segurança também presta contas: quando o watchdog devolve
+        os volumes, o gatilho da linha duck_up é core.duck:_watchdog_loop —
+        é assim que o dono distingue a fala que fechou a troca de um duck
+        preso que a rede soltou (bug de 31/10)."""
+        duck.down()                       # stale/check apertados pela base
+        self.assertTrue(_wait(self._ducked))
+        self.assertTrue(_wait(lambda: not self._ducked()))
+        self.assertTrue(_wait(lambda: self._event_lines("duck_up")),
+                        "watchdog soltou o duck sem registrar a prova")
+        self.assertIn('gatilho="core.duck:_watchdog_loop"',
+                      self._event_lines("duck_up")[-1])
+
+    def test_register_speech_probe_deixa_prova_no_log(self):
+        """Casa com sonda ou sem sonda muda o comportamento do watchdog — o
+        log precisa dizer qual das duas foi registrada (e com qual função)."""
+        duck.register_speech_probe(self._sonda)
+        lines = self._event_lines("duck_probe")
+        self.assertEqual(len(lines), 1)
+        self.assertRegex(lines[0],
+                         r'gatilho="tests\.test_duck_watchdog:'
+                         r'test_register_speech_probe')
+        self.assertIn('sonda="Uv3LogProofTest._sonda"', lines[0])
+
+    def test_registro_quebrado_nao_derruba_o_duck(self):
+        """A prova é acréscimo: caminho de log impossível (um arquivo no lugar
+        do diretório) não pode impedir o duck de descer nem de subir."""
+        bloqueado = Path(self._tmp.name) / "bloqueado"
+        bloqueado.write_text("isto é um arquivo, não um diretório",
+                             encoding="utf-8")
+        duck.ACTIVITY_LOG_PATH = bloqueado / "activity.log"
+        duck.down()
+        self.assertTrue(_wait(self._ducked), "prova quebrada travou o down()")
+        self.assertIn(("set-sink-input-volume", "12", "12%"), self.comandos)
+        duck.up()
+        self.assertTrue(_wait(lambda: not self._ducked()),
+                        "prova quebrada travou o up()")
+        self.assertIn(("set-sink-input-volume", "12", "60%"), self.comandos)
 
 
 if __name__ == "__main__":

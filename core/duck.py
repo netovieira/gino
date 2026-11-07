@@ -17,14 +17,31 @@ STT worker, where waiting on a spawned process would be a dropout. down() and
 up() are idempotent — a second down() while ducked keeps the ORIGINAL volumes
 saved, so overlapping triggers (utterance opens, then the reply starts) cannot
 stack two ducks into 4% or lose the restore point.
+
+UV-3 (prova no vivo): the exchange itself is now measurable. Every real
+transition writes one canonical line to ``logs/activity.log``::
+
+    [2026-11-07 17:40:12] duck_down: seq=7 gatilho="core.groq_stt:_open_segment" n=1 apps="Firefox:60->12"
+    [2026-11-07 17:40:19] duck_up: seq=7 gatilho="core.groq_stt:_close" n=1 apps="Firefox:12->60" preso_s=7.4
+
+``seq`` pairs the two halves of one exchange, ``gatilho`` names the exact
+``módulo:função`` that opened or closed the duck (the watchdog releasing a
+stuck duck shows up as ``core.duck:_watchdog_loop``), ``apps`` is the per-app
+before→after percent that the owner's rule promises (20% of what the app was
+playing AT THAT MOMENT, our own voice never touched). Re-entrant down() calls
+are deliberately NOT logged: they re-assert the same duck, and a log full of
+them would read as N exchanges. Writing never raises and never blocks a duck.
 """
 from __future__ import annotations
 
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
+from datetime import datetime
+from pathlib import Path
 
 DUCK_FACTOR = 0.20          # each app keeps a fifth of its current volume
 # Safety net for the "duck stuck at 20%" class of bugs: every path that opens
@@ -40,16 +57,105 @@ DUCK_STALE_S = 3.0          # no live speech for this long ⇒ restore volumes
 DUCK_CHECK_S = 1.0          # how often the watchdog looks
 _SAVED_LOCK = threading.Lock()
 _saved: dict[str, int] = {}     # sink-input index → volume percent to restore
+_saved_names: dict[str, str] = {}   # sink-input index → app name (só o log)
+_saved_targets: dict[str, int] = {}  # index → nível do duck (só o log)
+_seq = 0                        # número do duck atual: casa down() com up()
+_opened_at = 0.0                # monotonic de quando o duck abriu (preso_s)
 _beat: float = 0.0              # monotonic time of the last sign of speech
 _probe = None                   # optional external "someone is speaking" test
 _watchdog: threading.Thread | None = None
 _wake = threading.Event()       # set only to end the watchdog (tests/shutdown)
+
+# UV-3: a prova da sequência vive aqui. Um caminho de módulo (e não uma
+# constante congelada) para o teste poder apontar para um tmp dir.
+ACTIVITY_LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "activity.log"
+_APPS_FIELD_CHARS = 240         # a linha do log é uma só, e cortada
 
 _INPUT_RE = re.compile(r"Sink Input #(\d+)")
 _PID_RE = re.compile(r'application\.process\.id\s*=\s*"(\d+)"')
 _VOL_RE = re.compile(r"Volume:.*?(\d+)%")
 _NAME_RE = re.compile(r'application\.name\s*=\s*"([^"]*)"')
 _SPEC_RE = re.compile(r"Sample Specification:.*?(\d+)ch\s*(\d+)Hz")
+
+
+def _stamp() -> str:
+    # Hora LOCAL, como toda linha que o dono lê no activity.log (ui.py).
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _one_line(value: object, limit: int = _APPS_FIELD_CHARS) -> str:
+    """Texto de uma linha só, cortado — o que vai no activity.log."""
+    return " ".join(str(value if value is not None else "").split())[:limit]
+
+
+def _append_activity(event: str, fields: str) -> None:
+    """Uma linha ``[data hora] evento: campos`` no activity.log.
+
+    Silenciosa por construção: registrar a prova nunca pode derrubar o duck
+    (disco cheio, diretório ausente, permissão) nem o áudio da conversa.
+    """
+    try:
+        path = Path(ACTIVITY_LOG_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{_stamp()}] {event}: {fields}\n")
+    except Exception as exc:                    # noqa: BLE001 — prova é acréscimo
+        print(f"[Duck] registro no activity.log falhou: {exc}")
+
+
+def _caller_tag(depth: int = 2) -> str:
+    """``módulo:função`` de quem abriu/fechou o duck.
+
+    ``depth=2`` porque a chamada sai de dentro da função instrumentada
+    (down/up/register_speech_probe): frame 1 é ela, frame 2 é o chamador real.
+    Lido ANTES de descer para a thread — no worker o frame do chamador já
+    desapareceu. É a proveniência que o UV-3 pede ("quem mandou abaixar?"), e
+    ``sys._getframe`` custa um atributo de frame, sem stack trace e sem I/O.
+    """
+    try:
+        frame = sys._getframe(depth)
+    except Exception:
+        return "?"
+    try:
+        module = str(frame.f_globals.get("__name__", "?"))
+        return _one_line(f"{module}:{frame.f_code.co_name}", 80)
+    except Exception:
+        return "?"
+
+
+def _apps_field(antes: dict[str, int], depois: dict[str, int],
+                names: dict[str, str]) -> str:
+    """``nome:antes->depois`` por aplicativo.
+
+    ``antes``/``depois`` têm as MESMAS chaves (são os dicts do mesmo duck),
+    então a ordem vem de ``depois`` — a do down() é o nível aplicado, a do
+    up() é o volume devolvido.
+    """
+    parts = []
+    for idx, after in depois.items():
+        name = names.get(idx) or f"sink#{idx}"
+        before = antes.get(idx, after)
+        parts.append(f"{_one_line(name, 40)}:{before}->{after}")
+    return _one_line(" ".join(parts)) if parts else "nenhum"
+
+
+def _log_duck(event: str, seq: int, gatilho: str, antes: dict[str, int],
+              depois: dict[str, int], names: dict[str, str], n: int,
+              held_s: float | None = None) -> None:
+    """A linha do UV-3: sequência completa, pareada por ``seq``.
+
+    Chamada FORA de _SAVED_LOCK e com os dicts já copiados por quem abriu ou
+    fechou o duck — registrar a prova não segura o lock nem corre o risco de
+    reentrância. ``n`` é o número de aplicativos afetados, sempre o mesmo nos
+    dois lados do par.
+    """
+    fields = (f'seq={seq} gatilho="{gatilho}" n={n} '
+              f'apps="{_apps_field(antes, depois, names)}"')
+    if event == "duck_down":
+        fields += f" fator={DUCK_FACTOR:.2f}"
+    if held_s is not None:
+        fields += f" preso_s={held_s:.1f}"
+    _append_activity(event, fields)
 
 
 def _pactl(*args: str) -> str:
@@ -110,6 +216,11 @@ def register_speech_probe(fn) -> None:
     ever having to duck anything itself."""
     global _probe
     _probe = fn
+    # UV-3: prova de que a casa tem sonda de fala de verdade — sem essa linha
+    # o log não diz se o watchdog está sendo enganado pelo stream ócio.
+    _append_activity("duck_probe", (
+        f'gatilho="{_caller_tag()}" '
+        f'sonda="{_one_line(getattr(fn, "__qualname__", None) or "removida", 80)}"'))
 
 
 def _own_stream_active() -> bool:
@@ -169,7 +280,16 @@ def _ensure_watchdog() -> None:
 
 def down() -> None:
     """Every other application to 20% of its current volume. Idempotent."""
+    # A proveniência é lida AQUI, no frame de quem chamou: dentro da thread o
+    # chamador já desapareceu.
+    gatilho = _caller_tag()
+
     def _run() -> None:
+        global _seq, _opened_at
+        antes: dict[str, int] = {}
+        depois: dict[str, int] = {}
+        nomes: dict[str, str] = {}
+        seq = 0
         with _SAVED_LOCK:
             global _beat
             if _saved:
@@ -182,22 +302,55 @@ def down() -> None:
                 target = max(1, int(round(pct * DUCK_FACTOR)))
                 _pactl("set-sink-input-volume", idx, f"{target}%")
                 _saved[idx] = pct
+                _saved_names[idx] = name
+                _saved_targets[idx] = target
+                antes[idx] = pct
+                depois[idx] = target
+                nomes[idx] = name
             if _saved:
                 _beat = time.monotonic()
+                _opened_at = _beat
+                _seq += 1
+                seq = _seq
                 _ensure_watchdog()
                 print(f"[Duck] {len(_saved)} aplicativo(s) a 20% enquanto "
                       f"a conversa acontece")
+        if depois:
+            _log_duck("duck_down", seq, gatilho, antes, depois, nomes,
+                      len(depois))
     threading.Thread(target=_run, daemon=True, name="duck-down").start()
 
 
 def up() -> None:
     """Give every ducked application back the volume it had. Idempotent."""
+    gatilho = _caller_tag()
+
     def _run() -> None:
+        global _seq, _opened_at
+        antes: dict[str, int] = {}
+        depois: dict[str, int] = {}
+        nomes: dict[str, str] = {}
+        seq = 0
+        n = 0
+        held: float | None = None
         with _SAVED_LOCK:
             if not _saved:
                 return
-            for idx, pct in _saved.items():
+            original = dict(_saved)
+            nomes = dict(_saved_names)
+            applied = dict(_saved_targets)
+            seq = _seq
+            n = len(original)
+            held = time.monotonic() - _opened_at if _opened_at else None
+            for idx, pct in original.items():
                 _pactl("set-sink-input-volume", idx, f"{pct}%")
-            print(f"[Duck] volume devolvido a {len(_saved)} aplicativo(s)")
+                antes[idx] = applied.get(idx, pct)
+                depois[idx] = pct
+            print(f"[Duck] volume devolvido a {len(original)} aplicativo(s)")
             _saved.clear()
+            _saved_names.clear()
+            _saved_targets.clear()
+            _opened_at = 0.0
+        if depois:
+            _log_duck("duck_up", seq, gatilho, antes, depois, nomes, n, held)
     threading.Thread(target=_run, daemon=True, name="duck-up").start()
