@@ -304,7 +304,9 @@ class HoloAvatar:
         self._t += dt
         t = self._t
         amp = max(0.0, min(1.0, float(amp)))
-        live = speaking and not muted
+        # O mute da UI fecha o MICROFONE do dono, não a boca: a fala do
+        # assistente anima a boca mesmo com o microfone mutado.
+        live = speaking
 
         # Idle sway. The phase is *integrated* rather than taken as
         # sin(t * rate * speed): multiplying absolute time by a speed that
@@ -436,8 +438,11 @@ class HoloAvatar:
         wide_t = v_wide if (live and v_open is not None) else 0.0
         self._wide += (max(-1.0, min(1.0, wide_t)) - self._wide) * _rate(dt, 0.030)
 
-        self._glow += ((0.0 if muted else amp) - self._glow) * (
-            0.35 if (0.0 if muted else amp) > self._glow else 0.10)
+        # Brilho: com o microfone mutado o ambiente não entra, mas a própria
+        # voz do assistente acende a cara (mute = ouvido, não boca).
+        _glow_amp = amp if (speaking or not muted) else 0.0
+        self._glow += (_glow_amp - self._glow) * (
+            0.35 if _glow_amp > self._glow else 0.10)
 
         self._scan += dt * (0.55 + 1.5 * self._glow)
         if self._scan > 1.35:

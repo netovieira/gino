@@ -427,7 +427,10 @@ def test_boot_wires_the_six_hour_review():
     assert i != -1, "o boot não liga o vigia de revisão"
     call = src[i:i + 400]
     assert "logger=" in call and "ready=" in call
-    assert "_awake" in call and "muted" in call
+    # Mute da UI = microfone (ordem do dono 07/11/2026): a revisão de 6 h só
+    # espera a sessão acordar; `muted` não pode mais segurar a rotina.
+    assert "_awake" in call
+    assert "muted" not in call
 
 
 def test_daemon_thread_runs_the_six_hour_cycle_end_to_end(env):

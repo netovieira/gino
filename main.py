@@ -2564,8 +2564,6 @@ class JarvisLive:
         self._brain_q: asyncio.Queue | None = None
         self._brain_busy = False
         self._last_qoder_update = 0.0
-        self._qoder_pending: list[dict] = []
-        self._qoder_flush_busy = False
         self.ui.on_music_ended    = self._on_music_ended
         self.ui.on_music_error    = self._on_music_error
         # Appointments ⇄ Trello mirror: a daemon thread that reconciles the
@@ -2738,8 +2736,7 @@ class JarvisLive:
             from core import comm_review as _comm_review
             _comm_review.start(
                 logger=lambda msg: self.ui.write_log(f"SYS: {msg}"),
-                ready=lambda: (bool(getattr(self, "_awake", True))
-                               and not bool(getattr(self.ui, "muted", False))))
+                ready=lambda: bool(getattr(self, "_awake", True)))
         except Exception as e:
             print(f"[CommReview] rotina de revisão indisponível: {e}")
         try:
@@ -3097,9 +3094,11 @@ class JarvisLive:
                                        origin="email")
         except Exception:
             route = {"muted": False}
-        mic_muted = bool(getattr(getattr(self, "ui", None), "muted", False))
-        if route.get("muted") or mic_muted:
-            # A decisão de falar é UMA (silêncio/mudo): o aviso é RETIDO como
+        # O mute da UI fecha o MICROFONE, não a boca: o aviso de e-mail fala
+        # mesmo com o microfone mutado. Só o portão de silêncio retém.
+        if route.get("muted"):
+            # A decisão de falar é o portão de silêncio (o mute da UI é só
+            # microfone): o aviso é RETIDO como
             # o resto — fila do silêncio + texto ao dono — em vez de sumir
             # numa linha SYS que ninguém lê.
             try:
@@ -4116,12 +4115,10 @@ class JarvisLive:
                           f"mudo={muted} falando={self._is_speaking} "
                           f"acordado={getattr(self, '_awake', True)} "
                           f"qoder={_qoder_jobs.phase()}")
-                    # Hold-and-deliver: a question that arrived while muted goes
-                    # out as soon as the sound comes back, even without speech.
-                    if (getattr(self, "_qoder_pending", None) and not muted
-                            and getattr(self, "_awake", True)):
-                        self._flush_qoder_pending()
-                    if (getattr(self, "_qoder_turn_backlog", None) and not muted
+                    # Backlog do dono capturado antes de o Qoder terminar: a
+                    # fala dele vira turno assim que houver sessão — o mute da
+                    # UI fecha só o microfone e não segurava mais nada daqui.
+                    if (getattr(self, "_qoder_turn_backlog", None)
                             and getattr(self, "_awake", True)):
                         self._qoder_flush_pending()
                 except Exception as e:
@@ -4584,13 +4581,13 @@ class JarvisLive:
     def _whatsapp_owner_wake(self, account: str, item: dict) -> bool:
         """Gancho do core/whatsapp, executado na thread do neonize.
 
-        Só entrega quando a fala pode sair agora: acordado, microfone aberto e
-        sessão viva. Dormindo/mudo/sem sessão devolve False e o item fica na
-        gaveta de core/whatsapp para `wake()` drenar no próximo despertar.
+        Só entrega quando a sessão pode responder agora: acordado e sessão
+        viva. O mute da UI fecha só o microfone do dono — mensagem dele pelo
+        WhatsApp continua tendo resposta mesmo com o microfone mutado.
+        Dormindo/sem sessão devolve False e o item fica na gaveta de
+        core/whatsapp para `wake()` drenar no próximo despertar.
         """
         if not getattr(self, "_awake", True):
-            return False
-        if getattr(getattr(self, "ui", None), "muted", False):
             return False
         if getattr(self, "session", None) is None:
             return False
@@ -4615,9 +4612,11 @@ class JarvisLive:
         return True
 
     def _drain_whatsapp_owner_wake(self) -> bool:
-        """Entrega a gaveta de mensagens do dono no despertar (uma frase)."""
-        if getattr(getattr(self, "ui", None), "muted", False):
-            return False
+        """Entrega a gaveta de mensagens do dono no despertar (uma frase).
+
+        O mute da UI fecha só o microfone; a mensagem escrita do dono tem
+        resposta normal — nada aqui espera o microfone reabrir.
+        """
         if getattr(self, "session", None) is None:
             return False
         if getattr(self, "_loop", None) is None:
@@ -5497,7 +5496,8 @@ class JarvisLive:
         code = str(otp.get("code") or "").strip()
         if not code:
             return False
-        if not getattr(self, "_awake", True) or getattr(self.ui, "muted", False):
+        # Mute da UI = microfone; o código é FALA e continua saindo.
+        if not getattr(self, "_awake", True):
             return False
         if not self._loop or self.audio_in_queue is None:
             return False
@@ -6016,8 +6016,7 @@ class JarvisLive:
 
     def _sleep_announce(self, text: str) -> None:
         try:
-            if getattr(self.ui, "muted", False):
-                return
+            # Mute da UI = microfone; o aviso de sono fala normalmente.
             self._say_now(text, log=True, origin="sono",
                           log_text=f"SYS: {text}")
         except Exception:
@@ -6562,8 +6561,8 @@ class JarvisLive:
         """Conclusão de fundo barrada pela boca fechada: vai como TEXTO.
 
         A lei do dono (05/11): todo fim de trabalho em segundo plano gera
-        anúncio em uma frase, e quando a fala está retida (silêncio/mute) a
-        mensagem vai como texto — nunca se perde. O mute não estoca fala para
+        anúncio em uma frase, e quando a fala está retida (modo silêncio) a
+        mensagem vai como texto — nunca se perde. O silêncio não estoca fala para
         a boca dizer depois (lei de 03/11, respeitada aqui): a frase entra
         como texto do assistente na tela/log de atividade e na memória da
         sessão, com `audio_generated=false` para a revisão contar. Nenhum
@@ -6827,8 +6826,7 @@ class JarvisLive:
                 turn=turn_id)
             if not decision.narrate:
                 return
-            if getattr(self.ui, "muted", False):
-                return
+            # Mute da UI = microfone; a narração de progresso fala normalmente.
             # Modo silêncio: zero narração de progresso. Não retemos murmúrio
             # (não é resposta); ele simplesmente não existe enquanto o assunto
             # está cortado.
@@ -7452,8 +7450,7 @@ class JarvisLive:
             return
         if _narration.is_generic(text):
             return
-        if getattr(self.ui, "muted", False):
-            return
+        # Mute da UI = microfone; a dica do sidecar fala normalmente.
         if persona:
             info = _personas.get(persona) or {}
             name = str(info.get("name") or persona)
@@ -8780,13 +8777,11 @@ class JarvisLive:
                                 f"sample={float(primary.get('sample_score') or 0.0):.2f} "
                                 f"s={float(analysis.get('voiced_seconds') or 0.0):.1f} "
                                 f"seg={len(analysis.get('segments') or [])})")
-                            # Mute means muted: the refusal notice is a spoken
-                            # line too, and it must not be the one thing that
-                            # crosses the mute.
-                            if not getattr(getattr(self, "ui", None),
-                                           "muted", False):
-                                self._say_now("Não reconheço essa voz. Se for alguém autorizado, "
-                                              "peça ao dono para me apresentar.")
+                            # O aviso de recusa é fala como qualquer outra: o
+                            # mute da UI fecha o microfone, não a boca. A
+                            # decisão de segurança (cancelar o fluxo) não muda.
+                            self._say_now("Não reconheço essa voz. Se for alguém autorizado, "
+                                          "peça ao dono para me apresentar.")
                             self._flows_cancel(
                                 turn_id, "voiceprint: voz desconhecida")
                             _duck.up()
@@ -14303,17 +14298,10 @@ class JarvisLive:
             else:
                 return
 
-        if bool(getattr(self.ui, "muted", False)):
-            if attention:
-                # Mute is the user's choice; hold the message instead of losing
-                # it, and deliver it on the next turn that is not muted.
-                if kind in ("done", "error", "cancelled"):
-                    self._qoder_pending = [e for e in self._qoder_pending
-                                           if e.get("kind") not in ("question", "approval")]
-                self._qoder_pending.append(ev)
-                self.ui.write_log("SYS: Qoder precisa da sua atenção — guardei a "
-                                  "mensagem para quando o som voltar.")
-            return
+        # O mute da UI fecha só o microfone do dono: a mensagem do Qoder é
+        # FALA dele e continua saindo. Antes a mensagem era retida "para o
+        # som voltar" — semântica antiga de mute-total, removida por ordem do
+        # dono em 07/11/2026.
 
         if kind == "progress" and not self._qoder_progress_allowed():
             return
@@ -14341,28 +14329,6 @@ class JarvisLive:
                 )
             except Exception as e:
                 print(f"[Qoder] não consegui entregar {kind}: {e}")
-
-    def _flush_qoder_pending(self) -> None:
-        """Deliver one Qoder message held while muted (called on the mic thread)."""
-        if not self._qoder_pending or getattr(self, "_qoder_flush_busy", False):
-            return
-        loop = getattr(self, "_loop", None)
-        if loop is None or not getattr(self, "session", None):
-            return
-        ev = self._qoder_pending.pop(0)
-        self._qoder_flush_busy = True
-
-        async def _run() -> None:
-            try:
-                await self._deliver_qoder_event(ev)
-            finally:
-                self._qoder_flush_busy = False
-
-        try:
-            asyncio.run_coroutine_threadsafe(_run(), loop)
-        except Exception as e:
-            self._qoder_flush_busy = False
-            print(f"[Qoder] pendente não entregue: {e}")
 
     def request_reconnect(self, keep_context: bool = True, reason: str = ""):
         """Thread-safe: ask the run loop to tear down and rebuild the Live
@@ -15351,10 +15317,6 @@ class JarvisLive:
                 if not _heard:
                     self._log_heard(text)
                 self.wake(reason=f"você chamou {self._asst_name}")
-        # A Qoder question/result held while muted reaches the user now that
-        # there is a turn (and the mute is off).
-        if getattr(self, "_qoder_pending", None) and not self.ui.muted:
-            self._flush_qoder_pending()
         blocked = self._is_blocked_phrase(text)
         if blocked:
             try:
@@ -18338,40 +18300,11 @@ class JarvisLive:
         style = str(style or "").strip()
         if not style:
             style = self._resolve_say_style(origin, ref)
-        # ── Mute stops the MOUTH, not the ears ──────────────────────────────
-        # The owner's defect report: with `ui.muted` on the assistant still
-        # talked. Mute used to gate only the microphone; now a line handed to
-        # the TTS (answer, gate, persona, notice, boca) is not synthesised at
-        # all while muted. It is not retained for later either — an
-        # announcement spoken ten minutes after the fact is exactly what he
-        # does not want. The microphone keeps listening; only SPEECH stops.
-        # `force` is the silence-mode release worker, whose lines the owner
-        # already ordered to sound.
-        if not force and bool(getattr(getattr(self, "ui", None), "muted", False)):
-            try:
-                self._note_speech(text, "", generated=False, turn=ref,
-                                  origin="mute")
-            except Exception:
-                pass
-            if log:
-                speaker = str(label or self._asst_name)
-                try:
-                    self.ui.write_log(
-                        f"SYS: microfone mutado — {speaker} não falou: "
-                        f"{str(text)[:120]}")
-                except Exception:
-                    pass
-            # Furo provado dos 15 casos mudos (log: "microfone mutado — Gino
-            # não falou: Terminei em segundo plano ..." — activity.log:17539,
-            # 17553, 17575 de 05/11): a conclusão morria sem voz E sem texto.
-            # A lei do mute continua — nada de fala acumulada para depois —
-            # mas a mensagem não se perde: com a boca calada ela vai como
-            # TEXTO (painel, sessão e tela), uma vez só (wake_announce já
-            # reclamou o id antes de chegar aqui).
-            if str(origin or "") == "aviso":
-                self._announce_text_fallback(text, label=str(label or ""),
-                                             turn=ref)
-            return
+        # ── Mute da interface = MICROFONE, nunca a boca ─────────────────────
+        # Ordem do dono (07/11/2026): o botão/gesto de mute só fecha o
+        # microfone dele. A fala do assistente NÃO é suprimida pelo mute da
+        # UI — o único caminho que cala a voz é o portão abaixo (`_speech_route`:
+        # "silêncio" falado e palavra-código) e o controle de volume.
         # O ÚNICO ponto de decisão de fala: se o assunto está cortado, a boca
         # não sintetiza. O texto vai para a tela/WhatsApp e a fala fica na
         # fila retida, para sair na liberação. Um `if` aqui cobre resposta,
@@ -20582,9 +20515,6 @@ class JarvisLive:
                             if txt:
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
-                                if (getattr(self, "_qoder_pending", None)
-                                        and not self.ui.muted):
-                                    self._flush_qoder_pending()
 
                         if sc.turn_complete:
                             if self._turn_done_event:
@@ -20837,22 +20767,16 @@ class JarvisLive:
                     self._duck_check_drain()
                     continue
 
-                # ── Mute closes the SPEAKERS, never the ears ─────────────────
-                # A chunk already in the playback queue (realtime answer,
-                # persona, anything synthesised before the mute) is dropped
-                # here, so turning mute on silences the assistant immediately.
-                # The microphone stream and every listener stay open: the
-                # owner wants the mic listening, only the speech stops.
-                if bool(getattr(getattr(self, "ui", None), "muted", False)):
-                    _now_mute = time.monotonic()
-                    if _now_mute - getattr(self, "_mute_drop_logged", 0.0) > 30.0:
-                        self._mute_drop_logged = _now_mute
-                        print("[Play] microfone mutado — fala descartada")
-                    continue
+                # ── Mute da interface não fecha o alto-falante ──────────────
+                # Ordem do dono (07/11/2026): o mute só fecha o MICROFONE dele.
+                # Um chunk na fila de reprodução toca mesmo com o mute ligado —
+                # a voz do assistente nunca é suprimida pelo botão da UI. O que
+                # cala a voz é o portão de silêncio ("silêncio" falado /
+                # palavra-código) e o controle de volume, cada um no seu lugar.
 
                 # ── Fala de uma geração anterior ────────────────────────────
-                # Mesmo mecanismo do mute: o chunk já saiu da fila, mas não
-                # toca. Uma fala nova (turno novo, boca prioritária) incrementa
+                # O chunk já saiu da fila, mas não toca. Uma fala nova (turno
+                # novo, boca prioritária) incrementa
                 # `_say_gen`; o que estava enfileirado dela morre aqui, com o
                 # motivo no terminal — nunca fica preso atrás do turno antigo.
                 _chunk_gen = getattr(chunk, "gen", None)

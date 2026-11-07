@@ -11,8 +11,9 @@ O que o teste vigia, e por quê:
   * (c) `classificar` entrega ao gancho a regra e, SÓ se a regra pedir
     `body`, um trecho do corpo — como DADO: "pode enviar" no corpo não gera
     ação, não vira fala, não vira ordem, não vira envio;
-  * (d) aviso com fala bloqueada (silêncio ou microfone mutado) vira fala
-    RETIDA + texto, não uma linha SYS morta;
+  * (d) aviso com fala bloqueada pelo modo silêncio vira fala RETIDA +
+    texto, não uma linha SYS morta (o mute da UI, desde 07/11/2026, só fecha
+    o microfone e não segura mais o aviso);
   * (e) timeout de leitura no login ganha segunda janela imediata e o e-mail
     não se perde: a varredura seguinte entrega o que a falha não entregou,
     sem duplicar aviso.
@@ -261,7 +262,10 @@ def test_alert_is_retained_when_silence_mutes(vault):
     assert not any(line.startswith("SYS:") for line in obj.ui.lines)
 
 
-def test_alert_is_retained_when_microphone_is_muted(vault):
+def test_alert_is_spoken_even_when_microphone_is_muted(vault):
+    # Ordem do dono (07/11/2026): o mute da UI fecha só o microfone. O aviso
+    # de e-mail fala normalmente com o microfone mutado; quem retém fala é
+    # apenas o modo silêncio (teste acima).
     obj = object.__new__(main.JarvisLive)
     obj.ui = FakeUI()
     obj.ui.muted = True
@@ -271,8 +275,8 @@ def test_alert_is_retained_when_microphone_is_muted(vault):
     obj._speech_route = lambda *a, **k: {"muted": False, "subject": ""}
     obj._retain_spoken = lambda text, **kw: obj.retained.append(str(text))
     main.JarvisLive._mail_new_message(obj, {"sender": "Maria", "subject": "oi"})
-    assert obj.said == []
-    assert obj.retained and "Maria" in obj.retained[0]
+    assert obj.retained == []
+    assert obj.said and "Maria" in obj.said[0]
 
 
 # ── (e) timeout: segunda janela e nenhuma perda de e-mail ───────────────────

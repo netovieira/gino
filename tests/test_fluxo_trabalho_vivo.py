@@ -15,11 +15,12 @@ Cobre os quatro furos provados pela auditoria de 05/11:
   18:38:59: zero atualizações). Agora sai uma frase com estado real, no
   máximo uma por janela de 40 s, deduplicada, e o guard da boca continua
   valendo: nada de "estou executando", nada de ferramenta/caminho/JSON.
-* T7 — 15 conclusões mudas: a causa é o portão do mute em ``_say_blocking``,
-  que descartava o aviso sem voz E sem texto ("SYS: microfone mutado — Gino
-  não falou: Terminei em segundo plano ..." — activity.log 17539/17553/17575
-  de 05/11). Agora, com a boca fechada, a conclusão vai como TEXTO e nunca
-  se perde.
+* T7 — 15 conclusões mudas: a causa era o portão do mute da UI em
+  ``_say_blocking``, que descartava o aviso sem voz E sem texto ("SYS:
+  microfone mutado — Gino não falou ..." — activity.log 17539/17553/17575
+  de 05/11). Ordem do dono (07/11/2026) derrubou esse portão: o mute da UI
+  fecha SÓ o microfone e a conclusão é falada como qualquer aviso. Quem
+  cala a voz é apenas o modo silêncio (``_speech_route``).
 """
 from __future__ import annotations
 
@@ -370,9 +371,13 @@ class ProgressSpeechTests(unittest.TestCase):
 
 
 class MutedCompletionTextTests(unittest.TestCase):
-    """(d) Conclusão com a boca fechada: vira TEXTO, nunca se perde."""
+    """(d) Mute da UI = MICROFONE: mutado, a fala ainda sai como fala.
 
-    def _obj(self, muted: bool):
+    Ordem do dono (07/11/2026): o botão de mute não cala mais a boca — o
+    portão que retém fala é SOMENTE o modo silêncio (`_speech_route`).
+    """
+
+    def _obj(self, muted: bool, route: dict | None = None):
         ui_lines: list[str] = []
         contents: list[tuple[str, str]] = []
 
@@ -393,32 +398,56 @@ class MutedCompletionTextTests(unittest.TestCase):
         obj._turn_ref = 7
         obj._resolve_say_style = lambda origin, ref: ""
         obj._note_speech = lambda *a, **k: 0
+        obj._speech_route = lambda *a, **k: dict(
+            route or {"muted": False, "subject": ""})
+        obj._voice_train_note_speech = lambda *a, **k: 0
+        obj._speaker_names = lambda labels: set()
+        obj.retained: list[str] = []
+        obj._retain_spoken = lambda text, **k: obj.retained.append(text)
         return obj, ui_lines, contents
 
-    def test_muted_announcement_goes_as_text(self):
-        obj, lines, contents = self._obj(muted=True)
-        main.JarvisLive._say_blocking(
-            obj, "Terminei em segundo plano: Consertar elo de relançamento.",
-            log=True, origin="aviso")
-        spoken_text = [l for l in lines
-                       if "Terminei em segundo plano" in l and "Gino:" in l]
-        self.assertEqual(len(spoken_text), 1,
-                         "a conclusão mudada tem de sair exatamente uma vez "
-                         "como texto")
-        self.assertIn('"audio_generated":false', spoken_text[0])
-        self.assertIn("aviso-texto", spoken_text[0])
-        self.assertTrue(any("Consertar elo" in text
-                            for _t, text in contents))
-        self.assertEqual(len(obj._session_log), 1)
+    def _synth_spy(self):
+        calls: list[str] = []
 
-    def test_ordinary_lines_while_muted_are_still_dropped(self):
-        # A lei do mute não mudou: só o aviso de segundo plano tem texto.
+        def _fake(text, _st, **_kw):
+            calls.append(str(text))
+            return b""
+
+        return calls, _fake
+
+    def _say(self, obj, text, **kw):
+        with mock.patch("core.brain.settings", return_value={}), \
+                mock.patch("core.brain.synth_pcm24k", side_effect=self.synth):
+            main.JarvisLive._say_blocking(obj, text, **kw)
+
+    def test_muted_announcement_is_still_spoken(self):
+        # Mutado: a conclusão de segundo plano é sintetizada, não calada.
         obj, lines, contents = self._obj(muted=True)
-        main.JarvisLive._say_blocking(
-            obj, "Pode, autorizado.", log=True, origin="gate")
-        self.assertTrue(any("não falou" in l for l in lines))
-        self.assertEqual(obj._session_log, [])
-        self.assertEqual(contents, [])
+        self.calls, self.synth = self._synth_spy()
+        self._say(obj, "Terminei em segundo plano: Consertar elo de relançamento.",
+                  log=True, origin="aviso")
+        self.assertTrue(self.calls, "mute da UI não pode suprimir a fala")
+        self.assertEqual(obj.retained, [])
+        self.assertFalse(any("não falou" in l for l in lines),
+                         "o portão de mute sumiu do caminho da fala")
+
+    def test_ordinary_lines_while_muted_are_spoken(self):
+        obj, lines, contents = self._obj(muted=True)
+        self.calls, self.synth = self._synth_spy()
+        self._say(obj, "Pode, autorizado.", log=True, origin="gate")
+        self.assertTrue(self.calls)
+        self.assertFalse(any("não falou" in l for l in lines))
+
+    def test_silence_gate_still_retains_speech(self):
+        # O portão que cala a voz é o silêncio — e ele continua valendo,
+        # mute da UI ligado ou não.
+        obj, lines, contents = self._obj(
+            muted=False, route={"muted": True, "subject": "TheroTV"})
+        self.calls, self.synth = self._synth_spy()
+        self._say(obj, "Fala que o assunto está cortado.", log=True,
+                  origin="aviso")
+        self.assertEqual(self.calls, [], "silêncio não pode sintetizar")
+        self.assertEqual(obj.retained, ["Fala que o assunto está cortado."])
 
     def test_text_fallback_helper_is_self_contained(self):
         obj, lines, contents = self._obj(muted=False)

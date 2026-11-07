@@ -730,11 +730,13 @@ class HudCanvas(QWidget):
                     self._base_halo  = random.uniform(48, 68)
                 self._last_t = now
 
-            if self.muted:
-                self._tgt_scale, self._tgt_halo = self._base_scale, self._base_halo
-            elif self.speaking:
+            # Mute = microfone fechado. A FALA continua: enquanto o assistente
+            # fala, o núcleo pulsa com a voz dele, mute ou não.
+            if self.speaking:
                 self._tgt_scale = self._base_scale + amp * 0.13
                 self._tgt_halo  = self._base_halo  + amp * 95.0
+            elif self.muted:
+                self._tgt_scale, self._tgt_halo = self._base_scale, self._base_halo
             else:
                 self._tgt_scale = self._base_scale + amp * 0.06
                 self._tgt_halo  = self._base_halo  + amp * 75.0
@@ -789,10 +791,11 @@ class HudCanvas(QWidget):
     # for its own sake, which is what made the old glowing orb feel dead.
 
     def _core_colours(self):
-        if self.muted:
-            return qcol(C.MUTED_C), qcol(C.MUTED_C)
+        # A fala manda no visual: mute da UI fecha só o microfone.
         if self.speaking:
             return qcol(C.PRI), qcol(C.ACC)
+        if self.muted:
+            return qcol(C.MUTED_C), qcol(C.MUTED_C)
         if self.state in ("THINKING", "PROCESSING"):
             return qcol(C.PRI), qcol(C.ACC2)
         if self.state == "LISTENING":
@@ -807,7 +810,9 @@ class HudCanvas(QWidget):
         bg = qcol(C.BG)
         amp = self._amp_disp
         t = self._core_phase
-        live = (self.speaking or amp > 0.04) and not self.muted
+        # Com o microfone mutado nada do ambiente entra; a própria voz do
+        # assistente continua animando o núcleo (mute = microfone, não boca).
+        live = self.speaking or amp > 0.04
 
         def blend(col: QColor, a: float) -> QColor:
             """Pre-mix onto the background instead of asking Qt to composite.
@@ -974,13 +979,15 @@ class HudCanvas(QWidget):
             _r_head = min(fw * 0.355, _band_h / (self._avatar.SPAN + 0.08))
             _head_cy = _band_t + (_band_h - self._avatar.SPAN * _r_head) / 2.0 + _r_head
 
-            if self.muted:
+            # A fala manda no visual: mute da UI fecha só o microfone.
+            if self.speaking:
+                _main = qcol(C.PRI)
+                _acc = qcol(C.ACC)
+            elif self.muted:
                 _main = _acc = qcol(C.MUTED_C)
             else:
                 _main = qcol(C.PRI)
-                if self.speaking:
-                    _acc = qcol(C.ACC)
-                elif self.state in ("THINKING", "PROCESSING"):
+                if self.state in ("THINKING", "PROCESSING"):
                     _acc = qcol(C.ACC2)
                 elif self.state == "LISTENING":
                     _acc = qcol(C.GREEN)
@@ -1021,10 +1028,11 @@ class HudCanvas(QWidget):
 
         # status text
         sy = _sy_status
-        if self.muted:
-            txt, col = "⊘  MUTED",     qcol(C.MUTED_C)
-        elif self.speaking:
+        if self.speaking:
+            # O mute da UI fecha só o microfone: falar, ele fala.
             txt, col = "●  SPEAKING",  qcol(C.ACC)
+        elif self.muted:
+            txt, col = "⊘  MUTED",     qcol(C.MUTED_C)
         elif self.state == "THINKING":
             sym = "◈" if self._blink else "◇"
             txt, col = f"{sym}  THINKING",   qcol(C.ACC2)
@@ -1051,7 +1059,9 @@ class HudCanvas(QWidget):
         amp = self._amp_disp
         mid = (N - 1) / 2.0
         for i in range(N):
-            if self.muted:
+            # Mudo = ouvido fechado, não boca: com o assistente falando as
+            # barras seguem a voz dele mesmo com o microfone mutado.
+            if self.muted and not self.speaking:
                 hgt, cl = 2, qcol(C.MUTED_C)
             else:
                 env     = (1.0 - abs(i - mid) / mid) ** 0.7      # center-weighted hump
@@ -7398,7 +7408,7 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {color}; background: transparent;")
             return l
 
-        lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen"))
+        lay.addWidget(_fl("[F4] Mudo do microfone  ·  [F11] Fullscreen"))
         lay.addStretch()
         lay.addWidget(_fl("By FatihMakes", C.PRI_DIM))
         return w

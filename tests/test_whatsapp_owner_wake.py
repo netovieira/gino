@@ -155,15 +155,21 @@ class OwnerWakeTest(unittest.TestCase):
         self.assertEqual(obj._loop.scheduled, [])
         obj._inject_user_turn.assert_not_called()
 
-    def test_muted_owner_keeps_the_item_for_the_next_wake(self):
+    def test_muted_mic_still_delivers_the_owner_message(self):
+        # Ordem do dono (07/11/2026): o mute da UI fecha só o microfone. A
+        # mensagem escrita dele no WhatsApp tem resposta na hora, mute ou não.
         obj = self._obj()
         obj.ui.muted = True
 
         self._deliver_on_neonize_thread(
             obj, "trabalho", owner_item("preciso de você", "WA-5"))
 
-        self.assertEqual([q["id"] for q in whatsapp.pending_owner()], ["WA-5"])
-        obj._inject_user_turn.assert_not_called()
+        self.assertEqual(whatsapp.pending_owner(), [])
+        self.assertEqual(len(obj._loop.scheduled), 1)
+        obj._loop.run()
+        obj._inject_user_turn.assert_called_once()
+        line = obj._inject_user_turn.call_args[0][0]
+        self.assertIn("preciso de você", line)
 
     def test_no_session_returns_false_without_draining(self):
         obj = self._obj()

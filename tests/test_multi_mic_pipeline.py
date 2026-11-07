@@ -397,15 +397,17 @@ def _live_for_speech():
     return obj, main
 
 
-def test_mute_blocks_text_from_becoming_speech(monkeypatch):
+def test_muted_mic_still_allows_speech(monkeypatch):
+    # Ordem do dono (07/11/2026): mute da UI = microfone apenas. A fala sai
+    # mesmo com o microfone mutado, e nenhum "mutado" trava o synthesis.
     obj, main = _live_for_speech()
     obj.ui.muted = True
     called = []
     monkeypatch.setattr("core.brain.synth_pcm24k",
                         lambda *a, **k: called.append(1) or b"\x00" * 240)
     main.JarvisLive._say_blocking(obj, "Abrindo o Terminal.", label="Gino")
-    assert called == []
-    assert any("mutado" in line for line in obj.ui.logs)
+    assert called == [1]
+    assert not any("mutado" in line for line in obj.ui.logs)
 
 
 def test_unmuted_still_speaks(monkeypatch):
