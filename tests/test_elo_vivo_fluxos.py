@@ -55,8 +55,18 @@ from core.flows.live import FlowsRuntime
 
 @pytest.fixture(autouse=True)
 def _sem_log_real(tmp_path, monkeypatch):
-    """Nenhum teste daqui escreve no activity.log do dono."""
+    """Nenhum teste daqui escreve no activity.log do dono.
+
+    Três escritores, três caminhos: o espelho (``MIRROR_DIR``, no fixture
+    ``espelho``), o registro de ação do executor e a medição de latência da
+    boca — esta última vive em ``core.flows.mouth._LOG_PATH`` e é chamada pela
+    ponte com o default de produção, inclusive quando o runtime nasce do
+    ``main._flows_get``.
+    """
+    from core.flows import mouth as mouth_mod
+
     monkeypatch.setattr(exe, "_ACTIVITY_LOG_PATH", tmp_path / "activity.log")
+    monkeypatch.setattr(mouth_mod, "_LOG_PATH", tmp_path / "latencia.log")
     task_mirror.reset()
     yield
     task_mirror.reset()
