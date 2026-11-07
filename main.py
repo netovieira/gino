@@ -4770,6 +4770,19 @@ class JarvisLive:
             wa_persona = None
         if wa_persona:
             self._persona_whatsapp_route_audit(account, chat, wa_persona)
+            # UP-1: evento persona_routed no activity.log — prova de que a
+            # rota por persona funcionou (nome da persona, mensagem original
+            # truncada e fator de identificação).
+            try:
+                meta = _activity.make_meta(
+                    chan="whatsapp", origin="persona_routed")
+                msg_preview = str(text or "")[:120]
+                self.ui.write_log(_activity.with_meta(
+                    f"SYS: persona_routed — {wa_persona['name']} "
+                    f"(slug={wa_persona['slug']}, factor={wa_persona['factor']}): "
+                    f"{msg_preview!r}", meta))
+            except Exception:
+                pass
         persona_extra = ""
         if wa_persona and direct:
             persona_extra = (
