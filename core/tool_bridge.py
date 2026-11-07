@@ -108,6 +108,12 @@ ACTION_TIERS: dict[str, str] = {
     "email_control": TIER_MEDIUM,
     "mail_control": TIER_MEDIUM,
     "whatsapp_control": TIER_MEDIUM,
+    # linkedin_control: rota antiga DESLIGADA (dono, 07/11/2026). LinkedIn nao
+    # e caminho proprio: passou a ser uma regra do fluxo de corpo de e-mail
+    # (core/email_flows.py, tipo linkedin_notification). O plugin continua no
+    # tier por seguranca caso seja reabilitado; hoje esta inerte em
+    # plugins_enabled.linkedin_control = false. core/linkedin.py segue no repo
+    # por historico e nada nele e chamado pelo fluxo de e-mail.
     "linkedin_control": TIER_MEDIUM,
     "trello_control": TIER_MEDIUM,
     "cakto_sales": TIER_MEDIUM,

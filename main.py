@@ -8052,6 +8052,10 @@ class JarvisLive:
                 self._flows_rt = False
                 return None
             self._flows_rt = rt
+            # UP-8 (passo 6 do FLUXO TRABALHO): o fio do andamento é plugado
+            # no MESMO boot da ponte. Sem isto o espelho grava a etapa e o
+            # evento sai `hook=ausente` — a auditoria vê, a boca fica muda.
+            self._flows_progress_hook(rt)
             return rt
 
     # UP-5 (Fase 6 TASK7): o gate de atenção por webcam é plugado AQUI, no
@@ -8112,6 +8116,48 @@ class JarvisLive:
                 self.ui.write_log(line)
             except Exception:
                 pass
+
+    # UP-8 (FLUXO TRABALHO passo 6): o fio do andamento é plugado AQUI, no boot
+    # da ponte, porque é o espelho quem sabe quando uma etapa nova passou e é a
+    # boca quem sabe fraseá-la. Sem esta linha o evento sai `hook=ausente`: a
+    # auditoria vê a etapa e o dono não ouve nada.
+    def _flows_progress_hook(self, rt) -> bool:
+        """Instala ``mouth.progress_notifier`` no espelho de tarefas (UP-8).
+
+        O contrato é o de ``core.task_mirror.set_progress_hook``: um
+        ``handler(payload)`` que devolve ``{spoken, sentence, reason}`` e roda
+        na thread que gravou a linha (tail do transcrito ou fila do Qoder). Por
+        isso a fala sai por ``_live_progress_speech`` — o caminho do andamento
+        que já tem o teto de 40 s e a regra "nunca enquanto o dono fala" — e
+        nunca por ``_say_now`` direto, que atropelaria a resposta em curso.
+
+        A boca reutilizada é a do próprio runtime (modelo, guard e timeout já
+        configurados): boca desligada em ``config/flows.json`` continua calada,
+        o espelho segue gravando e nada aqui é capaz de quebrar o boot.
+        """
+        try:
+            from core.flows import mouth as _flows_mouth
+            cfg = getattr(rt, "config", None)
+            handler = _flows_mouth.progress_notifier(
+                speak=self._live_progress_speech,
+                config=cfg,
+                mouth=getattr(getattr(rt, "orchestrator", None), "mouth", None))
+            _task_mirror.set_progress_hook(handler)
+            installed = _task_mirror.progress_hook() is not None
+            line = (f"[fluxos] progress_hook instalada={int(installed)} "
+                    f"boca={int(bool(getattr(cfg, 'mouth_enabled', True)))}")
+            try:
+                self.ui.write_log(_activity.with_meta(
+                    line, _activity.make_meta(chan="sistema",
+                                              origin="task_mirror")))
+            except Exception:
+                print(line)
+            print(f"[Fluxos] andamento falado: "
+                  f"{'LIGADO' if installed else 'NÃO instalado'}")
+            return installed
+        except Exception as e:
+            print(f"[Fluxos] hook de progresso indisponível: {e!r}")
+            return False
 
     def _flows_speak(self, text: str) -> None:
         # Ponto de saída da boca: a lei do dono (04/11/2026) é aplicada AQUI

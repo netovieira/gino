@@ -529,6 +529,10 @@ _ORIGIN_ALIASES: dict[str, str] = {
 # ACTION_TIERS; a fonte da verdade é o tier do bridge.
 _SENSITIVE_ACTIONS_FALLBACK = frozenset({
     "send_message", "email_control", "mail_control", "whatsapp_control",
+    # linkedin_control fora do caminho de acoes: rota desligada pelo dono
+    # (07/11/2026) — LinkedIn virou regra do fluxo de corpo de e-mail
+    # (core/email_flows.py). Fica aqui só como cinto de seguranca: se alguem
+    # reabilitar o plugin, ele ainda pede confirmacao.
     "linkedin_control", "trello_control", "cakto_sales", "android_control",
     "iphone_control", "mac_control", "home_control", "browser_control",
     "computer_control", "upload", "upload_file", "purchase", "buy",
