@@ -348,7 +348,10 @@ class LocalWhisperListener(GroqListener):
                  on_lost: Callable[[str, str, float], None] | None = None,
                  on_gate_drop: Callable[[str, float], None] | None = None,
                  preroll_s: float | None = None,
-                 max_utterance_s: float | None = None) -> None:
+                 max_utterance_s: float | None = None,
+                 on_partial: Callable[[str, float], None] | None = None,
+                 on_final: Callable[[str, float], None] | None = None,
+                 progressive_interval_s: float | None = None) -> None:
         whisper = _Whisper(model, language, device, compute_type,
                            on_status or (lambda m: None), prompt=prompt,
                            sample_rate=sample_rate)
@@ -363,7 +366,10 @@ class LocalWhisperListener(GroqListener):
             on_lost=on_lost,
             on_gate_drop=on_gate_drop,
             preroll_s=preroll_s,
-            max_utterance_s=max_utterance_s)
+            max_utterance_s=max_utterance_s,
+            on_partial=on_partial,
+            on_final=on_final,
+            progressive_interval_s=progressive_interval_s)
         # Read self.prompt at call time, not now: the assistant's name is only
         # settled later in startup, and the hint has to carry the real one.
         self._transcribe_fn = lambda pcm: whisper.transcribe_pcm(

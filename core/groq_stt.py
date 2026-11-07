@@ -42,6 +42,7 @@ import requests
 from core import duck as _duck
 from core import noise_filter as _noise
 from core import silero_vad
+from core import stt_streaming
 
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 MODELS = ("whisper-large-v3-turbo", "whisper-large-v3")
@@ -580,7 +581,10 @@ class GroqListener:
                  on_gate_drop: Callable[[str, float], None] | None = None,
                  preroll_s: float | None = None,
                  max_utterance_s: float | None = None,
-                 use_vad: bool | None = None) -> None:
+                 use_vad: bool | None = None,
+                 on_partial: Callable[[str, float], None] | None = None,
+                 on_final: Callable[[str, float], None] | None = None,
+                 progressive_interval_s: float | None = None) -> None:
         self._key, self._model, self._lang = api_key, model, language
         self.prompt = prompt
         # Optional local transcriber (core.local_stt): same segmentation and
@@ -718,6 +722,41 @@ class GroqListener:
             except Exception as _vad_err:
                 print(f"[{engine_label}] Silero VAD indisponível "
                       f"({_vad_err.__class__.__name__}) — usando RMS puro")
+        # ── Transcrição incremental ao vivo (UP-3) ───────────────────────────
+        # A `core.stt_streaming.StreamingSession` opens per utterance and
+        # receives the SAME blocks the segmenter receives — on a dedicated
+        # thread, never on the 64 ms audio callback.  While the sentence is
+        # still open it transcribes progressive windows and reports them
+        # through `on_partial(text, ms_since_open)`; the definitive result
+        # keeps going through the old path (worker + endpointing) and is
+        # announced through `on_final(text, ms_since_open)`.  The session is
+        # never finalized with its own transcription: that would run the
+        # engine twice over the same audio.  Everything here is best-effort:
+        # without `on_partial`, with JARVIS_STT_PARTIAL=0, or on any failure
+        # the live path stays exactly what it was before this hook.
+        self._on_partial_stream = on_partial
+        self._on_final_stream = on_final
+        self._partial_enabled = (on_partial is not None
+                                 and os.environ.get(
+                                     "JARVIS_STT_PARTIAL", "1") != "0")
+        try:
+            _interval = float(progressive_interval_s
+                              if progressive_interval_s is not None
+                              else stt_streaming.DEFAULT_PROGRESSIVE_INTERVAL_S)
+        except (TypeError, ValueError):
+            _interval = stt_streaming.DEFAULT_PROGRESSIVE_INTERVAL_S
+        self._partial_interval_s = min(
+            stt_streaming.MAX_PROGRESSIVE_INTERVAL_S,
+            max(stt_streaming.MIN_PROGRESSIVE_INTERVAL_S, _interval))
+        self._partial_q: queue.Queue = queue.Queue()
+        self._partial_thread: threading.Thread | None = None
+        self._partial_dead = False
+        # When the CURRENT utterance opened: the ms_since_open clock of both
+        # partial and final events.
+        self._segment_opened_at = 0.0
+        # Set while the worker is transcribing (or has a clip waiting): the
+        # partial steps aside instead of stealing the engine from the final.
+        self._transcribing = threading.Event()
 
     @property
     def local(self) -> bool:
@@ -808,6 +847,7 @@ class GroqListener:
         self._seg, self._active, self.speaking = [], False, False
         self._above = self._below = self._voiced = 0
         self._reset_voice_state()
+        self._partial_end()
         # The ring holds audio from before this instant. After a mute it is
         # stale, and prepending it to the next sentence would paste words said
         # with the microphone closed onto the front of it.
@@ -837,6 +877,7 @@ class GroqListener:
         self._seg, self._active, self.speaking = [], False, False
         self._above = self._below = self._voiced = 0
         self._reset_voice_state()
+        self._partial_end()
         self._pre.clear()
         if not self.assistant_speaking:
             _duck.up()
@@ -958,6 +999,8 @@ class GroqListener:
             self._above = self._below = self._voiced = 0
             self._reset_voice_state()
             self._drop_segment = False
+            # The partial session of that discarded segment must die with it.
+            self._partial_end()
 
         if not self._active:
             # Track the room while nobody speaks; follow drops quickly, rises slowly.
@@ -1042,6 +1085,11 @@ class GroqListener:
         else:
             self._below += 1
             self._proof_buf.clear()
+        # UP-3: the same block also feeds the live partial session (only
+        # queued here — transcription runs on the partial thread, never on
+        # this callback). Asleep, the ear is the wake word's: no partials.
+        if self._partial_enabled and not self.sleeping:
+            self._partial_enqueue(("block", raw, bool(_speech)))
         if self.assistant_speaking:
             cap = _SPEAK_CAP_BLOCKS
         else:
@@ -1104,6 +1152,16 @@ class GroqListener:
             print(f"[{self.label}] energia sustentada por "
                   f"{self._above * _BLOCK_SECONDS:.2f}s sem prova de voz — "
                   f"abrindo o turno mesmo assim")
+        # UP-3: open the live partial session of THIS utterance. It is primed
+        # with the whole segment as it stands — the ring's 1.5 s of preroll
+        # plus the blocks that fired the detector — so the first progressive
+        # window already carries the beginning of the phrase.
+        self._segment_opened_at = time.monotonic()
+        if self._partial_enabled and not self.sleeping:
+            self._partial_start()
+            self._partial_drain()
+            self._partial_enqueue(("open", self._segment_opened_at,
+                                   list(self._seg)))
         # The room includes the speakers: while a sentence is open the music
         # drops, and comes back when it closes — without this, Whisper
         # transcribes the lyrics along with the user. Asleep, every cough would
@@ -1199,6 +1257,13 @@ class GroqListener:
               f"cortando em trechos transcrevíveis (teto de "
               f"{cap_blocks * _BLOCK_SECONDS:.0f}s de voz)")
         self._emit(seg, voiced, forced=True, proven=proven, bypass=bypass)
+        # UP-3: the partial session restarts with the new chunk — a monologue
+        # is transcribed progressively in pieces, never over one growing blob.
+        self._partial_enqueue(("end",))
+        if self._partial_enabled and not self.sleeping:
+            self._segment_opened_at = time.monotonic()
+            self._partial_drain()
+            self._partial_enqueue(("open", self._segment_opened_at, []))
 
     def _close(self, capped: bool = False) -> None:
         seg, voiced = self._seg, self._voiced
@@ -1228,6 +1293,11 @@ class GroqListener:
             print(f"[{self.label}] utterance hit the {_MAX_BLOCKS}-block cap — "
                   f"transcribing the captured part only")
         self._emit(seg, voiced, proven=proven, bypass=bypass)
+        # UP-3: the partial session of this utterance is over. It is dropped,
+        # NOT finalized: the definitive transcription is the worker's job and
+        # running the engine twice on the same audio would only make the turn
+        # slower. The `stt_final` event comes from `_process_utterance`.
+        self._partial_end()
 
     def _emit(self, seg: list[bytes], voiced: int,
               forced: bool = False, proven: bool = False,
@@ -1333,6 +1403,137 @@ class GroqListener:
         except Exception as e:
             print(f"[{self.label}] segment transcription failed: {e}")
         return ""
+
+    # ── transcrição incremental ao vivo (UP-3) ──────────────────────────────
+
+    def _partial_start(self) -> None:
+        """Start the dedicated partial thread on the first partial utterance.
+
+        Lazily, so a listener nobody wired to `on_partial` pays nothing; if
+        the thread cannot start (a machine without threads to spare) the
+        partial path dies quietly and the old path keeps answering turns.
+        """
+        if self._partial_thread is not None or self._partial_dead:
+            return
+        try:
+            thread = threading.Thread(target=self._run_partial,
+                                      name="stt-partial", daemon=True)
+            thread.start()
+            self._partial_thread = thread
+        except Exception as e:
+            self._partial_dead = True
+            print(f"[{self.label}] streaming parcial indisponível ({e!r}) — "
+                  f"só o caminho antigo de fim de frase daqui em diante")
+
+    def _partial_enqueue(self, item: tuple) -> None:
+        """Best-effort: queue one open/block/end token for the partial thread.
+
+        Runs on the audio callback thread; `put_nowait` on an unbounded queue
+        is a plain list append — no engine, no I/O, no lock worth mentioning.
+        Any failure kills the partial path alone (`_partial_dead`), never the
+        turn: the old end-of-utterance transcription does not depend on it.
+        """
+        if not self._partial_enabled or self._partial_dead:
+            return
+        try:
+            self._partial_q.put_nowait(item)
+        except Exception as e:
+            self._partial_dead = True
+            print(f"[{self.label}] fila parcial indisponível ({e!r}) — "
+                  f"só o caminho antigo de fim de frase daqui em diante")
+
+    def _partial_end(self) -> None:
+        """Retire the partial session of the segment that just ended/died."""
+        self._partial_enqueue(("end",))
+
+    def _partial_drain(self) -> None:
+        """Forget tokens of a previous utterance if the partial thread lags."""
+        try:
+            while True:
+                self._partial_q.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _run_partial(self) -> None:
+        """The dedicated partial thread: owns the current StreamingSession.
+
+        One session per utterance, created on the "open" token and fed with
+        every subsequent block.  Transcription calls happen HERE, off the
+        audio callback, and are skipped whenever the real worker has a clip
+        waiting (`_partial_transcribe`) — the partial never steals the engine
+        from the final result.  A dying session costs one log line: the turn
+        itself is still produced by the old path.
+        """
+        session: stt_streaming.StreamingSession | None = None
+        while not self._stop.is_set():
+            try:
+                item = self._partial_q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            kind = item[0]
+            try:
+                if kind == "open":
+                    _, started_at, blocks = item
+                    session = stt_streaming.StreamingSession(
+                        transcribe_fn=self._partial_transcribe,
+                        on_partial=lambda text, is_final: (
+                            None if (is_final or not text)
+                            else self._note_partial(text, started_at)),
+                        # The preroll already lives in the segment (the
+                        # listener's own ring primed this session), so the
+                        # session must not keep a second one.
+                        preroll_s=0.0,
+                        progressive_interval_s=self._partial_interval_s,
+                        sample_rate=self._sr)
+                    for blk in blocks:
+                        session.feed_pcm16(blk, is_speech=True)
+                elif kind == "block":
+                    if session is not None:
+                        session.feed_pcm16(item[1], is_speech=bool(item[2]))
+                else:  # "end"
+                    session = None
+            except Exception as e:
+                print(f"[{self.label}] transcrição parcial falhou "
+                      f"({e!r}) — seguindo só pelo caminho antigo")
+                session = None
+
+    def _partial_transcribe(self, pcm: bytes) -> str:
+        """Engine call for a progressive window; returns "" when it must step
+        aside.  Never raises: `transcribe_pcm` already swallows the engine's
+        errors, and the guard below keeps the partial from competing with a
+        real transcription the worker is doing or about to do."""
+        if self.sleeping or self._transcribing.is_set() or not self._q.empty():
+            return ""
+        try:
+            return self.transcribe_pcm(bytes(pcm))
+        except Exception as e:
+            print(f"[{self.label}] parcial falhou ({e!r}) — seguindo")
+            return ""
+
+    def _note_partial(self, text: str, started_at: float) -> None:
+        """Report one progressive window: (text, ms since the utterance opened)."""
+        if self._on_partial_stream is None or not text:
+            return
+        ms = max(0.0, (time.monotonic() - started_at) * 1000.0)
+        try:
+            self._on_partial_stream(str(text), ms)
+        except Exception as e:
+            print(f"[{self.label}] aviso de parcial falhou ({e!r})")
+
+    def _note_final(self, text: str) -> None:
+        """Announce the definitive transcription on the same ms_since_open
+        clock as the partials, from the worker thread that produced it.
+        Asleep, the ear is the wake word's and nothing is announced: same
+        rule that keeps the partial windows off while sleeping."""
+        if self._on_final_stream is None or not self._segment_opened_at:
+            return
+        if self.sleeping:
+            return
+        ms = max(0.0, (time.monotonic() - self._segment_opened_at) * 1000.0)
+        try:
+            self._on_final_stream(str(text), ms)
+        except Exception as e:
+            print(f"[{self.label}] aviso de final falhou ({e!r})")
 
     # ── worker thread ───────────────────────────────────────────────────────
 
@@ -1513,42 +1714,49 @@ class GroqListener:
             if not keep:
                 _duck.up()
                 return
+        self._transcribing.set()
         try:
-            if self._transcribe_fn is not None:
-                try:
-                    text = self._transcribe_fn(pcm)
-                except Exception as e:
-                    # Asleep, room audio neither leaves the machine nor
-                    # reaches the panel: a local failure drops quietly.
-                    if self.sleeping:
-                        print(f"[{self.label}] asleep — local STT failed "
-                              f"({e.__class__.__name__}), utterance dropped")
-                        return
-                    # Local model failed. Say so once, then keep listening
-                    # through the network rung instead of dropping speech.
-                    if self._fallback_fn is None:
-                        raise
-                    if not self._fallback_used:
-                        self._fallback_used = True
-                        self._on_status(f"{self.label} falhou ({e.__class__.__name__}) — "
-                                        "transcrevendo no Groq até resolver.")
-                    text = self._fallback_fn(pcm)
-            else:
-                text = transcribe(pcm, self._key, self._model, self._lang, self._sr,
-                                  prompt=self.prompt)
-        except requests.HTTPError as e:
-            code = e.response.status_code if e.response is not None else "?"
-            self._on_status(f"{self.label}: transcrição falhou ({code}).")
-            _duck.up()
-            return
-        except Exception as e:
-            if self.sleeping:
-                print(f"[{self.label}] asleep — utterance dropped "
-                      f"({e.__class__.__name__})")
+            try:
+                if self._transcribe_fn is not None:
+                    try:
+                        text = self._transcribe_fn(pcm)
+                    except Exception as e:
+                        # Asleep, room audio neither leaves the machine nor
+                        # reaches the panel: a local failure drops quietly.
+                        if self.sleeping:
+                            print(f"[{self.label}] asleep — local STT failed "
+                                  f"({e.__class__.__name__}), utterance dropped")
+                            return
+                        # Local model failed. Say so once, then keep listening
+                        # through the network rung instead of dropping speech.
+                        if self._fallback_fn is None:
+                            raise
+                        if not self._fallback_used:
+                            self._fallback_used = True
+                            self._on_status(f"{self.label} falhou ({e.__class__.__name__}) — "
+                                            "transcrevendo no Groq até resolver.")
+                        text = self._fallback_fn(pcm)
+                else:
+                    text = transcribe(pcm, self._key, self._model, self._lang,
+                                      self._sr, prompt=self.prompt)
+            except requests.HTTPError as e:
+                code = e.response.status_code if e.response is not None else "?"
+                self._on_status(f"{self.label}: transcrição falhou ({code}).")
+                _duck.up()
                 return
-            self._on_status(f"{self.label}: transcrição falhou: {e.__class__.__name__}.")
-            _duck.up()
-            return
+            except Exception as e:
+                if self.sleeping:
+                    print(f"[{self.label}] asleep — utterance dropped "
+                          f"({e.__class__.__name__})")
+                    return
+                self._on_status(
+                    f"{self.label}: transcrição falhou: {e.__class__.__name__}.")
+                _duck.up()
+                return
+        finally:
+            # UP-3: whatever way this left (result or early return), the
+            # partial windows may use the engine again from here on.
+            self._transcribing.clear()
         clean = text.strip()
         secs = len(pcm) / (2 * self._sr)
         # A real sentence the user spoke is never a prompt echo. Whisper
@@ -1584,6 +1792,10 @@ class GroqListener:
             _usage.note(self._usage_key, utterances=1, audio_s=secs)
         except Exception:
             pass
+        # UP-3: the definitive result on the partial path's own clock, logged
+        # next to the partials it replaced. The turn itself continues through
+        # the handler below exactly as before.
+        self._note_final(clean)
         # The handler runs the whole conversation (gates, brain, tools).
         # An exception there used to end this thread, and a dead consumer
         # means the assistant keeps hearing audio forever and answers

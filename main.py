@@ -14554,7 +14554,9 @@ class JarvisLive:
                 on_lost=self._stt_lost_audio,
                 on_gate_drop=self._stt_gate_drop,
                 preroll_s=lst["preroll_s"],
-                max_utterance_s=lst.get("max_utterance_s"))
+                max_utterance_s=lst.get("max_utterance_s"),
+                on_partial=self._stt_partial_event,
+                on_final=self._stt_final_event)
             self._wire_stt_hooks(self._groq)
             self._groq.sleeping = self._wake_enabled and not self._awake
             self.ui.write_log(f"SYS: Ouvindo com Whisper local ({lst['model']}, "
@@ -14588,7 +14590,9 @@ class JarvisLive:
             on_lost=self._stt_lost_audio,
             on_gate_drop=self._stt_gate_drop,
             preroll_s=st["preroll_s"],
-            max_utterance_s=st.get("max_utterance_s"))
+            max_utterance_s=st.get("max_utterance_s"),
+            on_partial=self._stt_partial_event,
+            on_final=self._stt_final_event)
         self._wire_stt_hooks(self._groq)
         self._groq.sleeping = self._wake_enabled and not self._awake
         self.ui.write_log(f"SYS: Ouvindo com Whisper no Groq ({st['model']}, "
@@ -14677,6 +14681,39 @@ class JarvisLive:
                 f"({summary}); nada foi ao STT nem ao voiceprint.")
         except Exception:
             pass
+
+    # ── Transcrição incremental ao vivo (UP-3) ──────────────────────────────
+
+    def _stt_partial_event(self, text: str, ms_since_open: float) -> None:
+        """Uma janela progressiva do StreamingSession virou linha no log.
+
+        While the owner is STILL talking, the partial path transcribed what
+        it has so far: this line is the evidence that the first response
+        units can start before the audio closes. The text is a WINDOW, not a
+        turn — the turn remains the definitive transcription (`stt_final`),
+        which arrives through the normal path with all the gates. Never
+        touches the brain, never silences anything: log only.
+        """
+        try:
+            self.ui.write_log(
+                f"[Fluxos] stt_partial texto={str(text)[:80]!r} "
+                f"ms_since_open={float(ms_since_open):.0f}")
+        except Exception as e:
+            print(f"[Fluxos] stt_partial não logado: {e!r}")
+
+    def _stt_final_event(self, text: str, ms_since_open: float) -> None:
+        """A transcrição definitiva da frase, no mesmo relógio dos parciais.
+
+        ms_since_open mede a frase inteira (abertura do segmento → texto
+        pronto): comparado ao último stt_partial, é a diferença que o
+        caminho incremental economizou por turno.
+        """
+        try:
+            self.ui.write_log(
+                f"[Fluxos] stt_final texto={str(text)[:80]!r} "
+                f"ms_since_open={float(ms_since_open):.0f}")
+        except Exception as e:
+            print(f"[Fluxos] stt_final não logado: {e!r}")
 
     def _note_unproven_voiceprint(self) -> None:
         """Conta o clipe sem prova que foi ao STT mas NÃO ao voiceprint.
