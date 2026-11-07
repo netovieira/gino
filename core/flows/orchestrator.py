@@ -41,6 +41,11 @@ CHAT_WHATSAPP = "chat_whatsapp"
 CHAT_EMAIL = "chat_email"
 CHAT_MEDIA = "monitor_multimidia"
 
+# UP-10: o evento ``execution_complete`` leva texto legível para o log, não
+# objeto gigante. O teto abaixo corta apenas os campos de texto; estado, ok,
+# contagem de fatos e tempo saem sempre inteiros.
+_EVENT_TEXT_CHARS = 80
+
 
 @dataclass
 class TurnPlan:
@@ -105,6 +110,57 @@ class _TurnState:
     prewarm_logged_at: float = 0.0
     memory_thread: threading.Thread | None = None
     defect_thread: threading.Thread | None = None
+
+
+# ── notificação de conclusão (UP-10) ───────────────────────────────────────
+#
+# FLUXO EXECUCAO passo 3 ("ORQUESTRADOR NOTIFICA CEREBRO"): até aqui a
+# notificação era só o retorno de ``run_plan`` — quem relia o activity.log não
+# via conclusão nenhuma, apenas o evento ``results``. As funções abaixo
+# resumem o despacho em campos estáveis (ações, desfecho por ação, tempo
+# total) para virarem um evento próprio. Pura função: texto nenhum é
+# inventado, só cortado.
+
+def _result_state(result: ExecutorResult) -> str:
+    """Desfecho de uma ação despachada, na ordem da verdade do portão.
+
+    Cancelamento e bloqueio vêm antes de ``ok`` porque um resultado pode
+    ter ``ok=True`` e ainda assim não ser execução (confirmação pendente).
+    """
+    if result.cancelled:
+        return "cancelado"
+    if result.blocked:
+        return "bloqueado"
+    if result.pending_confirm:
+        return "confirmacao_pendente"
+    if result.unverified:
+        return "sem_prova_material"
+    if result.ok:
+        return "ok"
+    return "falha"
+
+
+def _result_spoken(result: ExecutorResult) -> str:
+    """Primeira frase de fato do resultado (o que o cérebro tem para dizer)."""
+    for fact in (result.facts or []):
+        if not isinstance(fact, dict):
+            continue
+        spoken = " ".join(str(fact.get("spoken") or "").split())
+        if spoken:
+            return spoken[:_EVENT_TEXT_CHARS]
+    return ""
+
+
+def _execution_summary(results: list[ExecutorResult]) -> list[dict[str, Any]]:
+    """Uma linha resumida por ação despachada — os resultados do evento."""
+    return [{"task_id": str(r.task_id),
+             "state": _result_state(r),
+             "ok": bool(r.ok),
+             "facts": len(r.facts or []),
+             "spoken": _result_spoken(r),
+             "ms": round(float(r.ms or 0.0), 1),
+             "error": " ".join(str(r.error or "").split())[:_EVENT_TEXT_CHARS]}
+            for r in results]
 
 
 class Orchestrator:
@@ -586,19 +642,28 @@ class Orchestrator:
     def run_plan(self, plan: TurnPlan,
                  cancel_event: threading.Event | None = None
                  ) -> list[ExecutorResult]:
-        """Executa as ações do plano no executor (nunca no orquestrador)."""
+        """Executa as ações do plano no executor (nunca no orquestrador).
+
+        UP-10 (FLUXO EXECUCAO passo 3): terminado o despacho, o orquestrador
+        notifica o cérebro com o evento ``execution_complete`` — ações
+        executadas, resultado de cada uma e tempo total. Sem plano de ações
+        não há execução nenhuma, e portanto nenhum evento.
+        """
         with self._lock:
             state = self._turns.get(plan.turn_id)
         event = cancel_event or (state.cancel_event if state else None)
         actions = list(plan.decision.actions)
         if not actions:
             return []
+        # UP-10: o relógio do turno (injetável) mede o despacho inteiro.
+        started = self.clock()
         if event is not None and event.is_set():
             results = [self.executor.run(f"k{i}", a.tool, a.args,
                                       requires_confirm=a.requires_confirm,
                                       cancel_event=event)
                     for i, a in enumerate(actions, 1)]
             self._check_unverified_turn(plan, results)
+            self._notify_execution_complete(plan, actions, results, started)
             return results
         results: list[ExecutorResult] = []
         pool = concurrent.futures.ThreadPoolExecutor(
@@ -624,6 +689,9 @@ class Orchestrator:
                     facts=[f for r in results for f in r.facts])
         # FASE3-TASK4: verifica se algum resultado está unverified e marca o turno.
         self._check_unverified_turn(plan, results)
+        # UP-10: a conclusão é a última palavra do despacho — depois dela o
+        # cérebro tem o quadro inteiro (passos 4 e 5 do fluxo são boca).
+        self._notify_execution_complete(plan, actions, results, started)
         return results
 
     def _check_unverified_turn(self, plan: TurnPlan,
@@ -640,6 +708,31 @@ class Orchestrator:
                 if r.unverified:
                     _log_unverified(r.task_id, plan.turn_id,
                                     "turno marcado UNVERIFIED pelo orquestrador")
+
+    # ── notificação de conclusão (UP-10) ────────────────────────────────────
+    def _notify_execution_complete(self, plan: TurnPlan,
+                                   actions: list[Any],
+                                   results: list[ExecutorResult],
+                                   started: float) -> None:
+        """Evento ``execution_complete``: o cérebro fica sabendo que acabou.
+
+        Conteúdo (o que a auditoria pedia): o que foi despachado, o desfecho
+        de cada ação e o tempo total. O canal é o ``_event`` do orquestrador
+        — no processo vivo ele cai no activity.log (``log`` injetado pelo
+        ``main.py``) e em qualquer ouvinte ``on_event``; falha de log nunca
+        derruba o turno.
+        """
+        total_ms = round((self.clock() - started) * 1000.0, 1)
+        summaries = _execution_summary(results)
+        self._event("execution_complete", plan.turn_id,
+                    route=plan.route,
+                    actions=[str(a.tool) for a in actions],
+                    dispatched=len(actions),
+                    results=summaries,
+                    facts=sum(len(r.facts or []) for r in results),
+                    ok_count=sum(1 for r in results if r.ok),
+                    failures=sum(1 for r in results if not r.ok),
+                    total_ms=total_ms)
 
     # ── cancelamento ────────────────────────────────────────────────────────
     def cancel(self, turn_id: str, reason: str = "cancelado") -> bool:
