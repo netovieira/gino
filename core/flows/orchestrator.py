@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from core import actiongate as _actiongate
 from core import owner_law as _owner_law
 
 from . import partial as _partial
@@ -84,6 +85,10 @@ class TurnPlan:
     defect: dict[str, Any] = field(default_factory=dict)
     defect_wait: threading.Event = field(default_factory=threading.Event)
     owner_law: str = ""
+    # UV-4: origem canônica do turno (fala_do_dono, fala_visitante,
+    # automatica, filtro_email). Vazio = turno montado fora do ``begin``
+    # (testes, replays): as ações saem registradas como ``nao_declarada``.
+    origin: str = ""
 
     @property
     def route(self) -> str:
@@ -151,16 +156,62 @@ def _result_spoken(result: ExecutorResult) -> str:
     return ""
 
 
-def _execution_summary(results: list[ExecutorResult]) -> list[dict[str, Any]]:
-    """Uma linha resumida por ação despachada — os resultados do evento."""
+def _execution_summary(results: list[ExecutorResult],
+                       default_origin: str = "") -> list[dict[str, Any]]:
+    """Uma linha resumida por ação despachada — os resultados do evento.
+
+    UV-4: cada linha carrega a origem canônica (a do resultado, que o
+    executor escreveu no despacho; na ausência dela, a do turno). Nunca se
+    inventa origem ausente: vazio vira ``nao_declarada`` — a lacuna à vista.
+    """
+    fallback = _actiongate.normalize_origin(default_origin)
     return [{"task_id": str(r.task_id),
              "state": _result_state(r),
+             "origin": str(getattr(r, "origin", "") or "") or fallback,
              "ok": bool(r.ok),
              "facts": len(r.facts or []),
              "spoken": _result_spoken(r),
              "ms": round(float(r.ms or 0.0), 1),
              "error": " ".join(str(r.error or "").split())[:_EVENT_TEXT_CHARS]}
             for r in results]
+
+
+# UV-4 — o ``source`` que o processo vivo já passa em ``begin`` vira origem
+# canônica aqui, num mapa único. Rótulo desconhecido é conservador: o
+# actiongate o lê como ``automatica`` (origem que não se conhece não pode se
+# vender como pedido de ninguém); '' fica ``nao_declarada`` no log.
+_ORIGIN_BY_SOURCE = {
+    "owner": _actiongate.ORIGIN_OWNER_SPEECH,
+    "voice": _actiongate.ORIGIN_OWNER_SPEECH,
+    "voz": _actiongate.ORIGIN_OWNER_SPEECH,
+    "typed": _actiongate.ORIGIN_OWNER_SPEECH,
+    "texto": _actiongate.ORIGIN_OWNER_SPEECH,
+    "whatsapp": _actiongate.ORIGIN_OWNER_SPEECH,
+    "visitor": _actiongate.ORIGIN_VISITOR_SPEECH,
+    "visitante": _actiongate.ORIGIN_VISITOR_SPEECH,
+    "email": _actiongate.ORIGIN_EMAIL_FILTER,
+    "email_flow": _actiongate.ORIGIN_EMAIL_FILTER,
+    "filtro_email": _actiongate.ORIGIN_EMAIL_FILTER,
+    "task": _actiongate.ORIGIN_AUTOMATIC,
+    "queue": _actiongate.ORIGIN_AUTOMATIC,
+    "auto": _actiongate.ORIGIN_AUTOMATIC,
+    "system": _actiongate.ORIGIN_AUTOMATIC,
+    "sistema": _actiongate.ORIGIN_AUTOMATIC,
+    "monitor": _actiongate.ORIGIN_AUTOMATIC,
+}
+
+
+def _plan_origin(source: str) -> str:
+    key = " ".join(str(source or "").split()).strip().lower()
+    if key in _ORIGIN_BY_SOURCE:
+        return _ORIGIN_BY_SOURCE[key]
+    if not key:
+        # Fonte não informada fica vazia DE PROPÓSITO: '' atravessa o sistema
+        # como ``nao_declarada`` no log. Colar o rótulo pronto aqui faria o
+        # portão relê-lo como origem declarada desconhecida — e origem
+        # desconhecida é automatica.
+        return ""
+    return _actiongate.normalize_origin(key)
 
 
 class Orchestrator:
@@ -217,9 +268,13 @@ class Orchestrator:
     def begin(self, turn_id: str, text: str, *, trust: str = TRUST_OWNER,
               speak: bool = True, source: str = "owner") -> TurnPlan:
         started = self.clock()
+        # UV-4: o turno nasce com origem canônica — é ela, não uma suposição
+        # posterior, que viaja até o log de cada ação despachada.
+        origin = _plan_origin(source)
         if not self.config.enabled:
             plan = TurnPlan(turn_id=str(turn_id), text=str(text),
-                            active=False, reason="flows desligados")
+                            active=False, reason="flows desligados",
+                            origin=origin)
             self._event("turn_disabled", plan.turn_id)
             return plan
 
@@ -227,7 +282,8 @@ class Orchestrator:
             decision = self.router.route(text, trust=trust)
             plan = TurnPlan(turn_id=str(turn_id), text=str(text),
                             decision=decision, blocked=True,
-                            reason="untrusted", active=False)
+                            reason="untrusted", active=False,
+                            origin=origin)
             self._event("turn_blocked", plan.turn_id, trust=trust)
             return plan
 
@@ -254,7 +310,7 @@ class Orchestrator:
             turn_id=str(turn_id), text=str(text), decision=decision,
             route_ms=route_ms, fallback_ms=fallback_ms,
             used_fallback=used_fallback, context=context,
-            local_chat=local_chat)
+            local_chat=local_chat, origin=origin)
 
         state = _TurnState(plan=plan)
         with self._lock:
@@ -281,6 +337,7 @@ class Orchestrator:
                                      self.config.media_monitor)
             plan.spawned.append(CHAT_MEDIA)
         self._event("turn", plan.turn_id, route=plan.route,
+                    origin=plan.origin,
                     actions=[a.tool for a in decision.actions],
                     lookups=[lk.kind for lk in decision.lookups],
                     fallback=used_fallback, ms=round(route_ms, 3))
@@ -669,7 +726,8 @@ class Orchestrator:
         if event is not None and event.is_set():
             results = [self.executor.run(f"k{i}", a.tool, a.args,
                                       requires_confirm=a.requires_confirm,
-                                      cancel_event=event)
+                                      cancel_event=event,
+                                      origin=plan.origin)
                     for i, a in enumerate(actions, 1)]
             self._check_unverified_turn(plan, results)
             self._notify_execution_complete(plan, actions, results, started)
@@ -682,7 +740,8 @@ class Orchestrator:
             futures = [
                 pool.submit(self.executor.run, f"k{i}", a.tool, a.args,
                             requires_confirm=a.requires_confirm,
-                            cancel_event=event)
+                            cancel_event=event,
+                            origin=plan.origin)
                 for i, a in enumerate(actions, 1)
             ]
             for future in futures:
@@ -732,9 +791,10 @@ class Orchestrator:
         derruba o turno.
         """
         total_ms = round((self.clock() - started) * 1000.0, 1)
-        summaries = _execution_summary(results)
+        summaries = _execution_summary(results, default_origin=plan.origin)
         self._event("execution_complete", plan.turn_id,
                     route=plan.route,
+                    origin=_actiongate.normalize_origin(plan.origin),
                     actions=[str(a.tool) for a in actions],
                     dispatched=len(actions),
                     results=summaries,

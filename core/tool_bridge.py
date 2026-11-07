@@ -336,6 +336,10 @@ def _safe_float(value: Any, default: float) -> float:
 class CallRequest(BaseModel):
     name: str
     args: dict = Field(default_factory=dict)
+    # UV-4: quem chama declara a origem do pedido ('' = nao declarada). A
+    # origem vai ao ledger de auditoria e ao activity.log; com origem
+    # EXPLÍCITA 'automatica' a chamada não toca dispositivo sensível.
+    origin: Optional[str] = None
 
 
 class ConfirmRequest(BaseModel):
@@ -386,6 +390,52 @@ def _jsonable(value: Any) -> Any:
         return jsonable_encoder(value)
     except Exception:
         return str(value)
+
+
+def _append_activity_line(event: str, fields: str) -> None:
+    """UV-4: linha ``[ts] EVENTO: campos`` no activity.log (mesmo formato do
+    executor dos fluxos). Falha de log nunca derruba um call: o rastro é
+    acréscimo, o ledger JSONL do bridge é a auditoria completa."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        path = Path(__file__).resolve().parent.parent / "logs" / "activity.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{ts}] {event}: {fields}\n")
+    except Exception:
+        pass
+
+
+def action_risk_tier(name: Any, args: Optional[dict] = None) -> str:
+    """Resolve the tier for an action name, escalating on dangerous args.
+
+    Module-level so the policy has ONE definition and callers without a
+    bridge instance (core/actiongate.py's UV-4 origin gate, the flows
+    executor) ask the same question the ``/call`` gate asks. Unknown names
+    fall through to high, exactly as in the instance method.
+    """
+    action_name = str(name or "")
+    if action_name == "personas" and isinstance(args, dict):
+        # Reading personas/projects/models is safe; changing the board is
+        # high-risk and needs the owner's spoken confirmation.
+        action = str(args.get("action") or "").strip().lower()
+        if action in ("list", "show", "models", "for_project"):
+            return TIER_SAFE
+        return TIER_HIGH
+    if action_name == "terminal_run" and isinstance(args, dict):
+        # Opening the window is direct; the command typed inside it is
+        # classified on its own. A destructive one still needs the gate.
+        if terminal_command_is_dangerous(args.get("command")):
+            return TIER_HIGH
+        return TIER_LOW
+    tier = ACTION_TIERS.get(action_name, TIER_HIGH)
+    tokens = _ESCALATING_ARGS.get(action_name)
+    if tokens and isinstance(args, dict):
+        for key in _ARG_SCAN_KEYS:
+            value = args.get(key)
+            if isinstance(value, str) and value.strip().lower() in tokens:
+                return TIER_HIGH
+    return tier
 
 
 class ToolBridge:
@@ -505,29 +555,13 @@ class ToolBridge:
     # ── policy ─────────────────────────────────────────────────────────────
 
     def risk_tier(self, name: str, args: Optional[dict] = None) -> str:
-        """Resolve the tier for an action name, escalating on dangerous args."""
-        action_name = str(name or "")
-        if action_name == "personas" and isinstance(args, dict):
-            # Reading personas/projects/models is safe; changing the board is
-            # high-risk and needs the owner's spoken confirmation.
-            action = str(args.get("action") or "").strip().lower()
-            if action in ("list", "show", "models", "for_project"):
-                return TIER_SAFE
-            return TIER_HIGH
-        if action_name == "terminal_run" and isinstance(args, dict):
-            # Opening the window is direct; the command typed inside it is
-            # classified on its own. A destructive one still needs the gate.
-            if terminal_command_is_dangerous(args.get("command")):
-                return TIER_HIGH
-            return TIER_LOW
-        tier = ACTION_TIERS.get(action_name, TIER_HIGH)
-        tokens = _ESCALATING_ARGS.get(action_name)
-        if tokens and isinstance(args, dict):
-            for key in _ARG_SCAN_KEYS:
-                value = args.get(key)
-                if isinstance(value, str) and value.strip().lower() in tokens:
-                    return TIER_HIGH
-        return tier
+        """Resolve the tier for an action name, escalating on dangerous args.
+
+        UV-4: a definição mora em ``action_risk_tier`` (função de módulo) para
+        que o portão de origem do actiongate pergunte ao MESMO tier que o
+        ``/call`` pergunta. Este método é a fachada histórica da instância.
+        """
+        return action_risk_tier(name, args)
 
     # ── app construction ───────────────────────────────────────────────────
 
@@ -566,7 +600,8 @@ class ToolBridge:
 
         @app.post("/call", dependencies=auth)
         async def call(payload: CallRequest):
-            return await self._handle_call(payload.name, payload.args)
+            return await self._handle_call(payload.name, payload.args,
+                                           origin=payload.origin)
 
         @app.post("/confirm", dependencies=auth)
         async def confirm(payload: ConfirmRequest):
@@ -697,9 +732,42 @@ class ToolBridge:
 
     # ── /call ──────────────────────────────────────────────────────────────
 
-    async def _handle_call(self, name: str, args: dict):
+    async def _handle_call(self, name: str, args: dict,
+                           origin: Optional[str] = None):
         args = args if isinstance(args, dict) else {}
         tier = self.risk_tier(name, args)
+
+        # UV-4 — rastrear origem de toda ação de dispositivo. O rótulo canônico
+        # vai ao ledger e ao activity.log; origem EXPLÍCITA 'automatica' (ou
+        # rótulo desconhecido, que a regra do actiongate trata como tal) é
+        # bloqueada em dispositivo sensível ANTES de portão, pending ou
+        # execução. Ausência de origem não bloqueia nada: é lacuna de
+        # rastreamento, registrada como 'nao_declarada' para a métrica fechar.
+        from core import actiongate as _gate
+        origin_logged = _gate.normalize_origin(origin)
+        origin_block = _gate.origin_block_reason(name, origin, args)
+        if origin_block:
+            message = f"Action '{name}' blocked: {origin_block}"
+            self._log(f"[ToolBridge] {message}")
+            self._audit_action(name, args, tier, approved=False,
+                               result=message, status="origin_blocked",
+                               origin=origin_logged)
+            _append_activity_line(
+                "device_action",
+                f"tool={name} origin={origin_logged} tier={tier} "
+                f"status=origin_blocked")
+            return JSONResponse(
+                status_code=403,
+                content={"status": "origin_blocked", "action": name,
+                         "tier": tier, "origin": origin_logged,
+                         "message": message},
+            )
+        if tier != TIER_SAFE:
+            # Rastro de despacho no activity.log: toda ação com efeito (low,
+            # medium, high) sai com a origem — leitura pura não polui.
+            _append_activity_line(
+                "device_action",
+                f"tool={name} origin={origin_logged} tier={tier}")
 
         approved = True
         if tier in (TIER_MEDIUM, TIER_HIGH):
@@ -713,7 +781,9 @@ class ToolBridge:
                         f"confirmation channel is bound to the bridge."
                     )
                     self._audit_action(name, args, tier, approved=False,
-                                       result=message, status="confirmation_required")
+                                       result=message,
+                                       status="confirmation_required",
+                                       origin=origin_logged)
                     return JSONResponse(
                         status_code=409,
                         content={
@@ -738,7 +808,8 @@ class ToolBridge:
                     self._audit_action(name, args, tier, approved=False,
                                        result=approved.body.decode("utf-8", "replace")
                                        if isinstance(approved.body, bytes) else str(approved.body),
-                                       status=confirm_status)
+                                       status=confirm_status,
+                                       origin=origin_logged)
                     return cancelled if cancelled is not None else approved
                 if not approved:
                     cancelled = self._remember_denial(name, args, tier)
@@ -748,7 +819,8 @@ class ToolBridge:
                                f"voice yet. Ask the owner to say 'pode' or 'pode "
                                f"enviar' out loud; there is no popup to click.")
                     self._audit_action(name, args, tier, approved=False,
-                                       result=message, status="denied")
+                                       result=message, status="denied",
+                                       origin=origin_logged)
                     return JSONResponse(
                         status_code=403,
                         content={"status": "denied", "action": name,
@@ -760,7 +832,8 @@ class ToolBridge:
         if executor is None:
             message = "No tool executor is configured on the bridge."
             self._audit_action(name, args, tier, approved=approved,
-                               result=message, status="unavailable")
+                               result=message, status="unavailable",
+                               origin=origin_logged)
             return JSONResponse(status_code=503,
                                 content={"status": "unavailable",
                                          "error": message})
@@ -775,7 +848,8 @@ class ToolBridge:
                        f"{self._timeout:g}s. It may still be running in the app.")
             self._log(f"[ToolBridge] {message}")
             self._audit_action(name, args, tier, approved=approved,
-                               result=message, status="timeout")
+                               result=message, status="timeout",
+                               origin=origin_logged)
             return JSONResponse(status_code=504,
                                 content={"status": "timeout", "action": name,
                                          "tier": tier, "error": message})
@@ -783,16 +857,18 @@ class ToolBridge:
             message = f"Action '{name}' failed: {exc}"
             self._log(f"[ToolBridge] {message}")
             self._audit_action(name, args, tier, approved=approved,
-                               result=message, status="error")
+                               result=message, status="error",
+                               origin=origin_logged)
             return JSONResponse(status_code=500,
                                 content={"status": "error", "action": name,
                                          "tier": tier, "error": str(exc)})
 
         text = result if isinstance(result, str) else str(result)
-        self._audit_action(name, args, tier, approved=approved, result=text, status="ok")
+        self._audit_action(name, args, tier, approved=approved, result=text,
+                           status="ok", origin=origin_logged)
         self._issue_receipt(name, args, result)
         return {"status": "ok", "action": name, "tier": tier,
-                "approved": True, "result": text}
+                "approved": True, "origin": origin_logged, "result": text}
 
     def _preauthorized(self, name: str, args: dict) -> bool:
         """True when a separate, narrow grant already authorises this exact call."""
@@ -1359,12 +1435,12 @@ class ToolBridge:
     # ── audit ──────────────────────────────────────────────────────────────
 
     def _audit_action(self, action: str, args: dict, tier: str, approved: bool,
-                      result: str, status: str) -> None:
+                      result: str, status: str, origin: str = "") -> None:
         self._audit(action=action, args=args, tier=tier, approved=approved,
-                    result=result, status=status)
+                    result=result, status=status, origin=origin)
 
     def _audit(self, *, action: str, args: Any, tier: str, approved: bool,
-               result: Any, status: str) -> None:
+               result: Any, status: str, origin: str = "") -> None:
         if self._audit_path is None:
             return
         record = {
@@ -1376,6 +1452,10 @@ class ToolBridge:
             "result": summarize(result),
             "status": status,
         }
+        # UV-4: rastro de origem na linha de auditoria. Vazio = registro sem
+        # despacho de ação (ex.: /confirm), não "nao_declarada".
+        if origin:
+            record["origin"] = str(origin)
         try:
             self._audit_path.parent.mkdir(parents=True, exist_ok=True)
             line = json.dumps(record, ensure_ascii=False, default=str)

@@ -461,12 +461,146 @@ def confirm(title: str, message: str) -> bool:
     return False
 
 
-# ── autonomous WhatsApp reply grant ─────────────────────────────────────────
+# ── UV-4: origem de toda ação de dispositivo ────────────────────────────────
 
 def _fold(value: object) -> str:
+    """Comparação sem caixa nem acentos (origem de UV-4 e grants de WhatsApp).
+
+    Servia só ao grant de resposta autônoma do WhatsApp; desde UV-4 também é
+    o normalizador do rótulo de origem — um dobrador, duas famílias de regra.
+    """
     text = unicodedata.normalize("NFKD", str(value or ""))
     return "".join(c for c in text if not unicodedata.combining(c)).strip().lower()
 
+
+#
+# A queixa do dono (PLANO Fase 7 TASK4) é "mexeu sem pedido". Rastrear é o
+# primeiro passo: toda ação despachada carrega um rótulo de origem entre os
+# quatro do contrato — fala do dono, fala de visitante, automática, ou vinda
+# do filtro de e-mail. O segundo passo é a política: ação com origem
+# EXPLÍCITA ``automatica`` não toca dispositivo sensível (tier medium/high do
+# tool_bridge — exatamente as ações que hoje já exigem a voz do dono). Uma
+# origem não declarada ('') não ganha bloqueio novo: ela é registrada como
+# ``nao_declarada`` no log, que é justamente a lacuna que a métrica de 24 h
+# precisa mostrar para ser fechada.
+
+ORIGIN_OWNER_SPEECH = "fala_do_dono"
+ORIGIN_VISITOR_SPEECH = "fala_visitante"
+ORIGIN_AUTOMATIC = "automatica"
+ORIGIN_EMAIL_FILTER = "filtro_email"
+ORIGIN_UNDECLARED = "nao_declarada"
+
+ACTION_ORIGINS = frozenset({ORIGIN_OWNER_SPEECH, ORIGIN_VISITOR_SPEECH,
+                            ORIGIN_AUTOMATIC, ORIGIN_EMAIL_FILTER})
+
+# Rótulos que o app já usa nos turnos e chamadas (``source=``) viram origem
+# canônica aqui, num lugar só — quem despacha não inventa nome.
+_ORIGIN_ALIASES: dict[str, str] = {
+    "owner": ORIGIN_OWNER_SPEECH,
+    "dono": ORIGIN_OWNER_SPEECH,
+    "voice": ORIGIN_OWNER_SPEECH,
+    "voz": ORIGIN_OWNER_SPEECH,
+    "typed": ORIGIN_OWNER_SPEECH,
+    "texto": ORIGIN_OWNER_SPEECH,
+    "whatsapp": ORIGIN_OWNER_SPEECH,   # só o chat direto chega a rotear
+    "visitor": ORIGIN_VISITOR_SPEECH,
+    "visitante": ORIGIN_VISITOR_SPEECH,
+    "guest": ORIGIN_VISITOR_SPEECH,
+    "convidado": ORIGIN_VISITOR_SPEECH,
+    "email": ORIGIN_EMAIL_FILTER,
+    "mail": ORIGIN_EMAIL_FILTER,
+    "email_flow": ORIGIN_EMAIL_FILTER,
+    "email_filter": ORIGIN_EMAIL_FILTER,
+    "auto": ORIGIN_AUTOMATIC,
+    "automatic": ORIGIN_AUTOMATIC,
+    "system": ORIGIN_AUTOMATIC,
+    "sistema": ORIGIN_AUTOMATIC,
+    "proactive": ORIGIN_AUTOMATIC,
+    "proativa": ORIGIN_AUTOMATIC,
+    "scheduled": ORIGIN_AUTOMATIC,
+    "timer": ORIGIN_AUTOMATIC,
+    "queue": ORIGIN_AUTOMATIC,
+    "task": ORIGIN_AUTOMATIC,
+    "monitor": ORIGIN_AUTOMATIC,
+}
+
+# Espelho dos tiers medium/high de core/tool_bridge.py, usado SOMENTE quando
+# o bridge não é importável (ambiente enxuto sem fastapi). Manter em passo com
+# ACTION_TIERS; a fonte da verdade é o tier do bridge.
+_SENSITIVE_ACTIONS_FALLBACK = frozenset({
+    "send_message", "email_control", "mail_control", "whatsapp_control",
+    "linkedin_control", "trello_control", "cakto_sales", "android_control",
+    "iphone_control", "mac_control", "home_control", "browser_control",
+    "computer_control", "upload", "upload_file", "purchase", "buy",
+    "root_exec", "dev_agent", "code_helper", "qoder_agent", "qoder_job",
+    "personas", "phrase_blocklist", "restart_pc",
+})
+
+
+def normalize_origin(value: object, default: str = ORIGIN_UNDECLARED) -> str:
+    """Rótulo livre de origem -> um dos nomes canônicos de UV-4.
+
+    Vazio/ausente devolve ``default`` (por padrão ``nao_declarada``: ausência
+    é registrada, não presumida). Rótulo fora do vocabulário mas DECLARADO é
+    conservador: vira ``automatica`` — origem que não se conhece não pode se
+    vender como pedido de ninguém.
+    """
+    folded = _fold(value)
+    if not folded:
+        return str(default or ORIGIN_UNDECLARED)
+    # O marcador de lacuna é idempotente: lido de um log e re-normalizado,
+    # continua 'nao_declarada' — nunca vira origem automática.
+    if folded == ORIGIN_UNDECLARED:
+        return ORIGIN_UNDECLARED
+    if folded in ACTION_ORIGINS:
+        return folded
+    canonical = _ORIGIN_ALIASES.get(folded)
+    if canonical:
+        return canonical
+    return ORIGIN_AUTOMATIC
+
+
+def is_sensitive_device(action: object, args: dict | None = None) -> bool:
+    """True quando a ação é de dispositivo sensível (tier medium/high).
+
+    A régua é a MESMA do portão de confirmação do bridge: o que já exige a
+    voz do dono é o que uma execução automática nunca pode tocar sem pedido.
+    Sem o bridge importável, vale o espelho estático (conservador: nome
+    desconhecido não é sensível por aqui, mas o bridge — o dono do tier —
+    também cai em high para desconhecidos; no ambiente enxuto a função é
+    só o fallback do bloqueio por origem).
+    """
+    name = str(action or "").strip()
+    if not name:
+        return False
+    try:
+        from core import tool_bridge as _bridge
+        tier = _bridge.action_risk_tier(name, args if isinstance(args, dict) else None)
+        return tier in (_bridge.TIER_MEDIUM, _bridge.TIER_HIGH)
+    except Exception:
+        return name in _SENSITIVE_ACTIONS_FALLBACK
+
+
+def origin_block_reason(action: object, origin: object,
+                        args: dict | None = None) -> str:
+    """Motivo do bloqueio UV-4, ou '' quando a ação pode ser despachada.
+
+    Bloqueia SOMENTE origem explícita que canonicamente é ``automatica`` em
+    dispositivo sensível. Origem vazia (não declarada) não bloqueia — é
+    lacuna de rastreamento, não acusação; o log registra ``nao_declarada``.
+    """
+    if not str(origin or "").strip():
+        return ""
+    if normalize_origin(origin) != ORIGIN_AUTOMATIC:
+        return ""
+    if not is_sensitive_device(action, args):
+        return ""
+    return (f"origem {ORIGIN_AUTOMATIC} nao toca dispositivo sensivel "
+            f"'{str(action or '').strip()}' (UV-4: nada de acao automatica "
+            f"sem pedido do dono)")
+
+
+# ── autonomous WhatsApp reply grant ─────────────────────────────────────────
 
 # A short consent said WITHOUT a pending request must not match an ordinary
 # sentence that happens to contain "pode". Only a send-shaped phrase ("pode

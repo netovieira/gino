@@ -116,10 +116,18 @@ def _blocking_enabled(now: datetime | None = None) -> bool:
 
 
 def _append_activity(event: str, task_id: str, tool: str,
-                     reason: str) -> None:
-    """Escreve ``[ts] EVENTO: task_id=.. tool=.. reason=..`` no activity log."""
+                     reason: str, origin: str = "") -> None:
+    """Escreve ``[ts] EVENTO: task_id=.. tool=.. reason=.. [origin=..]``.
+
+    UV-4: quando há origem declarada ela fecha a linha — toda ação de
+    dispositivo fica rastreável no activity.log sem mudar o formato antigo
+    para os leitores de sempre (o sufixo é opcional).
+    """
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {event}: task_id={task_id} tool={tool} reason={reason}\n"
+    line = f"[{ts}] {event}: task_id={task_id} tool={tool} reason={reason}"
+    if origin:
+        line += f" origin={origin}"
+    line += "\n"
     try:
         _ACTIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _ACTIVITY_LOG_PATH.open("a", encoding="utf-8") as fh:
@@ -136,6 +144,43 @@ def _log_unverified(tool: str, task_id: str, reason: str) -> None:
 def _log_execution_blocked(tool: str, task_id: str, reason: str) -> None:
     """UP-9: grava evento ``execution_blocked`` no activity log."""
     _append_activity("execution_blocked", task_id, tool, reason)
+
+
+# ── UV-4: origem de toda ação de dispositivo ───────────────────────────────
+#
+# A política de origem mora em core/actiongate.py (vocabulário canônico,
+# sensibilidade e o motivo do bloqueio). O executor é o portão de despacho
+# dos fluxos: ele DECLARA a origem no resultado, recusa origem explícita
+# ``automatica`` em dispositivo sensível sem nunca chamar o runner, e grava
+# cada ação com efeito colateral no activity.log com o rótulo — rastreável
+# mesmo quando o actiongate estiver indisponível (aí vale o vocabulário
+# mínimo local; ausência de portão não apaga o rastro).
+
+_FALLBACK_ORIGIN_UNDECLARED = "nao_declarada"
+
+
+def _normalize_origin(value: Any) -> str:
+    """Rótulo de origem -> nome canônico (actiongate; fallback conservador)."""
+    try:
+        from core import actiongate
+        return actiongate.normalize_origin(value)
+    except Exception:
+        folded = " ".join(str(value or "").split()).strip().lower()
+        if folded in ("fala_do_dono", "fala_visitante", "automatica",
+                      "filtro_email"):
+            return folded
+        return folded if folded else _FALLBACK_ORIGIN_UNDECLARED
+
+
+def _origin_block_reason(tool: str, origin: str,
+                         args: dict[str, Any] | None = None) -> str:
+    """Motivo do bloqueio UV-4 (ou ''). Sem actiongate, não se inventa
+    bloqueio: a política é uma só e vive no portão de ações."""
+    try:
+        from core import actiongate
+        return actiongate.origin_block_reason(tool, origin, args)
+    except Exception:
+        return ""
 
 
 def _notify_owner_blocked(tool: str, task_id: str, reason: str) -> dict:
@@ -285,6 +330,10 @@ class ExecutorResult:
     facts: list[dict[str, Any]] = field(default_factory=list)
     ms: float = 0.0
     error: str = ""
+    # UV-4: origem canônica do despacho (fala_do_dono, fala_visitante,
+    # automatica, filtro_email ou nao_declarada). Campo de rastro: nunca é
+    # inferido depois — é o que quem pediu declarou no ato.
+    origin: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -295,6 +344,7 @@ class ExecutorResult:
             "blocked": self.blocked,
             "facts": self.facts, "ms": round(self.ms, 1),
             "error": self.error,
+            "origin": self.origin,
         }
 
 
@@ -362,7 +412,95 @@ class Executor:
             *, requires_confirm: bool = False,
             cancel_event: Event | None = None,
             person: str = "",
-            now: float | None = None) -> ExecutorResult:
+            now: float | None = None,
+            origin: str = "") -> ExecutorResult:
+        """UV-4: ``run`` é o portão de despacho dos fluxos.
+
+        A origem declarada por quem pede viaje no resultado (rastreável até o
+        activity.log), uma origem EXPLÍCITA ``automatica`` (ou rótulo
+        declarado fora do vocabulário) nunca toca dispositivo sensível — o
+        runner nem é chamado — e toda ação com efeito colateral fica registrada
+        com seu desfecho. Origem não declarada ('') não é bloqueada: é a
+        lacuna de rastreamento que a métrica de 24 h precisa mostrar, e o log
+        a grava como ``nao_declarada``.
+        """
+        label = _normalize_origin(origin)
+        block = _origin_block_reason(str(tool or ""), origin,
+                                     dict(args or {}))
+        if block:
+            result = self._origin_blocked(task_id, tool, label, block)
+        else:
+            result = self._run_inner(task_id, tool, args,
+                                     requires_confirm=requires_confirm,
+                                     cancel_event=cancel_event,
+                                     person=person, now=now)
+            result.origin = label
+        self._record_action(tool, str(task_id), result)
+        return result
+
+    def _origin_blocked(self, task_id: str, tool: str, label: str,
+                        block: str) -> ExecutorResult:
+        """Resultado de ação recusada pela política de origem (nunca roda).
+
+        Diferente do bloqueio UP-9, aqui o efeito NÃO aconteceu: o portão
+        fechou antes do runner. O dono é avisado pelo mesmo registro vivo do
+        actiongate — é notícia, nunca grant.
+        """
+        result = ExecutorResult(task_id=str(task_id), origin=label)
+        result.blocked = True
+        result.error = f"bloqueado: {block}"
+        result.facts = [{
+            "spoken": "acao automatica bloqueada: dispositivo sensivel so "
+                      "age por pedido do dono",
+            "ok": False, "assertion": False, "simulated": False,
+            "blocked": True, "origin_blocked": True, "detail": block,
+        }]
+        _append_activity("origin_blocked", str(task_id), str(tool), block,
+                         origin=label)
+        try:
+            from core import actiongate
+            actiongate.note_blocked({
+                "kind": "origin_blocked",
+                "tool": str(tool or ""),
+                "task_id": str(task_id or ""),
+                "reason": str(block),
+                "origin": label,
+                "message": (f"A execucao de {tool or 'ferramenta'} foi "
+                            f"bloqueada: origem automatica em dispositivo "
+                            f"sensivel sem pedido do dono"),
+            })
+        except Exception as exc:
+            log.warning("could not route the origin-blocked notice: %s", exc)
+        log.warning("[Executor] ACAO BLOQUEADA (UV-4): tool=%s task=%s "
+                    "origin=%s", tool, task_id, label)
+        return result
+
+    @staticmethod
+    def _record_action(tool: str, task_id: str,
+                       result: ExecutorResult) -> None:
+        """Uma linha ``device_action`` por ação com efeito colateral (UV-4).
+
+        Ferramenta de leitura não polui o log: não é 'ação de dispositivo' no
+        sentido da queixa. O desfecho usa a verdade do portão, na mesma ordem
+        do resumo do orquestrador.
+        """
+        if not _tier_has_side_effects(_get_action_tier(str(tool))):
+            return
+        state = ("bloqueado" if result.blocked else
+                 "cancelado" if result.cancelled else
+                 "confirmacao_pendente" if result.pending_confirm else
+                 "sem_prova_material" if result.unverified else
+                 "ok" if result.ok else "falha")
+        _append_activity("device_action", task_id, str(tool),
+                         f"state={state}",
+                         origin=result.origin or _normalize_origin(""))
+
+    def _run_inner(self, task_id: str, tool: str,
+                   args: dict[str, Any] | None = None,
+                   *, requires_confirm: bool = False,
+                   cancel_event: Event | None = None,
+                   person: str = "",
+                   now: float | None = None) -> ExecutorResult:
         started = time.monotonic()
         args = dict(args or {})
         result = ExecutorResult(task_id=str(task_id))
