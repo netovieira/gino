@@ -44,6 +44,12 @@ def _get_base_dir() -> Path:
 
 BASE_DIR        = _get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
+# Prova material da abertura no app (UV-5): uma linha em logs/activity.log.
+# Editável para os testes escreverem em tmp e nunca no log da corrida real.
+ACTIVITY_LOG_PATH = BASE_DIR / "logs" / "activity.log"
+# O texto registrado no log é uma linha só, com teto: resposta longa do
+# media_control não incha o log nem quebra o formato.
+_EVENT_TEXT_CHARS = 90
 
 HEADERS = {
     "User-Agent": (
@@ -281,6 +287,119 @@ def _scrape_trending(region: str = "TR", max_results: int = 8) -> list[dict]:
         print(f"[YouTube] ⚠️ Trending scrape failed: {e}")
         return []
 
+
+def _log_activity(line: str) -> None:
+    """Uma linha em ``logs/activity.log`` no formato canônico ``[data hora] texto``.
+
+    Silenciosa por construção: registrar a prova nunca pode derrubar a resposta
+    dada ao dono (disco cheio, diretório ausente, permissão).
+    """
+    try:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        path = Path(ACTIVITY_LOG_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(f"[{stamp}] {line}\n")
+    except Exception as e:
+        print(f"[YouTube] ⚠️ registro no activity.log falhou: {e}")
+
+
+def _event_text(value: object, limit: int = _EVENT_TEXT_CHARS) -> str:
+    """Texto de uma linha só, cortado — o que vai no activity.log."""
+    return " ".join(str(value if value is not None else "").split())[:limit]
+
+
+def _music_event_line(*, alvo: str, app_id: str, perfil: str, pwa: bool,
+                      aberto: bool, resposta: str) -> str:
+    """A linha ``youtube_music_pwa`` do activity.log (UV-5, passo 5).
+
+    Campos estáveis e rastreáveis: quem pediu (``origem``), se o pedido saiu
+    pelo atalho instalado — o app, não a aba (``pwa``) — e qual atalho é esse
+    (``app_id``/``perfil``, ``ausente`` quando não há PWA instalado), o que foi
+    tocado (``alvo=home`` ou a busca), se alguma janela visível resultou
+    (``aberto``) e a frase exata devolvida ao dono (``resposta``).
+
+    ``pwa=0 aberto=1`` é o caso honesto do Chrome; ``pwa=0 aberto=0`` é a
+    falha. É exatamente a diferença que a métrica da UV-5 exige ver no log.
+    """
+    return (
+        "[Media] youtube_music_pwa origem=youtube_video "
+        f"pwa={1 if pwa else 0} app_id={app_id or 'ausente'} "
+        f"perfil={perfil or 'ausente'} "
+        f"alvo=\"{_event_text(alvo) or 'home'}\" aberto={1 if aberto else 0} "
+        f"resposta=\"{_event_text(resposta)}\""
+    )
+
+
+def _pwa_shortcut() -> tuple[str, str]:
+    """(app_id, perfil) do atalho instalado, ou ("", "") quando não existe.
+
+    Só para o registro: quem lança o app é o media_control. O acesso é
+    protegido — falha aqui não muda em nada a resposta ao dono.
+    """
+    try:
+        from actions import media_control as _mc
+        found = _mc._find_youtube_music_pwa()
+    except Exception as e:
+        print(f"[YouTube] ⚠️ busca do atalho PWA falhou: {e}")
+        return "", ""
+    if not found:
+        return "", ""
+    return str(found[0]), str(found[1])
+
+
+def _music_app_gate(query: str) -> tuple[bool, str]:
+    """(o pedido é o app do YouTube Music?, o que sobra para tocar).
+
+    A detecção vive em ``core/youtube_browser.py``, que é quem conhece as duas
+    superfícies do YouTube. Sem o detector disponível, o comportamento é o de
+    sempre (janela controlada): o portão só fecha quando ele tem certeza.
+    """
+    try:
+        from core import youtube_browser as _ytb
+    except Exception as e:
+        print(f"[YouTube] ⚠️ detector de app indisponível: {e}")
+        return False, ""
+    try:
+        if not _ytb.is_music_app(query):
+            return False, ""
+        return True, _ytb.music_remainder(query)
+    except Exception as e:
+        print(f"[YouTube] ⚠️ detector de app falhou: {e}")
+        return False, ""
+
+
+def _open_music_app(query: str, player) -> str:
+    """Abre o app instalado do YouTube Music (PWA) — nunca uma aba do Chrome.
+
+    ``media_control`` é o dono do atalho: sem query ele retoma o player que já
+    está no ar ou abre a home do app; com query, toca a busca dentro do próprio
+    app. O desfecho volta como resposta da ação e vira uma linha no
+    activity.log — a prova de que o pedido saiu da janela controlada.
+    """
+    app_id, perfil = _pwa_shortcut()
+    try:
+        from actions import media_control as _mc
+        resposta = str(_mc.media_control({"action": "play", "query": query},
+                                         player=player) or "")
+    except Exception as e:
+        print(f"[YouTube] ⚠️ app do YouTube Music falhou: {e}")
+        resposta = f"Não consegui abrir o YouTube Music: {e}"
+
+    lowered = resposta.casefold()
+    # Vocabulário do media_control: "… no app instalado" / "… no app do
+    # YouTube Music" é o PWA; "… na tela" é a janela do Chrome; "Achei …, mas
+    # não consegui abrir a janela" e "Não consegui …" são falha.
+    falhou = lowered.startswith(("não consegui", "nao consegui", "falha", "achei"))
+    aberto = bool(resposta) and not falhou
+    na_tela = "na tela" in lowered
+    pwa = aberto and bool(app_id) and not na_tela
+    _log_activity(_music_event_line(alvo=query, app_id=app_id, perfil=perfil,
+                                    pwa=pwa, aberto=aberto, resposta=resposta))
+    print(f"[YouTube] ▶️ youtube music (app): {resposta or 'sem resposta'}")
+    return resposta or "Não consegui abrir o YouTube Music."
+
+
 def _handle_play(parameters: dict, player) -> str:
     query = parameters.get("query", "").strip()
     if not query:
@@ -288,6 +407,14 @@ def _handle_play(parameters: dict, player) -> str:
 
     if player:
         player.write_log(f"[YouTube] Searching: {query}")
+
+    # "YouTube Music" é o aplicativo instalado (PWA), não um vídeo. A janela
+    # controlada aqui embaixo é uma janela do Chrome — abrir o app nela é
+    # exatamente a aba que a validação UV-5 recusa. O pedido sai desta ação
+    # antes de qualquer Playwright.
+    is_app, music_query = _music_app_gate(query)
+    if is_app:
+        return _open_music_app(music_query, player)
 
     # The controlled window is the preferred path: the video plays on screen,
     # in a browser this assistant can actually pause and skip, and the profile
@@ -326,8 +453,13 @@ def _handle_play(parameters: dict, player) -> str:
     return f"Opened YouTube search for: {query} (manual selection required)"
 
 
-def _handle_login(parameters: dict, player) -> str:
-    """Sign in to the YouTube window once; the profile keeps the session."""
+def _handle_login(parameters: dict, player, speak=None) -> str:
+    """Sign in to the YouTube window once; the profile keeps the session.
+
+    O despachador chama todo action que não é `play` com (params, player,
+    speak) — sem o terceiro argumento o pedido "faz login no youtube" morria
+    no TypeError antes de abrir a janela.
+    """
     try:
         from core import youtube_browser as _ytb
         return _ytb.open_login()
@@ -478,6 +610,10 @@ TOOL = {
         "'bota um vídeo de Y', 'coloca o clipe Z', 'quero ouvir tal banda', "
         "'toca tal playlist'. action='play' searches YouTube and plays the "
         "first result in a Chrome window this assistant controls, on screen. "
+        "Exception: when the request names the YouTube Music APP itself "
+        "('abre o YouTube Music', 'toca YouTube Music'), this action hands it "
+        "to `media_control`, which launches the installed PWA in its own app "
+        "window — it does not search the site for the words 'youtube music'. "
         "action='login' opens that window at the Google sign-in so the user's "
         "account is used — offer it once when a play happens on a window that "
         "is not signed in. Also handles 'summarize' (transcript + Gemini "

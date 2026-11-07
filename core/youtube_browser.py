@@ -18,11 +18,21 @@ TRANSPORTE
     O player é o do próprio YouTube: clicar em `.ytp-play-button` e
     `.ytp-next-button` é o mesmo que o dedo do usuário nesses botões — sem
     depender de teclas do sistema, que o Wayland bloqueia para outras janelas.
+
+O APP DO YOUTUBE MUSIC NÃO É DESTA JANELA
+    "toca o YouTube Music" nomeia o aplicativo instalado (o PWA que o Chrome
+    lança com `--app-id`), não uma busca no site. Quem abre esse app é
+    `actions/media_control.py`; as funções `is_music_app` / `music_remainder`
+    abaixo existem só para o pedido sair daqui e ir para lá. Deixá-lo aqui
+    seria abrir mais uma aba do Chrome — o que a validação UV-5 chama de
+    "não é o app".
 """
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
+import unicodedata
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
@@ -47,6 +57,88 @@ def _chrome_exe() -> Optional[str]:
         if Path(p).exists():
             return p
     return None
+
+
+# ── o pedido é o APP do YouTube Music? ──────────────────────────────────────
+#
+# Palavras e formas que o STT devolve para o aplicativo instalado. A
+# comparação é sem acento e sem caixa porque a mesma frase chega do microfone
+# como "YouTube Music", "youtube música" ou "yt music".
+_MUSIC_APP_WORDS = ("youtube music", "youtube musica", "youtube-musica",
+                    "youtube-music", "you tube music", "yt music", "ytmusic",
+                    "music youtube")
+_MUSIC_APP_RE = re.compile(
+    r"music\.?youtube\.com"
+    r"|\byou\s*tube[\s\-_]*m[uú]sica?"
+    r"|\byt[\s\-_]*m[uú]sica?"
+    r"|\bm[uú]sica?\s+you\s*tube\b"
+    r"|\bm[uú]sica?\s+do\s+youtube\b", re.I)
+# Sobras que não fazem parte do nome da música: artigos, o verbo do pedido e
+# os cortesia de sempre ("abre o youtube music" -> nada além do app).
+_MUSIC_FILLER_RE = re.compile(
+    r"\b(?:o|a|os|as|um|uma|the|app|aplicativo|site|plataforma|p[áa]gina|"
+    r"abre|abrir|inicia|iniciar|roda|lanca|toca|tocar|play|p[oe]e|coloca|"
+    r"bota|pra|pro|para|por|mim|agora|a[ií]|favor|meu|minha)\b", re.I)
+# Preposição só faz barulho na sobra quando sobra sozinha nas pontas; no meio
+# ela pode pertencer ao título ("música do filme X" fica como está).
+_MUSIC_EDGE_PREP_RE = re.compile(
+    r"^(?:\s*(?:de|do|da|dos|das|no|na|nos|nas)\b|\b(?:de|do|da|dos|das|"
+    r"no|na|nos|nas)\s*$)", re.I)
+# Quem pede um vídeo não pede o aplicativo: "o clipe do YouTube Music Awards"
+# volta para a janela controlada, onde o vídeo de fato toca.
+_NOT_APP_RE = re.compile(
+    r"\b(?:video|videos|clipe|clipes|show|shows|concerto|festival|awards|"
+    r"premiacao|trailer|documentario|entrevista|coletanea|compilado|"
+    r"novidades|review|tutorial)\b")
+
+
+def _plain(text: object) -> str:
+    """Minúsculas, sem acento e com espaços únicos — o formato da comparação."""
+    raw = unicodedata.normalize("NFKD", str(text if text is not None else ""))
+    stripped = "".join(c for c in raw if not unicodedata.combining(c))
+    return " ".join(stripped.casefold().split())
+
+
+def is_music_app(query: object) -> bool:
+    """True quando o pedido nomeia o app do YouTube Music (o PWA instalado).
+
+    "youtube music", "abre o youtube music", "music.youtube.com" -> o app.
+    "daft punk", "clipe de 2020", "o clipe do YouTube Music Awards" -> não é o
+    app: continua no YouTube de vídeo, na janela que esta página controla.
+    """
+    n = _plain(query)
+    if not n or _NOT_APP_RE.search(n):
+        return False
+    if "music.youtube.com" in n:
+        return True
+    if _MUSIC_APP_RE.search(str(query if query is not None else "")):
+        return True
+    return any(word in n for word in _MUSIC_APP_WORDS)
+
+
+def music_remainder(query: object) -> str:
+    """O resto do pedido sem o nome do app ("youtube music lofi" -> "lofi").
+
+    Vazio quando o dono só quer o aplicativo aberto: é o sinal para quem lança
+    o PWA abrir a home (ou retomar o player que já está no ar) em vez de
+    buscar a palavra "music" como se fosse música.
+
+    Fora do caso "app" a frase volta como veio: nada de cortar palavra de um
+    título que o dono pediu ("Daft Punk" continua "Daft Punk").
+    """
+    raw = str(query if query is not None else "")
+    if not is_music_app(raw):
+        return " ".join(raw.split())
+    rest = " ".join(_MUSIC_APP_RE.sub(" ", raw).split())
+    # Artigos e cortesia em voltas até a frase parar de encolher: "abre o
+    # youtube music pra mim agora" só fica limpo na segunda passada.
+    for _ in range(4):
+        nxt = " ".join(_MUSIC_EDGE_PREP_RE.sub(
+            " ", _MUSIC_FILLER_RE.sub(" ", rest)).split())
+        if nxt == rest:
+            break
+        rest = nxt
+    return rest
 
 
 class _Session:
