@@ -28,6 +28,7 @@ REPO = Path(__file__).resolve().parents[1]
 _MIRROR = [
     "skills/conversation/SKILL.md",
     "skills/execution/SKILL.md",
+    "skills/escopo-do-pedido/SKILL.md",
     "skills/actions/SKILL.md",
     "skills/voice/SKILL.md",
     "skills/personas/SKILL.md",

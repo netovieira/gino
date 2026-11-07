@@ -252,6 +252,8 @@ def sections(base_dir: Path) -> list[dict]:
     minhas = [
         _item(base, "Conversa — o que responder e quando", "skills/conversation/SKILL.md"),
         _item(base, "Execução — como trabalhar em ordem", "skills/execution/SKILL.md"),
+        _item(base, "Escopo do pedido — cumprimento literal do que o dono pediu",
+              "skills/escopo-do-pedido/SKILL.md"),
         _item(base, "Ações — o menu de ferramentas", "skills/actions/SKILL.md"),
         _item(base, "Voz — como falar", "skills/voice/SKILL.md"),
         _item(base, "Personas — quem é cada um", "skills/personas/SKILL.md"),

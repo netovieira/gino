@@ -903,7 +903,9 @@ _QODER_COMPACT_SECTIONS = {
         "Settle WHO/WHAT the request is about before answering. When a request "
         "is ambiguous, insufficient or a needed detail is missing, ASK the "
         "owner — never choose for him (owner's top law, 05/11/2026: he decides, "
-        "you execute). When a rule is not obvious, read the full protocol in "
+        "you execute). Deliver the artefact, type, channel and scale he asked "
+        "for — swapping them is disobedience (skills/escopo-do-pedido/SKILL.md, "
+        "07/11/2026). When a rule is not obvious, read the full protocol in "
         "core/prompt.txt.\n\n"
     ),
     "PERSONA": (
