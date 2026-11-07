@@ -28,12 +28,21 @@ FAILURE IS HONEST
     One attempt, one timeout, one error message. A picture that could not be
     described comes back as an exception the caller shows — never as an empty
     string that reads like "the screen is empty".
+
+WHAT COMES IN FROM WHATSAPP
+    `describe_file` is the same turn starting from a file on disk instead of
+    bytes in memory: a photo the assistant received lands in
+    `memory/whatsapp_media/`, the inbox item carries that path
+    (`core/whatsapp.py`), and `actions/file_processor.py` hands it here. The
+    answer is then about the file that arrived — never about what a text model
+    would guess from the caption.
 """
 from __future__ import annotations
 
 import io
 import os
 import tempfile
+from pathlib import Path
 
 from core import qoder
 
@@ -56,6 +65,14 @@ _SUFFIX = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
            "image/webp": ".webp", "image/gif": ".gif", "image/bmp": ".bmp"}
 _FORMAT_SUFFIX = {"png": ".png", "jpeg": ".jpg", "jpg": ".jpg",
                   "webp": ".webp", "gif": ".gif", "bmp": ".bmp"}
+# O caminho inverso, para o arquivo que já está no disco: a foto que chegou pelo
+# WhatsApp vem com a extensão, e é ela que diz o MIME do anexo.
+_SUFFIX_MIME = {".png": "image/png", ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg", ".webp": "image/webp",
+                ".gif": "image/gif", ".bmp": "image/bmp"}
+# Um arquivo maior que isto não é uma foto lida em um turno — é o download de
+# outra coisa. O limite evita estourar memória antes mesmo de chamar o CLI.
+MAX_FILE_BYTES = 25 * 1024 * 1024
 
 
 def _truthy(value, default: bool = True) -> bool:
@@ -159,3 +176,42 @@ def describe(image: bytes, mime: str, question: str, *,
     if not text:
         raise RuntimeError("a visão via Qoder voltou vazia")
     return text
+
+
+def describe_file(path: str, question: str = "", *,
+                  model: str | None = None,
+                  timeout: float | None = None) -> str:
+    """O que existe neste arquivo de imagem — uma foto que chegou no WhatsApp.
+
+    Mesma tentativa única e mesma honestidade de `describe`: arquivo que não
+    está no disco, não é imagem ou é grande demais levanta em vez de virar
+    descrição inventada. O MIME vem da extensão porque é ela que o download do
+    WhatsApp grava (`_media_filename`), e o `--prepare` ainda confere o formato
+    real do arquivo antes de mandar.
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        raise RuntimeError("nenhum arquivo de imagem para descrever")
+    p = Path(raw).expanduser()
+    try:
+        is_file = p.is_file()
+    except OSError:
+        is_file = False
+    if not is_file:
+        raise RuntimeError(f"não encontrei o arquivo de imagem: {p.name}")
+    mime = _SUFFIX_MIME.get(p.suffix.lower(), "")
+    if not mime:
+        raise RuntimeError(
+            f"{p.name} não é uma imagem que eu saiba ler "
+            f"({p.suffix or 'sem extensão'})")
+    try:
+        size = p.stat().st_size
+        if size > MAX_FILE_BYTES:
+            raise RuntimeError(
+                f"imagem grande demais para um turno ({size // 1048576} MB)")
+        image = p.read_bytes()
+    except RuntimeError:
+        raise
+    except OSError as e:
+        raise RuntimeError(f"não consegui ler {p.name}: {e}") from e
+    return describe(image, mime, question, model=model, timeout=timeout)

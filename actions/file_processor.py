@@ -14,6 +14,15 @@ Supported types:
   video   → trim, extract_audio, extract_frame, info, compress
   zip     → list, extract
   pptx    → summarize, extract_text, to_pdf
+
+WHAT ARRIVES BY WHATSAPP
+    A foto/documento que chegam no WhatsApp são baixados para
+    memory/whatsapp_media/ e o caminho local vem no item do inbox
+    (core/whatsapp.py devolve media["path"] em action=recent). Passar esse
+    caminho aqui é o fluxo completo: a imagem é lida pelo backend de visão
+    CONFIGURADO (core/vision.py, Qoder com --attachment) e a resposta vem do
+    arquivo, não da legenda. Com a visão desligada este módulo cai na escada
+    Gemini que já usava antes.
 """
 
 import os
@@ -85,6 +94,60 @@ def _output_path(src: Path, suffix: str, new_ext: str = None) -> Path:
     name = f"{src.stem}_{suffix}{ext}"
     return src.parent / name
 
+
+# ── visão: o arquivo lido pelo backend CONFIGURADO ──────────────────────────
+#
+# Desde a Fase 2 o "olho" do assistente é um só (core/vision.py → Qoder com
+# `--attachment`, ou o VL local quando `vision_provider = local`), e é por ele
+# que uma foto recebida no WhatsApp precisa passar. O Gemini abaixo continua
+# como escada de reserva: serve ainda hoje a PDF/CSV/código e entra quando a
+# visão está desligada ou falhou — nunca no lugar dela quando ela funciona.
+_VISION_ACTIONS = ("describe", "ocr", "analyze", "read", "extract_text")
+
+
+def _vision_backend():
+    """(modulo vision, config de visão) ou (None, None) se não houver cérebro."""
+    try:
+        from core import vision as _vision
+        from core import brain as _brain
+        from memory.config_manager import get_plugin_config
+        return _vision, _brain.settings(get_plugin_config)
+    except Exception as e:
+        print(f"[FileProcessor] visão indisponível: {e}")
+        return None, None
+
+
+def _vision_read(path: Path, prompt: str) -> tuple[str, str]:
+    """(texto, motivo). Texto != "" quando a visão leu o arquivo de verdade.
+
+    Motivo é "" quando leu, "off" quando a visão está desligada (aí o Gemini é
+    o caminho normal, não uma queda) e a mensagem do erro quando ela tentou e
+    não conseguiu — quem chama decide entre cair no Gemini ou dizer isso.
+    """
+    _vision, st = _vision_backend()
+    if _vision is None or st is None:
+        return "", "off"
+    if not _vision.enabled(st):
+        return "", "off"
+    try:
+        text = _vision.describe_file(
+            str(path), prompt,
+            model=st.get("vision_qoder_model"),
+            timeout=st.get("vision_timeout"))
+    except Exception as e:
+        return "", str(e)[:200]
+    return str(text or "").strip(), ""
+
+
+def _saved_long_result(path: Path, result: str, params: dict) -> str:
+    """Resultados de tela cheia vão para um .txt ao lado do arquivo."""
+    if len(result) > 500 and params.get("save", True):
+        out = _output_path(path, "result", ".txt")
+        out.write_text(result, encoding="utf-8")
+        return f"{result[:300]}...\n\nFull result saved to: {out}"
+    return result
+
+
 def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
     try:
         from PIL import Image
@@ -93,30 +156,43 @@ def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
 
     action = action or "describe"
 
-    if action in ("describe", "ocr", "analyze", "read", "extract_text"):
+    if action in _VISION_ACTIONS:
+        prompt = {
+            "describe": "Describe this image in detail.",
+            "ocr":      "Extract all text visible in this image. Return only the text, formatted clearly.",
+            "analyze":  "Analyze this image thoroughly: objects, colors, composition, any text, context.",
+            "read":     "Read all text in this image, preserving structure and formatting.",
+            "extract_text": "Extract all text from this image.",
+        }.get(action, "Describe this image.")
+
+        if params.get("instruction"):
+            prompt = params["instruction"]
+
+        # 1) O backend de visão configurado — o mesmo olho da tela. Uma
+        # descrição é lida em voz alta pelo assistente, então pede-se português
+        # (a extração de texto é neutra: ali o que vale é o que está na imagem).
+        v_prompt = (prompt + " Responda em português."
+                    if action in ("describe", "analyze") else prompt)
+        text, reason = _vision_read(path, v_prompt)
+        if text:
+            return _saved_long_result(path, text, params)
+        if reason != "off":
+            print(f"[FileProcessor] visão não leu a imagem ({reason}); "
+                  f"usando a escada Gemini")
+
+        # 2) Reserva: o Gemini (visão desligada, ou tentou e falhou).
         try:
             model  = _gemini_client()
             img    = Image.open(path)
-            prompt = {
-                "describe": "Describe this image in detail.",
-                "ocr":      "Extract all text visible in this image. Return only the text, formatted clearly.",
-                "analyze":  "Analyze this image thoroughly: objects, colors, composition, any text, context.",
-                "read":     "Read all text in this image, preserving structure and formatting.",
-                "extract_text": "Extract all text from this image.",
-            }.get(action, "Describe this image.")
-
-            if params.get("instruction"):
-                prompt = params["instruction"]
-
             response = model.generate_content([prompt, img])
             result   = response.text.strip()
-
-            if len(result) > 500 and params.get("save", True):
-                out = _output_path(path, "result", ".txt")
-                out.write_text(result, encoding="utf-8")
-                return f"{result[:300]}...\n\nFull result saved to: {out}"
-            return result
+            if reason and reason != "off":
+                result = f"{result}\n\n(a visão estava indisponível: {reason})"
+            return _saved_long_result(path, result, params)
         except Exception as e:
+            if reason and reason != "off":
+                return (f"Não consegui ver esta imagem: a visão falhou "
+                        f"({reason}) e o reserva também ({e}).")
             return f"AI image analysis failed: {e}"
 
     if action == "resize":
@@ -844,7 +920,7 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "file_processor",
-    "description": "Processes any file that the user has uploaded or dropped onto the interface. Use this when the user refers to an uploaded file and wants an action on it. Supports: images (describe/ocr/resize/compress/convert), PDFs (summarize/extract_text/to_word), Word docs & text files (summarize/fix/reformat/translate), CSV/Excel (analyze/stats/filter/sort/convert), JSON/XML (validate/format/analyze), code files (explain/review/fix/optimize/run/document/test), audio (transcribe/trim/convert/info), video (trim/extract_audio/extract_frame/compress/transcribe/info), archives (list/extract), presentations (summarize/extract_text). ALWAYS call this tool when a file has been uploaded and the user gives a command about it. If the user's command is ambiguous, pick the most logical action for that file type.",
+    "description": "Processes any file that the user has uploaded or dropped onto the interface, and any file already saved on this machine. Use this when the user refers to an uploaded file and wants an action on it. Supports: images (describe/ocr/resize/compress/convert), PDFs (summarize/extract_text/to_word), Word docs & text files (summarize/fix/reformat/translate), CSV/Excel (analyze/stats/filter/sort/convert), JSON/XML (validate/format/analyze), code files (explain/review/fix/optimize/run/document/test), audio (transcribe/trim/convert/info), video (trim/extract_audio/extract_frame/compress/transcribe/info), archives (list/extract), presentations (summarize/extract_text). ALWAYS call this tool when a file has been uploaded and the user gives a command about it. If the user's command is ambiguous, pick the most logical action for that file type. A photo or document received on WhatsApp is a file too: whatsapp_control (action=recent) returns its local path in the media item's 'path' field, and image actions here read it with the configured vision backend — that is how 'descreva essa imagem' is answered from the picture itself instead of the caption.",
     "parameters": {
         "type": "OBJECT",
         "properties": {

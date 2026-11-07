@@ -19,6 +19,16 @@ que o neonize precisa para medir e converter não vem do apt (instalar exigiria
 root): ele mora em tools/ffmpeg/, extraído dos .deb do Ubuntu, e este módulo o
 põe no PATH antes de qualquer coisa tocar no neonize.
 
+O QUE CHEGA VIRA ARQUIVO, E O ARQUIVO VIRA CONTEÚDO: o download é uma thread
+(``_download_media``) porque o link do WhatsApp morre; quando o arquivo pousa,
+o caminho entra no próprio item (``media["path"]``) e ``recent()``/``search()``
+devolvem esse caminho a quem for ler a mídia. É por aí que uma foto recebida
+chega à visão (``core/vision.describe_file``, chamada por
+``actions/file_processor.py``) e que um áudio chega à transcrição do app
+(``main._transcribe_whatsapp_audio``, que espera o mesmo caminho). Sem o campo
+`path` o arquivo existiria no disco e continuaria invisível: a resposta sobre a
+foto sairia da legenda, não da foto.
+
 EVENTOS DO DONO: o whatsmeow entrega o horário em MILISSEGUNDOS e, depois da
 migração para LID, o chat como ``<id>@lid`` (um identificador interno, não o
 telefone). Este módulo normaliza os dois — ver ``_stamp_seconds`` e
@@ -925,15 +935,41 @@ def _load_inbox(acct: _Account) -> list[dict]:
         return []
 
 
+def _with_media_path(item: dict, acct: _Account) -> dict:
+    """Item de inbox + o caminho do arquivo, quando ele está no disco.
+
+    Quem lê o inbox (a ferramenta, depois o modelo) precisa do arquivo EXATO
+    para chamar a visão ou a transcrição — sem o campo `path` a foto baixada
+    existe no disco mas é invisível para o fluxo, e a resposta vira suposição.
+    Grupo nunca expõe caminho: mídia de grupo não é baixada nem lida.
+    """
+    try:
+        media = item.get("media")
+        if not isinstance(media, dict) or item.get("group"):
+            return item
+        found = media_path(item, acct.name)
+        out = dict(item)
+        out["media"] = ({**media, "path": found} if found
+                        else {k: v for k, v in media.items() if k != "path"})
+        return out
+    except Exception:
+        return item
+
+
 def recent(limit: int = 10, only_incoming: bool = True,
            account: str | None = None) -> list[dict]:
-    """As últimas mensagens recebidas, da mais nova para a mais antiga."""
+    """As últimas mensagens recebidas, da mais nova para a mais antiga.
+
+    Mídia baixada vem com ``media["path"]`` — o arquivo local pronto para ser
+    lido pela visão (foto) ou pela transcrição (áudio).
+    """
     try:
         a = _A(account)
     except KeyError:
         return []
     items = [m for m in _load_inbox(a) if not (only_incoming and m.get("from_me"))]
-    return list(reversed(items))[:max(1, int(limit or 10))]
+    return [_with_media_path(m, a)
+            for m in list(reversed(items))[:max(1, int(limit or 10))]]
 
 
 def search(query: str, limit: int = 8, account: str | None = None) -> list[dict]:
@@ -947,7 +983,8 @@ def search(query: str, limit: int = 8, account: str | None = None) -> list[dict]
         return []
     hits = [m for m in _load_inbox(a)
             if q in _norm(m.get("text", "")) or q in _norm(m.get("name", ""))]
-    return list(reversed(hits))[:max(1, int(limit or 8))]
+    return [_with_media_path(m, a)
+            for m in list(reversed(hits))[:max(1, int(limit or 8))]]
 
 
 # ── contatos ─────────────────────────────────────────────────────────────────
@@ -1531,6 +1568,31 @@ def download_wanted() -> bool:
         return True
 
 
+def _media_saved(item: dict, dest: Path, *, already: bool = False) -> None:
+    """Registra no item o arquivo que está no disco — e avisa no log.
+
+    O caminho dentro do item é o elo que faltava entre "chegou uma foto" e
+    "descreva essa foto": sem ele a mensagem é só o rótulo ``[foto]`` e
+    qualquer resposta sobre o conteúdo sai da imaginação do modelo, não do
+    arquivo. ``recent()``/``search()`` devolvem este mesmo caminho para quem
+    processa o arquivo (visão, PDF, transcrição).
+
+    O log não escreve caminho nem número: a linha é só o tipo e o tamanho,
+    porque o mesmo texto pode ser lido em voz alta.
+    """
+    media = item.get("media")
+    if not isinstance(media, dict):
+        return
+    media = {**media, "path": str(dest)}
+    item["media"] = media
+    try:
+        kb = dest.stat().st_size // 1024
+    except OSError:
+        kb = 0
+    _log(f"{_spoken_media(media)} salva para processamento ({kb} KB)"
+         + (" — já estava baixada" if already else ""))
+
+
 def _download_media(client, message, item: dict, acct: _Account) -> None:
     """Baixa o anexo para a pasta de mídia da conta (link do WhatsApp expira)."""
     media = item.get("media") or {}
@@ -1543,6 +1605,7 @@ def _download_media(client, message, item: dict, acct: _Account) -> None:
         return
     dest = acct.media_dir / _media_filename(item)
     if dest.exists():
+        _media_saved(item, dest, already=True)
         return
     try:
         acct.media_dir.mkdir(parents=True, exist_ok=True)
@@ -1556,6 +1619,9 @@ def _download_media(client, message, item: dict, acct: _Account) -> None:
                 dest.unlink()
         except Exception:
             pass
+        return
+    if dest.exists():
+        _media_saved(item, dest)
 
 
 def _find_local(hint: str, acct: _Account) -> Path | None:
