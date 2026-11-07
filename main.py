@@ -149,6 +149,7 @@ from core import qoder_jobs as _qoder_jobs
 from core import job_grant as _job_grant
 from core import free_models as _free_models
 from core import owner_auth as _owner_auth
+from core import owner_law as _owner_law
 from core import voice_grants as _voice_grants
 from core import voice_identity as _voice_identity
 from core.viseme               import VisemeStream
@@ -6244,6 +6245,27 @@ class JarvisLive:
 
     def _bridge_dispatch(self, name: str, args: dict) -> str:
         """Run a JARVIS action for the bridge from its worker thread."""
+        # UC-5 — lei dura: nenhum caminho de ferramenta vai auditar a fala do
+        # dono (grep/verify sobre activity.log, memory/chat, transcrição). A
+        # ordem de 2026-11-05 22:27 não é de tom: é de roteamento. Verificação
+        # de AÇÃO (recibo HMAC, action_verifier) segue viva; o que se corta é
+        # interrogar o que ELE disse.
+        try:
+            bloqueio = _owner_law.blocks_owner_speech_audit(name, args)
+        except Exception as e:
+            bloqueio = ""
+            print(f"[OwnerLaw] bloqueio indisponivel: {e!r}")
+        if bloqueio:
+            print(f"[OwnerLaw] {bloqueio}")
+            try:
+                self.ui.write_log(f"SYS: {bloqueio}")
+            except Exception:
+                pass
+            return ("BLOQUEADO por ordem do dono (2026-11-05 22:27): nao se "
+                    "audita a fala dele. Reclamacao ou ordem dele abre defeito; "
+                    "nao rode grep/verify/audit sobre o historico dele para "
+                    "confirmar se e verdade. Responda o defeito aberto e a "
+                    "correcao.")
         if str(name) in ("qoder_job", "qoder_agent", "local_ask"):
             if not (str(name) == "qoder_job" and self._job_reply_action(args)):
                 return ("Essa ação não existe no chat ao vivo. Para executar qualquer "
@@ -7980,6 +8002,17 @@ class JarvisLive:
             print(f"[Fluxos] histórico da boca indisponível: {e!r}")
             return []
 
+    def _flows_owner_law(self, turn_id) -> str:
+        """UC-5: linha de lei do turno (vazio quando não foi reclamação/ordem)."""
+        rt = self._flows_get()
+        if rt is None or turn_id is None:
+            return ""
+        try:
+            return str(rt.owner_law_context(str(turn_id)) or "")
+        except Exception as e:
+            print(f"[Fluxos] lei do dono indisponivel: {e!r}")
+            return ""
+
     def _flows_memory_context(self, turn_id) -> str:
         """Bloco de memória que o orquestrador foi buscar neste turno (UC-1).
 
@@ -8711,6 +8744,13 @@ class JarvisLive:
                 if _mem:
                     _context = (f"{_context}\n{_mem}".strip()
                                 if _context else _mem)
+            # UC-5: se a fala dele foi reclamação/ordem, o cérebro recebe a
+            # lei junto com o contexto. É o único canal que impede o modelo de
+            # montar a checagem por conta própria.
+            _law = self._flows_owner_law(turn_id)
+            if _law:
+                _context = (f"{_context}\n{_law}".strip()
+                            if _context else _law)
             self._qoder_live.ask(
                 payload, speaker=speaker, id=turn_id,
                 priority="now" if preempt else None,

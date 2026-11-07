@@ -24,6 +24,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from core import owner_law as _owner_law
+
 from . import partial as _partial
 from . import router as _router
 from .config import FALLBACK_REMOTE, FlowsConfig
@@ -71,6 +73,12 @@ class TurnPlan:
     memory_failed: str = ""
     lookups_run: list[str] = field(default_factory=list)
     memory_wait: threading.Event = field(default_factory=threading.Event)
+    # UC-5: reclamação/ordem do dono abre defeito no mesmo turno. ``defect``
+    # é o registro escrito; ``owner_law`` é a linha de lei que vai ao prompt
+    # do cérebro (e só a ele: a boca não comenta a ordem, cumpre).
+    defect: dict[str, Any] = field(default_factory=dict)
+    defect_wait: threading.Event = field(default_factory=threading.Event)
+    owner_law: str = ""
 
     @property
     def route(self) -> str:
@@ -96,6 +104,7 @@ class _TurnState:
     prewarm_last_route: str = ""
     prewarm_logged_at: float = 0.0
     memory_thread: threading.Thread | None = None
+    defect_thread: threading.Thread | None = None
 
 
 class Orchestrator:
@@ -220,7 +229,71 @@ class Orchestrator:
         # ``memory_timeout_ms``. Turno bloqueado/cancelado não consulta.
         if not plan.blocked and not state.cancelled:
             self._start_memory_worker(plan)
+            self._open_owner_defect(plan)
         return plan
+
+    # ── lei do dono (UC-5) ──────────────────────────────────────────────────
+    def _open_owner_defect(self, plan: TurnPlan) -> None:
+        """Reclamação/ordem do dono vira defeito aberto, nunca verificação.
+
+        A ordem de 2026-11-05 22:27 é literal: o que ele diz não se audita.
+        A linha de lei é posta aqui (é string pronta) e a gravação do defeito
+        vai para um fio: ``begin()`` segura o brief da boca (passo 2, <1 s)
+        e disco nenhum pode entrar nesse caminho. O evento só sai quando o
+        registro existe — nunca antes.
+        """
+        if not plan.decision.owner_complaint:
+            return
+        plan.owner_law = _owner_law.law_line()
+        worker = threading.Thread(
+            target=self._record_owner_defect, args=(plan.turn_id,),
+            name="flows-owner-law", daemon=True)
+        with self._lock:
+            state = self._turns.get(plan.turn_id)
+            if state is None:
+                return
+            state.defect_thread = worker
+        worker.start()
+
+    def _record_owner_defect(self, turn_id: str) -> None:
+        with self._lock:
+            state = self._turns.get(str(turn_id))
+            plan = state.plan if state is not None else None
+        if plan is None:
+            return
+        try:
+            record = _owner_law.record_owner_complaint(plan.text)
+        except Exception as exc:
+            # Sem o registro não há o que fingir: o log diz o erro e o
+            # turno segue — a lei não pode derrubar a conversa.
+            self._event("owner_defect_error", str(turn_id),
+                        error=f"{type(exc).__name__}: {exc}")
+            plan.defect_wait.set()
+            return
+        if record:
+            plan.defect = record
+            self._event("owner_defect_opened", str(turn_id),
+                        defect_id=record.get("id", ""),
+                        intent=record.get("intent", ""), audit="blocked")
+        plan.defect_wait.set()
+
+    def owner_defect(self, turn_id: str, *,
+                     timeout_ms: int = 1500) -> dict[str, Any]:
+        """Registro do defeito aberto neste turno (espera o fio, com teto)."""
+        with self._lock:
+            state = self._turns.get(str(turn_id))
+            plan = state.plan if state is not None else None
+        if plan is None or not plan.decision.owner_complaint:
+            return {}
+        plan.defect_wait.wait(timeout=max(0.0, timeout_ms / 1000.0))
+        return dict(plan.defect or {})
+
+    def owner_law_context(self, turn_id: str) -> str:
+        """A linha de lei deste turno, para o chamador do cérebro injetar."""
+        with self._lock:
+            state = self._turns.get(str(turn_id))
+            plan = state.plan if state is not None else None
+        return str(plan.owner_law or "") if plan is not None else ""
 
     # ── memória (UC-1) ──────────────────────────────────────────────────────
     def _start_memory_worker(self, plan: TurnPlan) -> None:

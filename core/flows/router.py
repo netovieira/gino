@@ -19,6 +19,8 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from core import owner_law as _owner_law
+
 TRUST_OWNER = "owner"
 TRUST_UNTRUSTED = "untrusted"
 
@@ -209,6 +211,13 @@ class Decision:
     draft: str = ""
     blocked: bool = False
     trust: str = TRUST_OWNER
+    # UC-5: a fala do dono é reclamação/ordem? Marcador, NÃO uma rota nova: o
+    # turno continua pelo mesmo caminho de antes (a boca fala o brief em <1 s
+    # e o cérebro responde), porque criar rota nova mexeria no portão do
+    # passo 2. O que muda é o que o orquestrador faz com o turno: abre o
+    # defeito e leva a lei ao cérebro em vez de deixar o modelo auditar a
+    # fala dele.
+    owner_complaint: bool = False
 
     @property
     def route(self) -> str:
@@ -301,6 +310,14 @@ class Router:
                 d.brief_label = "conversar"
                 d.target = "o dono"
                 d.draft = "Certo, deixa eu te responder, criador."
+
+        if not d.actions and not d.cancel:
+            # UC-5: reclamação ou ordem do dono. NÃO muda a rota (o turno
+            # segue o caminho de sempre, para não encostar no portão de <1 s
+            # da boca); muda o que o orquestrador faz com ele: defeito aberto
+            # no mesmo turno e a lei entregue ao cérebro. Quem decide aqui é
+            # só o marcador — a regra mora em core.owner_law.
+            d.owner_complaint = _owner_law.is_owner_complaint(n)
 
         if d.actions or d.lookups:
             self.rule_decisions += 1

@@ -22,6 +22,18 @@ from core import voice_cohorts
 
 DEFAULT_OWNER_NAME = "Anthero"
 
+# UC-5 — lei dura: a fala do dono não é auditável. A regra mora em
+# ``core.owner_law`` (é regra de roteamento, não de voiceprint); este módulo
+# a expõe porque ``decide()`` é a resposta canônica de "quem falou", e a
+# reclamação do dono só vale quando vem dele. Ver
+# :func:`core.owner_law.audit_verdict_for_owner_speech`.
+from core import owner_law as _owner_law  # noqa: E402
+
+record_owner_complaint = _owner_law.record_owner_complaint
+open_defect = _owner_law.open_defect
+blocks_owner_speech_audit = _owner_law.blocks_owner_speech_audit
+owner_speech_verdict = _owner_law.audit_verdict_for_owner_speech
+
 # Mirrors core.speaker_id.VERDICT_INDECISIVE: under this much voiced audio the
 # embedding is not comparable, so the answer is neutral, never "intruder".
 MIN_VOICED_SECONDS = 0.8

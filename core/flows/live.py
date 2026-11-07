@@ -357,6 +357,20 @@ class FlowsRuntime:
                     "local_chat_ms": round(
                         (self.clock() - live.started_at) * 1000.0, 1)}
 
+    def owner_defect(self, turn_id: str) -> dict[str, Any]:
+        """UC-5: o defeito aberto por esta fala do dono (vazio se não houve)."""
+        try:
+            return dict(self.orchestrator.owner_defect(str(turn_id)) or {})
+        except Exception:
+            return {}
+
+    def owner_law_context(self, turn_id: str) -> str:
+        """UC-5: a lei "não auditar o dono" para o prompt deste turno."""
+        try:
+            return str(self.orchestrator.owner_law_context(str(turn_id)) or "")
+        except Exception:
+            return ""
+
     def memory_context(self, turn_id: str, *,
                        timeout_ms: int | None = None) -> str:
         """UC-1: bloco de memória consultada neste turno, para o prompt do cérebro.

@@ -13,7 +13,8 @@ description: Contrato de arquitetura do dono (FLUXOS.md) — fluxos de fala, exe
 
 4. **O índice de conformidade abaixo é evidência, não opinião.** Cada linha é FEITO, PARCIAL, AUSENTE ou CONFLITANTE com medição ou leitura de código que prove; sem evidência na mão, a linha fica PENDENTE. Nunca invente estado. Ao mexer em qualquer fluxo, remeça e atualize a linha correspondente com a data.
 
-## CONFORMIDADE (medido 05/11/2026, janela 22:02–22:35 no processo vivo)
+5. **A fala do dono não se audita (ordem dele, 2026-11-05 22:16–22:27; regra implementada na UC-5).** Reclamação ou ordem do dono é dado de entrada e abre DEFEITO no mesmo turno — nunca "verificando se é verdade". Está vedado rodar grep/verify/audit sobre `activity.log`, `memory/chat` ou histórico de transcrição para conferir o que ele disse. A regra é código: `core/owner_law.py` (`classify`, `record_owner_complaint`, `blocks_owner_speech_audit`), exposta em `core/owner_decision.py`, aplicada no roteador (`Decision.owner_complaint`), no orquestrador (evento `owner_defect_opened` + a lei no prompt do cérebro) e na tool bridge (`_bridge_dispatch` recusa a chamada). Não se confunde com a verificação de AÇÕES: recibo HMAC e `core/action_verifier.py` auditam o que o sistema FEZ e continuam obrigatórios; o que a ordem corta é interrogar a palavra do dono.
+
 
 Base da medição: processo pid=223429, boot `activity.log:17842` (`SYS: boot origem=aberto pelo usuário (GNOME) pid=223429 hora=2026-11-05 22:02:19`). Veredites: `FEITO` só com trecho literal no log vivo pós-boot; `EM DISCO SEM RASTRO` = existe no HEAD, zero linhas desde o boot; `AUSENTE` = nem no HEAD. Dado pessoal nos trechos é suprimido (`[…]`). Nota de carga: o commit 94886f4 (filtro de e-mail) entrou no main às 22:13:01, DEPOIS do boot — esse código está no disco em HEAD mas não no bytecode do processo vivo.
 
