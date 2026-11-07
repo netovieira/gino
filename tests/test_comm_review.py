@@ -406,3 +406,69 @@ def test_sanitized_and_cut_flags_are_counted_instead_of_guessed(env):
     text = report.read_text(encoding="utf-8")
     assert "Vazamentos na fala: 2 sanitizados" in text
     assert "cortes no meio: 1" in text
+
+
+# ── UV-8: integração no vivo — o boot liga o vigia e a thread fecha o ciclo ─
+
+def test_boot_wires_the_six_hour_review():
+    """O gancho vive no ``main.py``; este teste trava o fio do scheduler.
+
+    Sem ele a rotina "existe no código" mas ninguém a liga: cadência de 6 h,
+    logger na UI (avisos vão para o Activity Log) e a janela do dono como
+    portão do anúncio — tudo presente no ``JarvisLive.__init__``.
+    """
+    import inspect
+    import main
+
+    assert comm_review.INTERVAL_S == 6 * 3600.0
+    src = inspect.getsource(main.JarvisLive.__init__)
+    assert "from core import comm_review" in src
+    i = src.find("_comm_review.start(")
+    assert i != -1, "o boot não liga o vigia de revisão"
+    call = src[i:i + 400]
+    assert "logger=" in call and "ready=" in call
+    assert "_awake" in call and "muted" in call
+
+
+def test_daemon_thread_runs_the_six_hour_cycle_end_to_end(env):
+    """A thread real do ``start()`` vence a janela, grava state/relatório e
+    deixa o evento na fila de verdade — a prova de que a cadência roda
+    sozinha, sem chamar ``review_once`` à mão."""
+    activity_path, report, state = env
+    now = time.time()
+    state.write_text(json.dumps({"last_run": now - 7 * 3600, "offset": 0,
+                                 "pending": None}), encoding="utf-8")
+    _write(activity_path, [
+        _line(now - 7 * 3600 + 60, "YOU", "me ouviu?"),
+        _line(now - 7 * 3600 + 120, "Gino", "ouvi."),
+        _line(now - 3600, "YOU", "e a tarefa?"),
+    ])
+
+    comm_review.start(interval=6 * 3600, poll=1.0, ready=lambda: True)
+    saved: dict = {}
+    deadline = time.monotonic() + 15
+    try:
+        while time.monotonic() < deadline:
+            try:
+                saved = json.loads(state.read_text(encoding="utf-8"))
+            except Exception:
+                saved = {}
+            if float(saved.get("last_run") or 0.0) > now - 1.0:
+                break
+            time.sleep(0.05)
+    finally:
+        comm_review.stop()
+
+    assert float(saved.get("last_run") or 0.0) > now - 1.0, \
+        "o vigia de 6 h não executou a revisão na thread"
+    assert saved["offset"] == activity_path.stat().st_size
+    assert not saved.get("pending")       # o anúncio virou evento na fila
+
+    text = report.read_text(encoding="utf-8")
+    assert "# Revisão de comunicação" in text
+    assert "janela" in text and "falas do dono: 2" in text
+
+    events = [row for row in task_queue.list_tasks("open")
+              if (row.get("payload") or {}).get("source") == "comm_review"]
+    assert len(events) == 1 and events[0]["kind"] == "event"
+    assert "Revisão de comunicação pronta" in events[0]["title"]
