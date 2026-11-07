@@ -20,9 +20,11 @@ Nada deste arquivo toca o ``logs/activity.log`` do dono: com ``MIRROR_DIR`` em
 """
 from __future__ import annotations
 
+import inspect
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -473,3 +475,137 @@ def test_progress_notifier_exige_andamento_no_payload():
 
     assert notifier({})["spoken"] is False
     assert notifier({"text": "  "})["reason"] == "sem andamento"
+
+
+# ── o plugue no vivo: o boot da ponte instala o gancho (main.py) ───────────
+#
+# O contrato acima é fechado entre espelho e boca. Sem a linha no ``main.py``
+# ele nunca roda no processo real: o espelho grava a etapa, o evento sai
+# ``hook=ausente`` e o dono continua sem ouvir nada. Estes testes amarram o
+# boot — o mesmo estilo do ``TestBootWiring`` da webcam (UP-5), com o método
+# não ligado chamando sobre um stub.
+
+def _stub_rt(**over):
+    rt = SimpleNamespace(
+        config=_config(),
+        orchestrator=SimpleNamespace(
+            mouth=mouth_mod.Mouth(_config(),
+                                  caller=_caller("Mudança no código, criador."))))
+    for key, value in over.items():
+        setattr(rt, key, value)
+    return rt
+
+
+def _stub_live(falado: list[str]):
+    captured: list[str] = []
+    return SimpleNamespace(
+        ui=SimpleNamespace(write_log=captured.append),
+        _live_progress_speech=falado.append,
+        _captured=captured)
+
+
+def test_boot_pluga_o_gancho_na_construcao_da_ponte():
+    import main
+
+    assert hasattr(main.JarvisLive, "_flows_progress_hook")
+    src = inspect.getsource(main.JarvisLive._flows_get)
+    assert "self._flows_progress_hook(rt)" in src
+
+
+def test_boot_usa_o_caminho_do_andamento_nunca_o_say_now():
+    import main
+
+    fn = main.JarvisLive._flows_progress_hook
+    # o docstring explica por que NÃO é o _say_now: o que vale é o corpo
+    src = inspect.getsource(fn).replace(fn.__doc__ or "", "")
+    assert "speak=self._live_progress_speech" in src
+    assert "self._say_now" not in src
+    assert "self._flows_speak" not in src
+
+
+def test_boot_instala_e_a_etapa_nova_sai_pela_boca(espelho):
+    import main
+
+    e = espelho
+    falado: list[str] = []
+    stub = _stub_live(falado)
+    assert task_mirror.progress_hook() is None
+
+    assert main.JarvisLive._flows_progress_hook(stub, _stub_rt()) is True
+    assert task_mirror.progress_hook() is not None
+    assert any("progress_hook instalada=1 boca=1" in l for l in stub._captured)
+
+    _run(ident="trabalho-20", lines=("editar core/login.py",))
+
+    assert falado == ["Mudança no código, criador."]
+    line = _activity_lines(e["activity"])[-1]
+    assert "event=task_progress" in line and "hook=installado" in line
+    assert 'voice="Mudança no código, criador."' in line
+
+
+def test_boot_com_boca_desligada_instala_e_fica_calado(espelho):
+    import main
+
+    e = espelho
+    falado: list[str] = []
+    stub = _stub_live(falado)
+    rt = _stub_rt(config=_config(mouth_enabled=False),
+                  orchestrator=SimpleNamespace(
+                      mouth=mouth_mod.Mouth(_config(mouth_enabled=False))))
+
+    assert main.JarvisLive._flows_progress_hook(stub, rt) is True
+    _run(ident="trabalho-21", lines=("editar core/io.py",))
+
+    assert falado == []
+    assert any("progress_hook instalada=1 boca=0" in l for l in stub._captured)
+    line = _activity_lines(e["activity"])[-1]
+    assert "spoken=false" in line and "progresso sem boca" in line
+
+
+def test_boot_sem_boca_no_runtime_nao_segura_o_andamento(espelho, monkeypatch):
+    import main
+    from core.flows import mouth as boca_mod
+
+    e = espelho
+    falado: list[str] = []
+    stub = _stub_live(falado)
+    # runtime sem orquestrador: o gancho constrói a boca dele, do config.
+    # O modelo real nunca é chamado — o caller do módulo é o fake do arquivo.
+    monkeypatch.setattr(boca_mod, "stream_ollama",
+                        _caller("Mudança no código, criador."))
+    rt = SimpleNamespace(config=_config(), orchestrator=None)
+
+    assert main.JarvisLive._flows_progress_hook(stub, rt) is True
+    _run(ident="trabalho-22", lines=("editar core/io.py",))
+
+    assert falado == ["Mudança no código, criador."]
+    line = _activity_lines(e["activity"])[-1]
+    assert "event=task_progress" in line and "hook=installado" in line
+
+
+def test_boot_quebrado_nao_derruba_a_ponte(espelho, monkeypatch):
+    import main
+    from core.flows import mouth as boca_mod
+
+    falado: list[str] = []
+    stub = _stub_live(falado)
+
+    def explode(**kw):
+        raise RuntimeError("mouth indisponível")
+
+    monkeypatch.setattr(boca_mod, "progress_notifier", explode)
+    assert main.JarvisLive._flows_progress_hook(stub, _stub_rt()) is False
+    assert task_mirror.progress_hook() is None
+    assert falado == [] and stub._captured == []
+
+
+def test_log_de_boot_sobrevive_a_ui_sem_janela(espelho, monkeypatch):
+    import main
+
+    def explode(_text):
+        raise RuntimeError("sem janela")
+
+    stub = _stub_live([])
+    stub.ui = SimpleNamespace(write_log=explode)
+    # a boca do stub nunca é acionada aqui; só o log de boot falha
+    assert main.JarvisLive._flows_progress_hook(stub, _stub_rt()) is True
