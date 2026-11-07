@@ -7,7 +7,9 @@ aqui. A ponte cuida do que é específico do processo vivo:
 * agenda a checagem de estabilidade do parcial (a hipótese precisa parar de
   mudar antes de virar fala);
 * mantém o supervisor expirando chats efêmeros em segundo plano;
-* guarda as marcas de tempo por turno para medir 1ª frase/1º áudio.
+* guarda as marcas de tempo por turno para medir 1ª frase/1º áudio;
+* consulta o portão de atenção (UP-5) antes de cada fala — só suprime com a
+  flag opt-in ligada em ``config/webcam_attention.json``.
 """
 from __future__ import annotations
 
@@ -76,7 +78,9 @@ class FlowsRuntime:
                  memory: Callable[..., dict[str, Any]] | None = None,
                  start_expiry_thread: bool = True,
                  interim_ack_ms: float | None = None,
-                 latency_log: Callable[[str], None] | None = None):
+                 latency_log: Callable[[str], None] | None = None,
+                 attention: Any | None = None,
+                 attention_log: Callable[[str], None] | None = None):
         self.config = config
         self.speak = speak
         self.log = log or (lambda _msg: None)
@@ -91,6 +95,11 @@ class FlowsRuntime:
         # UC-2 (passo 6): métrica de latência ponta-a-ponta no activity.log.
         # Injetável para os testes nunca escreverem no log real.
         self._latency = latency_log or _mouth._log_activity
+        # UP-5: monitor de atenção por webcam. Quem decide se a fala sai é o
+        # orquestrador (``attention_gate``); a ponte só empresta o caminho de
+        # log. ``attention=None`` (legado) não muda nada no vivo.
+        self.attention = attention
+        self._attention_log = attention_log or _mouth._log_activity
         self.supervisor = Supervisor(clock=clock)
         # O executor é o dono do portão de ferramenta. O runner é injetado
         # pelo processo vivo (main.py); sem ele o executor continua o stub
@@ -104,7 +113,8 @@ class FlowsRuntime:
         self.orchestrator = Orchestrator(
             config, supervisor=self.supervisor, fallback=fallback,
             executor=executor, clock=clock, log=self.log,
-            assistant_name=assistant_name, history=history, memory=memory)
+            assistant_name=assistant_name, history=history, memory=memory,
+            attention=attention)
         self._turns: dict[str, _LiveTurn] = {}
         self._lock = threading.RLock()
         self._closed = False
@@ -569,6 +579,15 @@ class FlowsRuntime:
                       trust: str = "untrusted") -> dict[str, Any]:
         return self.orchestrator.monitor_event(source, text, trust=trust)
 
+    def attention_allows(self, *, reason: str = "notificacao") -> bool:
+        """Portão para quem entrega fora do turno (notificação de monitor).
+
+        É a mesma consulta da fala, exposta para o processo vivo usar antes
+        de avisar por WhatsApp/e-mail. Nenhuma chamada aqui é obrigatória
+        hoje: com a flag desligada o resultado é sempre True.
+        """
+        return self._attention_gate(str(reason))
+
     def expire(self) -> list[tuple[str, str]]:
         killed = self.orchestrator.expire()
         for chat, reason in killed:
@@ -591,6 +610,14 @@ class FlowsRuntime:
             self._turns.clear()
         for live in live_turns:
             self._cancel_timer(live)
+        # UP-5: a câmera do monitor é recurso do processo vivo — ao fechar a
+        # ponte ela é liberada (sem isso o dispositivo fica preso).
+        att = self.attention
+        if att is not None:
+            try:
+                att.stop()
+            except Exception:
+                pass
 
     # ── medição ─────────────────────────────────────────────────────────────
     def turn_metrics(self, turn_id: str) -> dict[str, Any]:
@@ -624,8 +651,60 @@ class FlowsRuntime:
         return data
 
     # ── plumbing ────────────────────────────────────────────────────────────
+    def _attention_gate(self, kind: str) -> bool:
+        """Portão de atenção (UP-5) — consulta, grava o evento e responde.
+
+        Retorna False só quando o gate está LIGADO por flag opt-in
+        (``config/webcam_attention.json``), a webcam já viu o usuário e ele
+        desviou o olhar/sumiu do enquadramento. Qualquer outro caso — sem
+        monitor, monitor desligado, falha do monitor — entrega a fala, que é
+        o comportamento de sempre. O ``attention_event`` vai ao activity.log
+        em todos os casos com monitor, inclusive desligado: é a prova de que
+        o portão foi consultado antes de falar.
+        """
+        if self.attention is None:
+            return True
+        try:
+            deliver = bool(self.orchestrator.attention_gate(reason=kind))
+        except Exception as exc:
+            self._log(f"[Fluxos] portão de atenção indisponível: {exc!r}")
+            return True
+        try:
+            event = dict(self.attention.attention_event())
+        except Exception:
+            event = {}
+        try:
+            # O estado bruto do detector ("attentive" do snapshot) pode ser
+            # False com a flag desligada — quem decide a entrega é a resposta
+            # do monitor, então é ela que vai na linha, junto do "deliver".
+            attentive = bool(self.attention.is_attentive)
+        except Exception:
+            attentive = bool(event.get("attentive"))
+        try:
+            self._attention_log(
+                f"[Fluxos] attention_event motivo={kind} "
+                f"deliver={int(deliver)} "
+                f"attentive={int(attentive)} "
+                f"face={int(bool(event.get('face_detected')))} "
+                f"olhando_tela={int(bool(event.get('looking_at_screen')))} "
+                f"enabled={int(bool(event.get('enabled')))} "
+                f"frames={int(event.get('total_frames') or 0)} "
+                f"rostos={int(event.get('total_faces') or 0)}")
+        except Exception:
+            pass
+        return deliver
+
     def _speak(self, live: _LiveTurn, text: str, *, kind: str) -> None:
         if self.speak is None or not text:
+            return
+        if not self._attention_gate(kind):
+            # UP-5: o usuário não está olhando para a tela e o gate está
+            # ligado (flag opt-in). A frase morre aqui, antes de qualquer
+            # marcador de tempo: o turno continua vivo, o cérebro segue
+            # trabalhando e a métrica de latência não é tocada.
+            live.notes.append(f"atencao:suprimida:{kind}")
+            self._log(f"[Fluxos] fala {kind} suprimida: usuário desatento "
+                      "(gate de atenção ligado)")
             return
         first_unit = not live.first_phrase_at
         if first_unit:

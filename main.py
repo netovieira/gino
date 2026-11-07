@@ -8045,6 +8045,7 @@ class JarvisLive:
                     executor_runner=readonly_runner,
                     history=self._flows_history,
                     memory=self._flows_memory_load,
+                    attention=self._flows_attention(),
                     assistant_name=str(getattr(self, "_asst_name", "") or "Gino"))
             except Exception as e:
                 print(f"[Fluxos] runtime não iniciou: {e!r}")
@@ -8052,6 +8053,65 @@ class JarvisLive:
                 return None
             self._flows_rt = rt
             return rt
+
+    # UP-5 (Fase 6 TASK7): o gate de atenção por webcam é plugado AQUI, no
+    # boot da ponte, porque só o orquestrador decide falar e ele recebe o
+    # monitor pelo argumento ``attention=``. Antes disso o módulo existia e
+    # nenhum processo vivo o instanciava — o "gate" nunca foi consultado.
+    def _flows_attention(self):
+        """Instancia (uma vez) o ``AttentionMonitor`` do gate de atenção.
+
+        A flag é opt-in: ``config/webcam_attention.json`` com
+        ``enabled: false`` (default) mantém o comportamento vivo exatamente
+        como hoje — o monitor é criado e registrado no log, mas não abre a
+        webcam e jamais silencia fala. Com ``enabled: true`` a thread de
+        captura sobe e a boca passa por ``attention_gate`` antes de cada
+        frase. Ligar no vivo é decisão pendente do dono.
+        """
+        cached = getattr(self, "_attention_monitor", None)
+        if cached is not None:
+            return cached
+        monitor = None
+        try:
+            from core import webcam_attention as _attn
+            cfg = _attn.AttentionConfig.load()
+            monitor = _attn.build_monitor(
+                cfg, on_transition=self._flows_attention_transition)
+            monitor.start()  # no-op com enabled=false: nenhum dispositivo aberto
+            self._attention_monitor = monitor
+            line = ("[fluxos] attention_boot "
+                    f"enabled={int(cfg.enabled)} device={cfg.device} "
+                    f"fps={cfg.fps:.2f} rodando={int(monitor.is_running)}")
+            try:
+                self.ui.write_log(_activity.with_meta(
+                    line, _activity.make_meta(chan="sistema",
+                                              origin="attention")))
+            except Exception:
+                print(line)
+            print(f"[Atenção] gate "
+                  f"{'LIGADO' if cfg.enabled else 'desligado (flag opt-in)'}; "
+                  f"camera={'aberta' if monitor.is_running else 'fechada'}")
+        except Exception as e:
+            print(f"[Atenção] monitor indisponível: {e!r}")
+            monitor = None
+        return monitor
+
+    def _flows_attention_transition(self, attentive: bool, when: float) -> None:
+        """Evento ``attention_event`` de transição no log (UP-5).
+
+        Dispara na thread da webcam quando o estado muda; nunca quebra o
+        monitor se o log falhar (o chamador já isola, e aqui também).
+        """
+        line = (f"[fluxos] attention_event motivo=transicao "
+                f"attentive={int(bool(attentive))} t={float(when):.3f}")
+        try:
+            self.ui.write_log(_activity.with_meta(
+                line, _activity.make_meta(chan="sistema", origin="attention")))
+        except Exception:
+            try:
+                self.ui.write_log(line)
+            except Exception:
+                pass
 
     def _flows_speak(self, text: str) -> None:
         # Ponto de saída da boca: a lei do dono (04/11/2026) é aplicada AQUI

@@ -730,15 +730,36 @@ class Orchestrator:
         except Exception:
             return True
 
-    def log_attention_event(self) -> None:
-        """Registra o estado de atenção no log de eventos do orquestrador."""
+    def log_attention_event(self, *, reason: str = "",
+                            delivered: bool | None = None) -> None:
+        """Registra o estado de atenção no log de eventos do orquestrador.
+
+        UP-5: o evento chama-se ``attention_event`` e é gravado SEMPRE que o
+        monitor existe — com o gate desligado ele ainda é a prova de que o
+        portão foi consultado. Sem monitor, nenhum evento sai (legado).
+        """
         if self.attention is None:
             return
         try:
-            event = self.attention.attention_event()
-            self._event("attention", **event)
+            event = dict(self.attention.attention_event())
         except Exception:
-            pass
+            event = {"error": "monitor indisponível"}
+        if delivered is None:
+            event["deliver"] = event.get("attentive")
+        else:
+            event["deliver"] = bool(delivered)
+        self._event("attention_event", reason=str(reason), **event)
+
+    def attention_gate(self, *, reason: str = "fala") -> bool:
+        """Portão único de entrega (UP-5): consulta, registra e responde.
+
+        É o caminho que a ponte viva usa antes de abrir a boca. Sem monitor
+        injetado, sempre entrega — comportamento legado, nenhum evento.
+        """
+        deliver = self.should_deliver_notification()
+        if self.attention is not None:
+            self.log_attention_event(reason=reason, delivered=deliver)
+        return deliver
 
     def _event(self, kind: str, *args: Any, **fields: Any) -> None:
         if not self.config.log_events:

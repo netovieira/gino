@@ -27,10 +27,13 @@ Uso:
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Protocol
 
 try:
@@ -73,6 +76,78 @@ MIN_FACE_SIZE = 40
 # Resolução de captura (baixa para velocidade).
 CAPTURE_WIDTH = 320
 CAPTURE_HEIGHT = 240
+
+
+# ── configuração (flag opt-in do gate) ──────────────────────────────────────
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "webcam_attention.json"
+ENV_CONFIG_PATH = "JARVIS_WEBCAM_ATTENTION_CONFIG"
+
+
+@dataclass(frozen=True)
+class AttentionConfig:
+    """Flag do gate de atenção — ``config/webcam_attention.json``.
+
+    ``enabled`` é **opt-in** e o default é ``False``: enquanto o dono não
+    ligar a flag, o monitor existe, o portão é consultado e o evento
+    ``attention_event`` é gravado, mas nenhuma fala é suprimida — o vivo
+    continua falando exatamente como falava antes. Ligar o gate é decisão
+    de produto ainda pendente (UP-5, 2026-11-07).
+
+    Arquivo ausente, quebrado ou com chave desconhecida nunca derruba o
+    boot: vale o default (a mesma regra de ``config/flows.json``).
+    """
+
+    enabled: bool = False
+    device: int = 0
+    fps: float = DEFAULT_CAPTURE_FPS
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "AttentionConfig":
+        data = data if isinstance(data, dict) else {}
+        try:
+            device = int(data.get("device", 0))
+        except (TypeError, ValueError):
+            device = 0
+        try:
+            fps = float(data.get("fps", DEFAULT_CAPTURE_FPS))
+        except (TypeError, ValueError):
+            fps = DEFAULT_CAPTURE_FPS
+        return cls(enabled=bool(data.get("enabled", False)),
+                   device=max(0, device),
+                   fps=min(10.0, max(0.1, fps)))
+
+    @classmethod
+    def load(cls, path: str | os.PathLike[str] | None = None
+             ) -> "AttentionConfig":
+        path = Path(path or os.environ.get(ENV_CONFIG_PATH)
+                    or DEFAULT_CONFIG_PATH)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return cls()
+        return cls.from_dict(data)
+
+
+def build_monitor(
+    config: AttentionConfig | None = None,
+    *,
+    config_path: str | os.PathLike[str] | None = None,
+    camera: CameraSource | None = None,
+    detector: FaceAttentionDetector | None = None,
+    on_transition: Callable[[bool, float], None] | None = None,
+) -> AttentionMonitor:
+    """Monta o monitor a partir da flag opt-in (nunca abre a câmera aqui).
+
+    Com ``enabled=False`` o ``AttentionMonitor`` nem sobe a thread: nenhuma
+    webcam é ocupada e ``is_attentive`` responde True (presença assumida).
+    """
+    cfg = (config if isinstance(config, AttentionConfig)
+           else AttentionConfig.load(config_path))
+    return AttentionMonitor(enabled=cfg.enabled, device=cfg.device,
+                            fps=cfg.fps, camera=camera, detector=detector,
+                            on_transition=on_transition)
 
 
 # ── Protocolos (injeção de dependência) ─────────────────────────────────────
@@ -395,13 +470,28 @@ class AttentionMonitor:
     # ── integração com orquestrador ──────────────────────────────────────
 
     def should_notify(self) -> bool:
-        """Se o sistema deve enviar notificação ao usuário agora.
+        """Se o sistema deve entregar fala/notificação agora.
 
         Retorna True quando:
+
         - o monitor está desabilitado (presença assumida), ou
+        - a webcam ainda nunca confirmou presença alguma (``total_faces``
+          é zero), ou
         - o usuário está atento.
+
+        O meio da lista é o *fail-open* do gate (UP-5): câmera quebrada,
+        tampada ou fora do enquadramento desde o boot não pode calar o
+        assistente inteiro. Sem evidência positiva de rosto, "desatento" é
+        suspeita de sensor, não fato — e a lei do código é não fingir fato.
+        A supressão real só começa depois que o monitor viu o usuário e
+        perdeu o rosto/olhar.
         """
-        return self.is_attentive
+        if not self._enabled:
+            return True
+        with self._lock:
+            if self._state.total_faces == 0:
+                return True
+            return self._state.attentive
 
     def attention_event(self) -> dict[str, Any]:
         """Snapshot para o orquestrador registrar no log de eventos."""
