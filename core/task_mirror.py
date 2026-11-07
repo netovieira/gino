@@ -32,6 +32,19 @@ UP-7 (FLUXO TRABALHO, passo 4)
     Obsidian ou sem plano: a falha volta como mensagem honesta e uma linha no
     log; jamais quebra o turno.
 
+NOTIFICAÇÃO DE ANDAMENTO (UP-8, FLUXO TRABALHO passos 6-7)
+    Gravar no log não chega ao dono que está longe da tela: o passo 6 manda
+    "notificar a boca a cada mudança". Cada linha realmente nova que entra no
+    espelho passa por ``on_progress_update``, que decide (etapa nova OU janela
+    mínima do mesmo andamento), grava ``event=task_progress`` no activity.log e
+    chama o gancho instalado por ``set_progress_hook`` — no processo vivo, a boca
+    (``core.flows.mouth.progress_notifier``). Sem gancho instalado o evento fica
+    no log com ``hook=ausente``: há evidência da etapa, e ninguém inventa fala.
+    Os tetos são os módulos de baixo, não deste: ``PROGRESS_GAP_S`` (mesma
+    etapa) e ``PROGRESS_STAGE_GAP_S`` (piso entre etapas), com as alavancas
+    ``JARVIS_MIRROR_PROGRESS_GAP_S`` / ``JARVIS_MIRROR_PROGRESS_STAGE_GAP_S``.
+    Nunca levanta: notificar é consequência do log, não pré-condição dele.
+
 CICLO DE VIDA DA JANELA
     A janela nasce com a execução e morre com ela: o pid do terminal é anotado
     no nascimento e, em ``finish`` (sucesso, erro ou cancelamento), é terminado
@@ -88,12 +101,51 @@ _NOTE_FOLDER = "Planos"
 _NOTE_PROGRESS = 80
 _NOTE_LINE = 200
 
+# ── notificação de andamento (UP-8) ─────────────────────────────────────────
+ACTIVITY_LOG = BASE_DIR / "logs" / "activity.log"
+_DEFAULT_MIRROR_DIR = Path(MIRROR_DIR)
+
+PROGRESS_GAP_S = 45.0        # mesmo andamento: no máximo uma notícia por janela
+PROGRESS_STAGE_GAP_S = 12.0  # etapa diferente: piso contra o gotejo do transcrito
+PROGRESS_GAP_ENV = "JARVIS_MIRROR_PROGRESS_GAP_S"
+PROGRESS_STAGE_GAP_ENV = "JARVIS_MIRROR_PROGRESS_STAGE_GAP_S"
+_PROGRESS_GAP_MAX = 600.0
+_PROGRESS_TEXT = 180         # o que vai no log de auditoria
+_HOOK_TEXT = 400             # o que o gancho (a boca) recebe para frasear
+
+# "$ pytest -q" é teste, não comando qualquer: é a etapa que o dono quer ouvir.
+_TEST_RE = re.compile(
+    r"\b(?:pytest|unittest|jest|vitest|npm\s+test|yarn\s+test|ctest|mvn\s+test"
+    r"|cargo\s+test|go\s+test|phpunit|rspec)\b")
+
+# Rótulos de etapa: o que o dono ouve é "mudou o andamento", não a ferramenta.
+_STAGE_BY_PREFIX = (
+    ("$ ", "comando"),
+    ("editar ", "edicao"),
+    ("ler ", "leitura"),
+    ("buscar ", "busca"),
+    ("listar ", "busca"),
+    ("abrir ", "consulta_externa"),
+    ("pesquisar ", "consulta_externa"),
+    ("subagente:", "delegacao"),
+    ("organizar o plano", "plano"),
+    ("▸ subagente:", "inicio"),
+    ("» ", "resposta"),
+    ("│ ", "resultado"),
+    ("… usando", "ferramenta"),
+    ("… ", "resumo"),
+    ("· ", "nota"),
+    ("── ", "fim"),
+)
+
 _lock = threading.RLock()
 _entries: dict[str, dict] = {}
 _aliases: dict[str, str] = {}
 _last_active: str | None = None
 # Mantém as threads vivas para o collector não as destruir no meio.
 _tailers: list[threading.Thread] = []
+# ``on_progress_update`` de fora do módulo: a boca do processo vivo.
+_progress_hook = None
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -467,6 +519,8 @@ def _new_entry(ident: str, title: str, source: str) -> dict:
         "stop": threading.Event(),
         "windows": [],       # pids das janelas abertas para este espelho
         "active": set(),     # subagentes que ainda usam esta janela
+        "notify": {"at": 0.0, "stage": "", "text": ""},   # UP-8: ritmo da voz
+        "progressed": False,
     }
 
 
@@ -505,6 +559,8 @@ def _attach_existing(ident: str, title: str = "", source: str = "disk") -> dict:
         "stop": threading.Event(),
         "windows": [],
         "active": set(),
+        "notify": {"at": 0.0, "stage": "", "text": ""},
+        "progressed": False,
     }
     entry["stop"].set()
     _entries[ident] = entry
@@ -545,8 +601,14 @@ def begin(ident, title: str = "", source: str = "task",
             "log": snapshot.get("path", ""), "opened": should_open}
 
 
-def append(ident, text: str, prefix: str = "") -> None:
-    """Acrescenta uma linha com horário ao log da execução (ou do alias)."""
+def append(ident, text: str, prefix: str = "", notify: bool = True) -> None:
+    """Acrescenta uma linha com horário ao log da execução (ou do alias).
+
+    ``notify`` (UP-8): a linha gravada é o andamento, então ela também passa por
+    ``on_progress_update`` — que corta repetição, respeita a janela e só então
+    registra ``task_progress`` e chama a boca. Linhas de burocracia do próprio
+    espelho (plano aberto, fim) nascem com ``notify=False``.
+    """
     try:
         body = _one_line(text)
         if not body:
@@ -572,6 +634,8 @@ def append(ident, text: str, prefix: str = "") -> None:
         with path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
             fh.flush()
+        if notify:
+            on_progress_update(key, prefix + body)
     except Exception as exc:  # noqa: BLE001 - log não pode quebrar o turno
         print(f"[TaskMirror] append falhou ({ident}): {exc}")
 
@@ -598,9 +662,9 @@ def finish(ident, status: str = "done", summary: str = "") -> None:
              "failed": "falhou", "error": "falhou",
              "cancelled": "cancelado", "stopped": "parado"}.get(
                  str(status or "").strip().lower(), str(status or "fim"))
-    append(key, f"── fim: {label} ──", prefix="")
+    append(key, f"── fim: {label} ──", prefix="", notify=False)
     if summary:
-        append(key, summary)
+        append(key, summary, notify=False)
     if busy:
         return                      # o fim que importa é o da última execução
     try:
@@ -835,6 +899,206 @@ def _start_tailer(key: str, task_id: str, session_id: str,
     with _lock:
         _tailers[:] = [t for t in _tailers if t.is_alive()]
         _tailers.append(thread)
+
+
+# ── notificação de andamento (UP-8) ─────────────────────────────────────────
+
+def classify_stage(text) -> str:
+    """Rótulo da etapa a partir de uma linha gravada no espelho.
+
+    A boca não anuncia ferramenta nem caminho (lei do guard): o que sobe para
+    ela é a CLASSE do que mudou ("edicao", "testes", "comando"), nunca o
+    comando cru. Linha sem classe reconhecida devolve "" e vale como
+    "andamento", não como etapa nova.
+    """
+    line = _one_line(text, _HOOK_TEXT)
+    if not line:
+        return ""
+    low = line.lower()
+    if low.startswith("$ ") and _TEST_RE.search(line):
+        return "testes"
+    for prefix, stage in _STAGE_BY_PREFIX:
+        if low.startswith(prefix.lower()):
+            return stage
+    return ""
+
+
+def _progress_gap(name: str, default: float) -> float:
+    """Teto de notificação, com alavanca de ambiente (o dono decide o ritmo)."""
+    try:
+        raw = os.environ.get(name, "")
+    except Exception:
+        return float(default)
+    if not str(raw or "").strip():
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    if not value > 0:
+        return float(default)
+    return min(_PROGRESS_GAP_MAX, value)
+
+
+def _log_event(event: str, **fields) -> None:
+    """Uma linha ``event=... chave="valor"`` no activity.log. Nunca levanta.
+
+    Mesmo molde de ``core.obsidian``: é a evidência de que a etapa aconteceu,
+    lida pela auditoria (FLUXO TRABALHO passo 6).
+    """
+    try:
+        parts = [f"event={event}"]
+        for key, value in fields.items():
+            if value is None or value == "":
+                continue
+            text = str(value).replace('"', "'").replace("\n", " ")
+            parts.append(f'{key}="{text}"' if " " in text else f"{key}={text}")
+        path = _activity_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                     f"{' '.join(parts)}\n")
+            fh.flush()
+    except Exception:      # noqa: BLE001 - registrar não pode quebrar o log
+        pass
+
+
+def _activity_path() -> Path:
+    """O activity.log onde o espelho registra a etapa.
+
+    Produção: ``logs/activity.log`` (o mesmo arquivo do resto do sistema).
+    Teste com ``MIRROR_DIR`` em ``tmp_path``: o evento cai ao lado, no tmp —
+    rodar a suite não enche o log de auditoria do dono de etapas falsas.
+    """
+    override = os.environ.get("JARVIS_MIRROR_ACTIVITY_LOG", "").strip()
+    if override:
+        return Path(override).expanduser()
+    try:
+        mirror = Path(MIRROR_DIR)
+        if mirror != _DEFAULT_MIRROR_DIR:
+            return mirror.parent / "activity.log"
+    except Exception:      # noqa: BLE001 - caminho ruim não bloqueia o log
+        pass
+    return Path(ACTIVITY_LOG).expanduser()
+
+
+def set_progress_hook(handler) -> None:
+    """Instala o ``on_progress_update`` de fora: ``handler(payload)``.
+
+    No processo vivo é ``core.flows.mouth.progress_notifier(speak=...)``. Roda
+    na thread que gravou a linha (tail do transcrito ou fila), então o handler
+    tem de ser thread-safe e nunca pode travar o espelho — o custo de falar já
+    é do próprio handler. ``None`` desliga a voz e mantém o evento no log.
+    """
+    global _progress_hook
+    _progress_hook = handler if callable(handler) else None
+
+
+def progress_hook():
+    """O gancho instalado (``None`` quando a voz não está plugada)."""
+    return _progress_hook
+
+
+def on_progress_update(ident, text: str, *, stage: str = "",
+                       force: bool = False) -> dict:
+    """Decide, registra e voz: a mudança de andamento do espelho (UP-8).
+
+    Chamar ``append`` já faz isso para a linha gravada; a função é pública para
+    os eventos que não passam por uma linha de log (o progresso do sidecar com
+    um resumo novo) e para os testes. Regras duras:
+
+    * espelho encerrado ou inexistente: nada;
+    * mesma linha de novo: nada (o dedupe do log já cortou, aqui é a voz);
+    * mesma etapa: só depois de ``PROGRESS_GAP_S``;
+    * etapa nova: só depois de ``PROGRESS_STAGE_GAP_S``;
+    * a primeira notícia de uma execução sai na hora.
+
+    Nunca levanta e devolve ``{"ok", "notified", "reason"}``.
+    """
+    key = _resolve(ident) or str(ident or "")
+    line = _one_line(text, _HOOK_TEXT)
+    if not key or not line:
+        return {"ok": False, "notified": False, "reason": "sem conteudo"}
+    label = (stage or classify_stage(line))[:40]
+    payload: dict | None = None
+    hook = None
+    with _lock:
+        entry = _entries.get(key)
+        if entry is None:
+            return {"ok": False, "notified": False, "reason": "sem espelho"}
+        if entry.get("done"):
+            return {"ok": False, "notified": False, "reason": "encerrado"}
+        state = entry.get("notify")
+        if state is None:
+            state = entry["notify"] = {"at": 0.0, "stage": "", "text": ""}
+        now = time.monotonic()
+        gap = _progress_gap(PROGRESS_GAP_ENV, PROGRESS_GAP_S)
+        floor = _progress_gap(PROGRESS_STAGE_GAP_ENV, PROGRESS_STAGE_GAP_S)
+        waited = now - float(state.get("at") or 0.0)
+        same_stage = bool(label) and state.get("stage") == label
+        reason = ""
+        if state.get("text") == line and not force:
+            reason = "andamento repetido"
+        elif float(state.get("at") or 0.0) and not force:
+            if same_stage and waited < gap:
+                reason = f"mesma etapa ha {waited:.0f}s"
+            elif waited < floor:
+                reason = f"janela de {floor:.0f}s"
+        if reason:
+            return {"ok": True, "notified": False, "reason": reason}
+        state.update({"at": now, "stage": label, "text": line})
+        entry["updated"] = now
+        hook = _progress_hook
+        payload = {
+            "event": "task_progress",
+            "id": key,
+            "title": _one_line(entry.get("title"), 160),
+            "source": str(entry.get("source") or ""),
+            "log": str(entry.get("path") or ""),
+            "stage": label,
+            "text": line,
+            "elapsed_s": round(max(0.0, now - float(
+                entry.get("created") or now)), 1),
+            "first": not bool(entry.get("progressed")),
+        }
+        entry["progressed"] = True
+
+    spoken: bool | None = None
+    sentence = ""
+    reason = ""
+    error = ""
+    if hook is None:
+        hook_state = "ausente"
+    else:
+        hook_state = "installado"
+        try:
+            result = hook(dict(payload))
+            if isinstance(result, dict):
+                spoken = bool(result.get("spoken"))
+                sentence = _one_line(result.get("sentence") or "", 200)
+                reason = _one_line(result.get("reason") or "", 160)
+            else:
+                spoken = bool(result)
+        except Exception as exc:  # noqa: BLE001 - falar não pode quebrar o espelho
+            error = f"{type(exc).__name__}: {str(exc)[:200]}"
+            spoken = False
+    _log_event(
+        "task_progress",
+        id=payload["id"],
+        title=payload["title"],
+        stage=payload["stage"] or "andamento",
+        text=payload["text"][:_PROGRESS_TEXT],
+        source=payload["source"],
+        elapsed_s=payload["elapsed_s"],
+        hook=hook_state,
+        spoken=("" if spoken is None else str(spoken).lower()),
+        voice=sentence,
+        reason="" if spoken else (reason or error),
+        error=error,
+    )
+    return {"ok": True, "notified": True, "reason": "",
+            "stage": payload["stage"], "hook": hook is not None,
+            "spoken": spoken, "sentence": sentence, "error": error or reason}
 
 
 # ── subagent / queue hooks ──────────────────────────────────────────────────
@@ -1184,7 +1448,7 @@ def open_plan(ident=None, query: str = "", plan: str = "") -> dict:
         from core import obsidian
     except Exception as exc:  # noqa: BLE001 - cofre indisponível não quebra a fala
         message = f"O módulo do cofre não está disponível: {exc}"
-        append(key, f"· plano não abriu no Obsidian: {message}")
+        append(key, f"· plano não abriu no Obsidian: {message}", notify=False)
         return {"ok": False, "id": key, "title": snapshot.get("title", ""),
                 "note": "", "nextcloud": "", "registered": False,
                 "message": message}
@@ -1201,14 +1465,15 @@ def open_plan(ident=None, query: str = "", plan: str = "") -> dict:
     note = str(result.get("path") or "")
     message = str(result.get("message") or "")
     if opened:
-        append(key, f"▸ plano no Obsidian: {note}")
+        append(key, f"▸ plano no Obsidian: {note}", notify=False)
         if not registered:
             # O comando saiu mas o cofre não é o que o Obsidian tem aberto:
             # sem essa linha o dono veria "abriu" onde nada apareceu.
             append(key, "· cofre fora da lista do Obsidian — registre-o ou "
-                        "ajuste JARVIS_OBSIDIAN_VAULT")
+                        "ajuste JARVIS_OBSIDIAN_VAULT", notify=False)
     else:
-        append(key, f"· plano não abriu no Obsidian: {message or 'erro'}")
+        append(key, f"· plano não abriu no Obsidian: {message or 'erro'}",
+               notify=False)
     headline = f"Abri o plano de ação na tela: {note}"
     return {"ok": opened, "id": key, "title": snapshot.get("title", ""),
             "note": note, "nextcloud": str(result.get("nextcloud") or ""),
@@ -1226,16 +1491,20 @@ def status() -> dict:
                  "opened": bool(e.get("open_count"))}
                 for e in _entries.values()]
         active = _resolve(_last_active) if _last_active else ""
+        voice = _progress_hook is not None
     current = _queue_current()
+    # ``voice`` (UP-8): sem gancho o andamento é só log — a auditoria precisa
+    # saber se a boca estava plugada quando a etapa passou.
     return {"ok": True, "current": current, "active": active,
-            "mirrors": rows}
+            "voice": voice, "mirrors": rows}
 
 
 def reset() -> None:
     """Testes: esquece o estado em memória (não apaga os logs)."""
-    global _last_active
+    global _last_active, _progress_hook
     with _lock:
         _entries.clear()
         _aliases.clear()
         _tailers.clear()
         _last_active = None
+        _progress_hook = None

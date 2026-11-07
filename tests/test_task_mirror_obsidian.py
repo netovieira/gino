@@ -120,7 +120,10 @@ def test_obsidian_opened_event_lands_in_activity_log(env):
 
     result = task_mirror.open_plan(ident="tarefa-obs")
 
-    lines = _activity_lines(e["activity"])
+    # UP-8 põe ``event=task_progress`` no mesmo arquivo: aqui só interessa a
+    # abertura do cofre.
+    lines = [line for line in _activity_lines(e["activity"])
+             if "event=obsidian_opened" in line]
     assert len(lines) == 1, lines
     line = lines[0]
     assert line.startswith("[") and "] event=obsidian_opened " in line
@@ -228,7 +231,9 @@ def test_repeated_request_updates_the_same_note(env):
     second = task_mirror.open_plan(ident="tarefa-obs")
 
     assert first["note"] == second["note"]
-    assert len(_activity_lines(env["activity"])) == 2
+    opened = [line for line in _activity_lines(env["activity"])
+              if "event=obsidian_opened" in line]
+    assert len(opened) == 2
 
 
 def test_finished_execution_is_shown_as_concluded(env):

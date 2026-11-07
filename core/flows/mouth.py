@@ -110,6 +110,136 @@ SYS_COMPLEMENT = (
     "Fatos: nada foi executado; pedido cancelado. -> Nada foi executado."
 )
 
+# UP-8 (FLUXO TRABALHO passos 6-7): o andamento de um trabalho pesado em
+# segundo plano. A lei é a do complemento SEM asserção: a linha do espelho é o
+# fato observado, mas nenhuma etapa autoriza dizer que terminou, que deu certo
+# ou que algo foi enviado. Por isso o prompt proíbe as palavras de resultado e
+# a narrativa de ferramenta; o guard da fase ``complement`` é o portão final e,
+# se ele cortar, entra o template determinístico (``_progress_templates``).
+SYS_PROGRESS = (
+    "Você é a BOCA do Gino, um assistente falado em português do Brasil. Você "
+    "ouve de um espelho de execução o QUE MUDOU num trabalho pesado que roda "
+    "em segundo plano e diz UMA frase curta (máx. 14 palavras) entregando essa "
+    "mudança ao dono. REGRAS INVIOLÁVEIS: nada terminou neste turno — nunca "
+    "diga feito, pronto, concluído, aberto, enviado, anotado nem 'deu certo'; "
+    "nunca use gerúndio de ação (abrindo, executando, rodando, instalando, "
+    "testando); nunca cite ferramenta, comando, caminho, JSON, número de linha "
+    "ou aspas; não invente número, hora nem etapa que não está no fato; não "
+    "peça confirmação; responda só a frase.\n"
+    "Exemplos:\n"
+    "Etapa: edicao. Fato do espelho: editar core/login.py -> Mudança no código "
+    "do login, criador.\n"
+    "Etapa: testes. Fato do espelho: $ pytest -q -> Uma rodada de testes no "
+    "trabalho, criador.\n"
+    "Etapa: busca. Fato do espelho: buscar token em core -> Uma busca nova no "
+    "projeto."
+)
+
+# Template determinístico do andamento (mesma lei do modelo, sem modelo).
+# Ordem: a etapa nomeada primeiro (é a que menos vaza), o trecho do espelho
+# depois (só quando cabe na fala), a frase genérica por último. Cada candidato
+# passa pelo guard; o primeiro que passar é o que sai.
+PROGRESS_TEMPLATES = (
+    "O trabalho em segundo plano segue com {stage}.",
+    "O trabalho em segundo plano tem uma etapa nova: {brief}.",
+    "O trabalho em segundo plano tem novidade.",
+)
+PROGRESS_BRIEF_CHARS = 90
+
+# Extensão de arquivo de programa: o que nunca pode sair pela boca.
+_CODE_EXT_RE = re.compile(
+    r"\b[\w./_-]+\.(?:py|js|mjs|cjs|ts|tsx|json|md|sh|txt|log|toml|env|ya?ml"
+    r"|html|css|csv|lock|rb|go|rs|java|kt|swift|c|cpp|h|ino|php|sql)\b",
+    re.IGNORECASE)
+
+# Rótulo falável da etapa do espelho (nunca o nome da ferramenta).
+STAGE_WORDS = {
+    "edicao": "uma mudança no código",
+    "testes": "uma rodada de testes",
+    "comando": "um passo novo",
+    "leitura": "uma revisão do projeto",
+    "busca": "uma busca no projeto",
+    "consulta_externa": "uma consulta fora da máquina",
+    "delegacao": "um ajudante novo",
+    "plano": "o plano de ação",
+    "inicio": "o começo do trabalho",
+    "resposta": "uma resposta nova",
+    "resultado": "um resultado novo",
+    "ferramenta": "um passo novo",
+    "resumo": "uma novidade do trabalho",
+    "nota": "um lembrete do andamento",
+}
+
+
+def _clip_fact(text: str) -> str:
+    """O fato do espelho em uma linha falável: sem código, sem aspas vazadas."""
+    value = " ".join(str(text or "").split())
+    for junk in ("`", '"', "{", "}", "$", "│"):
+        value = value.replace(junk, "")
+    value = value.strip(" .,;:-")
+    if len(value) > PROGRESS_BRIEF_CHARS:
+        value = value[:PROGRESS_BRIEF_CHARS]
+    return value.rstrip(" ,;:.")
+
+
+def _speakable(text: str) -> bool:
+    """O trecho do espelho pode virar fala? Caminho, id e código não podem.
+
+    O guard pega JSON e ferramenta conhecida; um ``core/login.py`` no meio da
+    frase escapa dele e soa como telejornal para o dono. Critério conservador:
+    aparecem ``/``, ``_``, ``-`` ou ponto de extensão, a frase determinística
+    desce para a etapa nomeada (ou para a genérica).
+    """
+    value = str(text or "")
+    if not value or len(value) > PROGRESS_BRIEF_CHARS:
+        return False
+    if any(ch in value for ch in ("/", "\\", "_", "-", "—", "*", "#", ":")):
+        return False
+    if "." in value.strip("."):
+        return False
+    return bool(value.strip())
+
+
+def _leaks_path(text: str) -> bool:
+    """A frase citou um arquivo de programa? ``core/login.py`` no ouvido do dono
+    é vazamento, e o guard léxico não conhece caminho nenhum — nem ``/``.
+
+    Vale para a frase do modelo e para o template: o andamento é falado em
+    português, nunca em path.
+    """
+    value = str(text or "")
+    if "/" in value or "\\" in value:
+        return True
+    return bool(_CODE_EXT_RE.search(value))
+
+
+def _progress_templates(stage: str, fact: str) -> list[str]:
+    """Candidatos determinísticos, do que vaza menos para o mais genérico."""
+    label = " ".join(str(stage or "").split()).strip()
+    human = STAGE_WORDS.get(label, "")
+    brief = _clip_fact(fact)
+    out: list[str] = []
+    for template in PROGRESS_TEMPLATES:
+        if "{stage}" in template:
+            if human:
+                out.append(template.format(stage=human))
+        elif "{brief}" in template:
+            if _speakable(brief):
+                out.append(template.format(brief=brief))
+        else:
+            out.append(template)
+    return out
+
+
+def progress_facts(text: str, stage: str = "") -> list[dict[str, Any]]:
+    """O fato do andamento para o guard: observado, SEM autorização de asserção.
+
+    ``assertion`` falso é o coração do UP-8: a boca pode relatar a etapa, mas
+    nenhuma linha de espelho deixa ela dizer "terminou", "abriu" ou "enviei".
+    """
+    return [{"spoken": " ".join(str(text or "").split()),
+             "detail": str(stage or ""), "assertion": False}]
+
 
 def clean_sentence(text: str) -> str:
     text = str(text or "").strip()
@@ -434,6 +564,71 @@ class Mouth:
             fixed=not bool(result.get("text")),
             guard_tripped=tripped, missing_facts=missing)
 
+    # ── andamento de execução pesada (UP-8) ────────────────────────────────
+    def announce_progress(self, text: str, *, stage: str = "",
+                          cancel_ev: threading.Event | None = None
+                          ) -> MouthResult:
+        """A frase do andamento (FLUXO TRABALHO passos 6-7), nunca o resultado.
+
+        ``text`` é a linha que o espelho acabou de gravar; ``stage`` é a classe
+        dela ("edicao", "testes"). O fato entra no guard com ``assertion=False``
+        — a lei (a) vale integralmente: etapa nenhuma autoriza "feito",
+        "pronto", "abriu" ou "enviei", e anúncio de ação/ferramenta é cortado
+        antes do alto-falante. Modelo rejeitado ou mudo, a frase vem do template
+        determinístico sob a mesma checagem; não havendo frase segura,
+        silêncio — andamento calado é melhor que andamento inventado.
+        """
+        clean = " ".join(str(text or "").split())
+        if not clean:
+            return MouthResult(sentence="", fixed=True, raw="[progresso vazio]")
+        if not self.config.mouth_enabled:
+            return MouthResult(sentence="", fixed=True,
+                               raw="[progresso sem boca]")
+        facts = progress_facts(clean, stage)
+        self.calls += 1
+        user = (f"Etapa: {stage or 'andamento'}\n"
+                f"Fato do espelho: {clean[:400]}\nDiga a frase.")
+        result = self._call(
+            [{"role": "system", "content": SYS_PROGRESS},
+             {"role": "user", "content": user}],
+            self.config.mouth_complement_max_tokens, early_sentence=True,
+            temperature=0.3, cancel_ev=cancel_ev, fast_ack=True)
+        sentence = clean_sentence(result.get("text") or "")
+        tripped = ""
+        if sentence and _leaks_path(sentence):
+            # O modelo obedeceu ao guard léxico e citou o arquivo mesmo assim:
+            # path no ouvido do dono é vazamento, não conteúdo.
+            self.guard_trips += 1
+            tripped = f"caminho na frase: {sentence[:60]!r}"
+            sentence = ""
+        elif sentence:
+            ok, why = _guard.guard(sentence, facts, "complement")
+            if not ok:
+                self.guard_trips += 1
+                tripped = why
+                sentence = ""
+        if result.get("error"):
+            self.failures += 1
+            sentence = ""
+        fixed = not bool(sentence)
+        if fixed:
+            for candidate in _progress_templates(stage, clean):
+                if _leaks_path(candidate):
+                    continue
+                ok, _why = _guard.guard(candidate, facts, "complement")
+                if ok:
+                    sentence = candidate
+                    break
+            if not sentence and not tripped:
+                tripped = "nenhuma frase segura do andamento"
+        return MouthResult(
+            sentence=sentence,
+            ms=float(result.get("first_sentence_ms") or 0.0),
+            ttft_ms=float(result.get("ttft_ms") or 0.0),
+            raw=str(result.get("text") or ""),
+            error=str(result.get("error") or ""),
+            fixed=fixed, guard_tripped=tripped)
+
     # ── plumbing ────────────────────────────────────────────────────────────
     def _call(self, messages: list[dict[str, str]], max_tokens: int, *,
               early_sentence: bool, temperature: float,
@@ -462,6 +657,59 @@ class Mouth:
             return {"text": "", "ttft_ms": 0.0, "first_sentence_ms": 0.0,
                     "end_ms": 0.0, "error": f"{type(exc).__name__}: {exc}",
                     "aborted": False}
+
+
+def progress_notifier(*, speak: Callable[[str], Any],
+                      config: FlowsConfig | None = None,
+                      caller: Callable[..., dict[str, Any]] | None = None,
+                      mouth: Mouth | None = None) -> Callable[[dict], dict]:
+    """O ``on_progress_update`` do espelho: andamento que entra vira fala (UP-8).
+
+    Pluga em ``core.task_mirror.set_progress_hook``. Recebe o payload da linha
+    gravada, fraseia pela boca (com o guard do andamento) e entrega a frase ao
+    caminho de voz do processo — ``speak`` é o ``_say_now`` na vivo, nunca o
+    contrário: este módulo não conhece Qt, áudio nem ``main.py``.
+
+    Devolve ``{"spoken", "sentence", "reason"}`` para o evento
+    ``task_progress`` registrar o resultado na auditoria. Nunca levanta: erro de
+    áudio ou de config volta como ``spoken=False`` e o espelho segue gravando.
+    """
+    cache: dict[str, Any] = {}
+
+    def _mouth() -> Mouth:
+        if mouth is not None:
+            return mouth
+        rt = cache.get("mouth")
+        if rt is None:
+            cfg = config or FlowsConfig.load()
+            rt = Mouth(cfg, caller=caller)
+            cache["mouth"] = rt
+        return rt
+
+    def handler(payload: dict) -> dict:
+        try:
+            row = payload if isinstance(payload, dict) else {}
+            text = " ".join(str(row.get("text") or "").split())
+            if not text:
+                return {"spoken": False, "sentence": "",
+                        "reason": "sem andamento"}
+            result = _mouth().announce_progress(
+                text, stage=str(row.get("stage") or ""))
+            sentence = str(result.sentence or "")
+            if not sentence:
+                return {"spoken": False, "sentence": "",
+                        "reason": (result.guard_tripped or result.error
+                                   or result.raw or "sem frase segura")}
+            if not callable(speak):
+                return {"spoken": False, "sentence": sentence,
+                        "reason": "sem saida de voz"}
+            speak(sentence)
+            return {"spoken": True, "sentence": sentence, "reason": ""}
+        except Exception as exc:  # noqa: BLE001 - falar não quebra o espelho
+            return {"spoken": False, "sentence": "",
+                    "reason": f"{type(exc).__name__}: {exc}"}
+
+    return handler
 
 
 # ── medição de latência (FASE1-TASK4) ──────────────────────────────────────
