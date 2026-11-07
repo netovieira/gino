@@ -2887,6 +2887,10 @@ class JarvisLive:
         except Exception as e:
             print(f"[E-mail] aviso de reconexão indisponível: {e}")
         try:
+            _mail.set_filter_decision_hook(self._mail_filter_decision)
+        except Exception as e:
+            print(f"[E-mail] hook de decisão de filtro indisponível: {e}")
+        try:
             states = _mail.connect_all()
         except Exception as e:
             print(f"[E-mail] tentativa de conexão no boot falhou: {e}")
@@ -2938,6 +2942,29 @@ class JarvisLive:
         except Exception:
             pass
         print(f"[E-mail] aviso ({kind or '?'}): {message}")
+
+    def _mail_filter_decision(self, account: str, uid: str,
+                              action: str, motivo: str) -> None:
+        """Evento ``email_filter_decision`` no activity.log (UC-6).
+
+        Roda na thread da varredura de e-mail. Escreve uma linha no activity
+        log com a decisão do filtro (avisa/ignora/classificar) e o motivo
+        (regraN-campo ou fora-do-filtro). Nunca dados pessoais: conta, uid,
+        ação e motivo — sem remetente, assunto ou padrão de regra.
+        """
+        acct = " ".join(str(account or "").split())[:40] or "?"
+        uid_short = str(uid or "?")[:20]
+        act = str(action or "?")[:12]
+        mot = str(motivo or "?")[:30]
+        line = f"[fluxos] email_filter_decision conta={acct} uid={uid_short} acao={act} motivo={mot}"
+        try:
+            meta = _activity.make_meta(chan="sistema", origin="email_filter")
+            self.ui.write_log(_activity.with_meta(line, meta))
+        except Exception:
+            try:
+                self.ui.write_log(line)
+            except Exception:
+                pass
 
     def _mail_startup_notice(self, states) -> list[str]:
         """Fala no boot só a conta que precisa de mão humana. Resto = silêncio.

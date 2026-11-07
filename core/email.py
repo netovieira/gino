@@ -195,6 +195,10 @@ _retry_stop    = threading.Event()
 _notice_lock   = threading.Lock()
 _notice_hook   = None
 
+# Evento de decisão de filtro: chamado por _filter_trace para cada e-mail
+# processado com filtros ativos. O hook recebe (account, uid, action, motivo).
+_filter_decision_hook = None
+
 
 def _log(message: str) -> None:
     fn = _logger or (lambda msg: print(f"[Mail] {msg}"))
@@ -422,6 +426,17 @@ def _filter_trace(acct, item: dict, rule: dict | None, action: str) -> None:
             motivo = f"regra{pos}-{rule.get('field') or '?'}"
         _log(f"filtro {acct.name}: uid={item.get('uid') or '?'} "
              f"acao={action} motivo={motivo}")
+        # Evento email_filter_decision no activity.log (passo 4 da UC-6).
+        if callable(_filter_decision_hook):
+            try:
+                _filter_decision_hook(
+                    acct.name,
+                    str(item.get("uid") or ""),
+                    action,
+                    motivo,
+                )
+            except Exception:
+                pass          # o hook nunca derruba a varredura
     except Exception:
         pass          # o rastro nunca derruba a varredura
 
@@ -1201,6 +1216,19 @@ def set_retry_notice(handler=None) -> None:
     """
     global _notice_hook
     _notice_hook = handler if callable(handler) else None
+
+
+def set_filter_decision_hook(handler=None) -> None:
+    """Registra o callback de decisão de filtro (UC-6).
+
+    ``handler(account, uid, action, motivo)`` é chamado por ``_filter_trace``
+    para cada e-mail processado quando há filtros ativos. A ação é ``avisa``,
+    ``ignora`` ou ``classificar``; o motivo é ``regraN-campo`` ou
+    ``fora-do-filtro``. Roda na thread da varredura — quem escrever no
+    activity.log deve fazê-lo de forma thread-safe.
+    """
+    global _filter_decision_hook
+    _filter_decision_hook = handler if callable(handler) else None
 
 
 def _emit_notice(kind: str, acct: MailAccount) -> None:
@@ -2265,7 +2293,7 @@ def reset() -> None:
     continua sendo lido dali, pelo prazo normal. Reconexões em voo são
     interrompidas — nenhuma thread antiga mexe em conta da próxima rodada.
     """
-    global _watch_hook, _pending, _otp_processor
+    global _watch_hook, _pending, _otp_processor, _filter_decision_hook
     _retry_stop.set()
     with _retry_lock:
         _retry_threads.clear()
@@ -2273,6 +2301,7 @@ def reset() -> None:
         _accounts.clear()
     _watch_hook = None
     _otp_processor = None
+    _filter_decision_hook = None
     set_retry_notice(None)
     with _pending_lock:
         _pending = None
