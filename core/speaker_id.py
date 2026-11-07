@@ -145,6 +145,24 @@ _EPS = 1e-12
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
+# ── UC-7: activity.log events ───────────────────────────────────────────────
+_ACTIVITY_LOG_PATH = _ROOT / "logs" / "activity.log"
+
+
+def _log_activity(line: str) -> None:
+    """Append one line to ``logs/activity.log`` (UC-7: voice events).
+
+    Format: ``[YYYY-MM-DD HH:MM:SS] event=... key=value ...``.
+    Silent on failure — logging must never break enrollment or identification.
+    """
+    try:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        _ACTIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_ACTIVITY_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(f"[{stamp}] {line}\n")
+    except Exception:
+        pass
+
 
 def available(
     segmentation_model: str | Path | None = None,
@@ -740,6 +758,11 @@ class SpeakerId:
             self._sync_primary_locked(rec, label)
             rec["updated"] = now
             self._save_locked()
+            # UC-7: evento voice_enrolled no activity.log
+            _log_activity(
+                f"event=voice_enrolled person={display!r} device={label} "
+                f"samples={len(samples)} is_owner={is_owner}"
+            )
             return self._public(slug, rec)
 
     def replace_samples(
@@ -901,6 +924,11 @@ class SpeakerId:
             result["device"] = label
             result["backup"] = backup
             result.update(self._profile_stats(samples))
+            # UC-7: evento voice_enrolled no activity.log (por dispositivo)
+            _log_activity(
+                f"event=voice_enrolled person={display!r} device={label} "
+                f"samples={len(samples)} append={append}"
+            )
             return result
 
     def known_devices(self, name: str | None = None) -> list[str]:
@@ -1348,6 +1376,13 @@ class SpeakerId:
                 result["device"] = best_device
             if wanted:
                 result["profile"] = wanted
+            # UC-7: evento voice_identified no activity.log
+            if known and name is not None:
+                _log_activity(
+                    f"event=voice_identified person={name!r} "
+                    f"score={result['effective_score']:.3f} "
+                    f"verdict={verdict} device={best_device or '?'}"
+                )
             return result
 
     def _best_trusted(self, vec: np.ndarray) -> tuple[str | None, float, float]:
