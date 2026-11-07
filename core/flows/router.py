@@ -282,7 +282,11 @@ class Router:
                 d.lookups.append(Lookup("time"))
                 d.rule, d.intent, d.confidence = "hora", "lookup_time", 0.94
             elif CONTEXT_RE.search(n) and not AMBIG_RE.search(n):
-                d.lookups.append(Lookup("memory", {"query": "musica"}))
+                # UC-1: a consulta era feita com a palavra fixa "musica",
+                # qualquer que fosse a pergunta — por isso o índice devolvia
+                # lixo e o cérebro parava de chamar. A busca agora pede o que
+                # o dono realmente disse.
+                d.lookups.append(Lookup("memory", {"query": n[:160]}))
                 d.rule, d.intent, d.confidence = "contexto", "lookup_memory", 0.80
             elif AMBIG_RE.search(n):
                 d.needs_fallback = True

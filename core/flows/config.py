@@ -116,6 +116,19 @@ class FlowsConfig:
     duplicate_window_s: float = 2.0
     log_events: bool = True
 
+    # ── memória (UC-1, FALA passo 3 / RESPOSTA passo 1) ─────────────────────
+    # O cérebro consulta o índice ANTES de responder, sem esperar que o
+    # modelo decida chamar ``memory_search``. A janela é a do plano: últimas
+    # 6 h de eventos + tópicos abertos. O teto de tempo existe por causa do
+    # portão da boca (<1 s, passo 2): a consulta roda em thread própria e o
+    # chamador do cérebro espera no máximo ``memory_timeout_ms`` — nunca a
+    # boca.
+    memory_enabled: bool = True
+    memory_window_hours: float = 6.0
+    memory_limit: int = 8
+    memory_timeout_ms: int = 1200
+    memory_max_chars: int = 1800
+
     # ── consultas ───────────────────────────────────────────────────────────
     def budget_for(self, kind: str) -> Budget:
         kind = str(kind or "").lower()
@@ -143,6 +156,7 @@ class FlowsConfig:
         partial = data.get("partial") or {}
         executor = data.get("executor") or {}
         supervisor = data.get("supervisor") or {}
+        memory = data.get("memory") or {}
 
         fallback = str(router.get("fallback") or FALLBACK_REMOTE).strip().lower()
         if fallback not in VALID_FALLBACKS:
@@ -196,6 +210,25 @@ class FlowsConfig:
             executor_timeout = int(executor.get("timeout_ms") or 4000)
         except (TypeError, ValueError):
             executor_timeout = 4000
+        try:
+            memory_hours = float(memory.get("window_hours")
+                                 or default.memory_window_hours)
+        except (TypeError, ValueError):
+            memory_hours = default.memory_window_hours
+        try:
+            memory_limit = int(memory.get("limit") or default.memory_limit)
+        except (TypeError, ValueError):
+            memory_limit = default.memory_limit
+        try:
+            memory_timeout = int(memory.get("timeout_ms")
+                                 or default.memory_timeout_ms)
+        except (TypeError, ValueError):
+            memory_timeout = default.memory_timeout_ms
+        try:
+            memory_chars = int(memory.get("max_chars")
+                               or default.memory_max_chars)
+        except (TypeError, ValueError):
+            memory_chars = default.memory_max_chars
 
         routes = mouth.get("brief_routes")
         if isinstance(routes, list):
@@ -239,6 +272,11 @@ class FlowsConfig:
             media_monitor=_budget("media_monitor", default.media_monitor),
             duplicate_window_s=float(data.get("duplicate_window_s") or 2.0),
             log_events=bool(data.get("log_events", True)),
+            memory_enabled=bool(memory.get("enabled", True)),
+            memory_window_hours=min(72.0, max(0.25, memory_hours)),
+            memory_limit=min(40, max(1, memory_limit)),
+            memory_timeout_ms=max(0, memory_timeout),
+            memory_max_chars=min(8000, max(120, memory_chars)),
         )
 
     @classmethod

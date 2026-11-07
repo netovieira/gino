@@ -66,6 +66,7 @@ class FlowsRuntime:
                  on_chat_route: Callable[[dict[str, Any]], None] | None = None,
                  assistant_name: str = "Gino",
                  clock: Callable[[], float] = time.monotonic,
+                 memory: Callable[..., dict[str, Any]] | None = None,
                  start_expiry_thread: bool = True):
         self.config = config
         self.speak = speak
@@ -87,7 +88,7 @@ class FlowsRuntime:
         self.orchestrator = Orchestrator(
             config, supervisor=self.supervisor, fallback=fallback,
             executor=executor, clock=clock, log=self.log,
-            assistant_name=assistant_name, history=history)
+            assistant_name=assistant_name, history=history, memory=memory)
         self._turns: dict[str, _LiveTurn] = {}
         self._lock = threading.RLock()
         self._closed = False
@@ -355,6 +356,21 @@ class FlowsRuntime:
                     "route": str(live.plan.route),
                     "local_chat_ms": round(
                         (self.clock() - live.started_at) * 1000.0, 1)}
+
+    def memory_context(self, turn_id: str, *,
+                       timeout_ms: int | None = None) -> str:
+        """UC-1: bloco de memória consultada neste turno, para o prompt do cérebro.
+
+        É o ponto de entrada do processo vivo: só o caminho do raciocínio
+        espera, com teto de ``memory_timeout_ms``. A boca (passo 2, <1 s) não
+        chama este método e por isso não paga a consulta.
+        """
+        try:
+            return self.orchestrator.memory_context(
+                str(turn_id), timeout_ms=timeout_ms)
+        except Exception as exc:
+            self._log(f"[Fluxos] contexto de memoria falhou: {exc!r}")
+            return ""
 
     def is_chat_turn(self, turn_id: str) -> bool:
         """O plano deste turno é conversa pura (nenhuma ação/consulta/ambiguidade)?

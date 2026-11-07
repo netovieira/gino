@@ -18,6 +18,7 @@ boca pede esclarecimento em vez de inventar ação.
 from __future__ import annotations
 
 import concurrent.futures
+import datetime as dt
 import threading
 import time
 from dataclasses import dataclass, field
@@ -57,10 +58,27 @@ class TurnPlan:
     # pelo cérebro remoto ('' = o turno pertence ao raciocínio). É uma
     # sugestão conservadora do roteador; a frase final ainda passa pelo guard.
     local_chat: str = ""
+    # UC-1: consulta de memória executada de verdade (FALA passo 3 / RESPOSTA
+    # passo 1). ``memory_wait`` trava até o carregamento terminar ou estourar
+    # o teto; ``memory_context`` é o bloco injetado no prompt do cérebro;
+    # ``lookups_run`` é a prova do que foi consultado (nunca deduzida da
+    # rota). Nunca entra no contexto da boca: a boca fala com os 15 min
+    # históricos e o portão de <1 s é dela.
+    memory_context: str = ""
+    memory_topics: list[str] = field(default_factory=list)
+    memory_hits: int = 0
+    memory_ms: float = 0.0
+    memory_failed: str = ""
+    lookups_run: list[str] = field(default_factory=list)
+    memory_wait: threading.Event = field(default_factory=threading.Event)
 
     @property
     def route(self) -> str:
         return self.decision.route
+
+    @property
+    def memory_loaded(self) -> bool:
+        return self.memory_wait.is_set()
 
 
 @dataclass
@@ -77,6 +95,7 @@ class _TurnState:
     prewarm_count: int = 0
     prewarm_last_route: str = ""
     prewarm_logged_at: float = 0.0
+    memory_thread: threading.Thread | None = None
 
 
 class Orchestrator:
@@ -90,7 +109,8 @@ class Orchestrator:
                  on_event: Callable[[dict[str, Any]], None] | None = None,
                  assistant_name: str = "Gino",
                  history: Callable[[], list[dict[str, Any]]] | None = None,
-                 attention: Any | None = None):
+                 attention: Any | None = None,
+                 memory: Callable[..., dict[str, Any]] | None = None):
         self.config = config
         self.clock = clock
         self.log = log or (lambda _msg: None)
@@ -99,6 +119,11 @@ class Orchestrator:
         self.router = Router()
         self.mouth = mouth or Mouth(config, history=history)
         self.history = history
+        # UC-1: provedor de consulta ``(query, *, hours, limit) -> dict``.
+        # Quem injeta é o processo vivo (main.py), porque só ele tem a
+        # ChatMemory e o índice em mãos. Sem provedor, nada é fingido: o
+        # turno segue sem contexto e o log diz ``memory_loaded ... skipped``.
+        self.memory = memory
         self.executor = executor or Executor(
             timeout_ms=config.executor_timeout_ms,
             enabled=config.executor_enabled)
@@ -188,7 +213,140 @@ class Orchestrator:
                     actions=[a.tool for a in decision.actions],
                     lookups=[lk.kind for lk in decision.lookups],
                     fallback=used_fallback, ms=round(route_ms, 3))
+        # UC-1 (FALA passo 3): os lookups declarados pela rota e o contexto
+        # automático de memória são EXECUTADOS aqui — antes só eram nomeados
+        # no ``context``. Roda em thread própria: a boca do passo 2 (<1 s)
+        # nunca espera por isso, e o cérebro espera no máximo
+        # ``memory_timeout_ms``. Turno bloqueado/cancelado não consulta.
+        if not plan.blocked and not state.cancelled:
+            self._start_memory_worker(plan)
         return plan
+
+    # ── memória (UC-1) ──────────────────────────────────────────────────────
+    def _start_memory_worker(self, plan: TurnPlan) -> None:
+        if not self.config.memory_enabled:
+            plan.memory_wait.set()
+            return
+        worker = threading.Thread(
+            target=self._load_memory, args=(plan.turn_id, str(plan.text)),
+            name="flows-memory", daemon=True)
+        with self._lock:
+            state = self._turns.get(plan.turn_id)
+            if state is None:
+                plan.memory_wait.set()
+                return
+            state.memory_thread = worker
+        worker.start()
+
+    def _lookup_time(self) -> str:
+        return dt.datetime.now().strftime("%H:%M")
+
+    def _load_memory(self, turn_id: str, text: str) -> None:
+        """Executa os lookups do turno e carrega o contexto de memória.
+
+        Melhor esforço por desenho: memória lenta ou ausente não segura o
+        turno e não finge conteúdo. O que foi consultado vai para
+        ``plan.lookups_run`` e para o evento ``memory_loaded`` — é a prova
+        material de que o cérebro consultou o índice (UC-1).
+        """
+        with self._lock:
+            state = self._turns.get(str(turn_id))
+            plan = state.plan if state is not None else None
+        if plan is None:
+            return
+        run: list[str] = []
+        topics: list[str] = []
+        hits = 0
+        blocks: list[str] = []
+        failed = ""
+        skipped = ""
+        started = self.clock()
+        try:
+            for lk in plan.decision.lookups:
+                kind = str(lk.kind or "")
+                if kind == "time":
+                    run.append("time")
+                    blocks.append(f"[hora agora] {self._lookup_time()}")
+                elif kind == "system":
+                    run.append("system")
+                elif kind == "memory":
+                    run.append("memory")
+                    got = self._memory_block(
+                        str(lk.args.get("query") or text),
+                        hours=self.config.memory_window_hours)
+                    if got:
+                        blocks.append(got[0])
+                        topics.extend(got[1])
+                        hits += got[2]
+            if "memory" not in run and self.memory is not None:
+                # Consulta automática: mesmo sem a rota pedir, o fluxo manda
+                # carregar as últimas horas e os tópicos abertos antes de
+                # responder. É o passo 1 do RESPOSTA.
+                run.insert(0, "memory(auto)")
+                got = self._memory_block(
+                    text, hours=self.config.memory_window_hours)
+                if got:
+                    blocks.append(got[0])
+                    topics.extend(got[1])
+                    hits += got[2]
+            elif "memory" not in run:
+                # Sem provedor injetado não há o que fingir: registra-se o
+                # motivo, e o log deixa claro que a consulta não aconteceu.
+                skipped = "sem provedor de memoria"
+        except Exception as exc:
+            failed = f"{type(exc).__name__}: {exc}"
+        plan.memory_context = "\n".join(blocks)[: self.config.memory_max_chars]
+        plan.memory_topics = topics
+        plan.memory_hits = hits
+        plan.lookups_run = run
+        plan.memory_ms = round((self.clock() - started) * 1000.0, 1)
+        plan.memory_failed = failed
+        plan.memory_wait.set()
+        self._event("memory_loaded", str(turn_id), lookups=list(run),
+                    topics=list(topics), hits=hits,
+                    ms=plan.memory_ms, chars=len(plan.memory_context),
+                    **({"skipped": skipped} if skipped else {}),
+                    **({"error": failed} if failed else {}))
+
+    def _memory_block(self, query: str, *,
+                      hours: float) -> tuple[str, list[str], int] | None:
+        if self.memory is None:
+            return None
+        payload = self.memory(str(query or ""), hours=hours,
+                              limit=self.config.memory_limit) or {}
+        context = str(payload.get("context") or "").strip()
+        raw_topics = payload.get("topics") or []
+        topics = [str(t).strip() for t in raw_topics if str(t).strip()][:8]
+        try:
+            hits = int(payload.get("hits") or 0)
+        except (TypeError, ValueError):
+            hits = 0
+        if not context and not topics:
+            return None
+        return (context, topics, hits)
+
+    def memory_context(self, turn_id: str, *,
+                       timeout_ms: int | None = None) -> str:
+        """Bloco de memória para o prompt do cérebro; espera no máximo o teto.
+
+        O portão da boca (<1 s) não passa por aqui — este método é chamado
+        pelo caminho do raciocínio, que já espera o modelo. Estourado o teto,
+        devolve o que estiver pronto (vazio, se nada) e o turno segue.
+        """
+        if not self.config.memory_enabled:
+            return ""
+        budget = (self.config.memory_timeout_ms if timeout_ms is None
+                  else max(0, int(timeout_ms)))
+        with self._lock:
+            state = self._turns.get(str(turn_id))
+            plan = state.plan if state is not None else None
+        if plan is None:
+            return ""
+        if budget and not plan.memory_wait.wait(timeout=budget / 1000.0):
+            self._event("memory_timeout", str(turn_id),
+                        ms=budget, lookups=list(plan.lookups_run))
+            return ""
+        return str(plan.memory_context or "")
 
     def _apply_remote_fallback(self, decision: Decision, text: str) -> float:
         if self.fallback is None:

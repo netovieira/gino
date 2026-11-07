@@ -7914,6 +7914,7 @@ class JarvisLive:
                     on_chat_route=self._flows_on_chat_route,
                     executor_runner=readonly_runner,
                     history=self._flows_history,
+                    memory=self._flows_memory_load,
                     assistant_name=str(getattr(self, "_asst_name", "") or "Gino"))
             except Exception as e:
                 print(f"[Fluxos] runtime não iniciou: {e!r}")
@@ -7978,6 +7979,94 @@ class JarvisLive:
         except Exception as e:
             print(f"[Fluxos] histórico da boca indisponível: {e!r}")
             return []
+
+    def _flows_memory_context(self, turn_id) -> str:
+        """Bloco de memória que o orquestrador foi buscar neste turno (UC-1).
+
+        Só o caminho do cérebro chama: a boca já falou antes, com os 15
+        minutos históricos, e não espera aqui. Sem runtime ou sem plano,
+        devolve vazio e o prompt segue como antes.
+        """
+        rt = self._flows_get()
+        if rt is None or turn_id is None:
+            return ""
+        try:
+            return str(rt.memory_context(str(turn_id)) or "")
+        except Exception as e:
+            print(f"[Fluxos] contexto de memoria falhou: {e!r}")
+            return ""
+
+    def _flows_memory_load(self, query, *, hours=6.0, limit=8) -> dict:
+        """UC-1: consulta real do índice de memória para um turno.
+
+        É o provedor injetado no orquestrador (``memory=``). O contrato pede
+        duas coisas no passo 3 da FALA e no passo 1 da RESPOSTA: o contexto
+        das últimas horas e os tópicos abertos. Vem de três leituras, todas
+        best-effort e só de leitura:
+
+        * ``ChatMemory.search`` — a parte textual da pergunta, no corpus
+          indexado (TF-IDF com rebaixamento obrigatório quando não há
+          modelo de embedding);
+        * ``memory_index.query`` — eventos das últimas ``hours``;
+        * ``memory_index.active`` — projeto/tópico em foco agora.
+
+        Devolve ``{"context", "topics", "hits"}``. Nunca inventa: sem
+        memória, sem arquivo ou com erro, o bloco volta vazio e o log do
+        orquestrador registra o que não foi carregado.
+        """
+        out: dict = {"context": "", "topics": [], "hits": 0}
+        lines: list[str] = []
+        topics: list[str] = []
+        try:
+            hours = max(0.25, float(hours or 6.0))
+        except (TypeError, ValueError):
+            hours = 6.0
+        try:
+            limit = max(1, int(limit or 8))
+        except (TypeError, ValueError):
+            limit = 8
+        memory = getattr(self, "_chat_memory", None)
+        text = " ".join(str(query or "").split())
+        if memory is not None and text:
+            try:
+                for hit in (memory.search(text, limit=limit) or [])[:limit]:
+                    body = str(hit.get("text") or "").strip()
+                    if not body:
+                        continue
+                    src = str(hit.get("source") or "").strip()
+                    lines.append(f"- {body[:300]}"
+                                 + (f" [{src[-32:]}]" if src else ""))
+            except Exception as e:
+                print(f"[Fluxos] busca de memoria falhou: {e!r}")
+        try:
+            from datetime import datetime as _dt, timedelta as _td
+            from core import memory_index
+            try:
+                since = _dt.now() - _td(hours=hours)
+                events = memory_index.query(since=since, limit=limit)
+            except TypeError:
+                events = memory_index.query(limit=limit)
+            for ev in events or []:
+                label = str(ev.get("label") or ev.get("text") or "").strip()
+                if not label:
+                    continue
+                subj = str(ev.get("subject") or "").strip()
+                if subj and subj not in topics:
+                    topics.append(subj)
+                lines.append(f"- evento: {label[:200]}")
+            act = memory_index.active() or {}
+            for key in ("project", "subject"):
+                val = str(act.get(key) or "").strip()
+                if val and val not in topics:
+                    topics.append(val)
+        except Exception as e:
+            print(f"[Fluxos] indice de memoria indisponivel: {e!r}")
+        if not lines and not topics:
+            return out
+        out["context"] = "\n".join(lines)[:1800]
+        out["topics"] = topics[:8]
+        out["hits"] = len(lines)
+        return out
 
     def _flows_on_prewarm(self, plan) -> None:
         try:
@@ -8611,6 +8700,17 @@ class JarvisLive:
                 _hot = self._consume_carryover_hot(text)
                 if _hot:
                     _context = f"{_hot}\n{_context}".strip()
+            # UC-1 (FALA passo 3 / RESPOSTA passo 1): o cérebro recebe o
+            # contexto que o orquestrador FOI BUSCAR no índice, e não uma
+            # promessa de que ele poderia chamar ``memory_search``. A busca
+            # já corre em paralelo desde a abertura do turno; aqui só se
+            # colhe o resultado, com teto de ``memory_timeout_ms``. Turno de
+            # tarefa não é pergunta: fica com o prompt de sempre.
+            if not task_id:
+                _mem = self._flows_memory_context(turn_id)
+                if _mem:
+                    _context = (f"{_context}\n{_mem}".strip()
+                                if _context else _mem)
             self._qoder_live.ask(
                 payload, speaker=speaker, id=turn_id,
                 priority="now" if preempt else None,
