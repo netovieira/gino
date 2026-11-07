@@ -152,11 +152,19 @@ def guard(text: str, facts: list[dict[str, Any]] | None,
 
     # Lei (a): só afirma com fato autorizado (ok, não simulado, não pendente).
     # FASE3-TASK3: consulta o verificador externo antes de aceitar a asserção.
+    # FASE3-TASK4: exige prova material (recibo HMAC + verificação externa).
     allow = any(bool(f.get("assertion")) for f in facts)
     if not allow:
         hit = has_assertion(text)
         if hit:
             return False, f"asserção sem fato autorizado: {hit!r}"
+
+    # FASE3-TASK4: rejeita afirmação se algum fato está marcado como unverified.
+    unverified_facts = [f for f in facts if f.get("unverified")]
+    if unverified_facts:
+        hit = has_assertion(text)
+        if hit:
+            return False, "asserção sem prova material (FASE3-TASK4)"
 
     # Verifica externamente os fatos que carregam recibo de tool call.
     verified = _verify_facts(facts)

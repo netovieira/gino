@@ -199,6 +199,52 @@ def _link(label: str, path: Path | str, exists: bool | None = None) -> dict:
     return {"label": label, "path": str(p), "exists": ok}
 
 
+# ── FASE3-TASK4: marcadores de execução concreta ────────────────────────────
+
+def unverified_markers() -> list[dict]:
+    """Retorna marcadores de turnos UNVERIFIED para o painel GUIA.
+
+    Cada marcador indica uma ação que foi executada sem prova material
+    (recibo HMAC + verificação externa). O painel GUIA exibe esses marcadores
+    para que o dono veja quais ações não foram verificadas.
+    """
+    from core.flows.executor import _ACTIVITY_LOG_PATH, _is_observer_mode
+    from datetime import datetime, timezone
+
+    markers = []
+    observer = _is_observer_mode()
+
+    # Lê as últimas 50 linhas do activity log procurando TURN_UNVERIFIED.
+    try:
+        if not _ACTIVITY_LOG_PATH.exists():
+            return markers
+        lines = _ACTIVITY_LOG_PATH.read_text(encoding="utf-8").splitlines()
+        for line in lines[-50:]:
+            if "TURN_UNVERIFIED" not in line:
+                continue
+            # Extrai task_id e tool do log.
+            parts = line.split()
+            task_id = tool = reason = "?"
+            for part in parts:
+                if part.startswith("task_id="):
+                    task_id = part.split("=", 1)[1]
+                elif part.startswith("tool="):
+                    tool = part.split("=", 1)[1]
+                elif part.startswith("reason="):
+                    reason = part.split("=", 1)[1]
+            markers.append({
+                "task_id": task_id,
+                "tool": tool,
+                "reason": reason,
+                "observer_mode": observer,
+                "timestamp": line.split("]")[0].lstrip("["),
+            })
+    except Exception:
+        pass
+
+    return markers[-10:]  # últimos 10 marcadores
+
+
 def sections(base_dir: Path) -> list[dict]:
     """As seis seções fixas do GUIA, montadas do disco, agora."""
     base = Path(base_dir)
@@ -242,6 +288,29 @@ def sections(base_dir: Path) -> list[dict]:
         _item(base, "Índice de memória — como se busca", "core/memory_index.py"),
     ]
 
+    # FASE3-TASK4: seção de execução concreta com marcadores UNVERIFIED.
+    unverified = unverified_markers()
+    execution_items = [
+        _item(base, "Executor — execução concreta obrigatória",
+              "core/flows/executor.py"),
+        _item(base, "Verificador externo — prova material",
+              "core/action_verifier.py"),
+        _item(base, "Recibos HMAC — integridade do tool call",
+              "core/tool_receipts.py"),
+    ]
+    # Adiciona marcadores UNVERIFIED como itens dinâmicos.
+    for marker in unverified:
+        execution_items.append({
+            "label": f"[UNVERIFIED] {marker['tool']} (task {marker['task_id']})",
+            "path": f"activity_log:{marker['timestamp']}",
+            "origin": f"TURN_UNVERIFIED:{marker['task_id']}",
+            "date": marker.get("timestamp"),
+            "text": f"Ação sem prova material: {marker['reason']}",
+            "missing": False,
+            "unverified": True,
+            "observer_mode": marker.get("observer_mode", False),
+        })
+
     links: list[dict] = []
     for sec in (minhas, boca, cerebro, gates, memoria):
         for it in sec:
@@ -278,6 +347,12 @@ def sections(base_dir: Path) -> list[dict]:
          "short": "MEMÓRIA",
          "note": "O que deve ser coletado/indexado e o que não entra — a fronteira está nos próprios módulos.",
          "items": memoria},
+        {"title": "EXECUÇÃO CONCRETA (FASE3-TASK4)",
+         "short": "EXEC",
+         "note": "Ações com efeito colateral exigem prova material (recibo HMAC + verificação externa). Turnos UNVERIFIED são marcados explicitamente. Modo observador (2 semanas): loga mas não bloqueia.",
+         "items": execution_items,
+         "unverified_count": len(unverified),
+         "observer_mode": len(unverified) > 0 and unverified[0].get("observer_mode", False) if unverified else False},
         {"title": "LINKS",
          "short": "LINKS",
          "note": "Cada regra acima aponta para o arquivo-fonte; os documentos do vault ficam por último.",

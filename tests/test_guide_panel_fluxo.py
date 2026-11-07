@@ -93,16 +93,16 @@ def _qLabel():
     return QLabel
 
 
-# ── (a) as seis seções, montadas como o app monta ───────────────────────────
+# ── (a) as sete seções, montadas como o app monta ───────────────────────────
 
 def test_seis_secoes_presentes(qapp, mirror_root):
     from ui import GuideOverlay
     ov = GuideOverlay(parent=None, base_dir=mirror_root)
     titles = [ov._tabs.widget(i).objectName() for i in range(ov._tabs.count())]
-    assert ov._tabs.count() == 6, titles
+    assert ov._tabs.count() == 7, titles
     expect = {"MINHAS REGRAS (o assistente/orquestador)", "REGRAS DA BOCA",
               "REGRAS DO CÉREBRO", "REGRAS DO ORQUESTRADOR / GATES",
-              "MEMÓRIA", "LINKS"}
+              "MEMÓRIA", "EXECUÇÃO CONCRETA (FASE3-TASK4)", "LINKS"}
     assert set(titles) == expect
     # cada seção não é vazia: texto de regra aparece
     assert len(_all_text(ov)) > 10_000
@@ -191,7 +191,7 @@ def test_segreto_e_dado_pessoal_retidos(qapp, mirror_root):
 def test_painel_real_do_projeto(qapp):
     from ui import GuideOverlay
     ov = GuideOverlay(parent=None)            # base_dir = BASE_DIR, como no app
-    assert ov._tabs.count() == 6
+    assert ov._tabs.count() == 7
     visivel = _all_text(ov)
     assert "guard" in visivel or "Guardas da boca" in visivel
     # a seção LINKS aponta para o arquivo-fonte de cada regra

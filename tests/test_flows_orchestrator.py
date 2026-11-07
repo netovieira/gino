@@ -152,8 +152,11 @@ def test_confirmation_never_executes_the_tool():
 
 
 def test_executor_result_becomes_authorized_fact_only_when_real():
+    # FASE3-TASK4: resultado real também precisa de prova material (recibo HMAC + verified).
     orch, runner, _ = _orchestrator(runner=Runner(
-        fact={"ok": True, "spoken": "Volume em 40%", "simulated": False}))
+        fact={"ok": True, "spoken": "Volume em 40%", "simulated": False,
+              "call_id": "abc-123", "receipt_hmac": "sha256:deadbeef",
+              "verified": True}))
     plan = orch.begin("t1", "baixa o som")
     results = orch.run_plan(plan)
     assert runner.calls[0][0] == "media_control"
