@@ -23,6 +23,10 @@ def vault(tmp_path, monkeypatch):
     monkeypatch.setattr(obsidian, "VAULT", root)
     monkeypatch.setattr(obsidian, "PLANS_DIR", plans)
     monkeypatch.setattr(obsidian, "OBSIDIAN_BIN", "/snap/bin/obsidian")
+    # UP-7: abrir nota grava event=obsidian_opened; o activity.log do dono
+    # não pode virar alvo de teste.
+    monkeypatch.setattr(obsidian, "ACTIVITY_LOG", tmp_path / "activity.log")
+    monkeypatch.setattr(obsidian, "NEXTCLOUD_DIR", tmp_path / "Nextcloud")
     return root, plans
 
 

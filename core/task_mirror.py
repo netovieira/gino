@@ -23,6 +23,15 @@ LIMITES
     encontrado, o espelho mostra só as linhas de progresso do sidecar. Nada aqui
     levanta para o turno de voz: falhar ao abrir a janela vira uma linha no log.
 
+UP-7 (FLUXO TRABALHO, passo 4)
+    O dono também pode pedir o PLANO na tela, não só o terminal. Em
+    ``open_plan`` o espelho vira nota Markdown do cofre (título, plano de ação
+    do job corrente e o andamento já gravado) e é aberta no Obsidian por
+    ``core.obsidian`` — que registra ``event=obsidian_opened`` com o caminho no
+    activity.log e espelha a nota na pasta Nextcloud do dono. Sem cofre, sem
+    Obsidian ou sem plano: a falha volta como mensagem honesta e uma linha no
+    log; jamais quebra o turno.
+
 CICLO DE VIDA DA JANELA
     A janela nasce com a execução e morre com ela: o pid do terminal é anotado
     no nascimento e, em ``finish`` (sucesso, erro ou cancelamento), é terminado
@@ -73,6 +82,11 @@ _RECENT_DEDUP = 6.0
 _MAX_WINDOWS = 3               # pids lembrados por espelho (reaberturas)
 _CLOSE_TERM_WAIT = 1.0         # ptyxis sai em milissegundos; isto é só o teto
 _CLOSE_KILL_WAIT = 0.5
+
+# Nota do plano de ação (UP-7): quantas linhas do andamento cabem na nota.
+_NOTE_FOLDER = "Planos"
+_NOTE_PROGRESS = 80
+_NOTE_LINE = 200
 
 _lock = threading.RLock()
 _entries: dict[str, dict] = {}
@@ -964,8 +978,12 @@ def _newest_log() -> tuple[str, str]:
     return "", ""
 
 
-def show(ident=None, query: str = "", force: bool = False) -> dict:
-    """Abre o espelho da execução pedida, da fila corrente ou do live."""
+def _resolve_target(ident=None, query: str = "") -> tuple[str, str]:
+    """Id e título da execução pedida: task_id, título falado, fila ou live.
+
+    ``show`` e ``open_plan`` usam o mesmo mapa — é o que garante que "me mostra
+    trabalhando" e "abre o plano na tela" apontem para o mesmo trabalho.
+    """
     target = str(ident or "").strip()
     title = ""
     if not target:
@@ -979,6 +997,34 @@ def show(ident=None, query: str = "", force: bool = False) -> dict:
                 found, found_title = _newest_log()
                 if found and found != LIVE_ID:
                     target, title = found, found_title or title
+    return target, title
+
+
+def _entry_snapshot(ident: str, title: str = "") -> tuple[dict | None, bool]:
+    """(snapshot do espelho, veio_de_disco). ``None`` quando não existe.
+
+    Log antigo em disco é registrado como encerrado: abrir o plano de uma
+    execução que já terminou é pedido explícito do dono, não um espelho vivo.
+    """
+    global _last_active
+    with _lock:
+        key = _resolve(ident) or str(ident or "")
+        entry = _entries.get(key)
+        from_disk = False
+        if entry is None:
+            path = _path_for(key)
+            if path.is_file():
+                entry = _attach_existing(key, title or key)
+                from_disk = True
+            else:
+                return None, False
+        _last_active = entry["id"]
+        return dict(entry), from_disk
+
+
+def show(ident=None, query: str = "", force: bool = False) -> dict:
+    """Abre o espelho da execução pedida, da fila corrente ou do live."""
+    target, title = _resolve_target(ident, query)
 
     with _lock:
         key = _resolve(target) or target
@@ -1023,6 +1069,154 @@ def show(ident=None, query: str = "", force: bool = False) -> dict:
             "log": snapshot.get("path", ""), "opened": bool(ok),
             "message": ("Abri o espelho da execução na tela."
                         if ok else f"Não consegui abrir o terminal: {message}")}
+
+
+# ── plano de ação em nota (UP-7: FLUXO TRABALHO passo 4) ────────────────────
+
+def _log_tail(path, limit: int = _NOTE_PROGRESS) -> tuple[str, list[str]]:
+    """(início do cabeçalho, últimas linhas legíveis) de um log em disco."""
+    started = ""
+    lines: list[str] = []
+    try:
+        text = Path(str(path or "")).read_text(
+            encoding="utf-8", errors="replace")
+    except Exception:
+        return "", lines
+    for raw in text.splitlines():
+        if raw.startswith("# início:"):
+            started = raw.split(":", 1)[1].strip()
+        if raw.startswith("#") or not raw.strip():
+            continue
+        # Cerca de `` dentro do bloco quebraria a nota Markdown.
+        lines.append(_one_line(raw, _NOTE_LINE).replace("`", "'"))
+    return started, lines[-limit:]
+
+
+def _markdown_section(text: str, heading: str) -> str:
+    """Corpo de uma seção ``## <heading>`` de um Markdown, ou ''."""
+    out: list[str] = []
+    inside = False
+    for line in str(text or "").splitlines():
+        if not inside:
+            inside = line.strip().lower() == f"## {heading.lower()}"
+            continue
+        if line.strip().startswith("#"):
+            break
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def _active_plan_text() -> str:
+    """O plano de ação do job corrente (arquivo em ``~/.qoder/plans``), ou ''.
+
+    O passo 2 do fluxo grava o plano nesse arquivo antes da aprovação; é ele
+    que a nota tem de mostrar. Sem job, ou sem arquivo, a nota não inventa
+    plano nenhum — fica com o andamento do espelho.
+    """
+    try:
+        from core import qoder_jobs
+        job = getattr(qoder_jobs, "_ACTIVE", None)
+        if job is None:
+            return ""
+        path = str(getattr(job, "plan_path", "") or "").strip()
+        if path:
+            try:
+                text = Path(path).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                text = ""
+            section = _markdown_section(text, "Passos")
+            if section:
+                return section
+        return _one_line(getattr(job, "plan", "") or "", 1500)
+    except Exception:      # noqa: BLE001 - sem job do Qoder, sem plano na nota
+        return ""
+
+
+def plan_note_body(entry: dict, plan_text: str = "") -> str:
+    """A nota Markdown: plano de ação + andamento gravado no espelho."""
+    title = _one_line(entry.get("title"), 160) or str(entry.get("id") or "")
+    started, tail = _log_tail(entry.get("path"))
+    state = "concluída" if entry.get("done") else "em andamento"
+    plan = str(plan_text or "").strip() or (
+        "- O Qoder ainda não gravou um plano em arquivo; o que segue é o "
+        "andamento real desta execução.")
+    lines = [
+        f"# Plano de ação — {title}",
+        "",
+        f"- Execução: {entry.get('id') or ''}",
+        f"- Estado: {state}",
+        f"- Aberta em: {started or _stamp()}",
+        f"- Log ao vivo: {entry.get('path') or ''}",
+        "",
+        "## Plano de ação",
+        "",
+        plan,
+        "",
+        "## Andamento",
+        "",
+        "```",
+        *(tail or ["(o log ainda não tem linhas)"]),
+        "```",
+        "",
+        "_Gerada pelo espelho de execução na pasta do cofre; a cópia fica na "
+        "conta Nextcloud do dono._",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def open_plan(ident=None, query: str = "", plan: str = "") -> dict:
+    """Abre na tela a nota do plano de ação (Obsidian + cópia Nextcloud).
+
+    É o passo 4 do FLUXO TRABALHO: depois de aprovar, o dono pede para ver. O
+    espelho vira nota, o ``core.obsidian`` abre no Obsidian e grava
+    ``event=obsidian_opened`` no activity.log. Nada aqui levanta: sem cofre ou
+    sem Obsidian a resposta é a mensagem honesta, e a linha fica no log do
+    espelho para a auditoria ver que a tentativa aconteceu.
+    """
+    target, found_title = _resolve_target(ident, query)
+    snapshot, _from_disk = _entry_snapshot(target, found_title)
+    key = str((snapshot or {}).get("id") or _resolve(target) or target or "")
+    if snapshot is None:
+        return {"ok": False, "id": key,
+                "message": "Não há execução para abrir o plano."}
+    try:
+        from core import obsidian
+    except Exception as exc:  # noqa: BLE001 - cofre indisponível não quebra a fala
+        message = f"O módulo do cofre não está disponível: {exc}"
+        append(key, f"· plano não abriu no Obsidian: {message}")
+        return {"ok": False, "id": key, "title": snapshot.get("title", ""),
+                "note": "", "nextcloud": "", "registered": False,
+                "message": message}
+    body = plan_note_body(snapshot, plan or _active_plan_text())
+    note_title = f"Plano de ação — {_window_task_title(snapshot)}"
+    try:
+        result = obsidian.open_note(note_title, body, folder=_NOTE_FOLDER,
+                                    source="task_mirror")
+    except Exception as exc:  # noqa: BLE001
+        result = {"ok": False, "path": "", "nextcloud": "",
+                  "registered": True, "message": str(exc)}
+    opened = bool(result.get("ok"))
+    registered = bool(result.get("registered", True))
+    note = str(result.get("path") or "")
+    message = str(result.get("message") or "")
+    if opened:
+        append(key, f"▸ plano no Obsidian: {note}")
+        if not registered:
+            # O comando saiu mas o cofre não é o que o Obsidian tem aberto:
+            # sem essa linha o dono veria "abriu" onde nada apareceu.
+            append(key, "· cofre fora da lista do Obsidian — registre-o ou "
+                        "ajuste JARVIS_OBSIDIAN_VAULT")
+    else:
+        append(key, f"· plano não abriu no Obsidian: {message or 'erro'}")
+    headline = f"Abri o plano de ação na tela: {note}"
+    return {"ok": opened, "id": key, "title": snapshot.get("title", ""),
+            "note": note, "nextcloud": str(result.get("nextcloud") or ""),
+            "registered": registered,
+            "log": snapshot.get("path", ""),
+            "message": (f"{headline}. {message}" if opened and not registered
+                        else headline if opened
+                        else message or "Não consegui abrir o plano no Obsidian.")}
 
 
 def status() -> dict:
