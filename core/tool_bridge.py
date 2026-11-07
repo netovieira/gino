@@ -228,6 +228,8 @@ _REDACTED = "[REDACTED]"
 
 _DEFAULT_TIMEOUT = 120.0
 _RESULT_SUMMARY_CHARS = 500
+# Rastro de memoria no ledger: a linha prova a chamada; o conteudo e cortado.
+_MEMORY_ARGS_CHARS = 160
 
 # ── pending (refused) actions ───────────────────────────────────────────────
 #
@@ -288,6 +290,20 @@ def summarize(value: Any, limit: int = _RESULT_SUMMARY_CHARS) -> str:
             text = str(value)
     text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _clip(value: Any, limit: int = _MEMORY_ARGS_CHARS) -> Any:
+    """Trunca um campo de conteudo antes de ir ao ledger de auditoria.
+
+    A linha de memoria precisa existir no ``tool_bridge.log`` para valer como
+    prova do FLUXO RESPOSTA passo 1, mas o que se grava e o rastro da
+    chamada, nao o conteudo inteiro da conversa: query e anotacao saem
+    cortadas no limiar. ``None`` fica ausente do registro (evita "None"
+    literal no log).
+    """
+    if value is None:
+        return None
+    return summarize(value, limit)
 
 
 def _positive(value: Any, minimum: float) -> float:
@@ -571,29 +587,33 @@ class ToolBridge:
         @app.post("/memory/read", dependencies=auth)
         async def memory_read(payload: MemoryReadRequest):
             fn = self._find_method(self._memory, ("read", "memory_read"))
+            args = self._memory_args(path=_clip(payload.path))
             if fn is None:
-                return self._not_configured("memory", "Memory bridge is not configured.")
-            return await self._delegate(fn, path=payload.path)
+                return self._memory_unavailable("memory_read", args)
+            return await self._memory_call("memory_read", fn, args,
+                                           path=payload.path)
 
         @app.post("/memory/search", dependencies=auth)
         async def memory_search(payload: MemorySearchRequest):
             fn = self._find_method(self._memory, ("search", "memory_search"))
+            args = self._memory_args(query=_clip(payload.query),
+                                     limit=payload.limit)
             if fn is None:
-                return self._not_configured("memory", "Memory bridge is not configured.")
-            kwargs = {"query": payload.query}
-            if payload.limit is not None:
-                kwargs["limit"] = payload.limit
-            return await self._delegate(fn, **kwargs)
+                return self._memory_unavailable("memory_search", args)
+            kwargs = self._memory_args(query=payload.query,
+                                       limit=payload.limit)
+            return await self._memory_call("memory_search", fn, args, **kwargs)
 
         @app.post("/memory/note", dependencies=auth)
         async def memory_note(payload: MemoryNoteRequest):
             fn = self._find_method(self._memory, ("note", "memory_note", "append"))
+            args = self._memory_args(text=_clip(payload.text),
+                                     kind=payload.kind)
             if fn is None:
-                return self._not_configured("memory", "Memory bridge is not configured.")
-            kwargs = {"text": payload.text}
-            if payload.kind is not None:
-                kwargs["kind"] = payload.kind
-            return await self._delegate(fn, **kwargs)
+                return self._memory_unavailable("memory_note", args)
+            kwargs = self._memory_args(text=payload.text,
+                                       kind=payload.kind)
+            return await self._memory_call("memory_note", fn, args, **kwargs)
 
         @app.post("/voice/list", dependencies=auth)
         async def voice_list():
@@ -1279,6 +1299,62 @@ class ToolBridge:
             content={"status": "unavailable", "component": component,
                      "error": message},
         )
+
+    # ── memória: rastro no ledger (UV-7, fila SKILL.md item 3) ────────────
+
+    async def _memory_call(self, name: str, fn: Callable, args: dict,
+                           **kwargs):
+        """Roda um endpoint de memória e grava a linha no ``tool_bridge.log``.
+
+        ``/call`` sempre auditou; ``/memory/read``, ``/memory/search`` e
+        ``/memory/note`` eram os únicos caminhos da ponte sem rastro em disco.
+        Por isso a busca real de memória do cérebro (FLUXO RESPOSTA, passo 1)
+        acontecia e não deixava prova. Aqui cada chamada vira um registro com
+        nome, argumento cortado, tier, resultado resumido e status.
+        """
+        result = await self._delegate(fn, **kwargs)
+        status, outcome = self._memory_outcome(result)
+        self._audit_action(name, args, self._memory_tier(name),
+                           approved=True, result=outcome, status=status)
+        return result
+
+    def _memory_unavailable(self, name: str, args: dict) -> JSONResponse:
+        """Memória desligada também fica registrada: ausência com motivo."""
+        message = "Memory bridge is not configured."
+        self._audit_action(name, args, self._memory_tier(name),
+                           approved=False, result=message,
+                           status="unavailable")
+        return self._not_configured("memory", message)
+
+    @staticmethod
+    def _memory_outcome(result: Any) -> tuple[str, Any]:
+        """Extrai (status, resumo) do retorno do ``_delegate``."""
+        if isinstance(result, JSONResponse):
+            try:
+                body = json.loads(result.body.decode("utf-8", "replace"))
+            except Exception:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            status = str(body.get("status") or "error")
+            if status == "ok":
+                status = "error"
+            return status, (body.get("error") or body.get("result")
+                            or status)
+        if isinstance(result, dict):
+            return str(result.get("status") or "ok"), result.get("result")
+        return "ok", result
+
+    @staticmethod
+    def _memory_tier(name: str) -> str:
+        """Leitura e busca são leitura pura; anotar escreve no índice."""
+        return TIER_LOW if str(name) == "memory_note" else TIER_SAFE
+
+    @staticmethod
+    def _memory_args(**pairs) -> dict:
+        """Argumentos do registro: truncados e sem chaves vazias."""
+        return {key: value for key, value in pairs.items()
+                if value is not None}
 
     # ── audit ──────────────────────────────────────────────────────────────
 
