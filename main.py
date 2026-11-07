@@ -19675,6 +19675,25 @@ class JarvisLive:
                             self._apply_multi_mic_key, decision.name, key)
                     except Exception:
                         pass
+                # UP-2: registrar no activity.log quando o AEC por canal
+                # rejeita eco do TTS — prova de que o guard está funcionando.
+                # Throttle: no máximo uma linha por segundo para não inundar.
+                if not getattr(decision, "aec_clean", True):
+                    _now = time.monotonic()
+                    _last = getattr(self, "_multi_mic_aec_log_at", 0.0)
+                    if _now - _last >= 1.0:
+                        self._multi_mic_aec_log_at = _now
+                        try:
+                            meta = _activity.make_meta(
+                                chan="sistema",
+                                origin="multi_mic_aec_reject")
+                            self.ui.write_log(_activity.with_meta(
+                                f"[fluxos] multi_mic_aec_reject "
+                                f"source={decision.source} "
+                                f"name={decision.name} "
+                                f"verdict={decision.verdict}", meta))
+                        except Exception:
+                            pass
             chosen = getattr(mic.decision, "source", None)
             if chosen != index:
                 return                  # esta fonte não é a escolhida agora
@@ -20149,6 +20168,23 @@ class JarvisLive:
                                     if float(state.get("peak_rms") or 0.0) > 0.0)
                                 print(f"[Mic] captura por fonte: {_audible}/"
                                       f"{len(_audit)} com áudio medido")
+                                # UP-2: registrar no activity.log que N
+                                # dispositivos estão ativos simultaneamente —
+                                # prova de captura paralela.
+                                try:
+                                    _names = "+".join(
+                                        str(s.get("name") or f"mic{i}")
+                                        for i, s in enumerate(_audit))
+                                    meta = _activity.make_meta(
+                                        chan="sistema",
+                                        origin="multi_mic_active")
+                                    self.ui.write_log(_activity.with_meta(
+                                        f"[fluxos] multi_mic_active "
+                                        f"devices={len(_audit)} "
+                                        f"audible={_audible} "
+                                        f"sources={_names}", meta))
+                                except Exception:
+                                    pass
                             while True:
                                 await asyncio.sleep(0.5)
                                 if getattr(self, "_mic_route_dirty", False):
@@ -20737,11 +20773,27 @@ class JarvisLive:
                         self._out_level = max(f[0] for f in frames)
                         self._echo.note_output(pcm, RECEIVE_SAMPLE_RATE,
                                                self._out_level)
+                        # UP-2: feed the multi-mic's per-channel EchoGuards so
+                        # each microphone learns its own echo (distance/angle).
+                        _mm = getattr(self, "_multi_mic", None)
+                        if _mm is not None:
+                            try:
+                                _mm.note_output(pcm, RECEIVE_SAMPLE_RATE,
+                                                self._out_level)
+                            except Exception:
+                                pass
                     else:
                         lvl = _pcm_level(pcm)
                         self.ui.set_audio_level(lvl)
                         self._out_level = lvl
                         self._echo.note_output(pcm, RECEIVE_SAMPLE_RATE, lvl)
+                        # UP-2: same for the frame-less path.
+                        _mm = getattr(self, "_multi_mic", None)
+                        if _mm is not None:
+                            try:
+                                _mm.note_output(pcm, RECEIVE_SAMPLE_RATE, lvl)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
