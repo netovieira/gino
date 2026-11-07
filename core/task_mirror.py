@@ -671,6 +671,19 @@ def finish(ident, status: str = "done", summary: str = "") -> None:
         _close_windows(entry)
     except Exception as exc:  # noqa: BLE001 - fechar janela não quebra o turno
         print(f"[TaskMirror] fechar janela ({key}): {exc}")
+    # PORTÃO DE FECHAMENTO (ordem do dono, 07/11/2026): fechar "done" um item
+    # que tem asserção cadastrada em core/dev_audit e a asserção está em
+    # falha/nao_verificado gera AVISO registrado — uma linha
+    # ``event=close_advisory``, nunca fala, nunca bloqueio. A tarefa terminou
+    # e quem fecha continua sendo livre; o mecanismo existe para a
+    # divergência "fechado no plano x vivo de verdade" ficar no log.
+    if str(status or "").strip().lower() in ("done", "completed",
+                                             "concluido", "concluído"):
+        try:
+            from core import dev_audit
+            dev_audit.advise_close(key, status)
+        except Exception:  # noqa: BLE001 - auditoria não fecha nem quebra nada
+            pass
 
 
 def link(ident, target) -> None:

@@ -3550,6 +3550,10 @@ class JarvisLive:
         self._log_boot_provenance()
         self.ui.write_log(f"SYS: {self._asst_name} online — cérebro: {chain_txt}, "
                           f"voz {_brain.voice_label(st)}. Gemini desligado.")
+        # O serviço está de pé: a auditoria de implementação roda AGORA, e em
+        # thread dela (ordem do dono 07/11/2026 — conferir o que foi "fechado
+        # antes" contra o vivo, sem atrasar nem bloquear o boot).
+        self._start_dev_audit()
         print(f"[Economy] chain: {chain_txt}")
         print(f"[Economy] primary @ {st['base_url']}")
         # Which voice is actually in use, on stdout as well as in the panel: the
@@ -13503,6 +13507,42 @@ class JarvisLive:
         except Exception as e:
             print(f"[Boot] proveniência indisponível: {e}")
 
+    # ORDEM DO DONO (07/11/2026): o boot audita se o que foi "fechado antes"
+    # está VIVO. Mecanismo em core/dev_audit.py; aqui só o agendamento — no
+    # mesmo molde do boot de e-mail/WhatsApp: thread própria, daemon, fora do
+    # caminho crítico. Falha da auditoria é UMA linha de log; ela nunca sobe
+    # para o startup e nunca atrasa o "online" (roda 20 s depois, quando as
+    # threads de boot já pousaram suas linhas de evento).
+    _DEV_AUDIT_DELAY_S = 20.0
+
+    def _start_dev_audit(self) -> None:
+        """Auditoria de implementação: uma passada por boot, em thread própria."""
+        if getattr(self, "_dev_audit_started", False):
+            return
+        self._dev_audit_started = True
+
+        def _worker() -> None:
+            try:
+                from core import dev_audit
+                # A janela de "desde este boot" é o início do PROCESSO
+                # (não a importação tardia do módulo): as linhas de evento do
+                # próprio boot têm de cair dentro dela.
+                dev_audit.configure(
+                    log=self.ui.write_log,
+                    boot_epoch=_PROCESS_STARTED_WALL)
+                time.sleep(self._DEV_AUDIT_DELAY_S)
+                dev_audit.run_audit(janela="boot")
+            except Exception as e:
+                try:
+                    self.ui.write_log(
+                        f"[DevAudit] auditoria de implementacao indisponivel: "
+                        f"{type(e).__name__}")
+                except Exception:
+                    print(f"[DevAudit] auditoria de implementacao indisponivel: {e!r}")
+
+        threading.Thread(target=_worker, daemon=True,
+                         name="jarvis-dev-audit").start()
+
     def _restart_reply(self, message: str, *, reply_channel: str = "",
                        wa_account: str | None = None,
                        wa_chat: str | None = None) -> None:
@@ -21695,6 +21735,11 @@ class JarvisLive:
                         self._awake = True
                         self.ui.set_state("LISTENING")
                         self.ui.write_log(f"SYS: {self._asst_name} online.")
+
+                    # Serviço de pé: auditoria de implementação em thread
+                    # própria (ordem do dono 07/11/2026), mesmo molde do boot
+                    # em modo economia. Nunca bloqueia nem quebra o run().
+                    self._start_dev_audit()
 
                     if self._dashboard:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})
