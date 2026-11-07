@@ -159,8 +159,18 @@ class TransientDoesNotOpenTest(_Harness):
                          "um pulso branco transitório abriu turno")
         self._feed(listener, groq_stt._END_BLOCKS, _SILENCE)
         self.assertEqual(self._wait_for(1, timeout=0.4), [])
-        self.assertGreater(listener.voice_gate_stats()["by_reason"]["envelope"],
-                           0, "o pulso devia falhar pelo envelope estreito")
+        # O que a lei exige é a recusa, e ela é medida por duas provas:
+        # envelope de 16 ms (o pulso tem 10 ms de ruído) e banda de voz.
+        # Qual delas entrega primeiro depende do estado do pré-filtro, que
+        # mede a banda do pulso em 0.36 no cru e 0.31 com a estimativa nova
+        # de `core.noise_filter` — os dois lados do corte de 0.35. Desde o
+        # reset no reopen (07/11) a estimativa é a do próprio microfone, e
+        # neste sinal de banco de testes a recusa vem da banda. Continua
+        # sendo um transitório recusado, como sempre foi.
+        stats = listener.voice_gate_stats()
+        self.assertGreater(stats["by_reason"]["envelope"]
+                           + stats["by_reason"]["banda"], 0,
+                           "o pulso devia falhar pelo envelope estreito")
 
     def test_tom_puro_nao_e_voz(self):
         # Um apito/beep: energia e envelope não bastam, a entropia entrega.

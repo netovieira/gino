@@ -1,6 +1,6 @@
 """RNNoise-inspired pre-filter for audio before STT.
 
-Provides two entry points:
+Provides three entry points:
 
 * ``filter_block`` -- lightweight spectral gate for real-time 64 ms blocks.
   Uses a short FFT + Wiener-style gain curve.  Targets < 1 ms per block on
@@ -12,6 +12,14 @@ Provides two entry points:
   BEFORE sending to Whisper.  Latency is not critical here because the model
   inference dominates.
 
+* ``reset_noise_estimate`` -- forget what the gate learned about the room.  The
+  estimate is a running average, so it belongs to the microphone that produced
+  it: ``core/groq_stt.py`` calls it whenever the input stream reopens (a mute
+  window, a device switch, a new listener) -- see ``[STT] noise estimate
+  reset motivo=...`` on the console.  A gate left running on another device's
+  estimate multiplies every block down to the spectral floor and the assistant
+  is deaf while the microphone is still delivering audio.
+
 Design constraints:
   * Must not corrupt clean audio (high-energy signals pass through unchanged).
   * Graceful fallback: if ``noisereduce`` is not installed, ``filter_array``
@@ -19,6 +27,7 @@ Design constraints:
 """
 from __future__ import annotations
 
+import threading
 import time
 import numpy as np
 
@@ -58,13 +67,65 @@ _RMS_SILENCE_GATE = 0.003
 
 
 # Running noise estimate (module-level exponential average).
+#
+# One microphone stream writes it from the audio callback thread on every
+# 64 ms block; a stream reopen happens on a different thread. The lock exists
+# for that pair: without it a `reset_noise_estimate()` landing between the read
+# and the write of `filter_block` leaves the gate running on a torn (or None)
+# estimate, and an estimate learned from a device that no longer exists is
+# exactly the "deaf microphone" this module is blamed for.
 _noise_estimate: np.ndarray | None = None
+_estimate_lock = threading.Lock()
+# Observability for the next debug cycle: how many times the estimate was
+# forgotten in this process and why. Written under `_estimate_lock`.
+_reset_count = 0
+_last_reset_reason = ""
 
 
-def reset_noise_estimate() -> None:
-    """Forget the running noise floor estimate (e.g. after a mic switch)."""
-    global _noise_estimate
-    _noise_estimate = None
+def reset_noise_estimate(reason: str = "") -> bool:
+    """Forget the running noise floor estimate (e.g. after a mic switch).
+
+    Thread-safe and idempotent: calling it twice, or on an already-empty
+    estimate, is the same state as calling it once.  Returns True when there
+    WAS an estimate to forget, which is what the callers use to decide whether
+    the reset was a real event or a duplicate of a previous one.
+
+    After a reset the very next block re-seeds the estimate from its own
+    spectrum, so the gate is valid again immediately -- a reset never means
+    "unfiltered", it means "stop trusting the old room".
+    """
+    global _noise_estimate, _reset_count, _last_reset_reason
+    with _estimate_lock:
+        had = _noise_estimate is not None
+        _noise_estimate = None
+        _reset_count += 1
+        _last_reset_reason = str(reason or "")
+    return had
+
+
+def has_noise_estimate() -> bool:
+    """True once the gate has measured at least one block since the last reset."""
+    with _estimate_lock:
+        return _noise_estimate is not None
+
+
+def noise_estimate_mean() -> float | None:
+    """Mean of the current noise estimate (None when there is none).
+
+    Debug aid: a value far above the microphone's own spectrum is the signature
+    of the stuck gate -- the estimate belongs to another device or to a louder
+    moment of the room, and every block is being multiplied down to the
+    spectral floor.
+    """
+    with _estimate_lock:
+        estimate = _noise_estimate
+        return None if estimate is None else float(estimate.mean())
+
+
+def reset_stats() -> dict:
+    """How many estimate resets this process has seen, and the last reason."""
+    with _estimate_lock:
+        return {"count": _reset_count, "last_reason": _last_reset_reason}
 
 
 def filter_block(audio_int16: bytes | np.ndarray,
@@ -118,14 +179,20 @@ def filter_block(audio_int16: bytes | np.ndarray,
     if q25 < 1e-10:
         q25 = 1e-10
 
-    # Update the running noise estimate (exponential moving average).
-    if _noise_estimate is None or _noise_estimate.size != n_bins:
-        _noise_estimate = np.full(n_bins, q25, dtype=np.float32)
-    else:
-        _noise_estimate = (1.0 - _NOISE_ALPHA) * _noise_estimate + _NOISE_ALPHA * q25
+    # Update the running noise estimate (exponential moving average). The lock
+    # only covers the estimate itself -- the FFT above stays lock-free -- and
+    # the gain below uses the LOCAL copy, so a `reset_noise_estimate()` from
+    # the reopen path can never tear the value this block is about to use.
+    with _estimate_lock:
+        if _noise_estimate is None or _noise_estimate.size != n_bins:
+            estimate = np.full(n_bins, q25, dtype=np.float32)
+        else:
+            estimate = ((1.0 - _NOISE_ALPHA) * _noise_estimate
+                        + _NOISE_ALPHA * q25)
+        _noise_estimate = estimate
 
     # Wiener-style gain: suppress bins that are close to the noise floor.
-    noise_scaled = _OVER_SUB * _noise_estimate
+    noise_scaled = _OVER_SUB * estimate
     gain = np.maximum(_SPECTRAL_FLOOR, 1.0 - noise_scaled / (magnitude + 1e-10))
     # Smooth the gain across bins to reduce musical noise (3-tap average).
     kernel = np.array([0.25, 0.5, 0.25], dtype=np.float32)

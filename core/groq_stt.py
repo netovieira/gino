@@ -105,6 +105,25 @@ _FLOOR_MIN = 0.002       # the quietest floor we believe
 _THRESH_MIN = 0.006      # the quietest threshold we accept (≈ -44 dBFS)
 _FLOOR_MULT = 2.2        # speech must be this many times the room floor
 _LEVEL_LOG_S = 5.0       # console line with the mic level, to tune the above
+# The level line is never printed more than once per second, whatever the
+# period above is set to: the meter runs on the audio callback and a log line
+# per block would be the new defect.
+_PEAK_LOG_MIN_S = 1.0
+# ── Reabertura do microfone: o piso de ruido do filtro nao sobrevive a ela ──
+# `core.noise_filter` keeps a running average of the room spectrum and the RMS
+# gate multiplies every block by it. That average belongs to the stream that
+# measured it: when PulseAudio hands the microphone to another device, when a
+# mute window closes, when the stream is reopened after a stall, the old room
+# is gone but the estimate stayed — and a loud estimate pins the gate, the
+# filtered level collapses to the spectral floor, the floor of the segmenter
+# decays to `_FLOOR_MIN` and the assistant stays deaf while the log keeps
+# printing mic blocks. A gap this long with no block means the callback thread
+# was not running: whatever the filter learned came from another stream. Eight
+# missed blocks — no healthy stream hides that many, and no reopen of a real
+# device (main.py: "Microfone ativo mudou — reabrindo stream", the 8 s stall
+# watchdog) is faster than that. `notify_noise_reset()` below is the hook for
+# the change that arrives without a gap.
+_NOISE_RESET_GAP_S = 0.5
 _SLEEP_MAX_S = 4.0        # asleep, longer "utterances" are music/TV, not a call
 
 # ── Portão de transitório: tecla, clique e impacto não abrem turno ──────────
@@ -693,6 +712,22 @@ class GroqListener:
         self._end_blocks = _END_BLOCKS
         self._peak = 0.0
         self._peak_t = time.monotonic()
+        # Peak measured on the RAW block, before `filter_block`. The line that
+        # gets printed keeps both numbers because the two failures look alike
+        # in the log and are nothing alike in the machine: a raw peak near zero
+        # is a microphone that delivers nothing, a raw peak of a voice with a
+        # filtered peak near zero is the noise gate eating the speech — which is
+        # exactly what the 07/11 deafness was (491 `quiet` lines, 0 SPEECH,
+        # while the mic was talking the whole time).
+        self._peak_raw = 0.0
+        # When the last level line was printed: the throttle floor of
+        # `_PEAK_LOG_MIN_S`, separate from `_LEVEL_LOG_S` on purpose.
+        self._peak_log_t = self._peak_t
+        # The moment the noise gate's estimate stopped describing this stream.
+        # Set by `notify_noise_reset` (a device switch, from whoever owns the
+        # audio graph) and consumed by the first block of the new stream.
+        self._noise_reset_pending = False
+        self._noise_reset_motivo = "reopen"
         # When the last microphone block arrived. A segment can only be closed
         # BY a block (700 ms of quiet), so "no block for a while" is the one
         # proof that an open segment will never close on its own.
@@ -757,6 +792,11 @@ class GroqListener:
         # Set while the worker is transcribing (or has a clip waiting): the
         # partial steps aside instead of stealing the engine from the final.
         self._transcribing = threading.Event()
+        # ── TAREFA 07/11: o ouvido que reabre e continua surdo ──────────────
+        # This listener is a new pair of ears on (possibly) a new stream: the
+        # estimate the gate carries was measured by whoever listened before.
+        # Forget it before the first block arrives.
+        self._reset_noise_estimate("start")
 
     @property
     def local(self) -> bool:
@@ -879,6 +919,12 @@ class GroqListener:
         self._reset_voice_state()
         self._partial_end()
         self._pre.clear()
+        # This is the microphone closing on a sentence: the stream that comes
+        # back is a new one, and the noise estimate the gate carries belonged to
+        # the device that was just taken away. The first block after the reopen
+        # pays for it (see `feed`).
+        self._noise_reset_pending = True
+        self._noise_reset_motivo = "reopen"
         if not self.assistant_speaking:
             _duck.up()
         if not seg:
@@ -958,13 +1004,69 @@ class GroqListener:
         print(f"[{self.label}] fala retida durante o mute devolvida ao STT "
               f"({secs:.1f}s) — o agregador decide se junta com a continuação")
 
+    # ── ruido do filtro: quem reabre o microfone recomeça a estimativa ──────
+
+    def _reset_noise_estimate(self, motivo: str) -> None:
+        """Forget the room the RNNoise gate learned, because that room is gone.
+
+        The gate's estimate is a running average of the spectrum of the stream
+        that fed it. After a reopen the numbers describe a microphone that is
+        no longer open, and the Wiener gain derived from it suppresses the NEW
+        audio towards `_SPECTRAL_FLOOR` (0.02): the filtered level collapses,
+        the segmenter's floor decays to `_FLOOR_MIN`, the threshold to
+        `_THRESH_MIN`, and no voice — however loud — crosses it again. The log
+        then keeps printing blocks and never SPEECH: deaf with a live mic.
+
+        Idempotent and cheap: the next block re-seeds the estimate from its own
+        spectrum, so this is "stop trusting the old room", never "run
+        unfiltered". Never raises: a filter that cannot be reset must still
+        deliver the new audio.
+        """
+        try:
+            had = _noise.reset_noise_estimate(motivo)
+        except Exception as e:
+            print(f"[STT] reset da estimativa de ruido falhou "
+                  f"({e.__class__.__name__}) — seguindo com a antiga")
+            return
+        print(f"[STT] noise estimate reset motivo={motivo}"
+              + ("" if had else " (já limpa)"))
+
+    def notify_noise_reset(self, motivo: str = "device_change") -> None:
+        """Ask for a fresh noise estimate on the NEXT microphone block.
+
+        The owner of the audio graph (main.py, which opens and reopens the
+        streams) calls this when it swaps devices; the reset itself runs on the
+        audio callback, on the first block of the new stream, so nothing is
+        ever reset under a segment that is still open.
+
+        Nothing to wire for the plain reopen: `feed()` already notices the gap
+        in blocks a closed stream leaves behind (`_NOISE_RESET_GAP_S`). This
+        hook is for the change that arrives WITHOUT a gap long enough to be
+        noticed from here — and is the reason it exists at all: this module
+        cannot see PulseAudio, only the blocks it is handed.
+        """
+        self._noise_reset_pending = True
+        self._noise_reset_motivo = str(motivo or "reopen")
+
     # ── audio thread ────────────────────────────────────────────────────────
 
     def feed(self, block, preroll_only: bool = False) -> None:
         x = np.asarray(block, dtype=np.float32).ravel()
         if x.size == 0:
             return
-        self._last_feed_at = time.monotonic()
+        now = time.monotonic()
+        # ── reopen do microfone: filtro novo, ouvido novo ────────────────
+        # A closed stream stops handing blocks over, so a hole in the blocks is
+        # the reopen itself — the one form of it this thread can see. The noise
+        # estimate from the other side of that hole describes a device (or a
+        # room) that is gone, and the gate multiplied by it eats the new audio.
+        gap = now - self._last_feed_at
+        self._last_feed_at = now
+        if self._noise_reset_pending:
+            self._noise_reset_pending = False
+            self._reset_noise_estimate(self._noise_reset_motivo)
+        elif gap >= _NOISE_RESET_GAP_S:
+            self._reset_noise_estimate("reopen")
         # ── RNNoise pre-filter (FASE2-TASK1) ─────────────────────────────
         # Apply noise reduction to each 64 ms block BEFORE the VAD/RMS
         # threshold and before storing in the ring buffer.  When the filter
@@ -988,9 +1090,13 @@ class GroqListener:
             # where the endpointing window joins it with this same phrase.
             self._release_held()
         # Level is computed from the FILTERED audio so the RMS threshold
-        # benefits from the noise suppression (FASE2-TASK1).
+        # benefits from the noise suppression (FASE2-TASK1). The RAW level is
+        # metered too, and for a different reason: the two numbers together say
+        # where the audio dies — in the microphone, or in our own filter.
         x_filtered = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
         level = float(np.sqrt(np.mean(x_filtered * x_filtered))) / 32768.0
+        x_raw = np.frombuffer(raw_unfiltered, dtype=np.int16).astype(np.float32)
+        level_raw = float(np.sqrt(np.mean(x_raw * x_raw))) / 32768.0
 
         if self._drop_segment:
             # The reply started: whatever was half-open belongs to the previous
@@ -1014,13 +1120,20 @@ class GroqListener:
         # A level line every few seconds on the console: the one number that
         # says whether the microphone is even reaching us, and how it compares
         # to the threshold, so sensitivity can be tuned from a log instead of
-        # a guess.
+        # a guess. `raw` and `filtrado` split the same question in two: a raw
+        # peak of a voice with a filtered peak at the floor is the noise gate
+        # eating the speech; a raw peak at the floor is the device itself.
+        # Printed at most once per second (`_PEAK_LOG_MIN_S`), whatever the
+        # period above is set to — this runs on the audio callback.
         self._peak = max(self._peak, level)
-        now = time.monotonic()
-        if now - self._peak_t >= _LEVEL_LOG_S:
-            print(f"[Groq] mic peak {self._peak:.4f}  floor {self._floor:.4f}  "
-                  f"threshold {thresh:.4f}  {'SPEECH' if self._active else 'quiet'}")
-            self._peak, self._peak_t = 0.0, now
+        self._peak_raw = max(self._peak_raw, level_raw)
+        if (now - self._peak_t >= _LEVEL_LOG_S
+                and now - self._peak_log_t >= _PEAK_LOG_MIN_S):
+            print(f"[Groq] mic peak raw={self._peak_raw:.4f} "
+                  f"filtrado={self._peak:.4f} floor={self._floor:.4f} "
+                  f"gate={thresh:.4f}  {'SPEECH' if self._active else 'quiet'}")
+            self._peak, self._peak_raw = 0.0, 0.0
+            self._peak_t = self._peak_log_t = now
 
         if not self._active:
             # Determine if this block contains speech: Silero VAD when the
