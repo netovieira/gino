@@ -29,6 +29,20 @@ EXECUÇÃO CONCRETA OBRIGATÓRIA (FASE3-TASK4)
     recibo HMAC + verificação externa. Sem prova material, o fato é marcado
     como "unverified" e o guard rejeita a afirmação de resultado. Modo
     observador (primeiras 2 semanas): loga mas não bloqueia.
+
+PROVA MATERIAL — BLOQUEIO PÓS-OBSERVAÇÃO (UP-9)
+    Terminado o período de observação (29/11/2026), a ação com efeito
+    colateral que devolve resultado SEM recibo HMAC deixa de ser apenas
+    "unverified": ela é BLOQUEADA. O bloqueio é um portão temporal
+    (``_blocking_enabled``) — antes de 29/11 nada muda, o resultado continua
+    sendo só marcado. Depois, o executor:
+      1. marca ``result.blocked`` e devolve ``ok=False`` com erro declarado;
+      2. grava o evento ``execution_blocked`` no activity log;
+      3. notifica o dono (core/actiongate — o registro de execuções
+         bloqueadas, de onde o app pega o aviso).
+    Bloquear não desfaz o efeito que já aconteceu: bloquear é recusar o
+    resultado como fato — o cérebro e a boca nunca afirmam o que não tem
+    prova.
 """
 from __future__ import annotations
 
@@ -37,7 +51,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
 from typing import Any, Callable
@@ -58,28 +72,96 @@ Runner = Callable[[str, dict[str, Any]], Any]
 FASE3_TASK4_START = datetime(2026, 11, 15, tzinfo=timezone.utc)
 OBSERVER_MODE_WEEKS = 2
 
+# ── UP-9: gate temporal do bloqueio ────────────────────────────────────────
+#
+# O bloqueio efetivo (recusar o resultado, gravar ``execution_blocked`` e
+# avisar o dono) entra em vigor quando o período de observação termina:
+# FASE3_TASK4_START + OBSERVER_MODE_WEEKS semanas = 29/11/2026. Até lá o
+# comportamento é exatamente o de sempre — o código existe, o portão fica
+# fechado. Um resultado bloqueado nunca é entregue como fato; desfazer o
+# efeito que já aconteceu não está nas mãos do executor.
+
+MATERIAL_PROOF_BLOCK_START = (
+    FASE3_TASK4_START + timedelta(weeks=OBSERVER_MODE_WEEKS))
+
 _ACTIVITY_LOG_PATH = Path(__file__).resolve().parent.parent.parent / "logs" / "activity.log"
+
+# Motivo canônico do bloqueio — aparece no log e no aviso ao dono.
+BLOCK_REASON = "ação sem prova material (recibo HMAC + verificação externa)"
+
+
+def _as_utc(moment: datetime) -> datetime:
+    """Normaliza para UTC sem fuso (datas ingênuas viram UTC)."""
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment
 
 
 def _is_observer_mode(now: datetime | None = None) -> bool:
     """True se estamos dentro das 2 primeiras semanas (modo observador)."""
-    now = now or datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
+    now = _as_utc(now or datetime.now(timezone.utc))
     elapsed = (now - FASE3_TASK4_START).total_seconds()
     return 0 <= elapsed < OBSERVER_MODE_WEEKS * 7 * 86400
 
 
-def _log_unverified(tool: str, task_id: str, reason: str) -> None:
-    """Grava evento TURN_UNVERIFIED no activity log."""
+def _blocking_enabled(now: datetime | None = None) -> bool:
+    """UP-9: True somente a partir de 29/11/2026 — portão do bloqueio.
+
+    Antes do fim do período de observação o bloqueio não existe: nem
+    resultado recusado, nem ``execution_blocked``, nem aviso ao dono. É o
+    gate que permite preparar o bloqueio agora e ativá-lo na data.
+    """
+    now = _as_utc(now or datetime.now(timezone.utc))
+    return now >= MATERIAL_PROOF_BLOCK_START
+
+
+def _append_activity(event: str, task_id: str, tool: str,
+                     reason: str) -> None:
+    """Escreve ``[ts] EVENTO: task_id=.. tool=.. reason=..`` no activity log."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] TURN_UNVERIFIED: task_id={task_id} tool={tool} reason={reason}\n"
+    line = f"[{ts}] {event}: task_id={task_id} tool={tool} reason={reason}\n"
     try:
         _ACTIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _ACTIVITY_LOG_PATH.open("a", encoding="utf-8") as fh:
             fh.write(line)
     except Exception as exc:
-        log.warning("could not write TURN_UNVERIFIED to activity log: %s", exc)
+        log.warning("could not write %s to activity log: %s", event, exc)
+
+
+def _log_unverified(tool: str, task_id: str, reason: str) -> None:
+    """Grava evento TURN_UNVERIFIED no activity log."""
+    _append_activity("TURN_UNVERIFIED", task_id, tool, reason)
+
+
+def _log_execution_blocked(tool: str, task_id: str, reason: str) -> None:
+    """UP-9: grava evento ``execution_blocked`` no activity log."""
+    _append_activity("execution_blocked", task_id, tool, reason)
+
+
+def _notify_owner_blocked(tool: str, task_id: str, reason: str) -> dict:
+    """UP-9: notifica o dono de que uma execução foi bloqueada.
+
+    O canal é o portão de ações (core/actiongate): o registro fica vivo até o
+    app colhê-lo e é entregue a quem registrou ouvinte (a fala do dono, o
+    painel, o WhatsApp — quem injeta é o processo vivo). Sem actiongate, ou
+    com ele quebrado, o rastro continua no log: nada de silenciar um bloqueio.
+    """
+    payload = {
+        "kind": "execution_blocked",
+        "tool": str(tool or ""),
+        "task_id": str(task_id or ""),
+        "reason": str(reason or ""),
+        "message": (f"A execução de {tool or 'ferramenta'} foi bloqueada: "
+                    f"{reason or BLOCK_REASON}"),
+    }
+    try:
+        from core import actiongate
+        actiongate.note_blocked(payload)
+    except Exception as exc:
+        log.warning("could not route the blocked-execution notice: %s", exc)
+    log.warning("[Executor] ACAO BLOQUEADA (UP-9): tool=%s task=%s reason=%s",
+                tool, task_id, reason)
+    return payload
 
 
 def _has_material_proof(payload: Any) -> bool:
@@ -199,6 +281,7 @@ class ExecutorResult:
     cancelled: bool = False
     pending_confirm: bool = False
     unverified: bool = False
+    blocked: bool = False
     facts: list[dict[str, Any]] = field(default_factory=list)
     ms: float = 0.0
     error: str = ""
@@ -209,6 +292,7 @@ class ExecutorResult:
             "cancelled": self.cancelled,
             "pending_confirm": self.pending_confirm,
             "unverified": self.unverified,
+            "blocked": self.blocked,
             "facts": self.facts, "ms": round(self.ms, 1),
             "error": self.error,
         }
@@ -423,7 +507,8 @@ class Executor:
         return finish()
 
     def _check_material_proof(self, result: ExecutorResult, tool: str,
-                               task_id: str) -> None:
+                               task_id: str,
+                               now: datetime | None = None) -> None:
         """FASE3-TASK4: verifica prova material para ações com efeito colateral.
 
         Toda ação com risk_tier >= "low" exige prova material (recibo HMAC +
@@ -431,6 +516,10 @@ class Executor:
         "unverified" e o guard rejeita a afirmação de resultado.
 
         Modo observador (primeiras 2 semanas): loga mas não bloqueia.
+
+        UP-9: passado o período de observação (29/11/2026) o resultado sem
+        prova material é BLOQUEADO — ``blocked=True``, ``ok=False``, evento
+        ``execution_blocked`` no activity log e aviso ao dono.
         """
         tier = _get_action_tier(tool)
         if not _tier_has_side_effects(tier):
@@ -443,6 +532,12 @@ class Executor:
 
         # Sem prova material: marca como unverified.
         result.unverified = True
+        # Algum fato AFIRMAVA sucesso? Só existe resultado a bloquear quando a
+        # ação se vendeu como concluída — uma ferramenta que já respondeu
+        # "falhou" não ganha um bloqueio em cima da própria falha.
+        claimed_success = any(
+            isinstance(fact, dict) and fact.get("assertion")
+            for fact in result.facts)
         # Invalida asserções (o guard rejeita afirmação sem prova).
         for fact in result.facts:
             if isinstance(fact, dict) and fact.get("assertion"):
@@ -454,7 +549,7 @@ class Executor:
 
         # Modo observador: nas primeiras 2 semanas, loga mas não bloqueia.
         # Após esse período, o resultado unverified é retornado e o guard rejeita.
-        observer = _is_observer_mode()
+        observer = _is_observer_mode(now)
         if observer:
             # Restaura asserções (modo observador não bloqueia).
             for fact in result.facts:
@@ -462,3 +557,37 @@ class Executor:
                     fact["assertion"] = True
             log.info("[Executor] OBSERVER: ação sem prova material tool=%s task=%s",
                      tool, task_id)
+            return
+
+        # UP-9: o bloqueio efetivo tem portão temporal. Antes de 29/11/2026
+        # nada aqui muda o que sempre aconteceu: o fato continua só marcado.
+        if not _blocking_enabled(now) or not claimed_success:
+            return
+
+        self._block_without_proof(result, str(tool), str(task_id), tier)
+
+    def _block_without_proof(self, result: ExecutorResult, tool: str,
+                              task_id: str, tier: str) -> None:
+        """UP-9: recusa o resultado de ação com efeito colateral sem recibo HMAC.
+
+        O efeito pode já ter acontecido — o que se bloqueia é o resultado virar
+        fato: ``ok=False``, asserções mortas e um erro declarado. O evento
+        ``execution_blocked`` fica no activity log e o dono é avisado pelo
+        portão de ações. Silenciar um bloqueio não é opção: se o registro do
+        portão falhar, o log ainda guarda o rastro.
+        """
+        result.blocked = True
+        result.ok = False
+        result.error = f"bloqueado: {BLOCK_REASON}"
+        for fact in result.facts:
+            if not isinstance(fact, dict):
+                continue
+            fact["assertion"] = False
+            fact["unverified"] = True
+            fact["blocked"] = True
+            fact["detail"] = (str(fact.get("detail") or "")
+                              + f" | execution_blocked tier={tier}").strip(" |")
+            fact["spoken"] = ("a ação rodou sem prova material; "
+                              "o resultado foi bloqueado")
+        _log_execution_blocked(tool, task_id, BLOCK_REASON)
+        _notify_owner_blocked(tool, task_id, BLOCK_REASON)

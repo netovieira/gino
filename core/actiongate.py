@@ -76,6 +76,15 @@ por decisão do dono em 06/11/2026)
     itself — core/rootgate.py owns that, and since 06/11/2026 BOTH factors
     open it there as well (main._owner_password_grant). Unknown voices,
     personas, subagents and third-party text open nothing.
+
+BLOCKED EXECUTIONS THE OWNER HAS TO HEAR (UP-9, a partir de 29/11/2026)
+    Passado o período de observação, o executor deixa de entregar como fato
+    o resultado de uma ação com efeito colateral que voltou sem recibo HMAC.
+    A recusa é registrada aqui: ``note_blocked`` guarda avisos de vida curta
+    (``BLOCKED_TTL_SECONDS``) e entrega uma cópia a quem registrou
+    ``add_blocked_listener`` — a fala do dono, o painel, o WhatsApp; quem
+    injeta é o processo vivo, e sem ouvinte o rastro continua no activity
+    log. Um aviso destes não abre janela nenhuma: é notícia, nunca grant.
 """
 from __future__ import annotations
 
@@ -122,6 +131,110 @@ _replies: dict[tuple[str, str], dict] = {}
 # drop its "already denied" marks: a fresh "pode" is a new authorisation, so
 # the same call must be allowed to reach the normal gate again.
 _grant_listeners: list[weakref.ref] = []
+
+
+# ── UP-9: execuções bloqueadas por falta de prova material ─────────────────
+#
+# Depois do período de observação (29/11/2026) o executor recusa como fato o
+# resultado de uma ação com efeito colateral que voltou sem recibo HMAC. A
+# recusa precisa chegar ao dono — foi ele quem pediu a ação, e é ele quem
+# decide o que fazer com um resultado que não tem prova. O registro abaixo é
+# o portão dessa notícia: uma lista viva (com TTL, como tudo aqui) dos
+# bloqueios recentes, mais os ouvintes que o processo vivo registra para
+# falar/showar o aviso. Nada aqui autoriza execução nenhuma: é rastro e
+# aviso, não janela.
+
+
+# Quão recente um bloqueio precisa ser para ainda contar como "avisar".
+BLOCKED_TTL_SECONDS = 1800.0
+
+# Tetos do registro: uma sessão longa não pode acumular bloqueios para sempre.
+_MAX_BLOCKED = 50
+
+_blocked: list[dict] = []
+_blocked_listeners: list[weakref.ref] = []
+
+
+def add_blocked_listener(callback) -> None:
+    """Chama ``callback(payload)`` quando uma execução é bloqueada (UP-9).
+
+    Quem registra é o processo vivo (a fala do dono, o painel, o aviso por
+    WhatsApp). A referência é fraca: um listener que morre não vazia memória
+    nem bloqueia o executor. Um listener quebrado nunca derruba o registro —
+    o rastro no portão independe da entrega.
+    """
+    if not callable(callback):
+        return
+    try:
+        ref = weakref.WeakMethod(callback)
+    except TypeError:
+        ref = weakref.ref(callback)
+    with _lock:
+        if ref not in _blocked_listeners:
+            _blocked_listeners.append(ref)
+
+
+def note_blocked(payload: dict | None = None, **fields) -> dict:
+    """Registra uma execução bloqueada e devolve o aviso entregue.
+
+    O registro vive ``BLOCKED_TTL_SECONDS`` e é limitado a ``_MAX_BLOCKED``
+    entradas. Os ouvintes recebem uma cópia do payload; exceção de ouvinte
+    é engolida — o bloqueio já aconteceu e o log já guarda o rastro.
+    """
+    record = dict(payload or {})
+    record.update(fields)
+    record.setdefault("tool", "")
+    record.setdefault("task_id", "")
+    record.setdefault("reason", "")
+    record.setdefault("kind", "execution_blocked")
+    record["at"] = time.monotonic()
+    record["until"] = record["at"] + BLOCKED_TTL_SECONDS
+    with _lock:
+        _prune_blocked_locked()
+        _blocked.append(record)
+        if len(_blocked) > _MAX_BLOCKED:
+            del _blocked[:len(_blocked) - _MAX_BLOCKED]
+        refs = list(_blocked_listeners)
+    delivered = dict(record)
+    for ref in refs:
+        callback = ref()
+        if callback is None:
+            with _lock:
+                if ref in _blocked_listeners:
+                    _blocked_listeners.remove(ref)
+            continue
+        try:
+            callback(dict(record))
+        except Exception:
+            pass  # a entrega falha; o registro e o log ficam de pé
+    return delivered
+
+
+def blocked_actions(now: float | None = None) -> list[dict]:
+    """Os bloqueios ainda vivos (mais recente primeiro)."""
+    moment = time.monotonic() if now is None else float(now)
+    with _lock:
+        return [dict(item) for item in reversed(_blocked)
+                if moment < float(item.get("until", 0.0))]
+
+
+def has_blocked(now: float | None = None) -> bool:
+    """True enquanto há pelo menos um bloqueio vivo para avisar o dono."""
+    return bool(blocked_actions(now=now))
+
+
+def clear_blocked() -> None:
+    """Esquece os bloqueios registrados (colheita do app, ou teste)."""
+    with _lock:
+        _blocked.clear()
+
+
+def _prune_blocked_locked(now: float | None = None) -> None:
+    """Descarta registros vencidos. Chamado com o lock tomado."""
+    moment = time.monotonic() if now is None else float(now)
+    keep = [item for item in _blocked if moment < float(item.get("until", 0.0))]
+    if len(keep) != len(_blocked):
+        _blocked[:] = keep
 
 
 def add_grant_listener(callback) -> None:
@@ -278,6 +391,9 @@ def close() -> None:
         _send_factor = ""
         _pending = None
         _replies.clear()
+        # UP-9: fechar o portão também fecha o registro de bloqueios — uma
+        # sessão nova não herda avisos de execuções da sessão anterior.
+        _blocked.clear()
 
 
 def window_factor() -> str:
