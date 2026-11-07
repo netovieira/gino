@@ -32,6 +32,23 @@ from . import guard as _guard
 from .config import FlowsConfig
 from .router import Decision
 
+# UC-2 (FALA passo 2): ack intermediário da boca enquanto o cérebro tarda.
+# Se em 5 s nenhum unidade de fala saiu no turno (modelo local frio/preso,
+# brief suprimido), o runtime fala este template determinístico — modelo
+# zero, rede zero, fato zero. A lei (a) é respeitada: a frase não anuncia
+# ação nem ferramenta (passa por guard.announcement, medido 07/11/2026) e
+# não afirma resultado (passa por guard.guard fase ``brief``).
+INTERIM_SENTENCE = "Já estou vendo isso, criador."
+INTERIM_ACK_MS = 5000.0
+# UC-2 passo 4: timeout do Ollama REDUZIDO no caminho rápido da boca (brief/
+# chat = o ack de <1 s). Medido com measure_latency em 06/11/2026, o lfm3
+# quente responde em 76-85 ms; o teto de 25 s (mouth.timeout_s) só servia
+# para segurar o worker com o modelo frio ou preso. O caminho rápido desiste
+# em 6 s e cai no template determinístico — o portão intermediário (acima)
+# cobre qualquer silêncio além disso. O complement (pós-fato) mantém o teto
+# longo do config: ele nunca está no portão de <1 s.
+FAST_ACK_TIMEOUT_S = 6.0
+
 SYS_BRIEF = (
     "Você é a BOCA do Gino, um assistente falado em português do Brasil. "
     "Recebe do orquestrador apenas a INTENÇÃO de um pedido do dono e diz UMA "
@@ -106,12 +123,21 @@ def stream_ollama(messages: list[dict[str, str]], max_tokens: int,
                   *, model: str, url: str, timeout_s: float,
                   keep_alive: str = "10m", temperature: float = 0.3,
                   json_mode: bool = False, early_sentence: bool = False,
-                  cancel_ev: threading.Event | None = None) -> dict[str, Any]:
-    """Chamada streaming ao Ollama; devolve texto, TTFT e 1ª frase."""
+                  cancel_ev: threading.Event | None = None,
+                  deadline_s: float | None = None) -> dict[str, Any]:
+    """Chamada streaming ao Ollama; devolve texto, TTFT e 1ª frase.
+
+    ``deadline_s`` (UC-2 passo 4): teto absoluto da chamada, medido do início
+    ao último chunk. Estourado, a stream é abandonada com o que chegou — o
+    chamador do caminho rápido (brief/chat) cai no template determinístico em
+    vez de segurar o worker até o timeout HTTP. Sem o parâmetro, o
+    comportamento é o de sempre (``complement``, que espera os fatos).
+    """
     started = time.monotonic()
     out: dict[str, Any] = {"text": "", "ttft_ms": None,
                            "first_sentence_ms": None, "end_ms": None,
-                           "error": None, "aborted": False}
+                           "error": None, "aborted": False,
+                           "deadline_hit": False}
     payload: dict[str, Any] = {
         "model": model, "messages": messages, "stream": True,
         "keep_alive": keep_alive,
@@ -138,6 +164,10 @@ def stream_ollama(messages: list[dict[str, str]], max_tokens: int,
         for line in response.iter_lines(decode_unicode=True):
             if cancel_ev is not None and cancel_ev.is_set():
                 out["aborted"] = True
+                break
+            if (deadline_s is not None
+                    and (time.monotonic() - started) >= float(deadline_s)):
+                out["deadline_hit"] = True
                 break
             if not line:
                 continue
@@ -251,7 +281,7 @@ class Mouth:
             [{"role": "system", "content": system},
              {"role": "user", "content": user}],
             self.config.mouth_brief_max_tokens, early_sentence=True,
-            temperature=0.35, cancel_ev=cancel_ev)
+            temperature=0.35, cancel_ev=cancel_ev, fast_ack=True)
         sentence = result.get("text") or ""
         tripped = ""
         if sentence:
@@ -296,7 +326,7 @@ class Mouth:
             [{"role": "system", "content": SYS_CHAT},
              {"role": "user", "content": user}],
             self.config.mouth_chat_max_tokens, early_sentence=True,
-            temperature=0.6, cancel_ev=cancel_ev)
+            temperature=0.6, cancel_ev=cancel_ev, fast_ack=True)
         sentence = clean_sentence(result.get("text") or "")
         tripped = ""
         if sentence:
@@ -407,17 +437,27 @@ class Mouth:
     # ── plumbing ────────────────────────────────────────────────────────────
     def _call(self, messages: list[dict[str, str]], max_tokens: int, *,
               early_sentence: bool, temperature: float,
-              cancel_ev: threading.Event | None) -> dict[str, Any]:
+              cancel_ev: threading.Event | None,
+              fast_ack: bool = False) -> dict[str, Any]:
+        # fast_ack (UC-2 passo 4): brief e chat são o portão de <1 s e não
+        # podem herdar os 25 s do complement. O teto do caminho rápido é
+        # FAST_ACK_TIMEOUT_S (nunca acima do timeout do config), com deadline
+        # absoluto na stream — estourou, o chamador fala o template.
+        kw: dict[str, Any] = {
+            "model": self.config.mouth_model,
+            "url": self.config.mouth_url,
+            "timeout_s": self.config.mouth_timeout_s,
+            "keep_alive": self.config.mouth_keep_alive,
+            "temperature": temperature,
+            "early_sentence": early_sentence,
+            "cancel_ev": cancel_ev,
+        }
+        if fast_ack:
+            cap = min(self.config.mouth_timeout_s, FAST_ACK_TIMEOUT_S)
+            kw["timeout_s"] = cap
+            kw["deadline_s"] = cap
         try:
-            return self.caller(
-                messages, max_tokens,
-                model=self.config.mouth_model,
-                url=self.config.mouth_url,
-                timeout_s=self.config.mouth_timeout_s,
-                keep_alive=self.config.mouth_keep_alive,
-                temperature=temperature,
-                early_sentence=early_sentence,
-                cancel_ev=cancel_ev)
+            return self.caller(messages, max_tokens, **kw)
         except Exception as exc:
             return {"text": "", "ttft_ms": 0.0, "first_sentence_ms": 0.0,
                     "end_ms": 0.0, "error": f"{type(exc).__name__}: {exc}",

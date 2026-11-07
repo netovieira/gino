@@ -18,6 +18,7 @@ from typing import Any, Callable
 
 from .config import FlowsConfig
 from .executor import Executor
+from . import mouth as _mouth
 from .orchestrator import Orchestrator, TurnPlan
 from .router import TRUST_OWNER
 from .supervisor import Supervisor
@@ -53,6 +54,12 @@ class _LiveTurn:
     # `qoder_answered_at` / `[Say]`, nunca de um `return` que pulava o cérebro.
     chat_event: threading.Event | None = None
     chat_info: dict[str, Any] | None = None
+    # UC-2 (FALA passo 2): watchdog do ack intermediário. Se em
+    # ``interim_ack_ms`` nenhuma unidade de fala saiu no turno (boca presa
+    # com o modelo frio, brief suprimido), a boca fala o template puro e o
+    # dono deixa de esperar em silêncio pelos 30-44 s do cérebro.
+    interim_timer: threading.Timer | None = None
+    interim_spoken: bool = False
 
 
 class FlowsRuntime:
@@ -67,7 +74,9 @@ class FlowsRuntime:
                  assistant_name: str = "Gino",
                  clock: Callable[[], float] = time.monotonic,
                  memory: Callable[..., dict[str, Any]] | None = None,
-                 start_expiry_thread: bool = True):
+                 start_expiry_thread: bool = True,
+                 interim_ack_ms: float | None = None,
+                 latency_log: Callable[[str], None] | None = None):
         self.config = config
         self.speak = speak
         self.log = log or (lambda _msg: None)
@@ -75,6 +84,13 @@ class FlowsRuntime:
         self.on_chat_route = on_chat_route
         self.clock = clock
         self.assistant_name = assistant_name
+        # UC-2 (passo 2): portão do ack intermediário. O processo vivo usa o
+        # teto de 5 s; testes apertam via ``interim_ack_ms`` (0 desliga).
+        self._interim_ms = float(
+            _mouth.INTERIM_ACK_MS if interim_ack_ms is None else interim_ack_ms)
+        # UC-2 (passo 6): métrica de latência ponta-a-ponta no activity.log.
+        # Injetável para os testes nunca escreverem no log real.
+        self._latency = latency_log or _mouth._log_activity
         self.supervisor = Supervisor(clock=clock)
         # O executor é o dono do portão de ferramenta. O runner é injetado
         # pelo processo vivo (main.py); sem ele o executor continua o stub
@@ -163,6 +179,19 @@ class FlowsRuntime:
             # ainda decidindo), a frase fica pronta e só vai ao ar no arm.
             threading.Thread(target=self._brief_worker, args=(plan.turn_id,),
                              name="flows-brief", daemon=True).start()
+        if (speak_allowed and self._interim_ms > 0.0
+                and not plan.decision.cancel):
+            # UC-2 passo 2: último relógio do silêncio. Dispara em 5 s (padrão
+            # do código; config pode apertar via atributo ``interim_ack_ms``).
+            # Fala só quando NADA saiu no ar — o brief/chat normais bloqueiam
+            # o disparo por ``first_phrase_at``.
+            timer = threading.Timer(self._interim_ms / 1000.0,
+                                    self._interim_fired,
+                                    args=(plan.turn_id,))
+            timer.daemon = True
+            with self._lock:
+                live.interim_timer = timer
+            timer.start()
         return plan
 
     def arm_speech(self, turn_id: str, allowed: bool = True) -> bool:
@@ -267,6 +296,29 @@ class FlowsRuntime:
                           f"{result.sentence!r}")
                 return
         self._speak(live, result.sentence, kind="brief")
+
+    def _interim_fired(self, turn_id: str) -> None:
+        """UC-2 passo 2: o silêncio passou do portão — a boca acka o cérebro.
+
+        Template determinístico, sem modelo e sem rede: nunca afirma fato
+        (lei a) e não anuncia ação (``guard.announcement`` medido 07/11/2026
+        devolve vazio para a frase). Só vai ao ar se REALMENTE nada saiu:
+        brief/chat/já falado, turno encerrado/cancelado, voiceprint indeciso
+        (armado é condição) ou cérebro que respondeu primeiro bloqueiam o
+        disparo. O conteúdo continua vindo do cérebro (passo 4): a frase é
+        ack, não resposta.
+        """
+        with self._lock:
+            live = self._turns.get(str(turn_id))
+            if (live is None or self._closed or live.cancelled
+                    or live.interim_spoken or live.first_phrase_at
+                    or live.pending_brief or live.qoder_answered_at
+                    or not live.speech_armed):
+                return
+            live.interim_spoken = True
+        self._speak(live, _mouth.INTERIM_SENTENCE, kind="interim")
+        self._log("[Fluxos] boca intermediaria: cerebro sem primeira unidade "
+                  f"apos {self._interim_ms:.0f}ms ({turn_id})")
 
     def _chat_worker(self, turn_id: str) -> None:
         """D: resposta de conversa curta feita pela boca, sem tocar o cérebro.
@@ -461,17 +513,41 @@ class FlowsRuntime:
 
     def mark_answered(self, turn_id: str) -> None:
         self.orchestrator.mark_answered(turn_id)
+        first_unit: float | None = None
+        brain_ms: float | None = None
+        unit_kind = "cerebro"
         with self._lock:
             live = self._turns.get(str(turn_id))
-            if live is not None:
+            if live is not None and not live.qoder_answered_at:
                 live.qoder_answered_at = self.clock()
                 self._cancel_timer(live)
+                brain_ms = (live.qoder_answered_at - live.started_at) * 1000.0
+                if live.first_phrase_at:
+                    first_unit = ((live.first_phrase_at - live.started_at)
+                                  * 1000.0)
+                    unit_kind = ("intermediaria" if live.interim_spoken
+                                 else "boca")
+                else:
+                    first_unit = brain_ms
+        if live is not None and brain_ms is not None:
+            # UC-2 passo 6 (caminho cerebro): primeira unidade medida no
+            # vivo mais o texto do cérebro. O teto de 30 s (auditoria gap
+            # #2) é avaliado na primeira unidade de fala do turno; estourado,
+            # a linha diz ACIMA_DO_TETO em vez de fingir.
+            status = ("OK" if first_unit <= _mouth._CEILING_MS
+                      else "ACIMA_DO_TETO")
+            self._log_latency(
+                "cerebro", first_unit,
+                extra=(f"unidade={unit_kind} "
+                       f"cerebro_primeiro_texto_ms={brain_ms:.0f} "
+                       f"status={status}"))
 
     def finish(self, turn_id: str) -> None:
         with self._lock:
             live = self._turns.pop(str(turn_id), None)
         if live is not None:
             self._cancel_timer(live)
+            self._log_turn_breakdown(live)
         self.orchestrator.finish(turn_id)
 
     def cancel(self, turn_id: str, reason: str = "cancelado") -> bool:
@@ -551,7 +627,8 @@ class FlowsRuntime:
     def _speak(self, live: _LiveTurn, text: str, *, kind: str) -> None:
         if self.speak is None or not text:
             return
-        if not live.first_phrase_at:
+        first_unit = not live.first_phrase_at
+        if first_unit:
             live.first_phrase_at = self.clock()
         if kind == "brief":
             # A boca já está em fala: o primeiro texto do cérebro não pode
@@ -575,6 +652,15 @@ class FlowsRuntime:
             except Exception as exc:
                 self._log(f"[Fluxos] rota boca (medição) falhou: {exc!r}")
         self._log(f"[Fluxos] boca ({kind}): {text!r}")
+        if first_unit:
+            # UC-2 passo 6: métrica ponta-a-ponta no activity.log — o tempo
+            # do dono ouvir até a PRIMEIRA unidade de fala do turno (brief,
+            # chat, parcial ou intermediária). POR ÚLTIMO: o disco nunca
+            # pode abrir janela entre a fala e o callback de medição do
+            # processo vivo (on_chat_route), que é síncrono por contrato.
+            self._log_latency(
+                "boca", (live.first_phrase_at - live.started_at) * 1000.0,
+                extra=f"unidade={kind}")
 
     @staticmethod
     def _cancel_timer(live: _LiveTurn) -> None:
@@ -586,6 +672,55 @@ class FlowsRuntime:
                 timer.cancel()
             except Exception:
                 pass
+        interim = live.interim_timer
+        live.interim_timer = None
+        if interim is not None:
+            try:
+                interim.cancel()
+            except Exception:
+                pass
+
+    def _log_latency(self, caminho: str, first_unit_ms: float, *,
+                     extra: str = "") -> None:
+        """Linha canônica da métrica ponta-a-ponta (UC-2 passo 6).
+
+        Formato: ``[Fluxos] latencia e2e caminho=<boca|cerebro>
+        primeira_unidade_ms=<N> teto_ms=30000 <extra>``. Vai direto ao
+        activity.log (``core.flows.mouth._log_activity``), por design
+        independente do ``log`` da UI; falha de disco nunca derruba o turno.
+        """
+        line = (f"[Fluxos] latencia e2e caminho={caminho} "
+                f"primeira_unidade_ms={first_unit_ms:.0f} "
+                f"teto_ms={_mouth._CEILING_MS}"
+                + (f" {extra}" if extra else ""))
+        try:
+            self._latency(line)
+        except Exception:
+            pass
+
+    def _log_turn_breakdown(self, live: _LiveTurn) -> None:
+        """UC-2 passo 1: onde o tempo foi gasto — grava o detalhamento.
+
+        Roteador, fallback remoto, carga de memória e tempo do modelo da
+        boca saem medidos no activity.log a cada turno fechado; é a prova
+        material de que o cérebro paraleliza com a boca (passo 5) e de
+        quanto cada etapa custou no ponta-a-ponta.
+        """
+        try:
+            total_ms = (self.clock() - live.started_at) * 1000.0
+            first = (live.first_phrase_at or live.qoder_answered_at)
+            first_part = (f" primeira_unidade_ms="
+                          f"{(first - live.started_at) * 1000.0:.0f}"
+                          if first else "")
+            self._latency(
+                f"[Fluxos] latencia e2e turno={live.plan.turn_id} "
+                f"total_ms={total_ms:.0f}{first_part} "
+                f"rota_ms={live.plan.route_ms:.1f} "
+                f"fallback_ms={live.plan.fallback_ms:.1f} "
+                f"memoria_ms={live.plan.memory_ms:.1f} "
+                f"boca_brief_ms={live.brief_ms:.1f}")
+        except Exception:
+            pass
 
     def _log(self, message: str) -> None:
         try:
