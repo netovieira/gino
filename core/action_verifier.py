@@ -23,8 +23,10 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -176,6 +178,18 @@ _MESSAGE_TOOLS = frozenset({
     "whatsapp_send", "email_send", "send_whatsapp", "send_email",
 })
 
+#: Actions do whatsapp_control que entregam NOTA DE VOZ (sintetizada).
+#: Para elas a prova material nao e o texto -- o texto falado nunca entra no
+#: inbox, que registra "[audio]" -- e sim a entrada de audio do mesmo
+#: destinatario. Sem isto, um envio de voz bem-sucedido seria marcado como
+#: nao verificado, o que seria um portao de prova mais forte para a rota de
+#: voz do que para a de texto (contra a lei de paridade do dono, 07/11/2026).
+_VOICE_ACTIONS = frozenset({
+    "send_voice", "voice", "voice_note", "send_audio", "audio",
+    "nota_de_voz", "enviar_audio", "mandar_audio", "enviar_nota_de_voz",
+    "mandar_nota_de_voz", "ptt", "falar",
+})
+
 
 class MessageVerifier(Verifier):
     """Verifica se a mensagem foi enfileirada (WhatsApp inbox / email pending).
@@ -242,10 +256,72 @@ class MessageVerifier(Verifier):
             # Sem inbox para verificar — aceita.
             return True
 
+        # Nota de voz: a prova e o anexo de audio entregue ao destinatario,
+        # nunca a frase falada (que o inbox registra como "[audio]").
+        if _is_voice_send(args):
+            try:
+                return _search_inbox_audio(Path(inbox_path), recipient)
+            except Exception:
+                return True
+
         try:
             return _search_inbox(Path(inbox_path), recipient, text)
         except Exception:
             return True
+
+
+def _action_key(value: Any) -> str:
+    """Chave de action: caixa, acento, espaco e hífen viram o nome do catálogo.
+
+    Espelha ``plugins/whatsapp_control._norm_action`` sem importar o plugin
+    (este modulo roda em thread de verificacao, longe dos plugins).
+    """
+    raw = unicodedata.normalize("NFKD", str(value or "")).lower()
+    raw = "".join(c for c in raw if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", "_", raw.strip()).strip("_")
+
+
+def _is_voice_send(args: dict) -> bool:
+    return _action_key(args.get("action")) in _VOICE_ACTIONS
+
+
+def _entry_is_audio(entry: dict) -> bool:
+    """A entrada do inbox é um anexo de áudio enviado por nós?
+
+    `core.whatsapp.send_media` grava ``media.kind = "áudio"`` (o tipo que
+    `_send_any` devolve) e o texto ``[áudio]``; uma mensagem de voz
+    RECEBIDA chega com kind "áudio" ou "mensagem de voz". Aqui só interessa
+    o que saiu, então o chamador já filtrou ``from_me``.
+    """
+    media = entry.get("media")
+    if isinstance(media, dict):
+        if _action_key(media.get("kind")) in ("audio", "mensagem_de_voz",
+                                              "ogg", "opus"):
+            return True
+    texto = str(entry.get("text") or "").strip().lower()
+    return texto.startswith(("[áudio", "[audio", "[mensagem de voz"))
+
+
+def _search_inbox_audio(inbox_path: Path, recipient: str) -> bool:
+    """Prova material de uma nota de voz: anexo de áudio para o destinatário."""
+    try:
+        lines = inbox_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return True
+    for line in lines[-50:]:
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(entry, dict) or entry.get("from_me") is False:
+            continue
+        entry_to = str(entry.get("to") or entry.get("chat")
+                       or entry.get("recipient") or "")
+        if (recipient.lower() in entry_to.lower()
+                or entry_to.lower() in recipient.lower()):
+            if _entry_is_audio(entry):
+                return True
+    return False
 
 
 def _search_inbox(inbox_path: Path, recipient: str, text: str) -> bool:

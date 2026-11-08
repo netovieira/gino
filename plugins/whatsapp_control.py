@@ -9,18 +9,40 @@ Cada ação aceita `account` (nome da conta). Sem `account` e com várias contas
 respondemos pedindo qual — nunca escolhemos sozinhos pra não mandar a mensagem
 pela conta errada.
 
+PARIDADE DE MECANISMOS (ordem do dono, 07/11/2026 20:4x, literal: "os fluxos
+tem que usar os mesmos mecanismos que você, se um gate pode você pode […]
+certifique-se que todas as funções são acessíveis por você em qualquer momento
+por voz ou texto"). O app responde em áudio quando a entrada dele é voz; por
+isso `send_voice` existe e chama exatamente as duas funções internas que o
+turno de resposta já chamava — `core.voice_note.synthesize` (síntese) e
+`core.whatsapp.send_media` (entrega) — sem uma linha duplicada de TTS ou de
+envio. O portão também é um só: a rota de voz sai pelo MESMO
+`core/actiongate.py` da rota de texto, porque as duas são a mesma ferramenta
+no mesmo tier (core/tool_bridge.py: "whatsapp_control": TIER_MEDIUM) e o gate
+não olha a action.
+
+E o silêncio que disfarçava: action desconhecida ou argumento faltando NÃO cai
+mais na listagem de recentes. Devolve erro com a lista das actions válidas —
+listar conversas no lugar de um envio pedido é o que fez o assistente achar
+que `send_audio` tinha funcionado.
+
     "tem mensagem nova no zap?"              → action: recent
     "mande um zap pro João que chego já"     → action: send
+    "manda uma nota de voz pro João"         → action: send_voice
     "manda pelo trabalho"                    → action: send, account: trabalho
+    "manda a foto do boleto"                 → action: send_file
     "o que a Maria falou ontem?"             → action: search
     "pareie o WhatsApp"                      → action: pair  (QR na tela)
 """
 from __future__ import annotations
 
+import difflib
+import os
 import re
 import time
 import unicodedata
 
+from core import voice_note
 from core import whatsapp
 from memory.config_manager import get_plugin_setting, save_plugin_config
 
@@ -174,23 +196,137 @@ def _ambiguous(account: str) -> str | None:
             + ". Qual eu uso?")
 
 
+def _unknown_account(account: str) -> str | None:
+    """Frase de erro quando a conta nomeada não existe; None se dá para usar.
+
+    É o lado do argumento da regra do dono: nem action errada nem conta errada
+    podem virar listagem de conversas. Hoje, com uma conta digitada errado, o
+    `account` não bate em `_ambiguous` e a resposta era "qual eu uso?" — uma
+    pergunta sobre uma conta que o usuário acabou de nomear. Sem nenhuma conta
+    na lista (WhatsApp ainda não pareado, ou `_accounts()` indisponível) não
+    inventamos recusa: quem tenta é o core, e ele diz que falta parear.
+    """
+    raw = str(account or "").strip()
+    if not raw:
+        return None
+    accts = _accounts()
+    if not accts:
+        return None
+    names = [str(a.get("name") or "") for a in accts]
+    if any(_fold(n) == _fold(raw) for n in names):
+        return None
+    if _account_label(raw) is not None:
+        return None
+    return (f"não conheço a conta de WhatsApp '{raw}': nada foi enviado. "
+            "Contas pareadas: " + ", ".join(n for n in names if n) + ".")
+
+
+# ── o catálogo fechado de actions ────────────────────────────────────────────
+#
+# A lista é fechada de propósito (ordem do dono, 07/11/2026): antes, QUALQUER
+# string que não batesse caía no `else` e rodava `recent`. O assistente pedia
+# `send_audio`, recebia uma lista de conversas e não tinha como saber que o
+# envio não aconteceu. Agora action desconhecida ou ausente devolve erro com as
+# actions válidas, e só `recent` (e seus apelidos de leitura) lista mensagens.
+_CANONICAL_ACTIONS: dict[str, tuple[str, ...]] = {
+    "recent": ("recent", "inbox", "ler", "ler_mensagens", "mensagens", "novas",
+               "chegaram", "ver_mensagens"),
+    "search": ("search", "buscar", "procurar", "procurar_mensagem"),
+    "send": ("send", "enviar", "manda", "mandar", "enviar_mensagem",
+             "mandar_mensagem"),
+    # Nota de voz: o texto é falado pelo motor de voz do app. Os apelidos que
+    # em 07/11/2026 caíam no `recent` ("send_audio", "audio", "voice") agora
+    # fazem o que o dono pediu.
+    "send_voice": ("send_voice", "voice", "voice_note", "send_audio", "audio",
+                   "nota_de_voz", "enviar_audio", "mandar_audio",
+                   "enviar_nota_de_voz", "mandar_nota_de_voz", "falar", "ptt"),
+    # Arquivo que já existe (foto, vídeo, documento, áudio de arquivo): o tipo
+    # é escolhido em um ponto só, `core.whatsapp._send_any`, pela extensão.
+    "send_file": ("send_file", "send_media", "media", "enviar_arquivo",
+                  "mandar_arquivo", "enviar_midia", "enviar_media",
+                  "mandar_midia", "enviar_foto", "mandar_foto", "enviar_video",
+                  "mandar_video", "enviar_documento", "mandar_documento"),
+    "open_media": ("open_media", "abrir_midia", "abrir_arquivo", "open_file"),
+    "open": ("open", "open_app", "open_window", "abrir", "abrir_app",
+             "abrir_janela", "lancar", "launch", "desktop"),
+    "status": ("status", "estado", "conectado"),
+    "accounts": ("accounts", "contas", "listar_contas", "quais_contas"),
+    "pair": ("pair", "parear", "connect", "conectar", "qr"),
+    "contacts": ("contacts", "contatos", "agenda"),
+}
+
+#: Todo apelido aceito → nome canônico. `run()` só conhece quem está aqui.
+ACTION_ALIASES: dict[str, str] = {alias: canonical
+                                  for canonical, aliases in
+                                  _CANONICAL_ACTIONS.items()
+                                  for alias in aliases}
+
+#: Os nomes que o erro de action desconhecida devolve ao modelo.
+VALID_ACTIONS: tuple[str, ...] = tuple(_CANONICAL_ACTIONS)
+
+#: Actions que precisam de uma conta pareada existente para fazer sentido.
+_ACCOUNT_ACTIONS = frozenset({"recent", "search", "send", "send_voice",
+                              "send_file", "open_media", "contacts"})
+
+
+def _norm_action(value: object) -> str:
+    """Normaliza a action vinda do modelo sem perder o sublinhado.
+
+    `_fold` não serve aqui: ele troca tudo que não é letra/dígito por espaço,
+    e "send_file" viraria "send file". Caixa, acento, hífen e espaço viram o
+    que o catálogo usa; o que não bater em `ACTION_ALIASES` é action
+    desconhecida — nunca mais "recent" por defeito de escrita.
+    """
+    raw = unicodedata.normalize("NFKD", str(value or ""))
+    raw = "".join(c for c in raw if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", "_", raw.strip().lower()).strip("_")
+
+
+def _unknown_action(action: str) -> tuple[str, str]:
+    """(spoken, body) — recusa honesta, sem listagem de mensagens.
+
+    Nomear a action pedida e as MAIS PRÓXIMAS é o que fecha o ciclo para quem
+    chamou por voz/texto: o erro tem que dizer o que existe, não só "deu
+    errado". A lista completa vem atrás, para o caso de não haver vizinho.
+    """
+    valid = ", ".join(VALID_ACTIONS)
+    if not str(action or "").strip():
+        return ("falta a action do WhatsApp: nada foi feito. Actions válidas: "
+                f"{valid} — para ler o que chegou use 'recent'.",
+                "falta a action")
+    near = difflib.get_close_matches(_norm_action(action), VALID_ACTIONS, n=3)
+    hint = f" As actions mais próximas de '{action}' são: {', '.join(near)}." \
+        if near else ""
+    return (f"não conheço a action '{action}' do WhatsApp: nada foi enviado "
+            "e eu não vou listar mensagens no lugar disso."
+            + hint + f" Actions válidas: {valid}.",
+            f"action desconhecida: {action}")
+
+
 PLUGIN = {
     "name": "whatsapp_control",
     "description": (
         "The user's OWN WhatsApp account(s), connected through their phone "
         "number(s): read the messages that arrived, search old ones, send a "
-        "message, send a file (photo / video / audio / document), open a file "
+        "text message, send a VOICE NOTE (action=send_voice — the assistant's "
+        "own speech synthesis, delivered as a WhatsApp voice message), send an "
+        "existing file (photo / video / audio file / document), open a file "
         "someone sent, open the WhatsApp DESKTOP APPLICATION WINDOW "
         "(action=open), check the connection, list the paired accounts, or pair "
         "a phone with a QR code. Use this EVERY time the user mentions WhatsApp "
-        "/ zap / 'mensagem no whatsapp' — including to send. The user may have "
+        "/ zap / 'mensagem no whatsapp' — including to send. Anything the app "
+        "can do on WhatsApp is reachable through this tool: when the owner "
+        "asks for a voice note use send_voice — do not fall back to text and "
+        "do not claim audio is unavailable. The user may have "
         "SEVERAL accounts (e.g. pessoal / trabalho): when they name one "
         "('manda pelo trabalho'), pass account=<name>; when they don't and "
         "more than one is paired, the tool asks which — relay that question, do "
         "not guess. IMPORTANT: when the user asks to OPEN / SHOW / LAUNCH the "
         "WhatsApp app itself ('abre o WhatsApp', 'abre a janela do zap') they "
         "want the WINDOW on screen, not a message summary — call action=open "
-        "exactly ONCE and do NOT call recent. Do NOT use send_message for "
+        "exactly ONCE and do NOT call recent. An action this tool does not "
+        "know comes back as an explicit error listing the valid actions; it "
+        "never returns the inbox. Do NOT use send_message for "
         "WhatsApp: that tool is the old keystroke path and it cannot read "
         "anything back."
     ),
@@ -200,27 +336,35 @@ PLUGIN = {
             "action": {
                 "type": "STRING",
                 "description": "recent (what arrived) | search (find in what "
-                               "arrived) | send (text message) | send_file "
-                               "(photo, video, audio, document) | open_media "
+                               "arrived) | send (text message) | send_voice "
+                               "(VOICE NOTE: the text you pass is spoken by "
+                               "the assistant's own voice engine and delivered "
+                               "as audio) | send_file (an existing file: "
+                               "photo, video, audio file, document — the type "
+                               "is taken from the file itself) | open_media "
                                "(open a photo/audio someone sent) | open "
                                "(launch the WhatsApp desktop app window — use "
                                "this for 'abre o WhatsApp', 'abrir a janela "
                                "do zap', 'open WhatsApp') | status (is it "
                                "connected) | accounts (list the paired "
                                "accounts) | pair (first-time QR) | contacts "
-                               "(who is in the address book)",
+                               "(who is in the address book). Any other value "
+                               "is refused with this list — never silently "
+                               "read as recent.",
             },
             "account": {
                 "type": "STRING",
                 "description": "Which WhatsApp account to use when the user has "
                                "more than one (e.g. 'pessoal', 'trabalho'). Omit "
                                "when they have one, or when they didn't say — "
-                               "the tool will ask.",
+                               "the tool will ask. A name that is not a paired "
+                               "account is refused, never guessed.",
             },
             "to": {
                 "type": "STRING",
-                "description": "send/send_file: the contact name as the user "
-                               "said it, or the phone number with country code. "
+                "description": "send/send_voice/send_file: the contact name as "
+                               "the user said it, or the phone number with "
+                               "country code. "
                                "When the user says 'manda pra mim', 'pra mim "
                                "mesmo' or 'pra conta principal', pass 'mim' — "
                                "the tool resolves it to the owner's own number "
@@ -232,7 +376,10 @@ PLUGIN = {
                 "description": "send: the text to send in the user's own "
                                "language. It goes out SIGNED with the speaker's "
                                "name ('*Gino:*' on the first line), because it "
-                               "is your message. Never invent an emotional or "
+                               "is your message. send_voice: the words to be "
+                               "SPOKEN (up to 1200 characters) — a voice note "
+                               "is never signed, because the voice itself says "
+                               "who speaks. Never invent an emotional or "
                                "personal message on the user's behalf — if the "
                                "user is dictating words to send AS THEMSELVES "
                                "(e.g. a love message to their partner), pass "
@@ -246,13 +393,17 @@ PLUGIN = {
                                "(personal/family message). Then the text is NOT "
                                "signed with the assistant's name — it is the "
                                "user's voice. Default false: your own text, "
-                               "signed with the current speaker name.",
+                               "signed with the current speaker name. Ignored "
+                               "by send_voice: audio is never signed.",
             },
             "path": {
                 "type": "STRING",
                 "description": "send_file: the full path of the file (or the "
                                "name of a file that already arrived here, e.g. "
-                               "'foto da Maria'). Never guess a path.",
+                               "'foto da Maria'). Never guess a path. The type "
+                               "that goes out — photo, video, audio (an .ogg / "
+                               ".opus leaves as a voice note), document — is "
+                               "decided by core.whatsapp on the file itself.",
             },
             "caption": {
                 "type": "STRING",
@@ -366,6 +517,11 @@ def _flag(value: object) -> bool:
 
 def _do_send(to: str, text: str, account: str = "",
              dictated: bool = False) -> tuple[str, str]:
+    """Rota de TEXTO. É também a referência do portão: `send_voice` e
+    `send_file` saem pelo mesmo `core/actiongate.py` que esta sai, porque as
+    três são a mesma ferramenta no mesmo tier (core/tool_bridge.py) — o portão
+    nunca olha a action, e é assim que tem que ser (ordem do dono, 07/11/2026).
+    """
     if not to:
         return _missing_destination(), "falta o destinatário"
     if not text:
@@ -386,7 +542,58 @@ def _do_send(to: str, text: str, account: str = "",
     return msg, msg
 
 
+def _do_send_voice(to: str, text: str, account: str = "") -> tuple[str, str]:
+    """NOTA DE VOZ: o mesmo mecanismo do turno de resposta, agora a pedido.
+
+    Ordem do dono (07/11/2026): o app entregava áudio quando a entrada dele era
+    voz — a ferramenta não tinha como pedir isso. Aqui não há nem uma linha de
+    TTS ou de envio reimplementada: `core.voice_note.synthesize` é a função que
+    `main.JarvisLive._synthesize_whatsapp_audio` (o turno de resposta) chama, e
+    `core.whatsapp.send_media` é a função que `_send_whatsapp_answer` chama. A
+    duração da nota (`seconds` da AudioMessage) é calculada na entrega, pelo
+    próprio neonize, a partir do Ogg Opus 48 kHz mono canônico que a síntese
+    produziu — esta rota não estima nada.
+
+    Sem áudio não existe plano B silencioso: se o motor de voz ou o ffmpeg
+    falharem, nada é enviado e o motivo é dito. Trocar para texto por conta
+    própria seria exatamente o que o dono mandou acabar.
+    """
+    if not to:
+        return _missing_destination(), "falta o destinatário"
+    if not text:
+        return ("o que eu falo? a nota de voz está sem texto", "falta o texto")
+    target, why = _resolve_recipient(to)
+    if why:
+        return why, why
+    amb = _ambiguous(account)
+    if amb:
+        return amb, "conta ambígua"
+    path, _spoken = voice_note.synthesize(text)
+    if not path:
+        return ("não consegui gerar o áudio agora (motor de voz ou ffmpeg "
+                "indisponíveis): NADA foi enviado. Quer que eu mande o mesmo "
+                "texto como mensagem escrita?", "sem áudio")
+    try:
+        ok, msg = whatsapp.send_media(target, path, "", account=account or None)
+    except Exception as e:
+        ok, msg = False, str(e)
+    finally:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+    if not ok:
+        return f"falhou: {msg}", msg
+    return msg, msg
+
+
 def _do_send_file(to: str, path: str, caption: str, account: str = "") -> tuple[str, str]:
+    """Mídia que JÁ EXISTE (foto, vídeo, documento, áudio de arquivo).
+
+    O tipo certo não é decidido aqui: `core.whatsapp._send_any` escolhe pelo
+    arquivo e, para .ogg/.opus, monta o AudioMessage como PTT com mimetype e
+    waveform canônicos — a mesma entrega que a nota de voz sintetizada usa.
+    """
     if not to:
         return _missing_destination(), "falta o destinatário"
     if not path:
@@ -552,7 +759,16 @@ def _account_choices() -> list[str]:
 # ── entrada da ferramenta ────────────────────────────────────────────────────
 
 def run(parameters: dict, player=None, session_memory=None) -> str:
-    action  = str(parameters.get("action") or "").strip().lower()
+    """A ferramenta. Action errada ou argumento faltando é ERRO, nunca inbox.
+
+    O `else` que existia aqui mandava qualquer action desconhecida para
+    `recent`: chamadas como `send_audio`, `voice` ou `msg_type` devolviam a
+    lista das últimas conversas, e isso era lido como se o envio tivesse
+    acontecido (07/11/2026). Desde a ordem do dono sobre paridade,
+    o catálogo é fechado (`ACTION_ALIASES`) e o que não está nele responde com
+    as actions válidas — sem painel, sem log de "envio", sem mensagem fantasma.
+    """
+    action  = _norm_action(parameters.get("action"))
     account = str(parameters.get("account") or "").strip()
     to      = str(parameters.get("to") or "").strip()
     text    = str(parameters.get("text") or "").strip()
@@ -565,36 +781,47 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
     except Exception:
         limit = 8
 
+    canonical = ACTION_ALIASES.get(action)
+    if canonical is None:
+        spoken, _body = _unknown_action(str(parameters.get("action") or ""))
+        return spoken
+    if canonical in _ACCOUNT_ACTIONS:
+        wrong_account = _unknown_account(account)
+        if wrong_account:
+            return wrong_account
+
     try:
-        if action in ("status", "estado", "conectado"):
+        if canonical == "status":
             spoken, body = _do_status(account)
             title = "WHATSAPP — estado"
-        elif action in ("accounts", "contas", "listar_contas", "quais_contas"):
+        elif canonical == "accounts":
             spoken, body = _do_accounts()
             title = "WHATSAPP — contas"
-        elif action in ("pair", "parear", "connect", "conectar", "qr"):
+        elif canonical == "pair":
             spoken, body = _do_pair(account)
             title = "WHATSAPP — pareamento"
-        elif action in ("send_file", "enviar_arquivo", "mandar_arquivo", "media"):
+        elif canonical == "send_file":
             spoken, body = _do_send_file(to, path or query or text, caption, account)
             title = "WHATSAPP — envio de arquivo"
-        elif action in ("open_media", "abrir_midia", "abrir_arquivo", "open_file"):
+        elif canonical == "send_voice":
+            spoken, body = _do_send_voice(to, text, account)
+            title = "WHATSAPP — nota de voz"
+        elif canonical == "open_media":
             spoken, body = _do_open_media(to, query or path, account)
             title = "WHATSAPP — abrir mídia"
-        elif action in ("open", "open_app", "open_window", "abrir", "abrir_app",
-                        "abrir_janela", "lancar", "launch", "desktop"):
+        elif canonical == "open":
             spoken, body = _do_open_window()
             title = "WHATSAPP — abrir aplicativo"
-        elif action in ("send", "enviar", "manda", "mandar"):
+        elif canonical == "send":
             spoken, body = _do_send(to, text, account, dictated)
             title = "WHATSAPP — envio"
-        elif action in ("search", "buscar", "procurar", "procurar_mensagem"):
+        elif canonical == "search":
             spoken, body = _do_search(query, limit, account)
             title = "WHATSAPP — busca"
-        elif action in ("contacts", "contatos", "agenda"):
+        elif canonical == "contacts":
             spoken, body = _do_contacts(limit, account)
             title = "WHATSAPP — contatos"
-        else:  # recent / inbox / ler — o padrão, porque é o que mais se pede
+        else:  # recent / inbox / ler — só quando foi isso que se pediu
             spoken, body = _do_recent(limit, account)
             title = "WHATSAPP — mensagens"
     except Exception as e:

@@ -94,6 +94,7 @@ from core import silence_code as _silence_code_mod
 from core.ghost_filter import GhostFilter as _GhostFilter
 from core import chat_memory as _chat_memory
 from core import personas as _personas
+from core import voice_note as _voice_note
 from core import memory_index as _memory_index
 from core import sleep as _sleep
 from core import task_queue as _task_queue
@@ -2803,10 +2804,59 @@ class JarvisLive:
         if not _wa.ffmpeg_ready():
             print("[WhatsApp] sem ffmpeg: foto e documento funcionam, "
                   "áudio e vídeo não (ver tools/ffmpeg no comentário do .gitignore)")
+        # PARIDADE DE MECANISMOS (ordem do dono, 07/11/2026): a rota chamável de
+        # nota de voz tem de ser conferida no PROCESSO VIVO, não só em teste.
+        # Foi o buraco do UP-8 (`hook=ausente` 214 vezes no log): mecanismo
+        # pronto, gancho instalado apenas na fixture. Aqui o boot grava a prova.
+        try:
+            self._whatsapp_parity_audit()
+        except Exception as e:
+            print(f"[WhatsApp] auditoria de paridade indisponível: {e!r}")
         try:
             self._whatsapp_startup_notice(states)
         except Exception as e:
             print(f"[WhatsApp] aviso de boot não falado: {e}")
+
+    # ── paridade de mecanismos (ordem do dono, 07/11/2026) ───────────────────
+    def _whatsapp_parity_audit(self) -> str:
+        """Prova no log do boot que a boca chamável de áudio existe e é fechada.
+
+        A regra do dono: "os fluxos têm que usar os mesmos mecanismos que você;
+        se um gate pode, você pode". Isso só vale se a rota existir no processo
+        real — por isso esta linha sai no boot vivo (``_start_whatsapp``), e o
+        ``core/dev_audit.py`` tem uma sonda que a procura (:func:`_any_since`,
+        só linhas de evento). O que ela confere, sem nada reimplementar:
+
+          * ``send_voice`` está no catálogo do plugin (a ação chamável existe);
+          * o catálogo é FECHADO — os apelidos de áudio caem em ``send_voice``,
+            não no ``recent`` (o fallback silencioso de 07/11/2026);
+          * o motor de síntese é UM só: ``core.voice_note.synthesize``, o mesmo
+            que o turno de resposta usa.
+
+        Nunca quebra o boot: cada peça é lida em volta de try, e a linha de
+        evento sai mesmo quando a auditoria não pôde ser feita (aí ela diz que
+        não pôde — uma ausência muda nunca conta como verde).
+        """
+        try:
+            from plugins import whatsapp_control as _wa_plugin
+            from core import voice_note as _vn
+            have_voice = int("send_voice" in getattr(_wa_plugin, "ACTION_ALIASES", {})
+                             and hasattr(_wa_plugin, "_do_send_voice"))
+            sealed = int(getattr(_wa_plugin, "ACTION_ALIASES", {}).get("send_audio")
+                         == "send_voice")
+            actions = len(getattr(_wa_plugin, "VALID_ACTIONS", ()))
+            one_engine = int(callable(getattr(_vn, "synthesize", None)))
+            line = (f"SYS: [WhatsApp] paridade de mecanismos: send_voice={have_voice} "
+                    f"catalogo_fechado={sealed} acoes={actions} motor_unico={one_engine}")
+        except Exception as e:
+            line = ("SYS: [WhatsApp] paridade de mecanismos: nao_verificado "
+                    f"({type(e).__name__})")
+        try:
+            self.ui.write_log(_activity.with_meta(
+                line, _activity.make_meta(chan="sistema", origin="whatsapp")))
+        except Exception:
+            print(line)
+        return line
 
     def _wait_boot_speech_ready(self, timeout: float = 25.0) -> bool:
         """O aviso de boot espera a fila de áudio existir — com teto, sem travar."""
@@ -5229,38 +5279,11 @@ class JarvisLive:
     def _whatsapp_audio_is_ptt(self, path) -> bool:
         """O arquivo é Opus mono em contêiner Ogg (PTT do WhatsApp)?
 
-        Usa ffprobe quando existe. Sem ffprobe (ambiente mínimo), aceita o
-        arquivo: a checagem é uma proteção extra, não um pré-requisito. O
-        ffprobe sempre reporta 48 kHz na decodificação de Opus, então a taxa
-        de entrada do OpusHead não é verificável por aqui — ela é garantida
-        na geração (`-ar 48000`).
+        Delegado a ``core/voice_note.py`` desde a ordem do dono de 07/11/2026
+        (paridade de mecanismos): a mesma guarda vale para a resposta do turno
+        e para o `whatsapp_control action=send_voice`. Não há segunda cópia.
         """
-        try:
-            import shutil
-            import subprocess as _sp
-            ffprobe = shutil.which("ffprobe")
-            if not ffprobe:
-                return True
-            proc = _sp.run(
-                [ffprobe, "-v", "error", "-select_streams", "a:0",
-                 "-show_entries", "stream=codec_name,sample_rate,channels:"
-                 "format=format_name",
-                 "-of", "default=noprint_wrappers=1", str(path)],
-                capture_output=True, timeout=30, text=True)
-            if proc.returncode != 0:
-                return False
-            info = {}
-            for line in (proc.stdout or "").splitlines():
-                if "=" in line:
-                    key, value = line.split("=", 1)
-                    info[key.strip()] = value.strip()
-            formats = (info.get("format_name") or "").split(",")
-            return (info.get("codec_name") == "opus"
-                    and info.get("sample_rate") == "48000"
-                    and info.get("channels") == "1"
-                    and "ogg" in formats)
-        except Exception:
-            return True
+        return _voice_note.is_ptt(path)
 
     def _speaker_names(self, extra=()) -> tuple[str, ...]:
         """Nomes que assinam mensagem escrita — e que nunca entram na fala."""
@@ -5276,103 +5299,20 @@ class JarvisLive:
     def _synthesize_whatsapp_audio(self, text: str) -> str:
         """TTS text → OGG/Opus file for a WhatsApp voice note.
 
-        Also leaves the exact text handed to the TTS in ``self._wa_tts_text``
-        so the Activity Log line can record the divergence from the message
-        shown when the owner audits a voice note.
+        O mecanismo mora em ``core/voice_note.py`` desde a ordem do dono de
+        07/11/2026 ("os fluxos têm que usar os mesmos mecanismos que você"):
+        o turno de resposta e o ``whatsapp_control action=send_voice`` chamam a
+        MESMA função. Aqui só fica o registro que a Activity Log cobra —
+        ``self._wa_tts_text``, o texto exato entregue ao TTS, para o dono poder
+        auditar a divergência entre o que foi mostrado e o que foi falado.
         """
-        text = str(text or "").strip()
-        # Áudio não assina: a voz já diz quem fala. O nome sai só do TTS.
-        text = _speech_guard.strip_speaker(text, self._speaker_names())
         self._wa_tts_text = ""
-        text = (_speech_guard.sanitize(
-            text, lang=(_activity.lang_of(text) or "pt")).text or text)
-        if not text or len(text) > 1200:
-            return ""
-        wav = ogg = None
-        try:
-            import shutil
-            import subprocess as _sp
-            import wave
-            from core import brain as _b
-            from core import whatsapp as _wa
-            _wa.ffmpeg_ready()
-            ffmpeg = shutil.which("ffmpeg")
-            if not ffmpeg:
-                return ""
-            st = _b.settings(get_plugin_config)
-            try:
-                from core.numwords import speakable as _spk
-                voice_text = _spk(
-                    text, style="hybrid" if st.get("tts_engine") == "fish"
-                    else "words")
-            except Exception:
-                voice_text = text
-            pcm = _b.synth_pcm24k(voice_text, st)
-            if not pcm:
-                self._wa_tts_text = voice_text
-                return ""
-            # Continuidade medida (05/11/2026): replies de ~25-29 s saíam com
-            # 24 buracos internos > 120 ms. Nenhum silêncio do arquivo passa
-            # de 100 ms — vale para peça única, Edge e qualquer motor.
-            pcm = _b.smooth_pcm_silence(pcm, 24000, max_internal_ms=100)
-            out_dir = BASE_DIR / "memory" / "whatsapp_media"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            stem = f"reply_{uuid.uuid4().hex}"
-            wav = out_dir / f"{stem}.wav"
-            ogg = out_dir / f"{stem}.ogg"
-            with wave.open(str(wav), "wb") as handle:
-                handle.setnchannels(1)
-                handle.setsampwidth(2)
-                handle.setframerate(24000)
-                handle.writeframes(pcm)
-            proc = _sp.run(
-                # `-ar 48000 -ac 1` é o que o próprio WhatsApp grava: sem
-                # isso o OpusHead sai com input rate 24000 (a taxa do WAV),
-                # um desvio do PTT canônico que o celular pode recusar.
-                [ffmpeg, "-y", "-v", "error", "-i", str(wav),
-                 "-c:a", "libopus", "-b:a", "48k", "-ar", "48000",
-                 "-ac", "1", str(ogg)],
-                capture_output=True, timeout=90)
-            try:
-                wav.unlink(missing_ok=True)
-            except Exception:
-                pass
-            wav = None
-            if proc.returncode != 0 or not ogg.exists():
-                try:
-                    ogg.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                self._wa_tts_text = voice_text
-                return ""
-            # O arquivo tem que ser exatamente o que o WhatsApp aceita como
-            # PTT (opus, 48 kHz, mono). Um .ogg renomeado/errado seria
-            # descartado pelo celular sem erro nenhum — melhor cair para
-            # texto do que mandar um áudio que ninguém ouve.
-            if not self._whatsapp_audio_is_ptt(ogg):
-                try:
-                    ogg.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                ogg = None
-                self._wa_tts_text = voice_text
-                print("[WhatsApp] OGG gerado não é Opus 48 kHz mono — "
-                      "caindo para texto")
-                return ""
-            result = str(ogg)
-            ogg = None
-            self._wa_tts_text = voice_text
-            return result
-        except Exception as e:
-            print(f"[WhatsApp] TTS→áudio falhou: {e}")
-            return ""
-        finally:
-            for path in (wav, ogg):
-                if path is not None:
-                    try:
-                        path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+        path, spoken = _voice_note.synthesize(
+            text,
+            names=self._speaker_names(),
+            folder=BASE_DIR / "memory" / "whatsapp_media")
+        self._wa_tts_text = spoken
+        return path
 
     def _send_whatsapp_answer(self, account: str | None, chat: str,
                               text: str, media_type: str = "text",
@@ -6934,10 +6874,21 @@ class JarvisLive:
                 if self._answers_on_whatsapp(meta):
                     try:
                         args = (tool_input or {}).get("args") or {}
-                        action = str(args.get("action") or "").lower()
+                        # O nome canônico vem do catálogo do próprio plugin
+                        # (um ponto só): `enviar_audio`, `voice`, `send_file`…
+                        # todos contam como entrega neste chat, inclusive a
+                        # nota de voz que a ordem do dono de 07/11/2026 pediu.
+                        canonical = ""
+                        try:
+                            from plugins import whatsapp_control as _wa_plugin
+                            canonical = _wa_plugin.ACTION_ALIASES.get(
+                                _wa_plugin._norm_action(args.get("action")))
+                        except Exception:
+                            canonical = str(args.get("action") or "").lower()
                         target = str(args.get("to") or "")
                         if (str((tool_input or {}).get("name") or "") == "whatsapp_control"
-                                and action in ("send", "send_file")
+                                and canonical in ("send", "send_file",
+                                                  "send_voice")
                                 and self._same_whatsapp_chat(target,
                                                              meta.get("wa_chat"))):
                             meta["wa_sent"] = True

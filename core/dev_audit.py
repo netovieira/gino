@@ -495,6 +495,90 @@ def _sonda_mic_reset_reopen() -> tuple[str, str]:
     return OK, ""
 
 
+def _sonda_whatsapp_paridade_gancho() -> tuple[str, str]:
+    """Paridade WhatsApp (estática): o boot vivo audita a rota chamável de áudio.
+
+    Dois buracos pagos pela mesma razão (07/11/2026): (a) o app sabia falar em
+    arquivo, a ferramenta não — "manda um áudio" virava texto na conta errada;
+    (b) action desconhecida caía no ``recent``, e a lista de conversas era lida
+    como se o envio tivesse acontecido. A sonda confere no código de produção,
+    sem ler ``tests/``:
+
+      * ``main._start_whatsapp`` chama ``_whatsapp_parity_audit`` (o gancho está
+        no BOOT, não só na fixture — o ``hook=ausente`` do UP-8);
+      * ``_whatsapp_parity_audit`` escreve a linha de evento ``paridade de
+        mecanismos`` que a sonda viva procura;
+      * o plugin tem ``_do_send_voice`` ligando ``voice_note.synthesize`` ao
+        ``whatsapp.send_media`` (UM motor, nenhuma segunda cópia de TTS);
+      * ``run`` recusa action fora do catálogo ANTES de qualquer listagem
+        (``canonical is None`` → ``_unknown_action``).
+    """
+    tree = _tree("main.py")
+    if tree is None:
+        return NV, "main.py ilegivel"
+    start = _find_func(tree, "_start_whatsapp")
+    audit = _find_func(tree, "_whatsapp_parity_audit")
+    if start is None or audit is None:
+        return FALHA, "falta _start_whatsapp ou _whatsapp_parity_audit no main.py"
+    if "_whatsapp_parity_audit" not in " ".join(_calls_in(start)):
+        return FALHA, "_start_whatsapp nao chama a auditoria de paridade"
+    if "paridade de mecanismos" not in ast.unparse(audit):
+        return FALHA, "auditoria nao grava a linha de evento da paridade"
+    plugin = _tree("plugins/whatsapp_control.py")
+    if plugin is None:
+        return NV, "plugins/whatsapp_control.py ilegivel"
+    sender = _find_func(plugin, "_do_send_voice")
+    run = _find_func(plugin, "run")
+    if sender is None or run is None:
+        return FALHA, "sumiu _do_send_voice ou run() do whatsapp_control"
+    calls = " ".join(_calls_in(sender))
+    if "synthesize" not in calls or "send_media" not in calls:
+        return FALHA, "send_voice nao usa o motor unico (voice_note.synthesize" \
+                      " + whatsapp.send_media)"
+    # O fallback morre num GUARDA, não numa string: o primeiro `if` do corpo
+    # de `run` tem de ser `canonical is None` (comparação direta, sem `and`
+    # disfarçando) e tem de retornar erro antes de qualquer listagem.
+    guard = next((s for s in run.body if isinstance(s, ast.If)), None)
+    test = getattr(guard, "test", None)
+    refused = bool(guard and isinstance(test, ast.Compare)
+                   and isinstance(test.ops[0], ast.Is)
+                   and isinstance(test.comparators[0], ast.Constant)
+                   and test.comparators[0].value is None
+                   and any(isinstance(n, ast.Return) for n in guard.body)
+                   and "_unknown_action" in " ".join(_calls_in(guard)))
+    if not refused:
+        return FALHA, "run() aceita action desconhecida sem erro (fallback vivo)"
+    listing = [s for s in run.body
+               if "_do_recent" in " ".join(_calls_in(s))]
+    if listing and run.body.index(guard) > run.body.index(listing[0]):
+        return FALHA, "run() lista conversas antes de recusar a action errada"
+    return OK, ""
+
+
+def _sonda_whatsapp_paridade_viva() -> tuple[str, str]:
+    """Paridade WhatsApp (viva): o log DESTE boot registrou a auditoria com verde.
+
+    Fonte no arquivo não basta — foi assim que o UP-8 viveu 214 vezes
+    ``hook=ausente``. A prova é a linha de evento escrita pelo
+    ``_whatsapp_parity_audit`` quando o processo subiu: sem linha, o mecanismo
+    não está plugado no vivo; com ``send_voice=0``/``catalogo_fechado=0``, está
+    plugado e quebrado. Log ilegível é ``nao_verificado`` (nunca verde).
+    """
+    lines, hits = _any_since(lambda ln: "paridade de mecanismos" in ln)
+    if lines is None:
+        return NV, "sem log de evento legivel neste boot"
+    if not hits:
+        return FALHA, "boot nao registrou a paridade do whatsapp"
+    last = hits[-1]
+    if "nao_verificado" in last:
+        return NV, "auditoria de paridade falhou ao rodar neste boot"
+    broken = [k for k in ("send_voice=0", "catalogo_fechado=0", "motor_unico=0")
+              if k in last]
+    if broken:
+        return FALHA, "paridade registrada como quebrada: " + ",".join(broken)
+    return OK, ""
+
+
 def _sonda_skill_escopo() -> tuple[str, str]:
     """Escopo do pedido (estática): a SKILL existe e é referida no bloco por turno.
 
@@ -575,6 +659,12 @@ for _a in (
     Assertion("skill.escopo-do-pedido",
               "SKILL.md do escopo existe e e referida no bloco compacto do turno",
               "estatica", _sonda_skill_escopo),
+    Assertion("whatsapp.paridade-gancho",
+              "boot vivo audita a rota chamavel de nota de voz e o catalogo fechado",
+              "estatica", _sonda_whatsapp_paridade_gancho),
+    Assertion("whatsapp.paridade-viva",
+              "linha de evento da paridade vista no log deste boot, sem flag quebrada",
+              "viva", _sonda_whatsapp_paridade_viva),
 ):
     register(_a)
 

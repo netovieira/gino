@@ -47,7 +47,10 @@ AUTONOMOUS WHATSAPP REPLIES
     confirm(): when a new individual WhatsApp message addresses the assistant
     by name, core/whatsapp_watch.py calls allow_whatsapp_reply(account, chat,
     name). That authorises exactly whatsapp_control with action=send to the
-    same contact on the same account, for AUTO_REPLY_SECONDS. Any other
+    same contact on the same account, for AUTO_REPLY_SECONDS -- and the same
+    reply delivered as a VOICE NOTE (action=send_voice), because the app
+    mirrors the format of what arrived and a stronger gate for the audio route
+    would break the owner's parity rule of 07/11/2026. Any other
     action, contact or account still reaches the owner's voice window, and
     this grant never opens the sudo window.
 
@@ -674,10 +677,40 @@ def revoke_whatsapp_reply(account: str, chat: str) -> None:
         _replies.pop(_reply_key(account, chat), None)
 
 
+_REPLY_ACTION_SEND = "send"
+_REPLY_ACTION_VOICE = "send_voice"
+#: O que a janela curta de resposta autônoma cobre. A ordem do dono de
+#: 07/11/2026 (paridade de mecanismos) é o motivo dos dois nomes: o app
+#: responde em áudio quando o que chegou foi áudio (regra 3 do WhatsApp),
+#: então recusar a nota de voz enquanto o texto do MESMO chat está liberado
+#: seria um portão paralelo, mais forte para a rota de voz. O escopo não muda
+#: nada: mesma conta, mesmo chat, mesmo TTL curto — só o formato da resposta.
+_REPLY_ACTIONS = frozenset({_REPLY_ACTION_SEND, _REPLY_ACTION_VOICE})
+
+
+def _reply_action_key(value: object) -> str:
+    """O nome CANÔNICO da action, resolvido no catálogo do próprio plugin.
+
+    A janela cobre o que a ferramenta FAZ, não o apelido que o modelo digitou:
+    "nota de voz", "audio" e "send_voice" são a mesma action em
+    plugins/whatsapp_control.py. Ler o mapa ali (em vez de copiar a lista de
+    apelidos para cá) é o que mantém uma única fonte da regra. Sem o plugin
+    importável, o fallback é o próprio nome dobrado — conservador, só acerta
+    os nomes canônicos.
+    """
+    try:
+        from plugins import whatsapp_control as _wa
+        return _wa.ACTION_ALIASES.get(_wa._norm_action(value), "")
+    except Exception:
+        folded = _fold(value).replace(" ", "_").replace("-", "_")
+        return folded if folded in _REPLY_ACTIONS else ""
+
+
 def whatsapp_reply_allowed(tool: str, args: dict | None = None) -> bool:
     """The bridge's preauthorize hook for the autonomous WhatsApp reply.
 
-    True only for ``whatsapp_control`` with ``action=send`` addressed to the
+    True only for ``whatsapp_control`` with ``action=send`` (or ``send_voice``,
+    the same reply spoken — see _REPLY_ACTIONS) addressed to the
     exact contact (by name or number) that triggered the grant, on the same
     account. Everything else returns False and still needs the owner's voice.
     An omitted account is accepted because the tool itself refuses to guess
@@ -686,7 +719,7 @@ def whatsapp_reply_allowed(tool: str, args: dict | None = None) -> bool:
     if _fold(tool) != "whatsapp_control":
         return False
     args = args if isinstance(args, dict) else {}
-    if _fold(args.get("action")) != "send":
+    if _reply_action_key(args.get("action")) not in _REPLY_ACTIONS:
         return False
     to = str(args.get("to") or "").strip()
     if not to:

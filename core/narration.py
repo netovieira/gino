@@ -74,6 +74,14 @@ _IMMEDIATE_ACTIONS = frozenset({
 _SEND_ACTIONS = frozenset({
     "send", "enviar", "manda", "mandar", "send_file", "enviar_arquivo",
     "mandar_arquivo", "media",
+    # Nota de voz (ordem do dono, 07/11/2026): WhatsApp em áudio é o mesmo
+    # "sai desta máquina" que o texto é — a narração não pode tratar a nota de
+    # voz como ação local. Mesma família de apelidos do catálogo em
+    # plugins/whatsapp_control.py (ACTION_ALIASES), aqui em lista explícita
+    # porque a narração não importa plugins.
+    "send_voice", "voice", "voice_note", "send_audio", "audio", "ptt",
+    "nota_de_voz", "enviar_nota_de_voz", "mandar_nota_de_voz",
+    "enviar_audio", "mandar_audio", "falar",
 })
 
 _EMAIL_SEND_ACTIONS = frozenset({"send", "enviar", "mandar", "escrever"})
