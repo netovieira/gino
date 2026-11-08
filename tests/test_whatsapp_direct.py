@@ -283,7 +283,7 @@ class SendAnswerTest(unittest.TestCase):
         send.assert_called_once_with("5511999999999", "resposta",
                                      account="trabalho", speaker="Gino")
 
-    def test_audio_answer_uses_send_media_and_falls_back_to_text(self):
+    def test_audio_answer_uses_send_media_and_never_duplicates_text(self):
         obj = self._obj()
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as handle:
             path = handle.name
@@ -301,40 +301,87 @@ class SendAnswerTest(unittest.TestCase):
         send.assert_not_called()
         self.assertFalse(Path(path).exists())
 
+    def test_audio_that_does_not_synthesize_sends_nothing_by_default(self):
+        # Lei do dono (07/11/2026): áudio pedido que não sai NÃO vira texto
+        # por omissão. Sem a flag, nada é enviado e a falha volta como False.
+        obj = self._obj()
         obj._synthesize_whatsapp_audio = mock.Mock(return_value="")
-        with mock.patch("core.whatsapp.send", return_value=(True, "ok")) as send:
-            self.assertTrue(obj._send_whatsapp_answer(
-                "trabalho", "5511999999999", "resposta", "audio"))
-        send.assert_called_once()
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with mock.patch("core.whatsapp.send_media") as send_media, \
+                mock.patch("core.whatsapp.send") as send:
+            with contextlib.redirect_stdout(buf):
+                self.assertFalse(obj._send_whatsapp_answer(
+                    "trabalho", "5511999999999", "resposta", "audio"))
+        send_media.assert_not_called()
+        send.assert_not_called()
+        self.assertFalse(obj._wa_audio_sent)
+        logged = buf.getvalue()
+        self.assertIn("não foi liberada", logged)
+        self.assertIn("nada foi enviado", logged)
 
-    def test_tts_that_raises_still_sends_plain_text(self):
+    def test_tts_that_raises_sends_nothing_by_default(self):
+        # Motor de voz fora do ar: o texto não entra no lugar por acidente.
         obj = self._obj()
         obj._synthesize_whatsapp_audio = mock.Mock(
             side_effect=RuntimeError("motor de voz fora"))
         with mock.patch("core.whatsapp.send_media") as send_media, \
-                mock.patch("core.whatsapp.send", return_value=(True, "ok")) as send:
-            self.assertTrue(obj._send_whatsapp_answer(
+                mock.patch("core.whatsapp.send") as send:
+            self.assertFalse(obj._send_whatsapp_answer(
                 "trabalho", "5511999999999", "resposta", "audio"))
         send_media.assert_not_called()
-        send.assert_called_once_with("5511999999999", "resposta",
-                                     account="trabalho", speaker="Gino")
+        send.assert_not_called()
         self.assertFalse(obj._wa_audio_sent)
 
-    def test_audio_that_fails_to_send_falls_back_to_text_once(self):
+    def test_audio_that_fails_to_send_sends_nothing_by_default(self):
         obj = self._obj()
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as handle:
             path = handle.name
         obj._synthesize_whatsapp_audio = mock.Mock(return_value=path)
         with mock.patch("core.whatsapp.send_media",
                         return_value=(False, "formato recusado")) as send_media, \
-                mock.patch("core.whatsapp.send", return_value=(True, "ok")) as send:
-            self.assertTrue(obj._send_whatsapp_answer(
+                mock.patch("core.whatsapp.send") as send:
+            self.assertFalse(obj._send_whatsapp_answer(
                 "trabalho", "5511999999999", "resposta", "audio"))
+        send_media.assert_called_once()
+        send.assert_not_called()
+        self.assertFalse(obj._wa_audio_sent)
+        self.assertFalse(Path(path).exists())   # falhou e mesmo assim limpou
+
+    def test_audio_failure_with_explicit_flag_falls_back_to_text_once(self):
+        # O caso legítimo continua existindo — mas só para quem PASSA A FLAG
+        # na chamada (espelho do turno assumido). A MESMA resposta sai em
+        # texto uma única vez, assinada, e nada de áudio repetido.
+        obj = self._obj()
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as handle:
+            path = handle.name
+        obj._synthesize_whatsapp_audio = mock.Mock(return_value=path)
+        with mock.patch("core.whatsapp.send_media",
+                        return_value=(False, "formato recusado")) as send_media, \
+                mock.patch("core.whatsapp.send",
+                           return_value=(True, "ok")) as send:
+            self.assertTrue(obj._send_whatsapp_answer(
+                "trabalho", "5511999999999", "resposta", "audio",
+                audio_text_fallback=True))
         send_media.assert_called_once()
         send.assert_called_once_with("5511999999999", "resposta",
                                      account="trabalho", speaker="Gino")
         self.assertFalse(obj._wa_audio_sent)
         self.assertFalse(Path(path).exists())
+
+    def test_synthesis_failure_with_explicit_flag_falls_back_to_text_once(self):
+        obj = self._obj()
+        obj._synthesize_whatsapp_audio = mock.Mock(return_value="")
+        with mock.patch("core.whatsapp.send_media") as send_media, \
+                mock.patch("core.whatsapp.send",
+                           return_value=(True, "ok")) as send:
+            self.assertTrue(obj._send_whatsapp_answer(
+                "trabalho", "5511999999999", "resposta", "audio",
+                audio_text_fallback=True))
+        send_media.assert_not_called()
+        send.assert_called_once()
+        self.assertFalse(obj._wa_audio_sent)
 
 
 class SynthesizeAnswerTest(unittest.TestCase):
@@ -582,9 +629,12 @@ class NoRoomSpeechTest(unittest.TestCase):
         obj._qoder_say.assert_called_once_with("t1", "resposta na sala")
         obj._send_whatsapp_answer.assert_not_called()
 
-    def test_owner_voice_audio_failure_falls_back_to_text_without_the_room(self):
-        # Áudio de saída indisponível: a MESMA resposta sai em texto pelo
-        # WhatsApp, sem cair no alto-falante.
+    def test_owner_voice_audio_failure_sends_nothing_and_flags_the_log(self):
+        # Lei do dono (07/11/2026) no caminho de produção: o espelho do turno
+        # é voz do assistente ao dono no zap e NÃO liga a flag. Áudio que não
+        # sai não vira texto: nada vai ao WhatsApp, nada cai no alto-falante,
+        # e o Activity Log registra a falha ("whatsapp não enviado").
+        from core import activity
         obj = self._obj()
         obj._speech_route = lambda *a, **k: {}
         obj._synthesize_whatsapp_audio = mock.Mock(return_value="")
@@ -596,14 +646,18 @@ class NoRoomSpeechTest(unittest.TestCase):
             "wa_chat": "5511999999999", "owner_voice": True})
         obj._qoder_text_buf["t1"] = "resposta falada"
         with mock.patch("core.whatsapp.send_media") as send_media, \
-                mock.patch("core.whatsapp.send",
-                           return_value=(True, "ok")) as send:
+                mock.patch("core.whatsapp.send") as send:
             main.JarvisLive._qoder_on_done(obj, "t1", "resposta falada")
         obj._qoder_say.assert_not_called()
         send_media.assert_not_called()
-        send.assert_called_once_with("5511999999999", "resposta falada",
-                                     account="trabalho", speaker="Gino")
+        send.assert_not_called()
         self.assertFalse(obj._wa_audio_sent)
+        line = next(l for l in obj.ui.logs
+                    if l.startswith("WHATSAPP Gino:"))
+        meta = activity.parse(line)
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta["origin"], "whatsapp não enviado")
+        self.assertFalse(meta.get("generated", False))
 
 
 class OutboundAccountTest(unittest.TestCase):

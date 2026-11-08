@@ -5316,12 +5316,25 @@ class JarvisLive:
 
     def _send_whatsapp_answer(self, account: str | None, chat: str,
                               text: str, media_type: str = "text",
-                              speaker: str = "") -> bool:
+                              speaker: str = "",
+                              audio_text_fallback: bool = False) -> bool:
         """Send the final answer back to the WhatsApp chat, once.
 
         Leaves two facts for the Activity Log line the caller writes:
         ``_wa_audio_sent`` (did the voice note actually go out?) and
         ``_wa_tts_text`` (the exact text handed to the TTS, if any).
+
+        ``audio_text_fallback`` é a FLAG EXPLÍCITA que a ordem do dono de
+        07/11/2026 exige para o único downgrade de áudio→texto que sobrou no
+        app: o espelho do turno (o dono mandou áudio, a síntese quebrou e a
+        MESMA resposta sai escrita). Por padrão é False — sem a flag, áudio que
+        não sai é falha dita, nunca texto no lugar. Quem assumiu esse desenho
+        (linha de teste ``...falls_back_to_text_once``) passa a flag, e assim
+        o caminho deixa de ser silencioso no código: está na assinatura.
+        A flag só tem efeito na rota ``media_type="audio"``; as chamadas por
+        texto (persona, erro do turno, cadastro de aparelho, senha digitada)
+        nunca passam por ela. Nenhum call site de produção liga a flag: todo
+        destino que existe aqui é voz do assistente ao dono/terceiro no zap.
         """
         text = str(text or "").strip()
         chat = str(chat or "").strip()
@@ -5370,6 +5383,18 @@ class JarvisLive:
                         print(f"[WhatsApp] resposta em áudio enviada: {msg}")
                         return True
                     print(f"[WhatsApp] áudio não enviado: {msg}")
+                if not audio_text_fallback:
+                    # ÁUDIO PEDIDO QUE NÃO SAI, SEM A FLAG, NÃO VIRA TEXTO.
+                    # É o defeito de 07/11/2026 na última rota que ainda o
+                    # tinha: o dono pediu/recebeu áudio e leu texto achando que
+                    # era o áudio. Aqui nada é enviado e a falha volta como
+                    # False — quem chama diz isso ao dono.
+                    print("[WhatsApp] o áudio não saiu e a resposta escrita "
+                          "não foi liberada (audio_text_fallback=False): "
+                          "nada foi enviado")
+                    return False
+                # Com a FLAG EXPLÍCITA (o espelho do turno, decidido por quem
+                # chama) a MESMA resposta sai em texto uma única vez.
             # Escrita assina: `*Gino:*` (ou o nome da persona) na primeira
             # linha. Quem assina é o `send()` do core — um ponto só; a voz não
             # assina nunca, e o áudio acima saiu sem nome nenhum.
@@ -7518,6 +7543,11 @@ class JarvisLive:
         audio_sent = False
         tts_text = ""
         if full and not meta.get("wa_sent"):
+            # Espelho do turno = resposta de voz do assistente ao dono/
+            # terceiro no zap: a flag fica OFF (a ordem de 07/11/2026).
+            # Áudio pedido que não sai NÃO degrada em texto — nada é
+            # enviado e a linha do Activity Log abaixo marca
+            # "whatsapp não enviado" com generated=False.
             sent = bool(self._send_whatsapp_answer(
                 meta.get("wa_account"), meta.get("wa_chat"), full,
                 meta.get("media_type") or "text", speaker=speaker))
@@ -13501,15 +13531,21 @@ class JarvisLive:
 
         A note from WhatsApp must not be acknowledged through the room
         speakers: the owner is on the phone. The audio comes from the same
-        sender used by every WhatsApp answer (text is the fallback when the
-        synthesis fails or silence mode is on), and it is sent BEFORE the
-        restart is fired so the chat never stays unanswered.
+        sender used by every WhatsApp answer. Silence mode still releases
+        the same answer as text (the voice is retained for later), but if
+        the synthesis itself fails nothing is sent: this is the assistant's
+        voice to the owner, so ``audio_text_fallback`` stays OFF — no
+        silent audio→text downgrade. It is sent BEFORE the restart is
+        fired so the chat never stays unanswered.
         """
         if str(reply_channel or "") == "whatsapp":
             chat = str(wa_chat or "").strip()
             if not chat:
                 return
             try:
+                # Confirmação de reinício em áudio: flag explicitamente OFF.
+                # Sem nota de voz a falha é dita no console; texto no lugar
+                # da voz seria o defeito proibido pelo dono em 07/11/2026.
                 self._send_whatsapp_answer(wa_account, chat, message,
                                            media_type="audio")
             except Exception as e:
