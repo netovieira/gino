@@ -176,7 +176,22 @@ class DirectChatTest(unittest.TestCase):
         self.assertEqual(kwargs["media_type"], "text")
         self.assertIn("MENSAGEM DE TERCEIRO", obj._qoder_turn.call_args[0][0])
 
-    def test_group_is_never_answered_not_even_with_the_name(self):
+    def test_group_is_judged_by_the_verdict_never_a_blind_refusal(self):
+        """LEI NOVA (ordem do dono, 09/11/2026 16:40): "AGORA VOCE VAI PODER
+        LER GRUPOS, MAS RESPONDER APENAS PESSOAS AUTORIZADAS" — decisão 11 do
+        plano do vault, que revogou a regra 4 dele próprio de 01/11 e
+        02/11/2026 ("grupo nunca é lido nem respondido").
+
+        O teste anterior ``test_group_is_never_answered_not_even_with_the_name``
+        codificava a regra morta: exigia ``ui.logs == []``, ou seja, recusa
+        CEGA antes de qualquer julgamento. Sob a lei nova o grupo nomeado
+        AINDA NÃO vira turno — o veredito de ``core/group_policy`` recusa
+        (aqui, sem allow-list nem dono provado) — mas a recusa agora é dita
+        com motivo numa linha de rastro ``event=grupo_turno``, e é isso que
+        se prova: nada de ``_qoder_turn``, nada de memória, E o motivo
+        registrado. O caso positivo (grupo autorizado que vira turno) mora em
+        ``tests/test_main_group_turn.py``.
+        """
         obj = self._obj()
         item = {"chat": "120363000000000000@g.us",
                 "name": "grupo 120363000000000000",
@@ -186,7 +201,11 @@ class DirectChatTest(unittest.TestCase):
         obj._qoder_turn.assert_not_called()
         obj._qoder_hold.assert_not_called()
         obj._memory_record_user.assert_not_called()
-        self.assertEqual(obj.ui.logs, [])
+        rastros = [ln for ln in obj.ui.logs if "event=grupo_turno" in ln]
+        self.assertEqual(len(rastros), 1,
+                         f"sem linha de rastro do veredito: {obj.ui.logs}")
+        self.assertIn("decisao=recusado", rastros[0])
+        self.assertIn("motivo=", rastros[0])
 
     def test_owner_echo_naming_the_assistant_is_an_order_in_that_chat(self):
         """Regra 5 do SKILL (04/11/2026): eco do dono COM o nome no chat de
