@@ -25,13 +25,15 @@ fakes; the gates themselves are the real code.
 """
 from __future__ import annotations
 
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import main
-from core import actiongate, whatsapp_watch
+from core import actiongate, group_policy, whatsapp_watch
 
 OWNER = "Anthero"
 OWNER_PCM = b"\x01\x00" * 8000
@@ -416,16 +418,93 @@ class WatcherCandidateTests(unittest.TestCase):
             self.assertFalse(whatsapp_watch.is_candidate(
                 self._item(media=None, text="oi, tudo bem?"), ACCOUNT))
 
-    def test_group_audio_is_never_a_candidate(self):
+    # ── ORDEM QUE MUDOU ESTE CASO (escrita aqui porque o teste afirmava o
+    # contrário) ──────────────────────────────────────────────────────────────
+    # Este caso se chamava `test_group_audio_is_never_a_candidate` e era a
+    # regra 4 de 01/11 e 02/11/2026 ("Grupo NUNCA é lido nem respondido",
+    # ``skills/whatsapp/SKILL.md:14``) aplicada ao pré-filtro do watcher.
+    # O dono REVOGOU essa regra com data, na rodada de decisões do plano de
+    # 07/11, no vault
+    # ``Documentos/Obsidian Vault/PLANO-2026-11-07-fluxo-plano-aprovacao-tarefa-e-vault-de-obras.md``:
+    #   linha 69-70: pergunta "Revogar a SUA regra vigente sobre grupos" ->
+    #                "AGORA VOCE VAI PODER LER GRUPOS, MAS RESPONDER APENAS
+    #                 PESSOAS AUTORIZADAS";
+    #   linha 84-85: pergunta "Voz desconhecida dentro de grupo autorizado" ->
+    #                "QUANDO ALGUEM QUE VOCE NAO CONHECE PERGUNTAR ALGO POR
+    #                 VOZ, REGISTRE A VOZ COMO MEMORIA PARA O MESMO, E O DE
+    #                 PERMISSOES DE VIZITANTE".
+    # Para registrar a voz de quem perguntou POR VOZ é preciso OUVIR a nota, e
+    # para ouvir é preciso que ela entre no fluxo: a nota de grupo voltou a ser
+    # candidata (pré-filtro barato, sem disco nem modelo -- o veredito em
+    # ``core/group_policy.group_verdict`` é quem decide, e a gravação de
+    # visitante mora em ``core/group_reply._register_unknown_voice``, sempre no
+    # nível VISITANTE: jamais dono). O que a linha 70 NÃO revogou é o
+    # privilégio, e o teste abaixo passa a travar exatamente isso, no lugar
+    # certo: ser candidato nunca é virar voz privilegiada do dono, abrir portão
+    # de ações nem chamar o handler do 1:1.
+    def test_group_audio_is_a_candidate_for_the_verdict(self):
         with mock.patch.object(whatsapp_watch.whatsapp, "sent_by_me",
                                return_value=False), \
                 mock.patch.object(whatsapp_watch.whatsapp, "list_accounts",
                                   return_value=[]), \
                 mock.patch.object(whatsapp_watch.whatsapp, "account_number",
                                   return_value=OWNER_CHAT):
-            self.assertFalse(whatsapp_watch.is_candidate(
+            self.assertTrue(whatsapp_watch.is_candidate(
                 self._item(group=True, chat="120363000000000000@g.us"),
                 ACCOUNT))
+
+    def test_group_audio_never_reaches_the_privileged_handler(self):
+        """Candidato ≠ privilégio: sem o dono no grupo, silêncio absoluto.
+
+        A nota de grupo entra na fila, mas o veredito (presença = ordem 6 do
+        dono, vault ...:82 "SE EU NAO ESTIVER NO CHAT, VOCE NEM VAI VER O
+        CHAT") fecha antes de qualquer I/O: nem o handler do 1:1 -- o único
+        caminho que roda voiceprint privilegiado, ``_decode_whatsapp_pcm`` e o
+        "pode" dos portões -- nem o respondedor de grupo são chamados, e nada
+        fica autorizado.
+        """
+        group = "120363000000000000@g.us"
+        calls: list = []
+        actiongate.close()
+        prev_responder = whatsapp_watch._group_responder
+        try:
+            with tempfile.TemporaryDirectory() as raw, \
+                    mock.patch.object(group_policy, "_PATH",
+                                      Path(raw) / "group_allowlist.json"), \
+                    mock.patch.object(group_policy, "_presence_source",
+                                      lambda _g, _a: False), \
+                    mock.patch.object(group_policy, "_presence_cache", {}), \
+                    mock.patch.object(whatsapp_watch.whatsapp, "sent_by_me",
+                                      return_value=False), \
+                    mock.patch.object(whatsapp_watch.whatsapp, "list_accounts",
+                                      return_value=[]), \
+                    mock.patch.object(whatsapp_watch.whatsapp, "account_number",
+                                      return_value=OWNER_CHAT):
+                whatsapp_watch.set_group_responder(
+                    lambda account, item, verdict: (
+                        calls.append(("respondedor", item)) or False))
+                whatsapp_watch.start(
+                    lambda account, item: calls.append(("handler", item)) or True,
+                    logger=lambda _m: None, assistant_name="Gino",
+                    direct_account=ACCOUNT, direct_chat=OWNER_CHAT)
+                item = self._item(group=True, chat=group)
+                # Entra no fluxo como candidato barato...
+                self.assertTrue(whatsapp_watch.is_candidate(item, ACCOUNT))
+                # ...e morre no veredito, sem nada autorizado.
+                self.assertFalse(whatsapp_watch.handle(ACCOUNT, item))
+        finally:
+            whatsapp_watch.stop()
+            whatsapp_watch.set_group_responder(prev_responder)
+            actiongate.close()
+        self.assertEqual(calls, [],
+                         "grupo jamais chama o handler do 1:1 (voz privilegiada)"
+                         " nem o respondedor sem o veredito autorizar")
+        self.assertFalse(actiongate.authorized(),
+                         "nota de grupo não abre portão de ações")
+        self.assertFalse(actiongate.whatsapp_reply_allowed(
+            "whatsapp_control",
+            {"action": "send", "to": group, "account": ACCOUNT}),
+            "grupo recusado não deixa grant de resposta vivo")
 
 
 if __name__ == "__main__":
