@@ -11,6 +11,8 @@ Cobre o contrato ditado pelo dono em 02/11/2026:
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 import time
 
@@ -18,6 +20,7 @@ import pytest
 
 import main
 from core import silence_gate
+from core.memory_index import slugify
 
 
 class FakeUI:
@@ -51,6 +54,11 @@ def live(tmp_path, monkeypatch):
     # O índice real não pode influenciar o assunto destes testes.
     monkeypatch.setattr(main._memory_index, "active",
                         lambda: {"project": "", "subject": ""})
+    # NENHUM estado real do dono entra aqui: nem o do gate, nem o da
+    # palavra-código (UC-4), nem o config que a espelha. Sem o _silence_code_state_file
+    # e sem o API_CONFIG_PATH, o teste enxergava memory/silence_code.json do
+    # dono e a palavra gravada nele mudava a rota da ordem no meio do teste.
+    monkeypatch.setattr(main, "API_CONFIG_PATH", tmp_path / "api_keys.json")
     obj = object.__new__(main.JarvisLive)
     obj._asst_name = "Gino"
     obj._awake = True
@@ -65,6 +73,7 @@ def live(tmp_path, monkeypatch):
     obj._speech_audit_lock = threading.Lock()
     obj._silence_state_file = tmp_path / "silence_mode.json"
     obj._silence_queue_file = tmp_path / "silence_queue.json"
+    obj._silence_code_state_file = tmp_path / "silence_code.json"
     obj._silence_mode = silence_gate.SilenceGate(
         state_path=obj._silence_state_file,
         queue_path=obj._silence_queue_file)
@@ -83,6 +92,37 @@ def live(tmp_path, monkeypatch):
     obj._whatsapp_notify_owner = _notify
     obj.events: list[tuple[str, str]] = []
     yield obj
+
+
+@pytest.fixture()
+def live_com_palavra(live):
+    """O estado do dono reproduzido em arquivo TEMPORÁRIO: «silêncio» gravado
+    como palavra-código (a ordem literal dele, 09/11/2026 16:40).
+
+    É o caso que colide com o gate — exatamente o que quebrava o teste quando
+    o fixture lia o memory/silence_code.json real.
+    """
+    _gravar_palavra(live, "silêncio")
+    return live
+
+
+def _gravar_palavra(obj, palavra: str, projetos: tuple[str, ...] = ()) -> None:
+    """Escreve a palavra-código no estado UC-4 temporário e refaz o objeto."""
+    obj._silence_code_state_file.write_text(json.dumps({
+        "version": 1,
+        "code_word": palavra,
+        "active_projects": [{"slug": slugify(p, ""), "label": p}
+                            for p in projetos],
+    }, ensure_ascii=False), encoding="utf-8")
+    obj._silence_code_mode = None  # força o próximo acesso a reler o arquivo
+
+
+def _md5_estado_real() -> str | None:
+    caminho = main.SILENCE_CODE_STATE_PATH
+    try:
+        return hashlib.md5(caminho.read_bytes()).hexdigest()
+    except Exception:
+        return None
 
 
 def _wait_until(predicate, timeout: float = 3.0) -> bool:
@@ -282,3 +322,208 @@ def test_cinema_mode_still_toggles(live, tmp_path):
     assert live._cinema_state_file.exists()
     # E o cinema permanece independente do silêncio (estado próprio).
     assert live._silence_mode.active is False
+
+
+# ── a regra única: palavra isolada = global, palavra + nome = escopado ───────
+# Buraco medido (09/11/2026): com «silêncio» gravada como palavra-código em
+# memory/silence_code.json, «silêncio TheroTV» era tratada pelo SilenceCode
+# antes do gate e o escopado caía num segundo estado — o teste acima falhava
+# só porque o fixture lia o arquivo do dono.
+
+def _boca_muda(live) -> None:
+    """Silêncio que libera fala threads de TTS reais: a boca é stub."""
+    live._say_blocking = lambda text, **k: live.events.append(("say", text))
+    live._whatsapp_send_owner_audio = lambda text: (
+        live.events.append(("wa", text)) or True)
+    live._silence_pause = lambda: None
+
+
+def test_a_palavra_gravada_sozinha_liga_o_global_e_um_estado_so(live_com_palavra):
+    live = live_com_palavra
+    antes = live._silence_code_state_file.read_text(encoding="utf-8")
+
+    handled = main.JarvisLive._silence_mode_gate(live, "silêncio", b"\x00" * 3200)
+
+    assert handled is True
+    assert live._silence_mode.muted_all is True
+    # O global é o gate. O SilenceCode não mexeu no próprio estado: a regra
+    # é uma só, com um estado só.
+    assert (live._silence_code_state_file.read_text(encoding="utf-8") == antes)
+    assert live._silence_code().active_projects() == []
+
+
+def test_a_palavra_gravada_seguida_de_nome_e_escopada_so_aquele_projeto(
+        live_com_palavra):
+    live = live_com_palavra
+    antes = live._silence_code_state_file.read_text(encoding="utf-8")
+
+    # A letra do dono («silêncio terotv») e a letra do projeto (TheroTV)
+    # viram a mesma coisa: um assunto escopado. Como o nome chega grafado, o
+    # slug acompanha — a decisão de rota é a regra, não a grafia.
+    handled = main.JarvisLive._silence_mode_gate(
+        live, "silêncio therotv", b"\x00" * 3200)
+
+    assert handled is True
+    assert live._silence_mode.muted_all is False
+    assert live._silence_mode.is_muted(text="O TheroTV está no ar") is True
+    assert live._silence_mode.is_muted(subject="financas",
+                                       text="Fechei o caixa do dia") is False
+    assert live._speech_route("O TheroTV está no ar")["muted"] is True
+    assert live._speech_route("Fechei o caixa do dia")["muted"] is False
+    # Escopado é do gate, não do SilenceCode: nenhum segundo estado, nenhum
+    # segundo resumo esperando liberação por «libera silêncio».
+    assert (live._silence_code_state_file.read_text(encoding="utf-8") == antes)
+    assert live._silence_code().active_projects() == []
+
+
+@pytest.mark.parametrize("fala", [
+    "o silêncio caiu na conversa",
+    "silêncio caiu na conversa",
+    "silêncio é uma virtude",
+    "que silêncio bom hoje",
+    "o silêncio do projeto therotv me ajudou",
+])
+def test_fala_corrida_com_a_palavra_dentro_nao_e_comando(live_com_palavra, fala):
+    live = live_com_palavra
+
+    handled = main.JarvisLive._silence_mode_gate(live, fala, b"\x00" * 3200)
+
+    assert handled is False, "conversa virou comando"
+    assert live._silence_mode.active is False
+    assert live._silence_code().active_projects() == []
+
+
+@pytest.mark.parametrize("fala", [
+    "silêncio", "Silêncio", "SILENCIO", "silencio", "silêncio.",
+    "silêncio!", "Gino, silêncio", "silêncio, por favor", "silêncio total",
+])
+def test_caixa_pontuacao_e_acento_na_palavra_isolada_sao_global(
+        live_com_palavra, fala):
+    live = live_com_palavra
+
+    assert main.JarvisLive._silence_mode_gate(live, fala, b"\x00" * 3200) is True
+    assert live._silence_mode.muted_all is True, f"{fala!r} não ligou o global"
+
+
+@pytest.mark.parametrize("fala", [
+    "silêncio TheroTV", "Silêncio, therotv.", "SILENCIO THEROTV",
+    "silencio therotv", "Gino, silêncio TheroTV", "silêncio o projeto TheroTV",
+])
+def test_caixa_pontuacao_e_acento_com_nome_sao_escopadas(live_com_palavra, fala):
+    live = live_com_palavra
+
+    assert main.JarvisLive._silence_mode_gate(live, fala, b"\x00" * 3200) is True
+    assert live._silence_mode.muted_all is False, f"{fala!r} ligou o global"
+    subjects = live._silence_mode.muted_subjects()
+    assert [i["slug"] for i in subjects] == ["therotv"], f"{fala!r} -> {subjects}"
+    assert live._silence_mode.is_muted(text="O TheroTV está no ar") is True
+    assert live._silence_mode.is_muted(subject="financas") is False
+
+
+def test_repetir_a_palavra_desliga_o_global(live_com_palavra):
+    live = live_com_palavra
+    _boca_muda(live)
+
+    main.JarvisLive._silence_mode_gate(live, "silêncio", b"\x00" * 3200)
+    assert live._silence_mode.muted_all is True
+    main.JarvisLive._silence_mode_gate(live, "silêncio", b"\x00" * 3200)
+
+    assert live._silence_mode.active is False
+    assert live._silence_mode.muted_all is False
+    assert _wait_until(lambda: live._silence_mode.retained_count == 0)
+
+
+def test_repetir_o_nome_desliga_so_aquele_assunto(live_com_palavra):
+    live = live_com_palavra
+    _boca_muda(live)
+
+    main.JarvisLive._silence_mode_gate(live, "silêncio therotv", b"\x00" * 3200)
+    main.JarvisLive._silence_mode_gate(live, "silêncio financas", b"\x00" * 3200)
+    assert live._silence_mode.is_muted(subject="Finanças") is True
+    main.JarvisLive._silence_mode_gate(live, "silêncio therotv", b"\x00" * 3200)
+
+    assert live._silence_mode.is_muted(text="O TheroTV está no ar") is False
+    assert live._silence_mode.is_muted(subject="Finanças") is True
+    assert live._silence_mode.muted_all is False
+
+
+def test_o_escopado_nunca_desliga_o_global_por_acaso(live_com_palavra):
+    live = live_com_palavra
+    _boca_muda(live)
+
+    main.JarvisLive._silence_mode_gate(live, "silêncio", b"\x00" * 3200)
+    assert live._silence_mode.muted_all is True
+    main.JarvisLive._silence_mode_gate(live, "silêncio therotv", b"\x00" * 3200)
+
+    # O nome solta aquele assunto; o resto da sala continua calado.
+    assert live._silence_mode.muted_all is True
+    assert live._silence_mode.is_muted(text="O TheroTV está no ar") is False
+    assert live._silence_mode.is_muted(subject="financas",
+                                       text="Fechei o caixa do dia") is True
+
+
+def test_libera_silencio_devolve_a_sala_e_limpa_a_uc4(live_com_palavra):
+    live = live_com_palavra
+    _boca_muda(live)
+    _gravar_palavra(live, "silêncio", ("therotv",))
+    main.JarvisLive._silence_mode_gate(live, "silêncio", b"\x00" * 3200)
+    assert live._silence_mode.muted_all is True
+
+    handled = main.JarvisLive._silence_mode_gate(
+        live, "libera silêncio", b"\x00" * 3200)
+
+    assert handled is True
+    assert live._silence_mode.active is False
+    assert live._silence_code().active_projects() == []
+    # Um resumo só para a sala: a fila é compartilhada, não dobrada.
+    assert _wait_until(lambda: any("liberado" in t for t in live.wa))
+    falas = [t for kind_evt, t in live.events if kind_evt == "say"]
+    assert len(falas) == 1, f"resumo dobrado na liberação: {falas}"
+
+
+def test_libera_silencio_sem_nada_calado_nao_arma_o_global(live_com_palavra):
+    """O toggle do gate não pode ser acionado pela liberação.
+
+    «libera silêncio» dito com a sala falando é "nada a liberar" — nunca
+    "liga o silêncio total", que é o que um apply_order("") ingenuo faria.
+    """
+    live = live_com_palavra
+    _boca_muda(live)
+
+    assert main.JarvisLive._silence_mode_gate(
+        live, "libera silêncio", b"\x00" * 3200) is True
+    assert live._silence_mode.muted_all is False
+    assert live._silence_mode.active is False
+    assert live._silence_code().active_projects() == []
+
+
+def test_palavra_codigo_propria_continua_viva_na_uc4(live):
+    _gravar_palavra(live, "Oklahoma")
+
+    assert main.JarvisLive._silence_mode_gate(
+        live, "Oklahoma TheroTV", b"\x00" * 3200) is True
+    assert live._silence_code().active_projects() == [
+        {"slug": "therotv", "label": "TheroTV"}]
+    assert live._silence_mode.active is False
+    assert live._speech_route("O TheroTV está no ar")["muted"] is True
+    # E a palavra do silêncio segue sendo do gate, independente dela.
+    assert main.JarvisLive._silence_mode_gate(
+        live, "silêncio", b"\x00" * 3200) is True
+    assert live._silence_mode.muted_all is True
+    assert main.JarvisLive._silence_mode_gate(
+        live, "libera Oklahoma", b"\x00" * 3200) is True
+    assert live._silence_code().active_projects() == []
+
+
+def test_estes_testes_nunca_escrevem_no_estado_real_do_dono(
+        live_com_palavra, tmp_path):
+    live = live_com_palavra
+    antes = _md5_estado_real()
+    assert live._silence_code_state_file.is_relative_to(tmp_path)
+
+    for fala in ("silêncio", "silêncio terotv", "silêncio financas",
+                 "libera silêncio", "Oklahoma terotv"):
+        main.JarvisLive._silence_mode_gate(live, fala, b"\x00" * 3200)
+
+    assert _md5_estado_real() == antes, (
+        "memory/silence_code.json do dono foi tocado pelo teste")
