@@ -31,8 +31,12 @@ THIRD_CHAT = "5521888887777"
 
 
 def _persona(name: str, account: str = "") -> dict:
+    # Conta preenchida exige numero direto declarado (regra do dono 09/11):
+    # sem o booleano a persona e ativa mas nao tem numero, e a rota de conta
+    # tem de recusar.
     return {"id": name.lower(), "name": name, "aliases": [],
-            "whatsapp_account": account}
+            "whatsapp_account": account,
+            "direct_whatsapp": bool(account)}
 
 
 def wa_item(text: str = "", **overrides) -> dict:

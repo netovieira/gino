@@ -628,6 +628,78 @@ def _sonda_linkedin_config() -> tuple[str, str]:
     return FALHA, "nenhuma conta com filtro tipo=linkedin_notification dispatchavel"
 
 
+def _sonda_persona_sem_numero() -> tuple[str, str]:
+    """Persona sem número (estática): o cadastro manda e a rota de conta obedece.
+
+    Regra do dono (09/11/2026): Aline e Arnaldo seguem ativos sem WhatsApp
+    próprio; quem não tem ``direct_whatsapp`` declarado nunca recebe nem é
+    roteada por conta, e não envia por conta que não seja a do assistente.
+    A sonda lê SÓ código de produção (nenhum arquivo de ``tests/``):
+
+      * ``core/personas.py`` tem o leitor do campo (``direct_whatsapp`` +
+        ``own_account``), o ``whatsapp_account`` só é canônico com o booleano,
+        e ``_resolve_whatsapp_account`` devolve vazio para vazio (vazio =
+        nenhuma conta, nunca a principal — ordem 07/11/2026);
+      * ``core/whatsapp_watch.addressed_persona`` filtra o fator
+        ``conta_atribuida`` pelo leitor do cadastro (nada de comparar a conta
+        direto com a chave crua);
+      * ``core/whatsapp.send`` consulta ``persona_send_block`` antes de
+        qualquer ``_A(account)`` — a rota de saída morre na porta, não no log.
+    """
+    store = _tree("core/personas.py")
+    if store is None:
+        return NV, "core/personas.py ilegivel"
+    readers = ("direct_whatsapp", "own_account", "_normalize_direct_whatsapp")
+    for name in readers:
+        if _find_func(store, name) is None:
+            return FALHA, f"falta {name}() em core/personas.py"
+    upsert = _find_func(store, "upsert")
+    if upsert is None:
+        return FALHA, "sumiu upsert() de core/personas.py"
+    up_calls = " ".join(_calls_in(upsert))
+    if ("_normalize_direct_whatsapp" not in up_calls
+            or "direct_whatsapp" not in ast.unparse(upsert)):
+        return FALHA, "upsert nao le direct_whatsapp do cadastro"
+    clean = _find_func(store, "_clean_persona")
+    if clean is None or "direct_whatsapp" not in ast.unparse(clean):
+        return FALHA, "leitura do cadastro nao normalize direct_whatsapp"
+    resolve = _find_func(store, "_resolve_whatsapp_account")
+    if resolve is None:
+        return FALHA, "sumiu _resolve_whatsapp_account()"
+    # Vazio = NENHUMA conta (ordem 07/11/2026): a função devolve string vazia
+    # antes de qualquer comparação — nunca a conta principal por omissão.
+    if not any(isinstance(node, ast.Constant) and node.value == ""
+               for node in ast.walk(resolve)):
+        return FALHA, "conta vazia nao devolve nenhuma conta (vazio != principal)"
+    watch = _tree("core/whatsapp_watch.py")
+    if watch is None:
+        return NV, "core/whatsapp_watch.py ilegivel"
+    addressed = _find_func(watch, "addressed_persona")
+    helper = _find_func(watch, "_persona_own_account")
+    if addressed is None or helper is None:
+        return FALHA, "addressed_persona nao tem filtro de numero proprio"
+    if "own_account" not in " ".join(_calls_in(helper)):
+        return FALHA, "o filtro de conta nao usa o leitor do cadastro"
+    if "_persona_own_account" not in " ".join(_calls_in(addressed)):
+        return FALHA, "a rota de conta ainda compara a chave crua do cadastro"
+    sender = _tree("core/whatsapp.py")
+    if sender is None:
+        return NV, "core/whatsapp.py ilegivel"
+    send = _find_func(sender, "send")
+    block = _find_func(sender, "persona_send_block")
+    if send is None or block is None:
+        return FALHA, "falta send() ou persona_send_block() no core/whatsapp.py"
+    calls = " ".join(_calls_in(send))
+    if "persona_send_block" not in calls:
+        return FALHA, "a saida nao consulta o portao de persona sem numero"
+    source = ast.unparse(send)
+    if source.find("persona_send_block") > source.find("_A(account)"):
+        return FALHA, "o portao roda depois de resolver a conta"
+    if "own_account" not in " ".join(_calls_in(block)):
+        return FALHA, "persona_send_block nao consulta direct_whatsapp/own_account"
+    return OK, ""
+
+
 for _a in (
     Assertion("UP-8.gancho-boot",
               "o boot real do main.py instala o gancho de progresso (task_mirror)",
@@ -665,6 +737,9 @@ for _a in (
     Assertion("whatsapp.paridade-viva",
               "linha de evento da paridade vista no log deste boot, sem flag quebrada",
               "viva", _sonda_whatsapp_paridade_viva),
+    Assertion("persona.sem-numero",
+              "direct_whatsapp manda na conta: cadastro, rota de entrada e saida",
+              "estatica", _sonda_persona_sem_numero),
 ):
     register(_a)
 

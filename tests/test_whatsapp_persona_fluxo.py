@@ -33,14 +33,19 @@ THIRD_CHAT = "5521888887777"
 GROUP_CHAT = "120363000000000000@g.us"
 
 ALINE = {"id": "aline", "name": "Aline", "aliases": [],
-         "whatsapp_account": "trabalho"}
+         "whatsapp_account": "trabalho", "direct_whatsapp": True}
 ARNALDO = {"id": "arnaldo", "name": "Arnaldo", "aliases": [],
-           "whatsapp_account": "trabalho"}
+           "whatsapp_account": "trabalho", "direct_whatsapp": True}
 
 
-def _persona(name: str, account: str = "") -> dict:
-    return {"id": name.lower(), "name": name, "aliases": [],
-            "whatsapp_account": account}
+def _persona(name: str, account: str = "", direct=None) -> dict:
+    # Regra do dono (09/11/2026): conta preenchida só dá número com
+    # direct_whatsapp declarado. Vazio = sem número (a persona continua ativa,
+    # respondendo pelo nome). `direct=None` segue a conta, como o cadastro faz.
+    record = {"id": name.lower(), "name": name, "aliases": [],
+              "whatsapp_account": account}
+    record["direct_whatsapp"] = bool(account) if direct is None else direct
+    return record
 
 
 def wa_item(text: str = "", **overrides) -> dict:

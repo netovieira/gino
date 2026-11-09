@@ -1255,6 +1255,40 @@ def current_speaker() -> str:
     return name or "Gino"
 
 
+def persona_send_block(speaker: str, account: str | None) -> str:
+    """Motivo de recusa de envio ("" = pode enviar) para quem assina.
+
+    Regra do dono (09/11/2026): persona sem número direto NÃO envia por conta
+    nenhuma. As palavras dela saem só pela conta principal do assistente — o
+    chat onde o dono a chama pelo nome. Quem tem ``direct_whatsapp`` declarado
+    envia pela conta dela como sempre; nome que não é persona cadastrada (o
+    próprio assistente) nunca é bloqueado. Sem cadastro legível, nada é
+    bloqueado: a recusa exige a prova do cadastro, nunca um palpite.
+    """
+    name = str(speaker or "").strip()
+    wanted = str(account or "").strip()
+    if not name or not wanted:
+        # Sem assinatura ou sem conta pedida: é o chat do assistente.
+        return ""
+    if name.casefold() == current_speaker().casefold():
+        return ""
+    try:
+        from core import personas as _personas
+        persona = _personas.get(name)
+    except Exception:
+        return ""
+    if not isinstance(persona, dict) or _personas.own_account(persona):
+        return ""
+    try:
+        canonical = _personas._resolve_whatsapp_account(wanted).casefold()
+    except Exception:
+        canonical = wanted.casefold()
+    if canonical == _personas.assistant_account().casefold():
+        return ""
+    return (f"{name} não tem WhatsApp próprio: ela responde quando o dono "
+            f"chama pelo nome no chat do assistente")
+
+
 def signed_text(text: str, speaker: str = "Gino") -> str:
     """Mensagem ESCRITA leva o nome de quem fala; áudio nunca leva.
 
@@ -1374,6 +1408,13 @@ def send(recipient: str, text: str, account: str | None = None,
     text = str(text or "").strip()
     if not text:
         return False, "a mensagem está vazia"
+    # Rota de saída de persona (regra do dono, 09/11/2026): quem não tem
+    # número direto não envia por conta que não é a do assistente. A recusa
+    # acontece antes de qualquer resolução de destino — nada sai, nada é
+    # assinado, nada é inventado.
+    blocked = persona_send_block(speaker or current_speaker(), account)
+    if blocked:
+        return False, blocked
     parts = split_text(text, MAX_TEXT_CHARS)
     if signed:
         parts[0] = signed_text(parts[0], speaker or current_speaker())
