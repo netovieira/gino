@@ -125,3 +125,38 @@ memory/restart_last.json
 memory/music_cache/
 *.lnk
 models/
+
+# ── Estado de execução do Gino (o processo escreve, não é obra) ──────────────
+# Critério: arquivo que o programa reescreve enquanto roda é estado, não obra.
+# Nada aqui tem contrapartida versionável; o código os cria com mkdir pai a pai
+# (core/silence_code.py, core/silence_gate.py, core/workflow_gate.py), então um
+# clone novo funciona sem nenhum deles. Sem wildcard: um de cada vez, para o
+# gitignore nunca engolir código por tabela.
+
+# A palavra-código do dono que libera o silêncio. É credencial falada: se este
+# repo for publicado um dia, o áudio dele deixa de ser trava de segurança.
+memory/silence_code.json
+
+# Fila de falas retidas enquanto o silêncio está ligado. Descartável e fala do
+# dono e dos presentes na sala (dado pessoal).
+memory/silence_queue.json
+
+# Liga/desliga do modo silêncio (estado global e por nome). Mesmo módulo dos
+# dois acima: some sozinho no próximo boot, não é obra.
+memory/silence_mode.json
+
+# Livro do portão de plano: registros e aprovações de cada task. A ALAVANCA
+# continua versionada (config/workflow_gate.json) — o que fica fora é só o
+# histórico que o processo escreve.
+memory/workflow_gate.json
+
+# Livro de defeitos que os agentes abrem quando o dono reclama
+# (core/owner_law.py, funcao open_defect). É um diário appended em tempo de
+# execução com a palavra crua do dono, então é estado + dado pessoal. Não há
+# precedência versionada parecida em docs/ nem em memory/; se um dia a lista
+# virar obra, ela deve nascer curada num documento, não deste arquivo bruto.
+memory/defeitos/
+
+# Área de trabalho volante: backups, patches, snapshots, bench e notas feitas à
+# mão durante uma investigação. Recriada a cada serviço, nunca versionada.
+tmp/
