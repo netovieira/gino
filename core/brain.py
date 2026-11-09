@@ -417,6 +417,80 @@ def fish_voice_id(raw) -> str:
     return txt.rstrip("/").split("/")[-1].split("?")[0]
 
 
+# ── voz que não existe: o orquestrador fala pela persona ───────────────────
+
+#: A frase ouvida quando o ``reference_id`` de alguém sumiu do Fish Audio.
+VOICE_LOST_LINE = "está sem voz, me pediu pra lhe dizer"
+
+
+def persona_of_voice(voice_id) -> dict:
+    """O cadastro dono daquela voz do Fish Audio ({} quando não é de ninguém).
+
+    O id chega pelo Fish Audio já normalizado (``refresh_fish_voice`` corta a
+    página ``https://fish.audio/m/<id>/`` no hex), e o cadastro guarda o que o
+    dono digitou. Os dois nomes levam à mesma pessoa; nada de rede aqui.
+    """
+    wanted = str(voice_id or "").strip()
+    if not wanted:
+        return {}
+    try:
+        from core import personas as _personas
+        for candidate in dict.fromkeys((wanted, fish_voice_id(wanted))):
+            if not candidate:
+                continue
+            hit = _personas.find_by_voice_id(candidate)
+            if hit:
+                return hit
+        # Sobrou o outro lado da troca: o cadastro guarda o que o dono digitou
+        # (a página inteira, às vezes) e o Fish responde pelo id puro. Comparar
+        # os dois normalizados é checar, não adivinhar: ninguém é nomeado por
+        # semelhança.
+        target = fish_voice_id(wanted)
+        for record in _personas.list_personas():
+            if target and fish_voice_id(record.get("voice_id")) == target:
+                return record
+    except Exception:
+        return {}
+    return {}
+
+
+def voice_stand_in_text(text: str, voice_id="", persona: dict | None = None) -> str:
+    """A fala de quem ficou sem voz, dita pelo orquestrador por ela.
+
+    Ordem do dono (09/11/2026): "se não encontrar a voz, o Gino tem que falar
+    pela persona — 'O Fulano está sem voz, me pediu pra lhe dizer...'". O
+    artigo vem do gênero do cadastro, então "a Ariel" e "o Bernardo" saem
+    certos sem montar frase aos pedaços. Sem dono para a voz, o texto segue
+    limpo: não se inventa pessoa.
+    """
+    body = str(text or "").strip()
+    record = persona if isinstance(persona, dict) else persona_of_voice(voice_id)
+    name = str(record.get("name") or record.get("id") or "").strip()
+    if not name:
+        return body
+    try:
+        from core import personas as _personas
+        address = _personas.address(record) or name
+    except Exception:
+        address = name
+    address = (address[:1].upper() + address[1:]) if address else address
+    return f"{address} {VOICE_LOST_LINE}: {body}"
+
+
+def _voice_lost_stand_in(text: str, st: dict, voice_id: str,
+                         style: str | None = None) -> bytes:
+    """Retenta a mesma frase com a voz do Gino e o aviso na frente."""
+    persona = persona_of_voice(voice_id)
+    line = voice_stand_in_text(text, persona=persona)
+    name = str(persona.get("name") or persona.get("id") or "")
+    print(f"[TTS] voz {voice_id} não existe no Fish Audio; o Gino fala por "
+          f"{name or 'quem não tem cadastro'}")
+    # voice_id=None: sem override, a vez é da voz configurada do orquestrador.
+    # Sem override também não há nova tentativa de procuração — a chamada de
+    # dentro só pode cair no "segue a cadeia", nunca recursar infinitamente.
+    return synth_pcm24k(line, st, style=style)
+
+
 def voice_label(st: dict) -> str:
     if st.get("tts_engine") == "fish":
         return f"Fish Audio {st.get('fish_model')} voice {st.get('fish_voice_id') or '(default)'}"
@@ -1379,6 +1453,23 @@ class FishCreditsExhausted(RuntimeError):
     left. The caller falls back to another voice and switches brains."""
 
 
+class FishVoiceNotFound(RuntimeError):
+    """Fish Audio answered 404 for the requested ``reference_id``: that voice
+    does not exist on the account (deleted, renamed or a mistyped id).
+
+    Distinct from every other Fish failure on purpose. Out of credits or a bad
+    key is a service problem the engine chain can walk around; a missing voice
+    is a person who lost her voice, and the answer is not a random other voice
+    — it is the orchestrator reading her line out loud (see
+    :func:`voice_stand_in_text`)."""
+
+    def __init__(self, voice_id: str, text: str = ""):
+        super().__init__(
+            f"Fish Audio: voice {voice_id} not found (404)")
+        self.voice_id = str(voice_id or "")
+        self.text = str(text or "")
+
+
 def _fish_out_of_credits(r) -> bool:
     if r.status_code == 402:
         return True
@@ -1453,7 +1544,7 @@ def tts_fish_pcm24k(text: str, st: dict, style: str | None = None) -> bytes:
     if r.status_code == 401:
         raise RuntimeError("Fish Audio rejected the API key (401)")
     if r.status_code == 404 and st.get("fish_voice_id"):
-        raise RuntimeError(f"Fish Audio: voice {st['fish_voice_id']} not found (404)")
+        raise FishVoiceNotFound(st["fish_voice_id"], payload_text)
     r.raise_for_status()
     data = r.content
     if not data:
@@ -1953,6 +2044,8 @@ def synth_pcm24k(text: str, st: dict, voice_id: str | None = None,
     engine in the chain is tried automatically.  Priority: Fish > Qwen3 > Edge.
     FishCreditsExhausted is NOT caught here — the caller handles it to switch
     the whole session away from Fish (see main.py _fish_out logic).
+    FishVoiceNotFound (404 on a persona's ``voice_id``) is answered here: Gino
+    speaks the line for the persona, in his own voice.
     """
     tag = str(style or "").strip()
     engine = st.get("tts_engine") or "edge"
@@ -1967,6 +2060,28 @@ def synth_pcm24k(text: str, st: dict, voice_id: str | None = None,
             return _synth_one_engine(text, st, rung, voice_id=voice_id, style=style)
         except FishCreditsExhausted:
             raise  # caller handles this
+        except FishVoiceNotFound as exc:
+            # 404 no `reference_id`: não adianta trocar de motor e emudecer
+            # quem falou. Se a voz pedida era de uma persona (override), o
+            # orquestrador diz por ela; se era a voz do próprio Gino, não há
+            # por quem falar — ai segue a cadeia.
+            if voice_id:
+                try:
+                    return _voice_lost_stand_in(text, st, voice_id, style=style)
+                except FishCreditsExhausted:
+                    # A procuração usa a voz do Gino: se o crédito acabou aí,
+                    # é o chamador quem tem de trocar a sessão inteira para
+                    # fora do Fish — engolir isso aqui emudecia o aviso.
+                    raise
+                except Exception as exc2:  # sem stand-in: não silencia a linha
+                    print(f"[TTS] o Gino não conseguiu falar por "
+                          f"{voice_id}: {exc2}")
+                    last_exc = exc2
+                    continue
+            print(f"[TTS] voz {exc.voice_id!r} não existe no Fish Audio "
+                  f"— tentando outro motor")
+            last_exc = exc
+            continue
         except Exception as exc:
             last_exc = exc
             print(f"[TTS] {rung} failed: {exc} — trying next engine")
