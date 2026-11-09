@@ -28,6 +28,29 @@ Estado persistido (memory/silence_code.json)
 
 Lei (c) do contrato (FLUXOS.md): só a voz do dono autoriza ativação/liberação.
 O main.py trata disso; este módulo não faz verificação de voz — expõe o hook.
+
+A REGRA ÚNICA DE RECONHECIMENTO (dono, 09/11/2026 16:40: "a palavra é
+silêncio") vive em ``recognize()`` abaixo, e é uma só para as duas bocas:
+
+    fala == palavra, isolada (com vocativo, caixa, acento ou pontuação)
+        -> "global"   : o modo calado de tudo
+    palavra + nome de projeto
+        -> "escopado" : só aquele projeto fica mudo; os outros falam
+    "libera" + palavra  [+ nome]
+        -> "liberar_tudo" | "liberar"
+    qualquer outra fala
+        -> "none"     : conversa, não ordem
+
+Nada aqui é "começa com". ``silêncio caiu na conversa`` ou ``o silêncio
+é um hábito`` têm verbo e função, não têm projeto, e por isso nunca viram
+comando: ``_NOME_PROIBIDO`` e o teto de ``_MAX_NOME_TOKENS`` são o que
+separa um nome de uma frase.
+
+    Choque das duas palavras (medido, 09/11/2026): quando a palavra-código é
+    a MESMA palavra do gate, o ``main.py`` tratava «silêncio Nome» pelo
+    SilenceCode antes do SilenceGate, e o escopado ia para um segundo estado.
+    ``is_silence_word()`` expõe a colisão para o main.py decidir uma só vez
+    pelo gate; aqui a palavra continua configurável e vale para qualquer outra.
 """
 from __future__ import annotations
 
@@ -50,12 +73,40 @@ DEFAULT_MAX_RETAINED = 40
 _MAX_SUMMARY_SUBJECTS = 8
 _MAX_SNIPPET = 160
 
-# Padrões de ativação e liberação (aplicados à transcrição em minúsculas
-# sem acentos). O dono define a palavra-código em configure(); esta é a
-# forma genérica de ler a ordem.
-_ACTIVATE_RE_TEMPLATE = r"^(?:{cw})\s+(.+?)$"
-_DEACTIVATE_RE_TEMPLATE = r"^libera\s+(?:{cw})\b\s*(.*)$"
-_DEACTIVATE_ALL_RE_TEMPLATE = r"^libera\s+(?:{cw})\s*$"
+# A palavra do dono para o modo calado (core/silence_gate.py a conhece fixa).
+SILENCE_WORD = "silêncio"
+# Verbo da liberação, a única gramática do SilenceCode que o gate não tem.
+# É o verbo que o dono usa («libera Oklahoma»); nada além dele libera.
+LIBERAR_VERBO = "libera"
+
+# Um nome de projeto é curto e não é frase. Estas palavras são função,
+# pronome, preposição ou verbo: com qualquer uma nelas o que o microfone
+# ouviu é fala corrida — e fala corrida nunca vira comando. Tudo já em
+# ``_fold`` (minúsculo, sem acento), porque é assim que se compara.
+_NOME_PROIBIDO = frozenset({
+    # artigo, pronome, preposição, conjunção
+    "o", "a", "os", "as", "um", "uma", "uns", "umas", "e", "ou", "mas",
+    "de", "da", "do", "dos", "das", "no", "na", "nos", "nas", "em", "com",
+    "sem", "sob", "sobre", "para", "pro", "pra", "ao", "aos", "que", "quem",
+    "como", "quando", "onde", "por", "se", "sim", "nao", "eu", "me", "te",
+    "lhe", "voce", "ele", "ela", "eles", "elas", "isso", "isto", "aquele",
+    "aquela", "este", "esta", "esse", "essa", "todo", "toda", "todos",
+    "todas", "mundo", "gente",
+    # verbo / estado — o buraco medido: «silêncio caiu na conversa»
+    "ser", "sao", "esta", "estou", "estamos", "estiver", "ta", "to", "tamo",
+    "ficou", "fica", "fique", "cai", "caiu", "caia", "veio", "vem", "vai",
+    "vao", "vou", "tem", "tenho", "foi", "fora", "ha", "quero", "quer",
+    "pode", "posso", "deixa", "deixe", "pare", "cala", "calar", "fala",
+    "fale", "fico", "faz", "fez", "dar", "dando", "tendo", "sendo",
+    # cortesia e tempo, que o gate já descarta como resto
+    "favor", "pfv", "agora", "ja", "entao", "ok", "okay", "certo",
+    "beleza", "obrigado", "obrigada", "valeu", "bom", "boa", "oi", "ola",
+})
+# Palavras que querem dizer "tudo", e não "projeto".
+_GLOBAL_WORDS = frozenset({"total", "tudo", "geral", "geralzao", "sempre",
+                           "o mundo", "todo mundo", "tudo junto"})
+# Mais que isto já é frase, não nome.
+_MAX_NOME_TOKENS = 4
 
 
 def _fold(text: Any) -> str:
@@ -83,7 +134,150 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
-# ── parser de ordem ──────────────────────────────────────────────────────────
+# ── reconhecimento: a regra é uma só ─────────────────────────────────────────
+
+def is_silence_word(word: Any) -> bool:
+    """A palavra-código do dono É a própria palavra do silêncio?
+
+    ``memory/silence_code.json`` hoje grava exatamente isso
+    (dono, 09/11/2026 16:40: "a palavra é silêncio"). Quando é a mesma
+    palavra, o ``main.py`` decide uma vez só pelo SilenceGate — o estado do
+    escopado passa a ser um só, e o SilenceCode empresta apenas a liberação,
+    que é a única gramática que o gate não tem. Nunca lança.
+    """
+    return _fold(word).strip() == _fold(SILENCE_WORD).strip()
+
+
+_BORDA = " \t,;:.!?-–—\"'«»()[]{}"
+_VOCATIVO = r"^{nome}\s*[,:!.;-]?\s*"
+_CORTESIA_INI_RE = re.compile(
+    r"^(?:por\s+favor|pfv|agora|j[aá]|ei|hei)[\s,;:.-]+", re.IGNORECASE)
+_CORTESIA_FIM_RE = re.compile(
+    r"[\s,;:.!?-]+(?:por\s+favor|pfv|agora|j[aá]|ok|okay|certo|beleza|"
+    r"obrigado|obrigada|valeu)$", re.IGNORECASE)
+# "o projeto X", "na TheroTV": envolucro de conversa em volta do nome.
+_ENVOLUCRO_RES = (
+    re.compile(r"^(?:(?:o|a|os|as)\s+)?(?:projeto|assunto|tema|quest[aã]o)\s+",
+               re.IGNORECASE),
+    re.compile(r"^(?:no|na|nos|nas|do|da|dos|das|de|sobre|para|pro|pra)\s+",
+               re.IGNORECASE),
+)
+
+
+def _sem_borda(token: str) -> str:
+    """Um token da fala sem a pontuação que a transcrição cola nas bordas."""
+    return str(token or "").strip(_BORDA)
+
+
+def _sem_vocativo(texto: str, addresses: Iterable[str]) -> str:
+    """Tira o chamado do assistente no começo ("Gino, silêncio") — o gate já aceita."""
+    nomes = [str(a).strip() for a in addresses if str(a or "").strip()]
+    nomes += ["gino", "jarvis"]
+    sobra = str(texto or "").strip()
+    for nome in sorted({n for n in nomes if n}, key=len, reverse=True):
+        novo = re.sub(_VOCATIVO.format(nome=re.escape(nome)), "",
+                      sobra, count=1, flags=re.IGNORECASE).strip()
+        if novo != sobra:
+            return novo
+    return sobra
+
+
+def _sem_cortesia(texto: str) -> str:
+    sobra = " ".join(str(texto or "").split()).strip().strip(_BORDA)
+    anterior = None
+    while anterior != sobra:
+        anterior = sobra
+        sobra = _CORTESIA_INI_RE.sub("", sobra, count=1).strip().strip(_BORDA)
+    return _CORTESIA_FIM_RE.sub("", sobra, count=1).strip().strip(_BORDA)
+
+
+def _nome_de_projeto(resto: str) -> str | None:
+    """O que veio depois da palavra: nome, "tudo", ou frase.
+
+    ``str`` vazio  -> não há nome: é o modo calado GERAL.
+    ``str`` preenchido -> o nome do projeto (escopado).
+    ``None``        -> fala corrida: não é ordem. É esta linha que impede
+    a palavra de engolir «silêncio caiu na conversa».
+    """
+    sobra = _sem_cortesia(resto)
+    if not sobra or _fold(sobra) in _GLOBAL_WORDS:
+        return ""
+    anterior = None
+    while anterior != sobra:
+        anterior = sobra
+        for padrao in _ENVOLUCRO_RES:
+            novo = padrao.sub("", sobra, count=1)
+            if novo != sobra:
+                sobra = " ".join(novo.split()).strip().strip(_BORDA)
+    if not sobra or _fold(sobra) in _GLOBAL_WORDS:
+        return ""
+    tokens = [t for t in sobra.split() if t]
+    if not tokens or len(tokens) > _MAX_NOME_TOKENS:
+        return None
+    dobrado = [_fold(t) for t in tokens]
+    if any(t in _NOME_PROIBIDO or t in _GLOBAL_WORDS for t in dobrado):
+        # Só cortesia/tempo («silêncio aqui», «silêncio é bom»): não há nome
+        # na fala — o dono quer a sala, não um projeto.
+        if all(t in _NOME_PROIBIDO for t in dobrado):
+            return ""
+        # Com verbo ou função MISTURADA a um substantivo («caiu na
+        # conversa»): é frase, não ordem.
+        return None
+    if not any(ch.isalnum() for ch in _fold(sobra)):
+        return None
+    return " ".join(tokens)[:60]
+
+
+def recognize(text: str, word: str, *,
+              addresses: Iterable[str] = ()) -> dict:
+    """A ÚNICA regra de reconhecimento das ordens de silêncio.
+
+    ``{"kind": "global"|"escopado"|"liberar_tudo"|"liberar"|"none",
+    "project": str, "slug": str, "word": str}``. Nunca lança.
+
+    global      : a fala INTEIRA é a palavra, isolada (vocativo, caixa,
+                  acento, vírgula ou ponto não mudam isso), ou a palavra
+                  seguida de "total/tudo/geral".
+    escopado    : a palavra + o NOME de um projeto — e só o nome, no máximo
+                  ``_MAX_NOME_TOKENS`` tokens sem verbo, sem pronome, sem
+                  preposição no meio.
+    liberar*    : "libera" antes da palavra; sem nome = tudo, com nome = um.
+    none        : qualquer outra fala. Não existe "começa com": sobra que não
+                  é nome devolve none e a frase segue para o cérebro.
+    """
+    raw = " ".join(str(text or "").split()).strip()
+    out: dict[str, Any] = {"kind": "none", "project": "", "slug": "",
+                           "word": str(word or "")}
+    if not raw or "?" in raw or not str(word or "").strip():
+        return out
+    corpo = _sem_cortesia(_sem_vocativo(raw, addresses))
+    liberando = False
+    padrao_liberar = rf"^{re.escape(LIBERAR_VERBO)}\b[\s,;:.]*"
+    if re.match(padrao_liberar, corpo, re.IGNORECASE):
+        liberando = True
+        corpo = _sem_cortesia(re.sub(padrao_liberar, "", corpo, count=1,
+                                     flags=re.IGNORECASE))
+    corpo = _sem_cortesia(_sem_vocativo(corpo, addresses))
+    cw_tokens = [_sem_borda(t) for t in str(word).split() if t]
+    n = len(cw_tokens)
+    tokens = [_sem_borda(t) for t in corpo.split()]
+    tokens = [t for t in tokens if t]
+    if n == 0 or len(tokens) < n:
+        return out
+    # Correspondência EXATA: os primeiros tokens têm de ser a palavra, e só
+    # ela — nada de "começa com" colando a palavra em outra fala.
+    if _fold(" ".join(tokens[:n])) != _fold(" ".join(cw_tokens)):
+        return out
+    nome = _nome_de_projeto(" ".join(tokens[n:]))
+    if nome is None:
+        return out
+    if not nome:
+        out["kind"] = "liberar_tudo" if liberando else "global"
+        return out
+    out.update({"kind": "liberar" if liberando else "escopado",
+                "project": nome, "slug": slugify(nome, "")})
+    return out
+
 
 def parse_silence_code_order(
     text: str,
@@ -94,55 +288,22 @@ def parse_silence_code_order(
     Retorna ``{"action": "activate"|"deactivate"|"deactivate_all"|"none",
     "project": str, "slug": str}``. Nunca lança.
 
-    A palavra-código é comparada em lowercase sem acentos. O projeto é o
-    que vem depois dela na ativação; na liberação pode vir vazio (todos)
-    ou um projeto específico.
+    Finino sobre ``recognize()`` — a regra de reconhecimento é uma só para a
+    palavra-código e para a palavra do silêncio. A palavra vale em minúsculas
+    sem acentos; sem nome depois dela a ordem é GLOBAL (silencia tudo); com
+    nome, é aquele projeto; "libera ..." solta um projeto ou todos.
     """
-    raw = " ".join(str(text or "").split()).strip()
-    out = {"action": "none", "project": "", "slug": ""}
-    if not raw or not code_word:
-        return out
-    cw_fold = _fold(code_word).strip()
-    n = _fold(raw)
-    # Liberação total: "libera Oklahoma"
-    try:
-        if re.match(_DEACTIVATE_ALL_RE_TEMPLATE.format(cw=re.escape(cw_fold)), n):
-            out.update({"action": "deactivate_all", "project": "", "slug": ""})
-            return out
-    except re.error:
-        pass
-    # Liberação de projeto: "libera Oklahoma TheroTV"
-    try:
-        m = re.match(_DEACTIVATE_RE_TEMPLATE.format(cw=re.escape(cw_fold)), n)
-        if m:
-            proj = " ".join(raw.split())  # preserve original case
-            rest_raw = m.group(1).strip()
-            if rest_raw:
-                label = rest_raw[:60]
-                out.update({"action": "deactivate", "project": label,
-                            "slug": slugify(label, "")})
-            else:
-                out.update({"action": "deactivate_all", "project": "", "slug": ""})
-            return out
-    except re.error:
-        pass
-    # Ativação: "Oklahoma TheroTV"
-    try:
-        m = re.match(_ACTIVATE_RE_TEMPLATE.format(cw=re.escape(cw_fold)), n)
-        if m:
-            rest_folded = m.group(1).strip()
-            # Recupera o rótulo com o caso original
-            idx = raw.lower().find(cw_fold)
-            if idx >= 0:
-                label = raw[idx + len(cw_fold):].strip()[:60]
-            else:
-                label = rest_folded[:60]
-            if label:
-                out.update({"action": "activate", "project": label,
-                            "slug": slugify(label, "")})
-            return out
-    except re.error:
-        pass
+    decision = recognize(text, code_word)
+    out: dict[str, str] = {"action": "none", "project": "", "slug": ""}
+    kind = str(decision.get("kind") or "none")
+    project = str(decision.get("project") or "")
+    slug = str(decision.get("slug") or "")
+    if kind in ("global", "escopado"):
+        out.update({"action": "activate", "project": project, "slug": slug})
+    elif kind == "liberar":
+        out.update({"action": "deactivate", "project": project, "slug": slug})
+    elif kind == "liberar_tudo":
+        out.update({"action": "deactivate_all", "project": "", "slug": ""})
     return out
 
 

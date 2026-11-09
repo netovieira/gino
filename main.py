@@ -13036,52 +13036,55 @@ class JarvisLive:
         Voice only: without PCM (typed text) the gate never triggers. Without
         the owner's voiceprint the line is consumed without toggling — a TV
         saying the word must not become a turn either.
+
+        UMA regra só de reconhecimento (dono, 09/11/2026 16:40: "a palavra é
+        silêncio"), em ``core.silence_code.recognize``: a palavra exata e
+        isolada é o modo calado GERAL; a palavra + nome de projeto é
+        ESCOPADA; o resto é conversa. Nada aqui é "começa com" — «silêncio
+        caiu na conversa» não pode virar ordem.
+
+        Choque medido e agora decidido: com a palavra-código gravada como a
+        MESMA palavra do silêncio, o SilenceCode interceptava «silêncio
+        Nome» antes do gate e o escopado ia para um segundo estado. Quando a
+        palavra é a mesma, o ESTADO É UM SÓ — o gate (global e escopado);
+        o SilenceCode empresta apenas a liberação («libera ...»), que é a
+        única gramática que o gate não tem.
         """
         raw = " ".join(str(text or "").split()).strip()
         if not raw:
             return False
-        # UC-4: a palavra-código é tratada antes do "silêncio".
-        # Se for ordem de palavra-código, o SilenceCode resolve e retorna.
+        address = (getattr(self, "_asst_name", "") or "",)
         sc = self._silence_code()
-        if sc.code_word:
-            cw_result = sc.handle_transcription(raw)
-            if cw_result is not None:
-                # Só a voz do dono autoriza (mesma regra do gate).
-                if not pcm:
-                    return False
-                if not self._silence_owner_ok(pcm, device=device):
-                    try:
-                        self.ui.write_log(
-                            "SYS: palavra-código — ordem ignorada "
-                            "(voz nao reconhecida como o dono).")
-                    except Exception:
-                        pass
-                    return True
-                if log_heard:
-                    try:
-                        self._log_heard(raw)
-                    except Exception:
-                        pass
-                act = str(cw_result.get("action") or "")
-                if act in ("deactivate", "deactivate_all"):
-                    self._silence_code_release(cw_result)
-                else:
-                    proj = str(cw_result.get("project") or "tudo")
-                    try:
-                        self.ui.write_log(
-                            f"SYS: palavra-código «{sc.code_word}» — "
-                            f"silêncio para «{proj}». Sigo ouvindo.")
-                    except Exception:
-                        pass
-                    if act == "activate":
-                        try:
-                            self.interrupt()
-                        except Exception:
-                            pass
-                return True
-        order = _silence_gate_mod.parse_order(
-            raw, addresses=(getattr(self, "_asst_name", "") or "",))
-        if not order.get("triggered"):
+        cw = str(getattr(sc, "code_word", "") or "").strip()
+        mesma_palavra = bool(cw) and _silence_code_mod.is_silence_word(cw)
+        # UC-4 com palavra PRÓPRIA (ex.: "Oklahoma") tem prioridade: é outra
+        # palavra, não colide com o gate.
+        if cw and not mesma_palavra:
+            if _silence_code_mod.recognize(
+                    raw, cw, addresses=address).get("kind") != "none":
+                return self._silence_code_order(
+                    sc, raw, pcm, device=device, log_heard=log_heard)
+        decisao = _silence_code_mod.recognize(
+            raw, _silence_code_mod.SILENCE_WORD, addresses=address)
+        kind = str(decisao.get("kind") or "none")
+        liberando = kind in ("liberar", "liberar_tudo")
+        if kind == "none":
+            # A palavra no meio de uma frase não é ordem: segue para o cérebro.
+            return False
+        # A ordem é a decisão do ``recognize`` — o gate fica só com a máquina
+        # de estado (ligar/desligar, assunto, fila, resumo). Uma regra só para
+        # as duas bocas: não existe aqui o "começa com" do antigo parse_order.
+        order = ({"all": True, "subject": ""}
+                 if kind in ("global", "liberar_tudo") else
+                 {"all": False, "subject": str(decisao.get("project") or "")})
+        if liberando and not self._silence_gate().active:
+            # «libera» nunca LIGA o silêncio: com a sala falando, o gate não
+            # tem nada a soltar. Sobram os projetos UC-4 guardados por nome
+            # (herança da palavra-código), quando a palavra é outra; se for a
+            # mesma palavra, a fala não é ordem nenhuma e segue para o cérebro.
+            if mesma_palavra:
+                return self._silence_code_order(
+                    sc, raw, pcm, device=device, log_heard=log_heard)
             return False
         if not pcm:
             # Regra do dono: só a voz autoriza. Texto digitado nunca liga.
@@ -13098,6 +13101,13 @@ class JarvisLive:
                 self._log_heard(raw)
             except Exception:
                 pass
+        if mesma_palavra and liberando:
+            # Limpa os projetos UC-4 herdados da regra antiga. A fila é a
+            # MESMA do gate, então o resumo falado sai único, pela boca dele.
+            try:
+                sc.handle_transcription(raw)
+            except Exception as e:
+                print(f"[PalavraCodigo] liberação do estado legado falhou: {e}")
         subject_label = "" if order.get("all") else str(
             order.get("subject") or "")
         try:
@@ -13136,23 +13146,60 @@ class JarvisLive:
             self._silence_release(action, subject)
         return True
 
-    def _silence_code_release(self, cw_result: dict) -> None:
-        """UC-4: ao liberar palavra-código, produz e fala o resumo retido.
+    def _silence_code_order(self, sc, raw: str, pcm: bytes | None, *,
+                            device: str | None = None,
+                            log_heard: bool = True) -> bool:
+        """Ordem da palavra-código (UC-4) quando a palavra é PRÓPRIA.
 
-        Usa as linhas que já estão na fila do gate (mesmo storage) e também
-        as entries locais do SilenceCode. Depois de falar o resumo, limpa
-        a fila local do SilenceCode (as linhas do gate já foram tomadas
-        pelo take no gate, se necessário).
+        Mesma regra de reconhecimento do silêncio (``recognize``): palavra
+        isolada = global, palavra + nome = escopado, "libera ..." = volta.
+        Só a voz do dono autoriza; texto digitado nunca liga.
         """
-        sc = self._silence_code()
-        slug = cw_result.get("slug") or None
-        if cw_result.get("action") == "deactivate_all":
-            slug = None
-        try:
-            release = sc.deactivate(slug if slug else None)
-        except Exception as e:
-            print(f"[PalavraCodigo] liberação falhou: {e}")
-            release = {"entries": [], "dropped": 0, "summary_lines": []}
+        cw_result = sc.handle_transcription(raw)
+        if cw_result is None:
+            return False
+        if not pcm:
+            return False
+        if not self._silence_owner_ok(pcm, device=device):
+            try:
+                self.ui.write_log(
+                    "SYS: palavra-código — ordem ignorada "
+                    "(voz nao reconhecida como o dono).")
+            except Exception:
+                pass
+            return True
+        if log_heard:
+            try:
+                self._log_heard(raw)
+            except Exception:
+                pass
+        act = str(cw_result.get("action") or "")
+        if act in ("deactivate", "deactivate_all"):
+            self._silence_code_release(cw_result)
+        else:
+            proj = str(cw_result.get("project") or "tudo")
+            try:
+                self.ui.write_log(
+                    f"SYS: palavra-código «{sc.code_word}» — "
+                    f"silêncio para «{proj}». Sigo ouvindo.")
+            except Exception:
+                pass
+            if act == "activate":
+                try:
+                    self.interrupt()
+                except Exception:
+                    pass
+        return True
+
+    def _silence_code_release(self, release: dict) -> None:
+        """UC-4: produz e fala o resumo do que a palavra-código reteu.
+
+        Recebe o payload JÁ devolvido por ``SilenceCode.deactivate()``. Antes
+        isto chamava ``deactivate()`` uma segunda vez: o estado era liberado
+        duas vezes (com dois rewrites do arquivo) e, como o retorno não traz
+        o slug, a segunda liberava TUDO mesmo quando a ordem era por projeto.
+        """
+        release = release if isinstance(release, dict) else {}
         lines = list(release.get("summary_lines") or [])
         if not lines:
             lines = ["Palavra-código liberada. Nada ficou guardado."]
