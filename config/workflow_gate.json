@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "_comentario": "Alavanca do portão plano -> aprovação -> tarefa (core/workflow_gate.py). 'ativo': false volta EXATAMENTE o comportamento de antes da lei: nada é bloqueado, quem consulta recebe ok=True. O JSON é lido a CADA chamada, então editar aqui vale sem reiniciar o processo -- mesmo precedente de config/flows_rules.json (core/flow_ops/rules.py) e de core/flows/config.py. Arquivo ausente = ligado (a lei do dono é plano antes de execução). Arquivo podre, formato errado ou valor que não é liga nem desliga = mantém o último valor lido e grava event=workflow_gate decisao=config_recusada no logs/activity.log: o portão nunca se desliga sozinho por acidente, e nunca derruba quem chama. Escape de emergência sem tocar em disco: variável JARVIS_WORKFLOW_GATE=0 ou 1.",
+  "ativo": true
+}
