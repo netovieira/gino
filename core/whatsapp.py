@@ -141,6 +141,13 @@ OWNER_ID_KEEP_S = 900.0
 # Quantos avisos do dono ficam na gaveta esperando o próximo despertar.
 OWNER_PENDING_KEEP = 50
 
+# Consulta de participantes de grupo é RPC no aparelho pareado: o resultado é
+# cacheado este tempo. É o que responde "o dono está neste grupo?" — sem isso a
+# lei de privacidade de 09/11/2026 ("se eu não estiver no chat, você nem vai
+# ver o chat") teria que ser decidida por suposição.
+GROUP_INFO_TTL_S = 900.0
+_group_owner_cache: dict[str, tuple["bool | None", float]] = {}
+
 # Idade máxima de uma mensagem para valer como aviso na hora (tela/alto-falante
 # e o gancho de despertar). Mais velha que isto é histórico de reconexão: fica
 # no inbox, mas não acorda ninguém.
@@ -2084,6 +2091,112 @@ def _is_owner_order(acct: _Account, item: dict, direct: bool) -> bool:
     return _calls_assistant(acct, item)
 
 
+def _sender_identity(src, from_me: bool) -> tuple[str, str]:
+    """Quem ESCREVEU a mensagem: (telefone ou user do autor, lid).
+
+    Em chat individual o autor é o outro lado do chat. Em GRUPO o ``Chat`` é o
+    grupo e a pessoa vem em ``Sender`` — com o telefone em ``SenderAlt`` depois
+    da migração para LID, exatamente como ``_chat_identity`` resolve no 1:1.
+    Sem isto a allow-list de grupos (ordem do dono, 09/11/2026) não teria quem
+    checar: sobrar só o JID do grupo significaria responder a qualquer um ou a
+    ninguém.
+    """
+    sender = getattr(src, "Sender", None)
+    user = _jid_user(sender)
+    server = _jid_server(sender)
+    alt = getattr(src, "SenderAlt", None)
+    alt_user = _jid_user(alt)
+    phone = ""
+    if alt_user and _jid_server(alt) != "lid" and _digits(alt_user):
+        phone = _digits(alt_user)
+    if not phone and server not in ("", "lid"):
+        phone = _digits(user)
+    lid = user if server == "lid" else ""
+    return (phone or user), lid
+
+
+def owner_numbers() -> set[str]:
+    """Os números do dono nesta instalação (``owner_chat`` + pareados próprios).
+
+    É a ÚNICA definição de "quem é o dono" em número de telefone; a allow-list
+    de grupos e o ``is_owner`` de ``core/whatsapp_watch`` consultam daqui para
+    não existir uma segunda lista que possa divergir.
+    """
+    out: set[str] = set()
+    try:
+        from memory.config_manager import get_plugin_setting
+        out.add(_digits(get_plugin_setting(NS, "owner_chat", "") or ""))
+    except Exception:
+        pass
+    try:
+        for entry in list_accounts():
+            name = str((entry or {}).get("name") or "").strip()
+            out.add(_digits((entry or {}).get("number") or ""))
+            if name:
+                out.add(_digits(account_number(name)))
+    except Exception:
+        pass
+    out.discard("")
+    return out
+
+
+def owner_in_group(group: str, account: str | None = None) -> bool | None:
+    """O dono está entre os participantes deste grupo? ``None`` = não sei.
+
+    A lei do dono (09/11/2026) é "se eu não estiver no chat, você nem vai ver o
+    chat", então a pergunta tem que ser respondida com fato, não com suposição:
+    sem resposta do WhatsApp devolve None e o veredito é silêncio. O resultado é
+    cacheado por grupo (a consulta é uma RPC no aparelho pareado) e renovado a
+    cada ``GROUP_INFO_TTL_S``.
+    """
+    raw = str(group or "").strip()
+    if not raw or not raw.lower().endswith("g.us"):
+        return None
+    now = time.time()
+    with _lock:
+        hit = _group_owner_cache.get(raw)
+        if hit and now - hit[1] < GROUP_INFO_TTL_S:
+            return hit[0]
+    try:
+        a = _A(account)
+    except KeyError:
+        return None
+    client, connected, _err = _client_state(a)
+    if client is None or not connected:
+        return None
+    target, _choices = resolve(raw, a.name)
+    if target is None:
+        return None
+    try:
+        info = client.get_group_info(target)
+    except Exception as e:
+        _log(f"[{a.name}] participantes de {raw} indisponíveis: {e}")
+        return None
+    owners = owner_numbers()
+    seen: set[str] = set()
+    got: bool | None = None
+    try:
+        for p in (getattr(info, "Participants", None)
+                  or getattr(info, "participants", None) or []):
+            user = _jid_user(getattr(p, "JID", None))
+            digits = _digits(user)
+            if digits:
+                seen.add(digits)
+            alt = _digits(_jid_user(getattr(p, "JIDAlt", None)
+                                    or getattr(p, "Alt", None)))
+            if alt:
+                seen.add(alt)
+    except Exception:
+        return None
+    if not seen:
+        got = None
+    else:
+        got = bool(seen & owners)
+    with _lock:
+        _group_owner_cache[raw] = (got, now)
+    return got
+
+
 def _on_message(client, ev, acct: _Account) -> None:
     try:
         from neonize.utils import extract_text
@@ -2112,6 +2225,7 @@ def _on_message(client, ev, acct: _Account) -> None:
         elif not text:
             text = "[mensagem sem texto: reação ou evento]"
 
+        sender, sender_lid = _sender_identity(src, from_me)
         item = {
             "ts": stamp,
             "chat": chat,
@@ -2119,6 +2233,13 @@ def _on_message(client, ev, acct: _Account) -> None:
             "name": _chat_name(chat, ev.Info.Pushname or "", group, acct),
             "from_me": from_me,
             "group": group,
+            # Em grupo, QUEM escreveu (o chat é o grupo, não a pessoa). A
+            # allow-list do dono (09/11/2026) é por contato, então sem estes
+            # campos não existe como decidir "responder apenas pessoas
+            # autorizadas". Em 1:1 o autor é o próprio outro lado do chat.
+            "sender": sender,
+            "sender_lid": sender_lid,
+            "sender_name": (str(ev.Info.Pushname or "") if group else ""),
             # Inteiro: uma mensagem longa do dono não pode perder o fim antes
             # de virar turno. O inbox em disco guarda só as últimas mensagens,
             # então o tamanho continua contido.
@@ -2127,13 +2248,27 @@ def _on_message(client, ev, acct: _Account) -> None:
             "media": media,
         }
         # Rastro mínimo de que o evento chegou ao Python. Sem esta linha um
-        # MessageEv perdido era indistinguível de uma conexão muda; só chat
-        # individual (grupo NUNCA é lido nem vira turno). O LID vai junto
+        # MessageEv perdido era indistinguível de uma conexão muda. Grupo
+        # também é lido (ordem do dono, 09/11/2026) — o que continua proibido é
+        # responder a quem não está na allow-list. O LID vai junto
         # porque é ele que aparece no celular do dono.
         if not group:
             _log(f"[{acct.name}] evento {item['id'] or '(sem id)'} de {chat}"
                  + (f"/{lid}" if lid else "")
                  + f" ({'do dono/outro aparelho' if from_me else 'recebida'})")
+        else:
+            # Grupo é LIDO (a regra antiga de "grupo nunca é lido" foi revogada
+            # pelo dono em 09/11/2026). Ver o dono escrever aqui é a prova mais
+            # barata de que ele está no grupo — e presença dele é o pré-req de
+            # qualquer resposta (regra de privacidade geral).
+            _log(f"[{acct.name}] grupo {chat}: lida de "
+                 f"{item['sender_name'] or item['sender'] or '?'}"
+                 f"{' (eco)' if from_me else ''}")
+            try:
+                from core import group_policy as _group_policy
+                _group_policy.note_owner_sighting(chat, item["sender"])
+            except Exception:
+                pass
 
         # Turno do dono: a mensagem é UM turno, uma vez só. O mesmo evento pode
         # voltar numa reconexão (ou ser lido por duas rotinas), e responder
