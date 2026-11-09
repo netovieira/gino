@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "regra": "nome que o dono usa em fala -> entidade do Home Assistant. Regra do dono (09/11/2026): nome ensinado vira arquivo, não conversa. Só nomes e entity ids: nenhum segredo.",
+  "atualizado_em": "2026-11-09",
+  "apelidos": [
+    {
+      "apelido": "luz do quarto",
+      "entidade": "scene.fan_backlight",
+      "nome": "Luz do teto",
+      "dominio": "scene",
+      "desde": "2026-11-09",
+      "origem": "dono"
+    },
+    {
+      "apelido": "luz",
+      "entidade": "scene.fan_backlight",
+      "nome": "Luz do teto",
+      "dominio": "scene",
+      "desde": "2026-11-09",
+      "origem": "dono"
+    },
+    {
+      "apelido": "luz do teto",
+      "entidade": "scene.fan_backlight",
+      "nome": "Luz do teto",
+      "dominio": "scene",
+      "desde": "2026-11-09",
+      "origem": "dono"
+    }
+  ]
+}

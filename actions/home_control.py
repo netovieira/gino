@@ -10,19 +10,39 @@ The long-lived access token lives in the same vault as the other secrets
 home_assistant_secrets.token``). It is read at call time and never printed,
 logged or returned in an error message.
 
-Name resolution is by entity id or by the human friendly name, accent- and
-case-insensitive, with a short in-memory state cache (``GET /api/states``).
+Name resolution is a machine, not a guess, and it runs in this order:
+``(a)`` an explicit alias the owner taught (persistent map in
+``config/home_aliases.json``), ``(b)`` the human name in EVERY domain a person
+actually names (light, switch, scene, climate, fan, cover, media_player) — not
+only the domain the model happened to guess, ``(c)`` loose equality without
+accents, punctuation or stopwords, ``(d)`` never a flat denial: if nothing is
+found, the similar candidates come back with a question.
+
+The alias map is the answer to the order of 09/11/2026 ("regra do dono vira
+arquivo"): "acende a luz do quarto" failed because the only entity named
+"Luz do teto" is a *scene*, and the old code only looked in the domain it
+inferred from the word "luz". Names the owner teaches must not die in the
+conversation, so ``action='apelido'`` writes them to disk and the file is read
+from disk on EVERY call — a new alias takes effect without a restart (same
+precedent as ``config/flows.json`` and ``config/workflow_gate.json``). The map
+holds names and entity ids only; it never contains a secret.
+
 Every network call has a 5 s timeout and every failure becomes a sentence the
 assistant can speak instead of a traceback.
 """
 from __future__ import annotations
 
+import difflib
 import json
 import math
 import os
+import re
 import threading
 import time
 import unicodedata
+from datetime import date
+from pathlib import Path
+from typing import Any
 
 try:
     import requests
@@ -35,6 +55,13 @@ VAULT_NAMESPACE = "home_assistant_secrets"
 VAULT_KEY = "token"
 CACHE_TTL = 15.0
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+#: Mapa de apelidos do dono: nomes e entity ids, nunca segredo.
+DEFAULT_ALIAS_PATH = BASE_DIR / "config" / "home_aliases.json"
+ENV_ALIAS_PATH = "JARVIS_HOME_ALIASES"
+#: O que o arquivo pode guardar por entrada (falha fechada contra segredo).
+ALIAS_FIELDS = ("apelido", "entidade", "nome", "dominio", "desde", "origem")
+
 # Domains the action will toggle. Anything else (sensor, automation, script,
 # group, …) is refused before a service call is built.
 _TOGGLE_DOMAINS = frozenset({
@@ -44,6 +71,12 @@ _TOGGLE_DOMAINS = frozenset({
 
 # Domains counted in the spoken "status" (scenes are not devices).
 _DEVICE_DOMAINS = _TOGGLE_DOMAINS | {"cover", "vacuum"}
+
+#: Domains a HUMAN name may live in. Searching only the domain the model
+#: guessed is exactly what lost the "luz do quarto" of 09/11/2026: the light is
+#: a scene here. A name is looked for in all of them, always.
+_SEARCH_DOMAINS = ("light", "switch", "scene", "climate", "fan", "cover",
+                   "media_player")
 
 _UNAVAILABLE = frozenset({"unavailable"})
 _UNKNOWN = frozenset({"unknown"})
@@ -85,10 +118,23 @@ _ACTION_ALIASES = {
     "fechar": "turn_off", "desliga": "turn_off", "apaga": "turn_off",
     "set": "set", "ajustar": "set", "ajuste": "set", "ajusta": "set",
     "scene": "scene", "cena": "scene", "ativar_cena": "scene",
+    "apelido": "apelido", "registrar_apelido": "apelido",
+    "registrar_apelidos": "apelido", "ensinar_apelido": "apelido",
+    "ensinar": "apelido", "chamar": "apelido", "renomear": "apelido",
+    "nomear": "apelido", "apelid": "apelido",
+    "apelidos": "apelidos", "listar_apelidos": "apelidos",
+    "quais_apelidos": "apelidos", "mostrar_apelidos": "apelidos",
+    "mapa_apelidos": "apelidos",
+    "esquecer_apelido": "esquecer_apelido", "esquecer": "esquecer_apelido",
+    "remover_apelido": "esquecer_apelido", "desaprender": "esquecer_apelido",
 }
 
 _cache_lock = threading.Lock()
 _cache: dict = {"at": 0.0, "states": []}
+_alias_lock = threading.Lock()
+#: Caminho injetável (teste e vivo). Lido do DISCO a cada chamada: o apelido
+#: novo tem de valer sem reiniciar o processo.
+_alias_path: Path | None = None
 
 
 class HomeControlError(Exception):
@@ -204,6 +250,10 @@ def _fold(value: object) -> str:
     text = "".join(c for c in text if not unicodedata.combining(c))
     for char in ("_", "-", "/", ".", ",", ":", ";", "(", ")", "[", "]"):
         text = text.replace(char, " ")
+    # Nenhuma pontuação faz parte do nome do aparelho: "Tomada do Escritório!"
+    # e "¿luz do quarto?" são os mesmos nomes.
+    text = "".join(" " if unicodedata.category(char).startswith("P") else char
+                   for char in text)
     return " ".join(text.lower().split())
 
 
@@ -242,41 +292,345 @@ def _options(entities: list[dict], limit: int = 5) -> str:
     return text + (f" e mais {more}" if more > 0 else "")
 
 
-def resolve_entity(query: object, states: list[dict],
-                   domain: str | None = None) -> tuple[dict | None, str]:
-    """Resolve an entity id or a human name. Returns (entity, error_message)."""
-    raw = str(query or "").strip()
-    if not raw:
-        return None, "Diga qual dispositivo (ou passe entity_id)."
+def fold_name(value: object) -> str:
+    """O nome como chave: sem acento, sem pontuação, sem caixa (uso externo)."""
+    return _fold(value)
 
-    by_id = {str(entity.get("entity_id", "")).lower(): entity for entity in states}
-    lowered = raw.lower()
-    if lowered in by_id and (not domain or _domain_of(by_id[lowered]) == domain.lower()):
-        return by_id[lowered], ""
 
-    inferred = _infer_domain(raw)
-    domain = (domain or inferred or "").lower() or None
-    pool = [entity for entity in states
-            if not domain or _domain_of(entity) == domain]
+def _loose(value: object) -> frozenset[str]:
+    """O nome sem stopwords: "a luz do quarto" e "luz quarto" são a mesma coisa."""
+    return frozenset(token for token in _fold(value).split()
+                     if token not in _STOPWORDS)
+
+
+# ── mapa de apelidos do dono (config/home_aliases.json) ──────────────────────
+
+def configure_aliases(path: "str | os.PathLike[str] | None" = None) -> None:
+    """Redireciona o arquivo do mapa (teste e medição); ``None`` volta ao padrão."""
+    global _alias_path
+    with _alias_lock:
+        _alias_path = Path(path) if path not in (None, "") else None
+
+
+def alias_path() -> Path:
+    if _alias_path is not None:
+        return _alias_path
+    env = os.environ.get(ENV_ALIAS_PATH)
+    if env and env.strip():
+        return Path(env.strip())
+    return DEFAULT_ALIAS_PATH
+
+
+def _default_alias_doc(now: date | None = None) -> dict:
+    return {
+        "version": 1,
+        "regra": ("nome que o dono usa em fala -> entidade do Home Assistant. "
+                  "Regra do dono (09/11/2026): nome ensinado vira arquivo, não "
+                  "conversa. Só nomes e entity ids: nenhum segredo."),
+        "atualizado_em": (now or date.today()).isoformat(),
+        "apelidos": [],
+    }
+
+
+def _read_alias_raw(path: Path) -> tuple[Any, str]:
+    """O arquivo como está: ``(documento|None, "ok"|"ausente"|"corrompido")``."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, "ausente"
+    except (OSError, UnicodeDecodeError):
+        return None, "corrompido"
+    try:
+        raw = json.loads(text)
+    except ValueError:
+        return None, "corrompido"
+    if not isinstance(raw, dict) or not isinstance(raw.get("apelidos"), list):
+        return None, "corrompido"
+    return raw, "ok"
+
+
+def alias_entries() -> tuple[list[dict], str]:
+    """As entradas do mapa lidas do disco AGORA, e o motivo quando faltam.
+
+    ``(entradas, "")`` é o arquivo saudável. ``(vazio, "ausente: ...")`` ou
+    ``(vazio, "corrompido: ...")`` nunca derrubam nada: a busca por nome segue
+    funcionando, mas o motivo chega na frase e na sonda — esquecimento
+    silencioso é o defeito que este mapa existe para matar.
+    """
+    path = alias_path()
+    raw, status = _read_alias_raw(path)
+    if status == "ausente":
+        return [], f"mapa de apelidos ausente ({path})"
+    if status == "corrompido" or raw is None:
+        return [], f"mapa de apelidos corrompido ou ilegível ({path})"
+    entries: list[dict] = []
+    dropped = 0
+    for item in raw["apelidos"]:
+        if not isinstance(item, dict):
+            dropped += 1
+            continue
+        alias = str(item.get("apelido") or "").strip()
+        entity = str(item.get("entidade") or "").strip().lower()
+        if not alias or "." not in entity:
+            dropped += 1
+            continue
+        entries.append({
+            "apelido": alias,
+            "entidade": entity,
+            "nome": str(item.get("nome") or "").strip(),
+            "dominio": entity.split(".", 1)[0],
+            "desde": str(item.get("desde") or ""),
+            "origem": str(item.get("origem") or "dono"),
+        })
+    reason = ""
+    if dropped:
+        reason = f"{dropped} entrada(s) de apelido sem nome ou sem entidade válida"
+    return entries, reason
+
+
+def aliases_status() -> dict:
+    """Estado honesto do mapa para a sonda: carrega, quantos nomes, o motivo."""
+    path = alias_path()
+    entries, warning = alias_entries()
+    raw, status = _read_alias_raw(path)
+    return {"ok": status == "ok", "arquivo": str(path), "estado": status,
+            "apelidos": len(entries), "aviso": warning}
+
+
+def _alias_key_map(entries: list[dict]) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {}
+    for entry in entries:
+        out.setdefault(_fold(entry["apelido"]), []).append(entry)
+    return out
+
+
+#: Palavras que nomeiam o PEDIDO, não a coisa: sobram na fala e não podem
+#: atrapalhar o apelido ("acende a luz do quarto" ensina "luz do quarto").
+_REQUEST_WORDS = frozenset(_ACTION_ALIASES) | {
+    "deixa", "deixar", "coloca", "colocar", "poe", "pode", "consegue",
+    "quero", "gostaria", "agora", "ai", "ja", "vamos", "bora", "momento",
+}
+
+
+def _compact(value: object) -> list[str]:
+    """A fala reduzida ao que nomeia a coisa: sem stopwords, sem verbo de pedido."""
+    return [token for token in _fold(value).split()
+            if token not in _STOPWORDS and token not in _REQUEST_WORDS]
+
+
+def _contains_sequence(words: list[str], sub: list[str]) -> bool:
+    """``sub`` aparece como sequência contígua dentro de ``words``?"""
+    if not sub or len(sub) > len(words):
+        return False
+    return any(words[start:start + len(sub)] == sub
+               for start in range(0, len(words) - len(sub) + 1))
+
+
+def alias_for(query: object, entries: list[dict] | None = None
+              ) -> tuple[dict | None, str]:
+    """O apelido do dono para este pedido: ``(entrada|None, motivo_recusa)``.
+
+    Três leituras, nesta ordem: igualdade dobrada ("luz do quarto"), igualdade
+    frouxa sem stopwords ("acende a luz do quarto") e o apelido dentro da frase
+    — esta última só vale quando SOBRA NADA além do verbo e da própria frase do
+    apelido, para "a luz da sala" nunca ser respondida com a luz do quarto.
+    Um apelido gravado para duas entidades DIFERENTES é conflito: nada é
+    escolhido em sorteio — a recusa vem com os dois alvos e a saída (``trocar``).
+    """
+    entries = list(entries) if entries is not None else alias_entries()[0]
+    key = _fold(query)
+    if not key:
+        return None, ""
+    by_key = _alias_key_map(entries)
+    got = by_key.get(key)
+    if got is None:
+        loose = _loose(query)
+        if loose:
+            for folded, items in by_key.items():
+                if _loose(folded) == loose:
+                    got = items
+                    break
+    if got is None:
+        words = _compact(query)
+        best_len = 0
+        for folded, items in by_key.items():
+            phrase = [token for token in folded.split()
+                      if token not in _STOPWORDS and token not in _REQUEST_WORDS]
+            if not phrase or not _contains_sequence(words, phrase):
+                continue
+            residue = [token for token in words if token not in phrase]
+            if residue:
+                continue
+            if len(phrase) > best_len:
+                best_len, got = len(phrase), items
+    if not got:
+        return None, ""
+    targets = {str(entry["entidade"]).lower() for entry in got}
+    if len(targets) > 1:
+        alvos = ", ".join(sorted(
+            f"{entry['apelido']} → {entry['entidade']}" for entry in got))
+        return None, (f"o apelido '{query}' está gravado para entidades "
+                      f"diferentes ({alvos}); diga qual e registre de novo "
+                      "com trocar=true.")
+    return got[0], ""
+
+
+def _write_alias_doc(doc: dict) -> bool:
+    """Escrita atômica: arquivo meio gravado seria o mapa corrompido de amanhã."""
+    path = alias_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _alias_lock:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n",
+                           encoding="utf-8")
+            os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            path.with_suffix(path.suffix + ".tmp").unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def save_alias(alias: object, entity_id: object, nome: str = "", *,
+               origem: str = "dono", trocar: bool = False,
+               now: date | None = None) -> dict:
+    """Grava ``apelido -> entidade``. Idempotente; conflito só muda com trocar.
+
+    Um apelido = uma entrada. Regravar o mesmo nome para a MESMA entidade só
+    renova o texto; para outra entidade é conflito e precisa de ``trocar`` —
+    sorteio entre dois alvos é exatamente o que o dono não perdoa.
+    """
+    key = str(alias or "").strip()
+    entity = str(entity_id or "").strip().lower()
+    if not key:
+        return {"ok": False, "reason": "diga o apelido (ex.: 'luz do quarto').",
+                "entry": None}
+    if "." not in entity or " " in entity:
+        return {"ok": False,
+                "reason": f"'{entity}' não é uma entidade do Home Assistant "
+                          "(esperado dominio.nome, ex.: scene.fan_backlight).",
+                "entry": None}
+    path = alias_path()
+    raw, status = _read_alias_raw(path)
+    if status == "corrompido":
+        # Cobrir um mapa podre por cima descartaria o que o dono já ensinou.
+        return {"ok": False,
+                "reason": f"o mapa de apelidos em {path} está corrompido: "
+                          "conserte o arquivo antes de registrar nomes novos.",
+                "entry": None}
+    doc = raw if status == "ok" and isinstance(raw, dict) else _default_alias_doc(now)
+    entries = [item for item in doc.get("apelidos") or [] if isinstance(item, dict)]
+    folded = _fold(key)
+    same = [item for item in entries if _fold(item.get("apelido")) == folded]
+    clash = [item for item in same
+             if str(item.get("entidade") or "").strip().lower() != entity]
+    if clash and not trocar:
+        alvos = ", ".join(sorted({str(item.get("entidade") or "?").lower()
+                                  for item in clash}))
+        return {"ok": False,
+                "reason": f"'{key}' já aponta para {alvos}; para passar a "
+                          f"usar {entity} registre com trocar=true.",
+                "entry": None}
+    moment = (now or date.today()).isoformat()
+    old = same[0] if same else {}
+    entry = {"apelido": key, "entidade": entity,
+             "nome": (str(nome or "").strip()
+                      or str(old.get("nome") or "").strip()),
+             "dominio": entity.split(".", 1)[0],
+             "desde": str(old.get("desde") or moment),
+             "origem": str(old.get("origem") or origem or "dono")}
+    others = [item for item in entries
+              if _fold(item.get("apelido")) != folded]
+    doc["apelidos"] = others + [entry]
+    doc["atualizado_em"] = moment
+    written = _write_alias_doc(doc)
+    return {"ok": written,
+            "reason": "" if written
+            else f"não consegui gravar o mapa de apelidos em {path}",
+            "entry": entry}
+
+
+def remove_alias(alias: object) -> dict:
+    """Esquece um apelido. Sem o arquivo legível, nada é reescrito."""
+    key = str(alias or "").strip()
+    folded = _fold(key)
+    if not folded:
+        return {"ok": False, "reason": "diga qual apelido esquecer."}
+    path = alias_path()
+    raw, status = _read_alias_raw(path)
+    if status != "ok" or not isinstance(raw, dict):
+        return {"ok": False,
+                "reason": f"não há mapa de apelidos legível em {path}."}
+    entries = [item for item in raw.get("apelidos") or [] if isinstance(item, dict)]
+    kept = [item for item in entries if _fold(item.get("apelido")) != folded]
+    if len(kept) == len(entries):
+        return {"ok": False, "reason": f"'{key}' não é um apelido registrado."}
+    raw["apelidos"] = kept
+    raw["atualizado_em"] = date.today().isoformat()
+    return {"ok": _write_alias_doc(raw),
+            "reason": "" if kept else "apelido esquecido e o mapa ficou vazio",
+            "entry": None}
+
+
+def _entity_by_id(states: list[dict], entity_id: str) -> dict | None:
+    want = str(entity_id or "").strip().lower()
+    for entity in states:
+        if str(entity.get("entity_id") or "").lower() == want:
+            return entity
+    return None
+
+
+
+def _search_pool(raw: str, pool: list[dict], *, bare_ok: bool = True,
+                 boost: str = "") -> tuple[dict | None, str, str]:
+    """Busca um nome dentro de um pool: ``(entidade, mensagem, "ok"|"ask"|"miss")``.
+
+    ``ask`` é pergunta (tem mais de um / não disse qual) e encerra a rodada;
+    ``miss`` é "não está aqui" e autoriza alargar a busca para outro pool.
+    Confundir os dois foi o que fez o "luz do quarto" virar "não existe".
+    """
     if not pool:
-        if domain:
-            return None, f"Nenhuma entidade do domínio '{domain}' no Home Assistant."
-        return None, "O Home Assistant não devolveu entidades."
-
+        return None, "", "miss"
     folded = _fold(raw)
-    for entity in pool:
-        if folded and (folded == _fold(_name(entity))
-                       or folded == _fold(_object_id(entity))):
-            return entity, ""
+    if folded:
+        exatas = [entity for entity in pool
+                  if folded == _fold(_name(entity))
+                  or folded == _fold(_object_id(entity))]
+        # Dois domínios com o MESMO nome (light.portao e switch.portao): a
+        # resposta é a pergunta, nunca o primeiro da lista — isso seria um
+        # chute disfarçado de igualdade exata.
+        if len(exatas) == 1:
+            return exatas[0], "", "ok"
+        if len(exatas) > 1:
+            return None, (f"Tem mais de um '{raw}': {_options(exatas)}. "
+                          "Qual?"), "ask"
+
+    # (c) igualdade frouxa: sem stopwords — "a luz do quarto" = "luz quarto".
+    loose = _loose(raw)
+    if loose:
+        iguais = [entity for entity in pool
+                  if loose == _loose(_name(entity))
+                  or loose == _loose(_object_id(entity))]
+        if len(iguais) == 1:
+            return iguais[0], "", "ok"
+        if len(iguais) > 1:
+            return None, (f"Tem mais de um '{raw}': {_options(iguais)}. "
+                          "Qual?"), "ask"
 
     query_tokens = _tokens(raw)
-    # A bare domain word ("luz", "tomada") is a request for the only device of
-    # that kind, or a question when there are several.
     if not query_tokens:
-        if len(pool) == 1:
-            return pool[0], ""
-        return None, (f"Qual deles? {_options(pool)}" if len(pool) <= 5
-                      else f"Há {len(pool)} opções nesse tipo; diga o nome completo.")
+        # Um domínio nu ("luz", "tomada") pede o único aparelho daquele tipo.
+        # No pool ALARGADO isso é proibido: "luz" viraria lista de TV e tomada.
+        if bare_ok and len(pool) == 1:
+            return pool[0], "", "ok"
+        if bare_ok and len(pool) > 1:
+            return None, (f"Qual deles? {_options(pool)}" if len(pool) <= 5
+                          else f"Há {len(pool)} opções nesse tipo; diga o "
+                               "nome completo."), "ask"
+        return None, "", "miss"
 
     scored: list[tuple[int, dict]] = []
     for entity in pool:
@@ -288,18 +642,176 @@ def resolve_entity(query: object, states: list[dict],
             score = 1000 - len(candidate)
         else:
             score = overlap * 10 - len(query_tokens - candidate)
+        if boost and _domain_of(entity) == boost:
+            score += 100
         if score > 0:
             scored.append((score, entity))
 
     if not scored:
-        return None, (f"Não encontrei '{raw}' no Home Assistant."
-                      + (f" Opções: {_options(pool, 4)}." if domain else ""))
+        return None, "", "miss"
     scored.sort(key=lambda pair: pair[0], reverse=True)
     best_score = scored[0][0]
     tied = [entity for score, entity in scored if score == best_score]
     if len(tied) > 1:
-        return None, f"Tem mais de um '{raw}': {_options(tied)}. Qual?"
-    return scored[0][1], ""
+        return None, f"Tem mais de um '{raw}': {_options(tied)}. Qual?", "ask"
+    return scored[0][1], "", "ok"
+
+
+def _similar(raw: object, pool: list[dict], limit: int = 4) -> list[dict]:
+    """Os candidatos que se parecem com o pedido — a matéria da pergunta final."""
+    folded = _fold(raw)
+    if not folded or not pool:
+        return []
+    loose = _loose(raw)
+    ranked: list[tuple[float, dict]] = []
+    for entity in pool:
+        name = _fold(_name(entity))
+        obj = _fold(_object_id(entity))
+        ratio = max(difflib.SequenceMatcher(None, folded, name).ratio(),
+                    difflib.SequenceMatcher(None, folded, obj).ratio())
+        shared = len(loose & (_loose(_name(entity)) | _loose(_object_id(entity))))
+        score = ratio + 0.35 * shared
+        if score >= 0.40:
+            ranked.append((score, entity))
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    return [entity for _, entity in ranked[:limit]]
+
+
+def _miss_message(raw: str, pool: list[dict]) -> str:
+    """(d) nunca negar em seco: sem nada, devolvem os parecidos e a pergunta."""
+    candidates = _similar(raw, pool)
+    if not candidates:
+        return (f"Não encontrei '{raw}' no Home Assistant e nada com nome "
+                "parecido. Diga o nome completo ou a entity_id.")
+    return (f"Não encontrei '{raw}' no Home Assistant. O que mais se parece: "
+            f"{_options(candidates, 4)}. Era um desses? Se sim, eu anoto o nome.")
+
+
+def _hint_other_domains(states: list[dict], domain: str) -> str:
+    """O complemento do "Nenhuma entidade do domínio X": o que existe em volta."""
+    counts: dict[str, int] = {}
+    for entity in states:
+        other = _domain_of(entity)
+        if other and other != domain:
+            counts[other] = counts.get(other, 0) + 1
+    if not counts:
+        return ""
+    resumo = ", ".join(f"{name} ({n})" for name, n in
+                       sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:6])
+    return f" Em outros domínios existe: {resumo} — o nome pode estar aí."
+
+
+def resolve_entity(query: object, states: list[dict],
+                   domain: str | None = None) -> tuple[dict | None, str]:
+    """Resolve an entity id or a human name. Returns (entity, error_message).
+
+    O domínio que o modelo CHUTOU ordena a resposta, nunca fecha a porta: se
+    nada bate com o chute, a busca continua em todos os domínios que uma pessoa
+    nomeia (:data:`_SEARCH_DOMAINS`). Recusa por domínio só existe quando o
+    domínio foi PEDIDO de propósito (``domain=`` explícito, ``action='list'``).
+    """
+    raw = str(query or "").strip()
+    if not raw:
+        return None, "Diga qual dispositivo (ou passe entity_id)."
+
+    by_id = {str(entity.get("entity_id", "")).lower(): entity for entity in states}
+    lowered = raw.lower()
+    if lowered in by_id and (not domain or _domain_of(by_id[lowered]) == domain.lower()):
+        return by_id[lowered], ""
+
+    explicit = str(domain or "").strip().lower()
+    if explicit:
+        pool = [entity for entity in states if _domain_of(entity) == explicit]
+        if not pool:
+            return None, (f"Nenhuma entidade do domínio '{explicit}' no "
+                          "Home Assistant." + _hint_other_domains(states, explicit))
+        entity, error, kind = _search_pool(raw, pool)
+        if entity is not None:
+            return entity, ""
+        if kind == "ask":
+            return None, error
+        return None, _miss_message(raw, pool)
+
+    inferred = _infer_domain(raw)
+    if inferred:
+        narrow = [entity for entity in states
+                  if _domain_of(entity) == inferred]
+        entity, error, kind = _search_pool(raw, narrow)
+        if entity is not None:
+            return entity, ""
+        if kind == "ask":
+            return None, error
+
+    # (b) o chute não achou: o mesmo nome é procurado em todo domínio relevante.
+    wide = [entity for entity in states if _domain_of(entity) in _SEARCH_DOMAINS]
+    if not wide:
+        wide = list(states)
+    entity, error, kind = _search_pool(raw, wide, bare_ok=not inferred,
+                                       boost=inferred)
+    if entity is not None:
+        return entity, ""
+    if kind == "ask":
+        return None, error
+    return None, _miss_message(raw, wide)
+
+
+#: "light.sala" já é uma entidade; "luz do quarto" é fala do dono.
+_ENTITY_ID_RE = re.compile(r"^[a-z_][a-z0-9_]*\.[a-z0-9_]+$")
+
+
+def _vanished_alias_message(entry: dict, states: list[dict],
+                           warning: str = "") -> str:
+    """Apelido vivo apontando para entidade morta: dito, com os parecidos."""
+    alias = entry.get("apelido") or "?"
+    target = entry.get("entidade") or "?"
+    text = (f"O apelido '{alias}' aponta para {target}, que não existe mais "
+            "no Home Assistant.")
+    pool = ([entity for entity in states if _domain_of(entity) in _SEARCH_DOMAINS]
+            or list(states))
+    candidates = _similar(str(entry.get("nome") or "").strip() or alias, pool)
+    if candidates:
+        text += (f" O que existe de parecido agora: {_options(candidates, 3)}. "
+                 "É um desses? Me diga qual e eu regravo o apelido.")
+    else:
+        text += " Não há nada com nome parecido no Home Assistant agora."
+    if warning:
+        text += f" (e o mapa está indisponível: {warning})"
+    return text
+
+
+def resolve(query: object, states: list[dict],
+            domain: str | None = None) -> tuple[dict | None, str]:
+    """A resolução completa, na ordem da ordem do dono.
+
+    ``(a)`` apelido explícito do mapa → ``(b)`` nome humano em todo domínio
+    relevante → ``(c)`` igualdade frouxa → ``(d)`` nunca negar em seco. O
+    caminho antigo (só o domínio chutado) continua existindo como peça dentro
+    de ``(b)``, mas nunca como porta de entrada.
+    """
+    raw = str(query or "").strip()
+    if not raw:
+        return None, "Diga qual dispositivo (ou passe entity_id)."
+    if _ENTITY_ID_RE.match(raw.lower()):
+        return resolve_entity(raw, states, domain=domain)
+    entries, warning = alias_entries()
+    entry, conflict = alias_for(raw, entries)
+    if conflict:
+        return None, f"Não apliquei o apelido: {conflict}"
+    stale = None
+    if entry is not None:
+        entity = _entity_by_id(states, entry["entidade"])
+        if entity is not None:
+            return entity, ""
+        # O alvo do apelido sumiu da casa. O nome continua valendo por si só:
+        # a casa não pode parar porque o aparelho foi trocado. Se também não
+        # houver nome, a recusa diz qual apelido ficou velho e os parecidos.
+        stale = entry
+    entity, error = resolve_entity(raw, states, domain=domain)
+    if entity is None and stale is not None:
+        return None, _vanished_alias_message(stale, states, warning)
+    if entity is None and warning:
+        error = f"{error} (e o mapa de apelidos está indisponível: {warning})"
+    return entity, error
 
 
 # ── formatting ───────────────────────────────────────────────────────────────
@@ -360,7 +872,11 @@ def _list(states: list[dict], domain: str) -> str:
     if domain:
         pool = [entity for entity in states if _domain_of(entity) == domain]
         if not pool:
-            return f"Nenhuma entidade do domínio '{domain}' no Home Assistant."
+            # Verdade dita, mas nunca sozinha: "não tem light" não pode mais
+            # significar "a casa não tem luz" (09/11/2026).
+            return (f"Nenhuma entidade do domínio '{domain}' no Home Assistant."
+                    + _hint_other_domains(states, domain)
+                    + " Se você procurava um nome, diga-o que eu busco em tudo.")
         lines = [f"{_name(entity)} ({entity['entity_id']}): "
                  f"{entity.get('state', '?')}" for entity in pool[:60]]
         more = len(pool) - len(lines)
@@ -405,10 +921,18 @@ def _turn(parameters: dict, turn_on: bool) -> str:
                 "(entity_id ou nome, ex.: 'luz da sala').")
     domain = str(parameters.get("domain") or "").strip().lower() or None
     states = _states()
-    entity, error = resolve_entity(target, states, domain=domain)
+    entity, error = resolve(target, states, domain=domain)
     if entity is None:
         return error
     entity_domain = _domain_of(entity)
+    if entity_domain == "scene":
+        # "acende a luz do quarto" == ativar a cena que atende por esse nome.
+        if not turn_on:
+            return (f"{_name(entity)} é uma cena: cena não se desliga, se "
+                    "ativa. Diga o que apagar (luz ou tomada) ou qual cena "
+                    "ativar no lugar.")
+        _call_service("scene", "turn_on", {"entity_id": entity["entity_id"]})
+        return f"Cena {_name(entity)} ativada."
     if entity_domain not in _TOGGLE_DOMAINS:
         return (f"Não sei ligar/desligar {_name(entity)} "
                 f"(domínio {entity_domain}).")
@@ -592,7 +1116,7 @@ def _set_action(parameters: dict) -> str:
         return ("Diga o que ajustar: brightness_pct, temperature, "
                 "volume_level, position ou value.")
     domain = str(parameters.get("domain") or "").strip().lower() or None
-    entity, error = resolve_entity(target, _states(), domain=domain)
+    entity, error = resolve(target, _states(), domain=domain)
     if entity is None:
         return error
     service_domain, service, data = _set(entity, values)
@@ -604,18 +1128,97 @@ def _set_action(parameters: dict) -> str:
 
 def _scene(parameters: dict) -> str:
     name = _target(parameters)
-    scenes = [entity for entity in _states() if _domain_of(entity) == "scene"]
+    states = _states()
+    scenes = [entity for entity in states if _domain_of(entity) == "scene"]
     if not name:
         if not scenes:
-            return "Nenhuma cena cadastrada no Home Assistant."
+            return ("Nenhuma cena cadastrada no Home Assistant."
+                    + _hint_other_domains(states, "scene"))
         return f"Cenas disponíveis: {_options(scenes, 10)}."
-    if not scenes:
-        return "Nenhuma cena cadastrada no Home Assistant."
-    entity, error = resolve_entity(name, scenes, domain="scene")
+    # O nome vem do mapa de apelidos primeiro: "acende a luz do quarto" é cena.
+    entity, error = resolve(name, states)
     if entity is None:
         return error
+    if _domain_of(entity) != "scene":
+        return (f"{_name(entity)} ({entity['entity_id']}) não é cena, é "
+                f"{_domain_of(entity)}: para esse use ligar, desligar ou "
+                f"ajustar. Cenas que existem: {_options(scenes, 6)}.")
     _call_service("scene", "turn_on", {"entity_id": entity["entity_id"]})
     return f"Cena {_name(entity)} ativada."
+
+
+# ── o mapa de apelidos pela boca do dono ─────────────────────────────────────
+
+_ALIAS_KEYS = ("alias", "apelido", "nome", "chamar")
+
+
+def _alias_of(parameters: dict) -> str:
+    for key in _ALIAS_KEYS:
+        value = parameters.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _register_alias(parameters: dict) -> str:
+    """Grava ``apelido -> entidade`` no arquivo. A regra do dono vira config."""
+    alias = _alias_of(parameters)
+    if not alias:
+        return ("Diga o apelido e a entidade, ex.: apelido='luz do quarto', "
+                "entidade='Luz do teto'.")
+    alvo = str(parameters.get("entidade") or parameters.get("entity_id")
+               or parameters.get("target") or parameters.get("device")
+               or "").strip()
+    if not alvo:
+        entries, _reason = alias_entries()
+        entry, conflict = alias_for(alias, entries)
+        if conflict:
+            return conflict
+        if entry is None:
+            return (f"O que é '{alias}'? Diga a entidade (ex.: 'Luz do teto' "
+                    "ou scene.fan_backlight) que eu anoto.")
+        return (f"'{alias}' está anotado como {entry['nome'] or '?'} "
+                f"({entry['entidade']}).")
+
+    states = _states()
+    entity, error = resolve(alvo, states)
+    if entity is None:
+        # Prevenir é o ponto: apelido nasce apontando para algo que existe.
+        return f"Não anotei '{alias}': {error}"
+    trocar = bool(parameters.get("trocar") or parameters.get("replace")
+                  or parameters.get("substituir"))
+    got = save_alias(alias, entity["entity_id"], _name(entity), trocar=trocar)
+    if not got["ok"]:
+        return f"Não anotei '{alias}': {got['reason']}"
+    entry = got["entry"]
+    return (f"Anotado: '{entry['apelido']}' é {entry['nome'] or entry['entidade']} "
+            f"({entry['entidade']}). Vale daqui pra frente, sem você repetir.")
+
+
+def _forget_alias(parameters: dict) -> str:
+    alias = _alias_of(parameters) or str(_target(parameters) or "").strip()
+    got = remove_alias(alias)
+    if not got["ok"]:
+        return f"Não esqueci '{alias}': {got['reason']}"
+    return f"'{alias}' não é mais atalho para nada."
+
+
+def _alias_report(parameters: dict) -> str:
+    entries, reason = alias_entries()
+    if reason and not entries:
+        return f"Sem mapa de apelidos legível: {reason}."
+    if not entries:
+        return ("Nenhum apelido registrado. Diga 'a luz do quarto é a cena "
+                "Luz do teto' que eu anoto.")
+    lines = [f"{entry['apelido']} → {entry['nome'] or '?'} "
+             f"({entry['entidade']})" for entry in entries[:40]]
+    more = len(entries) - len(lines)
+    text = f"{len(entries)} apelido(s) da casa:\n" + "\n".join(lines)
+    if more > 0:
+        text += f"\n... e mais {more}."
+    if reason:
+        text += f"\nObs.: {reason}"
+    return text
 
 
 def home_control(parameters: dict, player=None, speak=None,
@@ -637,8 +1240,15 @@ def home_control(parameters: dict, player=None, speak=None,
             return _set_action(params)
         if action == "scene":
             return _scene(params)
+        if action == "apelido":
+            return _register_alias(params)
+        if action == "apelidos":
+            return _alias_report(params)
+        if action == "esquecer_apelido":
+            return _forget_alias(params)
         return (f"Ação desconhecida: '{action}'. Use status, list, turn_on, "
-                "turn_off, set ou scene.")
+                "turn_off, set, scene, apelido, apelidos ou "
+                "esquecer_apelido.")
     except HomeControlError as e:
         return str(e)
     except Exception as e:  # a tool must always answer, never crash the call
@@ -652,10 +1262,16 @@ def auto_authorized(parameters: dict | None = None) -> bool:
     tool actually implements qualify. Destructive Home Assistant operations
     (deleting automations, editing configuration) are not implemented here at
     all, so there is nothing else to grant.
+
+    ``apelido``/``esquecer_apelido`` write ONE local file of names and entity
+    ids — no device, no secret. The owner's rule is that a taught name has to
+    stick the moment it is said, so asking him to confirm his own vocabulary
+    would be the friction this map exists to remove.
     """
     action = str((parameters or {}).get("action") or "status").strip().lower()
     return _ACTION_ALIASES.get(action, action) in {
-        "status", "list", "turn_on", "turn_off", "set", "scene"}
+        "status", "list", "turn_on", "turn_off", "set", "scene",
+        "apelido", "apelidos", "esquecer_apelido"}
 
 
 def bridge_preauthorized(name: str, args: dict | None = None) -> bool:
@@ -669,21 +1285,29 @@ TOOL = {
     "name": "home_control",
     "description": (
         "Controls the owner's Home Assistant: reports which devices are on or "
-        "offline, lists entities, turns lights/switches/fans/climate on or off, "
+        "offline, lists entities, turns lights/switches/fans/climate/scenes on, "
         "adjusts brightness, temperature, volume or cover position, and "
         "activates scenes. Targets may be an entity_id or a human name in "
-        "Portuguese (e.g. 'luz da sala'). Use action='status' for 'quais luzes "
-        "estão ligadas?' and action='list' with a domain for 'lista as tomadas'. "
-        "This action cannot change Home Assistant configuration or delete "
-        "automations; do not promise that."
+        "Portuguese (e.g. 'luz da sala'): the name is looked up in the alias "
+        "map first and then in EVERY relevant domain, so never claim 'the house "
+        "has no X' from one empty domain. When the owner teaches a name "
+        "('a luz do quarto é a cena Luz do teto'), persist it with "
+        "action='apelido' — that rule is his, and a name that is not written "
+        "down is lost. action='apelidos' lists the map, "
+        "action='esquecer_apelido' removes one. Use action='status' for "
+        "'quais luzes estão ligadas?' and action='list' with a domain for "
+        "'lista as tomadas'. This action cannot change Home Assistant "
+        "configuration or delete automations; do not promise that."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": ("status, list, turn_on, turn_off, set or scene."),
-                "enum": ["status", "list", "turn_on", "turn_off", "set", "scene"],
+                "description": ("status, list, turn_on, turn_off, set, scene, "
+                                "apelido, apelidos or esquecer_apelido."),
+                "enum": ["status", "list", "turn_on", "turn_off", "set",
+                         "scene", "apelido", "apelidos", "esquecer_apelido"],
             },
             "entity_id": {
                 "type": "STRING",
@@ -697,6 +1321,22 @@ TOOL = {
             "name": {
                 "type": "STRING",
                 "description": "For action='scene': the scene name.",
+            },
+            "alias": {
+                "type": "STRING",
+                "description": ("For action='apelido'/'esquecer_apelido': the "
+                                "name the owner uses, e.g. 'luz do quarto'."),
+            },
+            "entidade": {
+                "type": "STRING",
+                "description": ("For action='apelido': what the alias points "
+                                "to — entity_id or human name, e.g. "
+                                "'Luz do teto' or scene.fan_backlight."),
+            },
+            "trocar": {
+                "type": "BOOLEAN",
+                "description": ("For action='apelido': replace an alias that "
+                                "already points somewhere else."),
             },
             "domain": {
                 "type": "STRING",
