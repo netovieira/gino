@@ -583,6 +583,22 @@ def _entity_by_id(states: list[dict], entity_id: str) -> dict | None:
     return None
 
 
+def _strict_name_hit(name: object, states: list[dict]) -> dict | None:
+    """Igualdade EXATA de nome dobrado, sem pontuação e sem acento.
+
+    Usada quando o alvo de um apelido sumiu: o nome antigo ainda pode valer
+    para a entidade que nasceu com ele. Semelhança não basta — acertar a
+    entidade "mais parecida" seria acender outra coisa e dizer que deu certo.
+    """
+    folded = _fold(name)
+    if not folded:
+        return None
+    hits = [entity for entity in states
+            if folded == _fold(_name(entity))
+            or folded == _fold(_object_id(entity))]
+    return hits[0] if len(hits) == 1 else None
+
+
 
 def _search_pool(raw: str, pool: list[dict], *, bare_ok: bool = True,
                  boost: str = "") -> tuple[dict | None, str, str]:
@@ -738,21 +754,48 @@ def resolve_entity(query: object, states: list[dict],
                   if _domain_of(entity) == inferred]
         entity, error, kind = _search_pool(raw, narrow)
         if entity is not None:
+            # O chute só fecha a conta se o MESMO nome não existir em outro
+            # domínio: escolher light quando scene tem o nome idêntico é o
+            # defeito original com uma moeda lançada por cima.
+            rivals = [other for other in _equality_hits(raw, _named_pool(states))
+                      if other is not entity]
+            if rivals:
+                return None, (f"Tem mais de um '{raw}': "
+                              f"{_options([entity] + rivals)}. Qual?")
             return entity, ""
         if kind == "ask":
             return None, error
 
     # (b) o chute não achou: o mesmo nome é procurado em todo domínio relevante.
-    wide = [entity for entity in states if _domain_of(entity) in _SEARCH_DOMAINS]
-    if not wide:
-        wide = list(states)
-    entity, error, kind = _search_pool(raw, wide, bare_ok=not inferred,
+    pool = _named_pool(states)
+    entity, error, kind = _search_pool(raw, pool, bare_ok=not inferred,
                                        boost=inferred)
     if entity is not None:
         return entity, ""
     if kind == "ask":
         return None, error
-    return None, _miss_message(raw, wide)
+    return None, _miss_message(raw, pool)
+
+
+def _named_pool(states: list[dict]) -> list[dict]:
+    """Os domínios que uma pessoa nomeia ao pedir um aparelho."""
+    found = [entity for entity in states if _domain_of(entity) in _SEARCH_DOMAINS]
+    return found or list(states)
+
+
+def _equality_hits(raw: object, pool: list[dict]) -> list[dict]:
+    """Toda entidade cujo nome/id bate com o pedido (exata ou sem stopwords)."""
+    folded = _fold(raw)
+    loose = _loose(raw)
+    hits: list[dict] = []
+    for entity in pool:
+        if folded and (folded == _fold(_name(entity))
+                       or folded == _fold(_object_id(entity))):
+            hits.append(entity)
+        elif loose and (loose == _loose(_name(entity))
+                        or loose == _loose(_object_id(entity))):
+            hits.append(entity)
+    return hits
 
 
 #: "light.sala" já é uma entidade; "luz do quarto" é fala do dono.
@@ -802,13 +845,16 @@ def resolve(query: object, states: list[dict],
         entity = _entity_by_id(states, entry["entidade"])
         if entity is not None:
             return entity, ""
-        # O alvo do apelido sumiu da casa. O nome continua valendo por si só:
-        # a casa não pode parar porque o aparelho foi trocado. Se também não
-        # houver nome, a recusa diz qual apelido ficou velho e os parecidos.
+        # O alvo do apelido sumiu da casa. O NOME ainda vale, mas só por
+        # igualdade estrita: trocar de entidade por semelhança seria acender
+        # outra coisa e dizer que deu certo.
         stale = entry
-    entity, error = resolve_entity(raw, states, domain=domain)
-    if entity is None and stale is not None:
+        for probe in (raw, str(entry.get("nome") or "").strip()):
+            achado = _strict_name_hit(probe, states)
+            if achado is not None:
+                return achado, ""
         return None, _vanished_alias_message(stale, states, warning)
+    entity, error = resolve_entity(raw, states, domain=domain)
     if entity is None and warning:
         error = f"{error} (e o mapa de apelidos está indisponível: {warning})"
     return entity, error
