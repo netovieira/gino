@@ -281,4 +281,10 @@ def test_sondas_estaticas_passam_na_arvore_real():
     for a in dev_audit.REGISTER:
         if a.probe_type in ("estatica", "config"):
             v, m = a.probe()
+            if a.id in dev_audit.PENDENCIAS_DECLARADAS:
+                assert v == dev_audit.NV, (
+                    f"{a.id}: pendencia declarada deveria estar nao_verificada,"
+                    f" mas a sonda respondeu {v} ({m}) — se o mecanismo entrou "
+                    "de verdade, tire o id de PENDENCIAS_DECLARADAS")
+                continue
             assert v == dev_audit.OK, f"{a.id}: {v} ({m})"

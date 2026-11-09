@@ -579,6 +579,47 @@ def _sonda_whatsapp_paridade_viva() -> tuple[str, str]:
     return OK, ""
 
 
+def _sonda_dossie_imparcial() -> tuple[str, str]:
+    """Dossiê imparcial (estática): fechar tarefa DISPARA um executor só pro dossiê?
+
+    Ordem do dono, literal (09/11/2026): "ao finalizar toda tarefa de
+    implementação tem que instanciar outra pro dossiê, para ser mais
+    imparcial". Quem escreve o dossiê já existe (`core/obras.py`:
+    `registrar_implementacao`, `gravar_prompt`, `registrar_commits`,
+    `registrar_testes`). O elo que falta é o disparo automático no fecho.
+
+    Veredito honesto: enquanto o disparo não existir isto é
+    ``nao_verificado`` -- a auditoria não afirma o que nunca aconteceu, e
+    também não abre defeito, porque pendência declarada não é regressão. O
+    dia em que alguém plugar `instanciar_dossie_imparcial` no fecho de tarefa,
+    a sonda passa a conferir os dois elos (função definida + chamada no
+    fecho) e só então verde.
+    """
+    obras = _tree("core/obras.py")
+    if obras is None:
+        return NV, "core/obras.py ilegivel"
+    faltam = [n for n in ("registrar_implementacao", "gravar_prompt",
+                          "registrar_commits", "registrar_testes")
+              if _find_func(obras, n) is None]
+    if faltam:
+        return FALHA, "mecanismo do dossier sumiu do obras.py: " + ",".join(faltam)
+    espelho = _tree("core/task_mirror.py")
+    if espelho is None:
+        return NV, "core/task_mirror.py ilegivel"
+    fechar = _find_func(espelho, "finish")
+    if fechar is None:
+        return FALHA, "finish sumiu do task_mirror.py"
+    chamado = " ".join(_calls_in(espelho))
+    if "instanciar_dossie_imparcial" not in _read("core/task_mirror.py") \
+            or "instanciar_dossie_imparcial" not in chamado:
+        return NV, ("disparo automatico do dossier ainda nao plugado no fecho "
+                    "de task (pendencia registrada 2026-11-09)")
+    if not any(c.endswith("instanciar_dossie_imparcial")
+               for c in _calls_in(fechar)):
+        return NV, "funcao do dossier existe mas nao e chamada dentro de finish()"
+    return OK, ""
+
+
 def _sonda_skill_escopo() -> tuple[str, str]:
     """Escopo do pedido (estática): a SKILL existe e é referida no bloco por turno.
 
@@ -737,11 +778,25 @@ for _a in (
     Assertion("whatsapp.paridade-viva",
               "linha de evento da paridade vista no log deste boot, sem flag quebrada",
               "viva", _sonda_whatsapp_paridade_viva),
+    Assertion("obras.dossie-imparcial",
+              "fechar tarefa dispara um executor separado so para escrever o dossier",
+              "estatica", _sonda_dossie_imparcial),
     Assertion("persona.sem-numero",
               "direct_whatsapp manda na conta: cadastro, rota de entrada e saida",
               "estatica", _sonda_persona_sem_numero),
 ):
     register(_a)
+
+
+#: Asserções que o dono sabe que ainda não valem: a pendência é DECLARADA, não
+#: escondida. Enquanto o item estiver aqui, a sonda tem de responder
+#: `nao_verificado` -- nem verde (mentira: o mecanismo não está plugado), nem
+#: vermelho (não é defeito novo: é trabalho marcado). Quando alguém plugar o
+#: disparo, o teste `test_sondas_estaticas_passam_na_arvore_real` quebra e
+#: obriga a tirar o id desta tupla: a pendência não sobrevive a si mesma.
+#: Ordem do dono, 09/11/2026 ("AO FINALIZAR TODA TAREFA ... INSTANCIAR OUTRA
+#: PRO DOSSIE"): o gatilho automático no fecho de tarefa ainda não existe.
+PENDENCIAS_DECLARADAS: tuple[str, ...] = ("obras.dossie-imparcial",)
 
 
 # ── execução ────────────────────────────────────────────────────────────────
