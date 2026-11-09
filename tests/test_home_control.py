@@ -5,10 +5,34 @@ and the REST layer is mocked.
 """
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from actions import home_control as hc
+
+#: A forma prometida ao modelo. Não é fotografia: é a porta da frente. Remover
+#: ou renomear uma ação, ou mexer no tipo/nome de um parâmetro, quebra aqui; e
+#: quem quiser uma ação nova tem de nomeá-la nesta lista (e despachá-la no
+#: handler, que o teste abaixo também cobra) — nunca receber o contrato por
+#: subconjunto, "startswith" ou qualquer asserção frouxa.
+ACTIONS = ["status", "list", "turn_on", "turn_off", "set", "scene",
+           "apelido", "apelidos", "esquecer_apelido"]
+PARAM_TYPES = {
+    "action": "STRING",
+    "entity_id": "STRING",
+    "target": "STRING",
+    "name": "STRING",
+    "alias": "STRING",
+    "entidade": "STRING",
+    "trocar": "BOOLEAN",
+    "domain": "STRING",
+    "params": "OBJECT",
+    "value": "STRING",
+}
 
 STATES = [
     {"entity_id": "light.luz_da_sala", "state": "on",
@@ -35,17 +59,60 @@ class ToolDeclarationTests(unittest.TestCase):
         tool = hc.TOOL
         self.assertEqual(tool["name"], "home_control")
         self.assertIs(tool["handler"], hc.home_control)
-        self.assertEqual(
-            tool["parameters"]["properties"]["action"]["enum"],
-            ["status", "list", "turn_on", "turn_off", "set", "scene"],
-        )
+
+        properties = tool["parameters"]["properties"]
+        # Os parâmetros pela raiz: nome E tipo de cada um, exatamente. Adicionar,
+        # renomear ou retipar um parâmetro tem de passar por aqui.
+        self.assertEqual({key: spec["type"] for key, spec in properties.items()},
+                         PARAM_TYPES)
+
+        action = properties["action"]
+        self.assertEqual(action["type"], "STRING")
+        self.assertEqual(action["enum"], ACTIONS)
+
+        # O enum é uma promessa: cada ação anunciada tem de ser despachada de
+        # fato pelo handler (ação no enum sem código = modelo enganado).
+        sandbox = tempfile.TemporaryDirectory()
+        self.addCleanup(sandbox.cleanup)
+        mapa = Path(sandbox.name) / "home_aliases.json"
+        with patch.object(hc, "_states", return_value=STATES), \
+                patch.object(hc, "_alias_path", mapa), \
+                patch.object(hc, "_api",
+                             side_effect=AssertionError("tocou a rede")):
+            for declared in ACTIONS:
+                with self.subTest(action=declared):
+                    out = hc.home_control({"action": declared})
+                    self.assertNotIn("Ação desconhecida", out)
+            # E o contrário: o que não está no enum continua recusado.
+            for outside in ("delete_automation", "config", "apelido_remoto"):
+                with self.subTest(action=outside):
+                    self.assertIn("Ação desconhecida",
+                                  hc.home_control({"action": outside}))
+
+        # O contrato escrito e o código andam juntos: a descrição do parâmetro
+        # cita exatamente as ações do enum.
+        advertised = sorted(
+            word for word in action["description"].replace(",", " ")
+            .replace(".", " ").split() if word in ACTIONS)
+        self.assertEqual(advertised, sorted(ACTIONS))
+
+    def test_the_alias_map_is_the_owner_file_by_default(self):
+        """Sem injeção e sem ambiente, o mapa é config/home_aliases.json do repo."""
+        self.assertEqual(hc.DEFAULT_ALIAS_PATH,
+                         hc.BASE_DIR / "config" / "home_aliases.json")
+        with patch.object(hc, "_alias_path", None), \
+                patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(hc.alias_path(), hc.DEFAULT_ALIAS_PATH)
+        # E o caminho injetável é o que vale: teste nunca escreve no arquivo dele.
+        with patch.object(hc, "_alias_path", Path("/tmp/so-teste.json")):
+            self.assertEqual(hc.alias_path(), Path("/tmp/so-teste.json"))
 
     def test_only_simple_actions_are_auto_authorized(self):
-        for action in ("status", "list", "turn_on", "turn_off", "set", "scene",
-                       "ligar", "desligar", "ajustar", "cena", ""):
+        for action in (ACTIONS + ["ligar", "desligar", "ajustar", "cena",
+                                  "ensinar", "esquecer", ""]):
             with self.subTest(action=action):
                 self.assertTrue(hc.auto_authorized({"action": action}))
-        for action in ("delete_automation", "config"):
+        for action in ("delete_automation", "config", "apelido_remoto"):
             with self.subTest(action=action):
                 self.assertFalse(hc.auto_authorized({"action": action}))
 
@@ -163,6 +230,97 @@ class HandlerTests(unittest.TestCase):
             out = hc.home_control({"action": "apagar_automacao"})
         self.assertIn("Ação desconhecida", out)
         states.assert_not_called()
+
+
+class AliasActionTests(unittest.TestCase):
+    """As três ações novas, cada uma pelo seu próprio comportamento.
+
+    ``apelido`` grava, ``apelidos`` lê o que está no disco, ``esquecer_apelido``
+    reescreve. Zero rede: ``_api`` é um alarme e ``_states`` é a fixture. O mapa
+    vive num arquivo temporário — o ``config/home_aliases.json`` do dono não é
+    lido nem escrito aqui (a porta dele é o teste de cima).
+    """
+
+    def setUp(self):
+        sandbox = tempfile.TemporaryDirectory()
+        self.addCleanup(sandbox.cleanup)
+        self.mapa = Path(sandbox.name) / "home_aliases.json"
+        for p in (patch.object(hc, "_alias_path", self.mapa),
+                  patch.object(hc, "_states", return_value=STATES),
+                  patch.object(hc, "_api", side_effect=self._rede)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def _rede(*args, **kwargs):
+        raise AssertionError(f"teste tocou a rede: {args}")
+
+    def _doc(self) -> dict:
+        return json.loads(self.mapa.read_text(encoding="utf-8"))
+
+    def _mapa_vazio(self) -> None:
+        self.mapa.write_text(json.dumps({"version": 1, "regra": "teste",
+                                         "atualizado_em": "2026-11-09",
+                                         "apelidos": []}), encoding="utf-8")
+
+    def _ensinar(self, alias: str, entidade: str) -> str:
+        return hc.home_control({"action": "apelido", "alias": alias,
+                                "entidade": entidade})
+
+    def test_apelido_grava_o_mapa_e_vale_na_chamada_seguinte(self):
+        """O nome ensinado sai da fala e entra no arquivo — a regra do dono."""
+        out = self._ensinar("luz do quarto", "Luz do Quarto")
+        self.assertIn("Anotado", out)
+        entry = self._doc()["apelidos"][0]
+        self.assertEqual(entry["apelido"], "luz do quarto")
+        self.assertEqual(entry["entidade"], "light.luz_do_quarto")
+        self.assertEqual(entry["nome"], "Luz do Quarto")
+        self.assertEqual(entry["dominio"], "light")
+        self.assertTrue(set(entry) <= set(hc.ALIAS_FIELDS))
+        entity, error = hc.resolve("luz do quarto", STATES)
+        self.assertEqual(error, "")
+        self.assertEqual(entity["entity_id"], "light.luz_do_quarto")
+
+    def test_apelido_apontando_para_o_nada_nao_escreve_nada(self):
+        """Apelido nasce ancorado em entidade real: alvo falso fica de fora."""
+        out = self._ensinar("luz do banheiro", "luz do banheiro")
+        self.assertIn("Não anotei", out)
+        self.assertFalse(self.mapa.exists())
+        self.assertEqual(hc.alias_entries()[0], [])
+
+    def test_apelidos_lista_o_que_esta_no_arquivo(self):
+        """Listar é ler o disco: o que o dono ensinou aparece dito, com o id."""
+        self._mapa_vazio()
+        self.assertIn("Nenhum apelido registrado",
+                      hc.home_control({"action": "apelidos"}))
+        self._ensinar("luz do quarto", "Luz do Quarto")
+        self._ensinar("tomada", "Tomada do Escritório")
+        out = hc.home_control({"action": "apelidos"})
+        self.assertIn("2 apelido(s) da casa", out)
+        self.assertIn("luz do quarto → Luz do Quarto (light.luz_do_quarto)", out)
+        self.assertIn("tomada → Tomada do Escritório "
+                      "(switch.tomada_do_escritorio)", out)
+
+    def test_esquecer_apelido_reescreve_o_arquivo(self):
+        """Esquecer tira a linha do arquivo e deixa as outras."""
+        self._ensinar("luz do quarto", "Luz do Quarto")
+        self._ensinar("tomada", "Tomada do Escritório")
+        out = hc.home_control({"action": "esquecer_apelido",
+                               "alias": "luz do quarto"})
+        self.assertIn("não é mais atalho", out)
+        self.assertEqual([entry["apelido"] for entry in self._doc()["apelidos"]],
+                         ["tomada"])
+        self.assertEqual([entry["apelido"] for entry in hc.alias_entries()[0]],
+                         ["tomada"])
+
+    def test_esquecer_o_que_nao_existe_nao_mexe_no_mapa(self):
+        """Recusa dita, arquivo intacto: esquecer por engano não apaga lição."""
+        self._ensinar("tomada", "Tomada do Escritório")
+        antes = self.mapa.read_text(encoding="utf-8")
+        out = hc.home_control({"action": "esquecer_apelido",
+                               "alias": "luz do quarto"})
+        self.assertIn("Não esqueci", out)
+        self.assertEqual(self.mapa.read_text(encoding="utf-8"), antes)
 
 
 if __name__ == "__main__":
