@@ -5,12 +5,27 @@ O QUE É UM GATILHO
     meses de conversa e nada disso é "nova") cujo texto contém o nome atual do
     assistente, sem diferenciar maiúsculas, ou menciona (@) o número dele.
     Só vale em chat INDIVIDUAL (terceiros e, no chat direto do dono, qualquer
-    mensagem sem exigir o nome). GRUPO NUNCA entra no fluxo — nem com o nome,
-    nem com menção, nem por ordem do dono: é decisão inegociável do dono
-    (01/11 e 02/11/2026), que cancelou a política de responder em grupo. Duas
-    exceções no chat DIRETO do dono (o número dele ou o número pareado da
-    própria conta): qualquer mensagem vale — e inclusive com `from_me=True`,
-    porque o dono escrevendo do celular chega como evento do próprio aparelho.
+    mensagem sem exigir o nome). Duas exceções no chat DIRETO do dono (o número
+    dele ou o número pareado da própria conta): qualquer mensagem vale — e
+    inclusive com `from_me=True`, porque o dono escrevendo do celular chega como
+    evento do próprio aparelho.
+
+GRUPOS (ordem literal do dono, 09/11/2026 — revoga a regra 4 de 01/11/2026)
+    "Agora voce vai poder LER grupos, mas responder APENAS pessoas autorizadas."
+    Grupo entrou no fluxo com filtro próprio, que NÃO é o gatilho de 1:1:
+    ``core/group_policy.group_verdict`` decide, nesta ordem — o dono está no
+    grupo? (regra de privacidade: sem o dono, o chat nem é visto) → o autor da
+    mensagem está na allow-list por contato (``config/group_allowlist.json``,
+    vale em qualquer grupo) → alguém chamou o assistente pelo nome/atual ou uma
+    persona cadastrada (ou marcou @ o número) → o texto É uma pergunta direta,
+    não trecho de música nem narração de conversa alheia → privacidade do
+    conteúdo. Passou, ``core/group_reply.respond`` espelha o formato (áudio
+    entra, áudio sai; texto entra, texto sai). Não passou, silêncio absoluto:
+    nada é respondido, nada é narrado, nada é enviado, e o motivo vai para o
+    log. A autorização do gate de ações só é estacionada quando existe um
+    respondedor injetado (o turno do app, que fala por ferramentas); o
+    respondedor embutido manda a resposta direto pelo core e não abre portão
+    nenhum.
 
 ECO DO DONO COMO ORDEM
     Num chat individual de terceiro, uma mensagem `from_me=True` (o dono
@@ -98,9 +113,23 @@ MAX_SEEN = 4096
 _lock = threading.Lock()
 _handler = None
 _otp_handler = None
+# Quem executa a resposta de grupo. None = `core.group_reply.respond` (o
+# caminho do próprio core, sem ferramentas). O app pode injetar um respondedor
+# que abra turno de verdade; nesse caso a autorização do gate passa a ser
+# estacionada para aquela conta+chat, como sempre foi no 1:1.
+_group_responder = None
 _logger = None
 _seen: OrderedDict = OrderedDict()
 _sent: dict[tuple[str, str], list[float]] = {}
+
+
+def set_group_responder(fn) -> None:
+    """Injeta ``fn(account, item, verdict) -> bool`` para responder em grupo."""
+    global _group_responder
+    if fn is not None and not callable(fn):
+        raise TypeError("set_group_responder precisa de um callable")
+    with _lock:
+        _group_responder = fn
 
 # ── fila de trabalho por conta (fora da thread de dispatch do neonize) ──────
 # A thread do neonize é UMA para todas as mensagens de todas as contas: se ela
@@ -215,7 +244,11 @@ def calls_assistant(item: dict, account: str = "") -> bool:
 # O observador também verifica NOME DE PERSONAS: mensagem com vocativo de
 # persona cadastrada, ou mensagem direta no WhatsApp atribuído a ela (chave
 # `whatsapp_account` do cadastro — deixa de ser enfeite: é o fator
-# `conta_atribuida` abaixo). O vocativo usa o MESMO resolvedor da voz
+# `conta_atribuida` abaixo). O fator de conta só vale para quem tem NÚMERO
+# PRÓPRIO: `direct_whatsapp` declarado true no cadastro (regra do dono,
+# 09/11/2026). Persona sem whatsapp não recebe nem é roteada por conta
+# nenhuma — continua respondendo quando o dono a chama pelo nome. O vocativo
+# usa o MESMO resolvedor da voz
 # (`core.persona_ops.relay.find_addressed_persona`); aqui não existe um
 # segundo matcher. Sem persona, a mensagem é só boca/cérebro como sempre;
 # com persona, vai pros dois E para a ela (quem entrega a resposta dela no
@@ -249,6 +282,23 @@ def _live_personas() -> list:
         return []
 
 
+def _persona_own_account(persona) -> str:
+    """A conta de UMA persona, no rótulo canônico para comparação.
+
+    Regra do dono (09/11/2026): só tem conta quem declara ``direct_whatsapp``.
+    Sem o campo (vazio = nenhum número) a pessoa não existe por conta, e a
+    recusa é o padrão: se o leitor do cadastro falhar, ninguém tem conta —
+    nunca se adivinha um número para rotear uma mensagem.
+    """
+    if not isinstance(persona, dict):
+        return ""
+    try:
+        from core import personas as _personas
+        return str(_personas.own_account(persona) or "").strip().casefold()
+    except Exception:
+        return ""
+
+
 def addressed_persona(text: object, account: str = "") -> dict | None:
     """A persona cadastrada a quem esta mensagem individual se dirige.
 
@@ -259,6 +309,10 @@ def addressed_persona(text: object, account: str = "") -> dict | None:
        mensagem direta no whats atribuído é dela por padrão, sem nome).
     Zero ou duas personas na conta, persona desconhecida ou nome que não casa
     vocativo: None — a rota normal decide e nenhuma persona é inventada.
+
+    Persona SEM número direto (``direct_whatsapp`` false ou não declarado)
+    nunca cai no fator 2: ela não recebe nem é roteada por conta alguma, e
+    continua respondendo só pelo vocativo (fator 1), no chat do assistente.
     """
     personas = _live_personas()
     if not personas:
@@ -274,8 +328,7 @@ def addressed_persona(text: object, account: str = "") -> dict | None:
     if not acct:
         return None
     assigned = [p for p in personas
-                if str(p.get("whatsapp_account") or "").strip().casefold()
-                == acct]
+                if _persona_own_account(p) == acct]
     if len(assigned) != 1:
         return None
     persona = assigned[0]
@@ -467,12 +520,62 @@ def owner_direct_chat(account: str) -> str:
     return _account_number(account)
 
 
+def _is_own_delivery_echo(item: dict) -> bool:
+    """A mensagem é a cópia de um ENVIO NOSSO voltando como evento (laço)?
+
+    Primeira barreira é o ID (``whatsapp.sent_by_me``); quando o ID já morreu
+    (processo reiniciado, histórico reenviado), a assinatura "Gino:" na
+    primeira linha é a segunda. Ler o ID falhou conta como eco: sem prova de
+    que a mensagem é nova, não se responde.
+    """
+    try:
+        if whatsapp.sent_by_me(item.get("id")):
+            return True
+    except Exception:
+        return True
+    return is_own_signature(item.get("text"))
+
+
+def _group_candidate(item: dict, account: str = "") -> bool:
+    """O pré-filtro BARATO de grupo (sem disco, sem RPC, sem modelo).
+
+    Checa só o que é memória: é novo (já checado antes daqui), tem autor
+    reconhecível, e chama o assistente/uma persona — ou é nota de voz, que só
+    pode ser julgada depois de transcrita. Todo o resto (dono presente,
+    allow-list, contexto, privacidade) é o veredito completo, e ele roda no
+    worker da conta: a thread de dispatch do neonize não pode esperar arquivo
+    nem consulta de participantes.
+    """
+    try:
+        from core import group_policy
+    except Exception:
+        return False
+    if not group_policy.is_group_message(item):
+        return False
+    if not group_policy.sender_jid(item):
+        return False
+    if item.get("from_me") and not group_policy.is_owner(
+            group_policy.sender_jid(item)):
+        # Eco deste processo no grupo é laço; eco de outro aparelho do dono é
+        # ordem dele e entra (o veredito decide o resto).
+        return False
+    if is_voice_item(item):
+        return True
+    return bool(calls_assistant(item, account)
+                or addressed_persona(item.get("text"), account))
+
+
 def is_candidate(item: dict, account: str = "") -> bool:
     """Nova e dirigida ao assistente: nome/menção, ordem do dono ou chat direto.
 
-    - Grupo: NUNCA. Nem com o nome, nem com menção, nem por ordem do dono —
-      a política de responder em grupo foi cancelada pelo dono.
-    - Chat direto do dono: qualquer mensagem (inclusive ``from_me=True``).
+    - Grupo: entra no fluxo como candidato barato (novo, tem autor, chamou o
+      assistente ou é áudio). A decisão de verdade — dono presente, allow-list
+      por contato, contexto de pergunta, privacidade — é do veredito em
+      ``_process``, não daqui: aqui só se evita enfileirar o que jamais seria
+      respondido, sem I/O.
+    - Chat direto do dono: qualquer mensagem (inclusive ``from_me=True``), e
+      NUNCA é bloqueado por regra de grupo — o que define o chat direto é o
+      chat, não a rótulo de mídia em volta dele.
     - Individual de terceiro: nome/menção. Eco com ``from_me=True`` só vale
       como ORDEM quando nomeia o assistente; sem o nome é resposta própria.
       Nota de voz (eco ou recebida) é candidata sempre: o nome é ouvido no
@@ -480,28 +583,27 @@ def is_candidate(item: dict, account: str = "") -> bool:
     """
     if not isinstance(item, dict):
         return False
-    if item.get("group"):
-        return False
     chat = str(item.get("chat") or "")
-    if not chat or chat.endswith("g.us"):
+    if not chat:
         return False
     if not _fresh(item):
         return False
     from_me = bool(item.get("from_me"))
+    # Anti-laço primeiro, em qualquer caminho: o eco de um envio DESTE processo
+    # é reconhecido pelo ID e, na falta dele, pela assinatura "Gino:" que ele
+    # carrega.
+    if from_me and _is_own_delivery_echo(item):
+        return False
     direct = _is_direct(account, item)
+    if item.get("group") or chat.endswith("g.us"):
+        # Grupo tem filtro próprio (``_group_candidate``) — menos o chat direto
+        # do dono: se o evento dele vier marcado como grupo por engano, a
+        # entrada dele continua valendo como sempre valeu (ordem 09/11/2026).
+        return True if direct else _group_candidate(item, account)
+    if direct:
+        return True
 
     if from_me:
-        # Anti-laço primeiro: o eco de um envio DESTE processo é reconhecido
-        # pelo ID e, na falta dele, pela assinatura "Gino:" que ele carrega.
-        try:
-            if whatsapp.sent_by_me(item.get("id")):
-                return False
-        except Exception:
-            return False
-        if is_own_signature(item.get("text")):
-            return False
-        if direct:
-            return True
         # Chat de outro número pareado do MESMO assistente: a mensagem aparece
         # nas duas contas e só a que RECEBEU deve responder (uma ordem, uma
         # resposta). O dono falando com o próprio assistente não é eco.
@@ -515,8 +617,6 @@ def is_candidate(item: dict, account: str = "") -> bool:
             return True
         return calls_assistant(item, account)
 
-    if direct:
-        return True
     # Nunca deixe um dos números pareados do próprio assistente reativar o
     # gatilho na outra conta.
     if _is_own_account(chat):
@@ -563,8 +663,17 @@ def _first_time(account: str, item: dict) -> bool:
     return True
 
 
-def _rate_key(account: str, item: dict) -> tuple[str, str]:
-    return (account, str(item.get("chat") or ""))
+def _rate_key(account: str, item: dict, sender: str = "") -> tuple[str, str]:
+    """A janela de rate limit. Em grupo é por GRUPO+CONTATO, não pelo grupo.
+
+    Cinco respostas por hora ao chat inteiro permitiam uma conversa só com o
+    dono e calavam o contato autorizado seguinte; com o autor na chave, o teto
+    continua sendo por pessoa — que é como o dono pensa a allow-list.
+    """
+    chat = str(item.get("chat") or "")
+    if sender and (item.get("group") or chat.endswith("g.us")):
+        return (account, f"{chat}#{sender}")
+    return (account, chat)
 
 
 def _rate_left(key: tuple[str, str]) -> bool:
@@ -596,6 +705,17 @@ def _process(account: str, item: dict) -> bool:
     account = str(account or "").strip()
     if not is_candidate(item, account):
         return False
+    chat = str(item.get("chat") or "")
+    # A rota de grupo só existe para o que NÃO é o chat direto do dono: a
+    # entrada dele nunca é bloqueada por regra de grupo (ordem 09/11/2026),
+    # mesmo se o evento vier com o rótulo de grupo colado por engano.
+    if ((item.get("group") or chat.endswith("g.us"))
+            and not _is_direct(account, item)):
+        # Grupo tem caminho próprio: o veredito completo decide e o
+        # respondedor executa o espelho de formato. O handler do app (turno com
+        # ferramentas) não é chamado sem o gate ser estacionado — ver
+        # `_process_group`.
+        return _process_group(account, item)
     with _lock:
         handler = _handler
     if handler is None:
@@ -611,7 +731,6 @@ def _process(account: str, item: dict) -> bool:
              f"{RATE_LIMIT} respostas na última hora — ignorando.")
         return False
 
-    chat = str(item.get("chat") or "")
     seconds = actiongate.allow_whatsapp_reply(account, chat, who)
     try:
         delivered = bool(handler(account, item))
@@ -629,6 +748,67 @@ def _process(account: str, item: dict) -> bool:
         f"mensagem de {who or chat} menciona {_trigger_name or 'o nome'}")
     _log(f"{label}; resposta autônoma pedida "
          f"(autorização de {seconds:.0f}s).")
+    return True
+
+
+def _process_group(account: str, item: dict) -> bool:
+    """O veredito de grupo inteiro, no worker da conta (com I/O permitido).
+
+    Nada é enviado nem autorizado antes do veredito passar: allow-list por
+    contato, dono presente no grupo, chamada pelo nome/persona, contexto de
+    pergunta e privacidade do conteúdo. Silêncio é o resultado normal — e é
+    silentemente silencioso: nenhuma resposta, nenhum aviso na sala, nenhuma
+    pergunta devolvida ao contato.
+    """
+    try:
+        from core import group_policy
+    except Exception as e:
+        _log(f"[grupos] politica indisponivel: {e}")
+        return False
+    verdict = group_policy.group_verdict(item, account=account)
+    if not verdict.allowed and not verdict.ask_owner:
+        _log(group_policy.describe(verdict))
+        return False
+    if not _first_time(account, item):
+        return False
+    chat = str(item.get("chat") or "")
+    who = verdict.sender_name or verdict.sender or chat
+    key = _rate_key(account, item, sender=verdict.sender)
+    if not _rate_left(key):
+        _log(f"[grupos] limite autônomo atingido para {who} em {chat}: "
+             f"{RATE_LIMIT} respostas na última hora — ignorando.")
+        return False
+
+    with _lock:
+        responder = _group_responder
+    injected = responder is not None
+    seconds = 0.0
+    if injected:
+        # Um respondedor injetado (o turno do app) fala POR FERRAMENTA e
+        # precisa do gate estacionado para esta conta+chat. O embutido manda a
+        # resposta direto pelo core e não abre portão nenhum.
+        seconds = actiongate.allow_whatsapp_reply(account, chat, who)
+    try:
+        if responder is None:
+            from core import group_reply
+            responder = group_reply.respond
+        delivered = bool(responder(account, item, verdict))
+    except Exception as e:
+        if injected:
+            actiongate.revoke_whatsapp_reply(account, chat)
+        _log(f"[grupos] a resposta do grupo falhou: {e}")
+        return False
+    if not delivered:
+        if injected:
+            actiongate.revoke_whatsapp_reply(account, chat)
+        if not verdict.allowed:
+            _log(group_policy.describe(verdict))
+        return False
+    _rate_record(key)
+    _log(f"[grupos] resposta de grupo entregue para {who} em {chat} "
+         f"({verdict.reply_format}, "
+         f"{'turno injetado' if injected else 'respondedor do core'}"
+         + (f", autorização de {seconds:.0f}s" if injected else "") + ").")
     return True
 
 
@@ -778,6 +958,15 @@ def _dispatch(account: str, item: dict) -> None:
     if not _fresh(item):
         return
     chat = str(item.get("chat") or "")
-    if item.get("group") or not chat or chat.endswith("g.us"):
+    if not chat:
+        return
+    if item.get("group") or chat.endswith("g.us"):
+        # Grupo é lido e enfileirado, mas só quando o pré-filtro barato (autor
+        # reconhecível + chamada ao assistente/persona/áudio) deixa esperança
+        # de resposta. Conversa paralela de terceiros não atravessa a fila e
+        # morre aqui, em silêncio, sem disco e sem RPC.
+        if not _group_candidate(item, account):
+            return
+        _enqueue(account, item)
         return
     _enqueue(account, item)

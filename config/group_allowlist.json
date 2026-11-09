@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "regra": "leitura de grupos liberada; resposta apenas a contatos da allow-list, em qualquer grupo (ordem do dono 09/11/2026)",
+  "atualizado_em": "2026-11-09",
+  "contatos": [
+    {
+      "jid": "5517981792464",
+      "nome": "Dono",
+      "tipo": "contato",
+      "autorizado_por": "padrao",
+      "data": "2026-11-09",
+      "dono": true,
+      "irrevogavel": true
+    }
+  ]
+}
