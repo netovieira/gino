@@ -379,3 +379,92 @@ def test_a_vault_em_si_nao_e_repositorio_nem_filial_de_um(vault_falsa):
                           str(vault_falsa)],
                           capture_output=True, text=True, timeout=60)
     assert "outside repository" in (fora.stderr + fora.stdout).lower()
+
+
+# ── o portão de chave: nome e tipo, nunca valor (dono, 09/11/2026) ──────────
+
+def test_marcar_chave_devolve_o_endereco_com_tipo_inferido():
+    marca = obras.marcar_chave("groq_api_key")
+    assert marca == "[key:groq_api_key, tipo:api_key]"
+    assert obras.marcar_chave("mail_password", tipo="senha") == \
+        "[key:mail_password, tipo:senha]"
+    assert obras.marcar_chave("linkedin_token") == "[key:linkedin_token, tipo:token]"
+
+
+@pytest.mark.parametrize("nome", ["", "   ", "com espaço", "chave[0]",
+                                  "1comeca_com_numero",
+                                  "um-nome-bem-longo-" + "x" * 60])
+def test_nome_que_nao_parece_nome_e_recusado(nome):
+    with pytest.raises(ValueError):
+        obras.marcar_chave(nome)
+
+
+def test_tipo_fora_do_vocabulario_e_recusado():
+    with pytest.raises(ValueError) as erro:
+        obras.marcar_chave("groq_api_key", tipo="senha-de-api")
+    assert "vocabulário fechado" in str(erro.value)
+
+
+def test_referenciar_troca_valor_por_endereco_e_mantem_a_dica():
+    texto = f'{{"gemini_api_key": "{SENHA}", "regiao": "southamerica-east1"}}'
+    saida = obras.referenciar(texto)
+    assert SENHA not in saida
+    assert "[key:gemini_api_key, tipo:api_key]" in saida
+    assert "southamerica-east1" in saida          # dado que não é segredo fica
+    assert not obras.contem_segredo(saida)
+
+
+def test_redigir_por_defecto_continua_em_retido():
+    # o registro nuvem (prompt.md, testes.md) não ganha endereço de chave sem
+    # que alguém peça: referenciar() é o caminho dos documentos.
+    saida = obras.redigir(f"senha: {SENHA}")
+    assert obras.REDACTED in saida and "[key:" not in saida
+    assert "[key:senha, tipo:senha]" in obras.referenciar(f"senha: {SENHA}")
+
+
+def test_o_referenciar_nao_inventa_endereco_para_segredo_sem_nome():
+    segredo = "a1b2" * 12
+    saida = obras.referenciar("Authorization: Bearer " + segredo)
+    assert segredo not in saida
+    assert obras.REDACTED in saida and "[key:" not in saida
+    pem = ("-----BEGIN RSA PRIVATE KEY-----\nTUACABECA123\n"
+           "-----END RSA PRIVATE KEY-----")
+    assert "TUACABECA123" not in obras.referenciar(pem)
+
+
+def test_inventariar_chaves_enumera_nome_e_tipo_sem_valor_nenhum(tmp_path):
+    (tmp_path / "config").mkdir()
+    segredo = "AIzaSyDUMMYdummy0123456789abcdefg"
+    (tmp_path / "config" / "api_keys.json").write_text(
+        '{"gemini_api_key": "%s", "whatsapp_token": "%s", "conta": '
+        '{"email_password": "outraSenha01"}}' % (segredo, "gsk_" + "A" * 30),
+        encoding="utf-8")
+    saida = obras.inventariar_chaves(base=tmp_path)
+    assert {item["chave"] for item in saida} == {
+        "gemini_api_key", "whatsapp_token", "email_password"}
+    assert {item["tipo"] for item in saida} == {"api_key", "token", "senha"}
+    assert {item["arquivo"] for item in saida} == {"config/api_keys.json"}
+    for item in saida:
+        assert set(item) == {"chave", "tipo", "arquivo"}
+        assert segredo not in str(item)
+
+
+def test_inventariar_chaves_sem_arquivo_nao_inventa_nada(tmp_path):
+    assert obras.inventariar_chaves(base=tmp_path) == []
+
+
+def test_documento_de_plano_do_obsidian_usa_endereco_de_chave(tmp_path,
+                                                              monkeypatch):
+    """O prompt gravado no esqueleto de plano sai com [key:...], não com o valor."""
+    from core import obsidian
+    monkeypatch.setattr(obsidian, "VAULT", tmp_path / "Jarvis")
+    monkeypatch.setattr(obsidian, "PLANS_DIR", tmp_path / "plans")
+    monkeypatch.setattr(obsidian, "ACTIVITY_LOG", tmp_path / "activity.log")
+    monkeypatch.setattr(obsidian, "NEXTCLOUD_DIR", tmp_path / "Nextcloud")
+    pasta = obsidian.create_plan_folder(
+        "PLANO-2026-11-09-gates.md",
+        prompt=f"ler config/api_keys.json e usar groq_api_key: {SENHA}")
+    texto = (pasta / "prompt.md").read_text(encoding="utf-8")
+    assert SENHA not in texto
+    assert "[key:groq_api_key, tipo:api_key]" in texto
+    assert obras.REDACTED in texto          # o caminho do arquivo some também

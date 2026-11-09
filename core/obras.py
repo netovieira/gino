@@ -38,6 +38,15 @@ e caminho de arquivo de segredo saem como ``[retido]``. Hash de commit é a
 única string longa que não é redigida — é pública e é a evidência do histórico
 (validada por ``_COMMIT_RE`` antes de encostar no disco).
 
+O PORTÃO DE CHAVE (ordem do dono, 09/11/2026): "cria um gate pra manipular
+esses dados de forma que você NÃO precise ler os mesmos, e nos documentos de
+planos, fases e tasks você informa a KEY e o TIPO para o modelo saber como
+usar sem ver o valor". Aqui isso são três peças: :func:`marcar_chave` (monta
+``[key:<nome>, tipo:<tipo>]``), :func:`referenciar` (redige trocando o valor
+pela marca, para documento de plano/fase/tarefa) e :func:`inventariar_chaves`
+(enumera nome e tipo das chaves configuradas sem devolver valor nenhum). O
+valor não passa por nenhum dos três: o que o modelo lê é o endereço.
+
 O caminho mora em UMA chave só (``OBRAS_DIR``, sobrescrevível pelo env
 ``JARVIS_OBRAS_DIR``) para poder mudar depois sem dor. O módulo é puro: sem Qt,
 sem ``main.py``, sem rede, e ``obras_dir()`` recusa caminho dentro do
@@ -45,6 +54,7 @@ repositório — a vault de obras nunca entra em git nenhum.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -153,7 +163,7 @@ _RE_LINHA_TESTE = re.compile(
 _LOCK = threading.RLock()
 
 
-def redigir(texto: Any) -> str:
+def redigir(texto: Any, *, marcar_chaves: bool = False) -> str:
     """Troca segredo por ``[retido]`` antes de qualquer escrita na vault.
 
     Ordem importa: primeiro o bloco PEM (que engole o resto), depois os pares
@@ -162,12 +172,24 @@ def redigir(texto: Any) -> str:
     (aparece ``[retido]``); vazamento não.
 
     Hash de commit NÃO passa por aqui: é público e é a evidência do histórico.
+
+    ``marcar_chaves=True`` muda só o caso "chave nomeada com valor": em vez de
+    ``[retido]`` sai ``[key:<nome>, tipo:<tipo>]`` -- o endereço da chave, que
+    é o que documento de plano, fase e task precisa carregar para o modelo
+    saber COMO usar sem ver o valor (ordem do dono, 09/11/2026). Sem nome
+    aproveitável a marca cai de volta em ``[retido]``: nunca sai valor por
+    omissão de tipo.
     """
     saida = str(texto if texto is not None else "")
     for pat in _SECRET_RE:
         if pat is _RE_CHAVE_VALOR:
-            saida = pat.sub(
-                lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{REDACTED}", saida)
+            def _sub(m: re.Match, *, marcar=marcar_chaves) -> str:
+                if marcar:
+                    marca = _marca_para_nome(m.group(2))
+                    if marca:
+                        return f"{m.group(1)}{m.group(2)}{m.group(3)}{marca}"
+                return f"{m.group(1)}{m.group(2)}{m.group(3)}{REDACTED}"
+            saida = pat.sub(_sub, saida)
         else:
             saida = pat.sub(REDACTED, saida)
     return saida
@@ -177,6 +199,136 @@ def contem_segredo(texto: Any) -> bool:
     """True se ainda há padrão de segredo no texto (usado como travão)."""
     alvo = str(texto if texto is not None else "")
     return any(pat.search(alvo) for pat in _SECRET_RE)
+
+
+# ── o portão de chave: nome e tipo, nunca valor ─────────────────────────────
+
+#: Vocabulário fechado de tipo de chave. Documento que cita tipo fora daqui
+#: está inventando contrato: :func:`marcar_chave` recusa.
+TIPOS_DE_CHAVE = (
+    "api_key", "token", "senha", "client_secret", "credencial", "chave_privada",
+    "endpoint", "outro",
+)
+
+#: A marca que substitui o valor nos documentos.
+MARCA_DE_CHAVE = "[key:{nome}, tipo:{tipo}]"
+
+#: Nome de chave utilizável: só ASCII, começando com letra, sem espaço e sem
+#: caminho. O teto de 64 chars também segura o blob de base64 que alguém tentar
+#: disfarçar de nome.
+_NOME_DE_CHAVE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+
+#: Heurística de tipo a partir do nome. Ordem importa: o mais específico
+#: primeiro (``client_secret`` antes de ``secret``, ``api_key`` antes de ``key``).
+_TIPO_POR_NOME = (
+    ("client_secret", "client_secret"),
+    ("private_key", "chave_privada"),
+    ("privkey", "chave_privada"),
+    ("api_key", "api_key"),
+    ("apikey", "api_key"),
+    ("access_token", "token"),
+    ("refresh_token", "token"),
+    ("token", "token"),
+    ("password", "senha"),
+    ("passwd", "senha"),
+    ("senha", "senha"),
+    ("secret", "client_secret"),
+    ("credential", "credencial"),
+    ("endpoint", "endpoint"),
+    ("url", "endpoint"),
+    ("uri", "endpoint"),
+)
+
+
+def tipo_de_chave(nome: Any) -> str:
+    """O tipo provável de uma chave pelo nome; ``outro`` quando não dá para dizer."""
+    bruto = _norm(nome).lower().replace("-", "_").replace(" ", "_")
+    for marca, tipo in _TIPO_POR_NOME:
+        if marca in bruto:
+            return tipo
+    return "outro"
+
+
+def marcar_chave(nome: Any, tipo: str = "") -> str:
+    """A marca ``[key:<nome>, tipo:<tipo>]`` para citar uma chave num documento.
+
+    Recusa nome que não parece nome (espaço, acento, caminho, blob) e tipo
+    fora do vocabulário fechado: a marca é contrato, e contrato frouxo volta
+    a pedir que alguém leia o valor para descobrir o que era.
+    """
+    bruto = _norm(nome)
+    if not _NOME_DE_CHAVE_RE.match(bruto):
+        raise ValueError(
+            f"nome de chave {nome!r} inutilizável: use ASCII, começando com "
+            "letra, sem espaço nem caminho (ex.: groq_api_key)")
+    alvo = _norm(tipo).lower() or tipo_de_chave(bruto)
+    if alvo not in TIPOS_DE_CHAVE:
+        raise ValueError(
+            f"tipo {tipo!r} fora do vocabulário fechado: "
+            + ", ".join(TIPOS_DE_CHAVE))
+    return MARCA_DE_CHAVE.format(nome=bruto, tipo=alvo)
+
+
+def _marca_para_nome(nome: Any) -> str:
+    """Marca para o nome capturado no texto; "" quando o nome não presta."""
+    try:
+        return marcar_chave(nome)
+    except ValueError:
+        return ""
+
+
+def referenciar(texto: Any) -> str:
+    """Redige trocando valor nomeado por ``[key:<nome>, tipo:<tipo>]``.
+
+    É o redator dos DOCUMENTOS de plano, fase e task. O resto da política de
+    ``redigir`` continua igual: bloco PEM, JWT, bearer, blob e caminho de
+    arquivo de segredo somem como ``[retido]`` -- sem nome de chave atrelado
+    não há endereço a citar.
+    """
+    return redigir(texto, marcar_chaves=True)
+
+
+#: Arquivos de chave deste projeto: só o NOME das chaves é lido, nunca o valor.
+_FONTES_DE_CHAVE = ("config/api_keys.json", "config/linkedin.json")
+
+
+def inventariar_chaves(base: Any = None) -> list[dict[str, str]]:
+    """Lista ``{"chave", "tipo", "arquivo"}`` das chaves configuradas.
+
+    É o portão que permite manipular o segredo sem lê-lo: o valor não entra
+    no retorno, no log, em lugar nenhum -- só a chave e o tipo, que é o que o
+    documento precisa para dizer COMO usar. Arquivo ausente ou ilegível
+    simplesmente não aparece; nada aqui levanta.
+    """
+    raiz = Path(base).expanduser() if base else BASE_DIR
+    achados: list[dict[str, str]] = []
+    vistos: set[tuple[str, str]] = set()
+    for relativo in _FONTES_DE_CHAVE:
+        caminho = raiz / relativo
+        try:
+            bruto = json.loads(caminho.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        blocos: list[dict] = []
+        if isinstance(bruto, dict):
+            blocos.append(bruto)
+            blocos += [v for v in bruto.values() if isinstance(v, dict)]
+        for bloco in blocos:
+            for nome in bloco:
+                nome_txt = _norm(nome)
+                if not _NOME_DE_CHAVE_RE.match(nome_txt):
+                    continue
+                if isinstance(bloco.get(nome), dict):
+                    continue  # é um grupo (ex.: "accounts"), não uma chave
+                chave_vista = (relativo, nome_txt)
+                if chave_vista in vistos:
+                    continue
+                vistos.add(chave_vista)
+                achados.append({"chave": nome_txt,
+                                "tipo": tipo_de_chave(nome_txt),
+                                "arquivo": relativo})
+    achados.sort(key=lambda item: (item["arquivo"], item["chave"]))
+    return achados
 
 
 def _norm(texto: Any) -> str:
@@ -761,6 +913,15 @@ arquivo daqui leva senha, token, chave de API, credencial de e-mail, bloco
 PEM, blob de base64 ou caminho de arquivo de segredo: `core.obras.redigir()`
 troca tudo por `[retido]` antes de encostar no disco. Hash de commit é a única
 string longa que passa — é público e é a evidência.
+
+## O portão de chave (ordem do dono, 09/11/2026)
+
+Documento de plano, fase e task **não cita valor**: cita a chave pelo nome e
+pelo tipo — `[key:<nome>, tipo:<tipo>]` — para o modelo saber como usar sem
+ler o segredo (`core.obras.marcar_chave`, `core.obras.referenciar`). O
+vocabulário de tipo é fechado (`TIPOS_DE_CHAVE`); nome que não parece nome é
+recusado. Para saber o que existe sem ler nada,
+`core.obras.inventariar_chaves()` devolve só `{chave, tipo, arquivo}`.
 
 ## Onde mora e como muda de lugar
 
