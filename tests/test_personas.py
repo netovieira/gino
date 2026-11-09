@@ -93,6 +93,14 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(config_manager, "get_plugin_setting",
                         lambda *args, **kwargs: 1.0)
 
+    # A checagem de voz é regra do dono e continua passando aqui, mas na
+    # BORDA: o teste confirma a lógica de ``validate_voice_id`` sem bater no
+    # Fish Audio real (com chave pareada o serviço respondia 404 para os ids
+    # falsos e derrubava a suíte inteira).
+    monkeypatch.setattr(personas, "fish_voice_lookup",
+                        lambda voice_id, key="", timeout=None:
+                        (True, f"voz-{voice_id}"))
+
     def write_catalog(models):
         (memory / "models.json").write_text(
             json.dumps({"models": models}), encoding="utf-8")
@@ -459,11 +467,78 @@ def test_required_fields_and_limits(env):
     with pytest.raises(ValueError, match="catálogo"):
         personas.upsert(fields(name="Modelo Ruim", model="No-Such-Model"))
 
-    # 12 personas fit; the 13th is refused.
-    for index in range(personas.MAX_PERSONAS):
+    # Teto duro de 12 caiu (ordem do dono, 09/11/2026): dá para cadastrar
+    # quantas personas couberem. O que é limitado é o trabalho simultâneo, e
+    # esse teto mora em core.persona_ops.limits, ajustável por config/UI —
+    # nunca mais no cadastro.
+    assert not hasattr(personas, "MAX_PERSONAS")
+    for index in range(13):
         personas.upsert(fields(name=f"Pessoa {index}", voice_id=f"v{index}"))
-    with pytest.raises(ValueError, match="limite"):
-        personas.upsert(fields(name="Pessoa 13", voice_id="v13"))
+    assert len(personas.list_personas()) == 13
+
+    from core.persona_ops import limits as persona_limits
+    caps = persona_limits.read_limits({})
+    assert caps == {"max_concurrent_personas": 4, "max_tasks_per_persona": 4}
+    adjustable = persona_limits.read_limits({"max_concurrent_personas": 7,
+                                             "max_tasks_per_persona": 2})
+    assert adjustable == {"max_concurrent_personas": 7,
+                          "max_tasks_per_persona": 2}
+
+
+def test_voice_descatalogada_bloqueia_mas_sem_rede_entrave_com_nota(
+        env, monkeypatch):
+    """A checagem no Fish Audio continua de pé, só que na borda stubada.
+
+    404 do serviço = cadastro recusado nomeando o id; serviço inacessível =
+    entra com nota ``voice_check`` (o cadastro não para por defeito alheio).
+    """
+    monkeypatch.setattr(personas, "fish_voice_lookup",
+                        lambda voice_id, key="", timeout=None:
+                        (False, "não encontrada no Fish Audio (404)"))
+    with pytest.raises(ValueError, match="não encontrada"):
+        personas.upsert(fields())
+    assert personas.get("fulana") is None
+
+    monkeypatch.setattr(personas, "fish_voice_lookup",
+                        lambda voice_id, key="", timeout=None:
+                        (None, "Fish Audio inacessível (Timeout)"))
+    persona = personas.upsert(fields())
+    assert persona["voice_check"] == (
+        "voz fish-ref-abc123 não verificada: Fish Audio inacessível (Timeout)")
+
+
+def test_role_e_cargo_o_campo_com_gino_orquestrador(env):
+    """Ordem do dono (09/11/2026): toda persona tem cargo; o Gino orquestra."""
+    persona = personas.upsert(fields(role="revisora de frontend"))
+    assert persona["role"] == "revisora de frontend"
+    assert personas.resolve_role(persona) == "revisora de frontend"
+    # Registro antigo sem o campo: o cargo de origem do dono vence, e o do
+    # Gino é Orquestrador mesmo sem haver um registro no quadro.
+    assert personas.ORCHESTRATOR_ROLE == "Orquestrador"
+    assert personas.resolve_role({"id": "gino", "name": "Gino"}) == \
+        "Orquestrador"
+    assert personas.resolve_role("aisha") == \
+        "Analista de Monitoramento e Segurança"
+    assert personas.resolve_role({"id": "ninguem"}) == ""
+    with pytest.raises(ValueError, match="cargo"):
+        personas.upsert(fields(name="Longa Demaismais", role="x" * 121))
+    with pytest.raises(ValueError, match="segredos"):
+        personas.upsert(fields(name="Segreda", role="token=abc123"))
+
+
+def test_aisha_bernardo_e_ariel_existem_so_no_plano(env):
+    """Ordem do dono (09/11/2026): a criação delas está proibida.
+
+    Elas vivem só na cascata e na tabela de cargos; cadastrar outra persona,
+    carregar o cadastro ou consultar a cascata não as cria.
+    """
+    assert personas.CASCADE_PERSONAS == ("aisha", "bernardo", "ariel")
+    personas.model_for("fulana")
+    personas.cascade_available()
+    personas.upsert(fields())
+    assert {p["id"] for p in personas.list_personas()} == {"fulana"}
+    for planned in personas.CASCADE_PERSONAS:
+        assert personas.get(planned) is None
 
 
 def test_reasoning_and_context_validation(env):

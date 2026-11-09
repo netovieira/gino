@@ -44,6 +44,56 @@ PAID MODELS
     and only while its factor is within ``max_price_factor``. The factor is
     snapshotted into the persona for display; the catalog stays the truth on
     the next edit.
+
+DIRECT WHATSAPP
+    The owner's rule (09/11/2026): a persona may exist without a WhatsApp
+    number of her own. ``direct_whatsapp`` is the boolean that grants her one.
+
+      * **empty/undeclared = False** — no number. The persona still answers by
+        name whenever the owner calls her in the assistant's own chat, but
+        there is no number to talk to her directly, she never receives a
+        message through an account, and no message is ever routed to her
+        because it landed on an account.
+      * an account is only hers with BOTH ``direct_whatsapp=True`` AND a
+        non-empty ``whatsapp_account``. Declaring the account explicitly in an
+        upsert implies the number (that is how a brand-new persona the
+        assistant defines with a WhatsApp gets one without saying twice).
+      * ``direct_whatsapp=False`` clears ``whatsapp_account`` in the same
+        save, so "remove o whats da Aline" is one call and leaves no stale
+        account behind.
+      * empty/undeclared ``whatsapp_account`` means NONE, never the main
+        account (owner order 07/11/2026). Whoever wants the main account must
+        say "principal" in full; it resolves to the live paired account and is
+        never a hardcoded number.
+
+    The main assistant is not a route in this store: his direct line is the
+    paired default account, read live (``assistant_account()``), and is always
+    on (``MAIN_ASSISTANT_DIRECT_WHATSAPP``). He does have a record — the
+    orchestrator himself (``MAIN_PERSONA_ID``, cargo ``Orquestrador``) — and
+    that record never carries a WhatsApp of its own.
+
+CARGOS
+    Owner order (09/11/2026): every persona has a ``role`` (cargo), and the
+    assistant's own record is the orchestrator. The role is what says which
+    subject belongs to whom, so a task that matches a persona is delegated
+    (:func:`core.persona_ops.delegation.plan`) instead of being done by the
+    orchestrator. ``DEFAULT_ROLES`` keeps the owner's founding roster honest
+    even in records written before the field existed.
+
+MODEL CASCADE
+    ``MODEL_CASCADE`` is the owner's quality order, best first. Nothing is
+    used without checking the live catalog: a model counts as free only with
+    price factor 0.0, and a model reported as at its usage limit is skipped
+    for :data:`EXHAUSTION_TTL_S`. :func:`model_for` answers "which model does
+    this persona run right now"; when nothing free is available it answers
+    None rather than spending credits. Aisha, Bernardo and Ariel start in the
+    cascade (``CASCADE_PERSONAS``).
+
+VOICE IDS
+    A ``voice_id`` is confirmed against Fish Audio before it is stored
+    (:func:`validate_voice_id`); an id the service does not know blocks the
+    registration and is named in the error. The API key is only ever sent in
+    a request header — never printed, never returned in a message.
 """
 from __future__ import annotations
 
@@ -53,6 +103,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -64,7 +115,6 @@ PERSONAS_PATH = BASE_DIR / "memory" / "personas.json"
 MODELS_PATH = BASE_DIR / "memory" / "models.json"
 SKILLS_DIR = BASE_DIR / "skills"
 
-MAX_PERSONAS = 12
 MAX_PERSONALITY = 2000
 MAX_ALIASES = 20
 MAX_ALLOWED_DIRS = 32
@@ -84,7 +134,64 @@ CONTEXT_MIN = 16_000
 CONTEXT_MAX = 1_000_000
 DEFAULT_CONTEXT = 200_000
 
+# ── cargos (ordem do dono, 09/11/2026) ──────────────────────────────────────
+#
+# Toda persona tem um CARGO: é o que diz ao orquestrador para que assunto ela
+# existe. O Gino é o dono do cargo de ``Orquestrador`` e não executa assunto que
+# tenha persona — delega (``persona_ask``).
+MAX_ROLE = 120
+ORCHESTRATOR_ROLE = "Orquestrador"
+MAIN_PERSONA_ID = "gino"
+MAIN_PERSONA_NAME = "Gino"
+# Cargo de origem do quadro do dono. Um registro sem ``role`` ainda tem cargo:
+# ``resolve_role`` cai nesta tabela antes de dizer "sem cargo".
+DEFAULT_ROLES = {
+    "gino": ORCHESTRATOR_ROLE,
+    "aisha": "Analista de Monitoramento e Segurança",
+    "bernardo": "Engenheiro de Arquitetura",
+    "ariel": "Designer de Interface",
+}
+
+# ── cascata de modelos (ordem do dono, 09/11/2026) ──────────────────────────
+#
+# "Defina o melhor sem custo algum": a lista abaixo é a ordem de QUALIDADE, do
+# melhor para o pior. Antes de usar um nome a cascata olha o catálogo vivo
+# (``memory/models.json``): multiplicador 0.0 é gratuito; qualquer coisa acima
+# disso, ou preço desconhecido, não é. Nome esgotado (limite de uso atingido)
+# também sai da frente. Nunca se gasta crédito por engano: se nada na cascata
+# está livre, a cascata devolve None e quem chama decide — ela não inventa
+# modelo pago.
+MODEL_CASCADE = (
+    "Qwen3.8-Max", "Kimi-K3.1-Pro", "DeepSeek-V4-Pro", "GLM-5.3",
+    "MiniMax-M3.1-Flash", "Kimi-K2.8-Preview", "Qwen3.8-Flash",
+    "GLM-5.3-Flash", "DeepSeek-Flash", "Efficient", "Auto",
+)
+# Personas que entram na cascata desde o cadastro (ordem do dono).
+CASCADE_PERSONAS = ("aisha", "bernardo", "ariel")
+# "Chegar ao limite de uso" é momentâneo: o nome fica de fora por este tempo e
+# depois volta a concorrer, sem reiniciar nada.
+EXHAUSTION_TTL_S = 900.0
+
+# ── Fish Audio ───────────────────────────────────────────────────────────────
+# Voz é cadastrada, não adivinhada: o ``voice_id`` é confirmado no serviço
+# ANTES de gravar. A chave nunca aparece em mensagem de erro, log ou print.
+FISH_API_BASE = "https://api.fish.audio"
+FISH_TIMEOUT = 15
+
 _GENDERS = {"f", "m", "n"}
+# Owner rule (09/11/2026): the main assistant always keeps his direct
+# WhatsApp. He is not a record in this store, so the rule lives in code and
+# his number is whatever account is paired as the default (never hardcoded).
+MAIN_ASSISTANT_DIRECT_WHATSAPP = True
+# "principal" por extenso é o único jeito de pedir a conta principal; vazio
+# nunca é a principal, vazio é nenhuma (ordem do dono, 07/11/2026).
+MAIN_ACCOUNT_WORDS = ("principal", "conta principal", "a principal",
+                      "main", "padrao", "padrão")
+_DIRECT_TRUE = ("1", "true", "sim", "s", "yes", "y", "verdadeiro", "direto",
+                "com whatsapp", "com número", "com numero")
+_DIRECT_FALSE = ("0", "false", "nao", "não", "n", "no", "falso", "sem",
+                 "sem whatsapp", "sem número", "sem numero")
+
 _GENDER_ALIASES = {
     "f": "f", "fem": "f", "feminino": "f", "feminina": "f", "female": "f",
     "m": "m", "masc": "m", "masculino": "m", "masculina": "m", "male": "m",
@@ -178,6 +285,55 @@ def _normalize_gender(value) -> str:
     return gender
 
 
+def _normalize_direct_whatsapp(value, *, default: bool = False) -> bool:
+    """direct_whatsapp como booleano honesto: vazio/não-declarado = False.
+
+    Nothing here ever guesses a number into existence: an unrecognised word is
+    refused with a spoken reason instead of falling back to True.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    key = _text(value).casefold()
+    if not key:
+        return default
+    if key in _DIRECT_TRUE:
+        return True
+    if key in _DIRECT_FALSE:
+        return False
+    raise ValueError("direct_whatsapp inválido: use sim ou não")
+
+
+def direct_whatsapp(persona) -> bool:
+    """True só quando o cadastro declara o número direto; vazio = False."""
+    if not isinstance(persona, dict):
+        return False
+    return _normalize_direct_whatsapp(persona.get("direct_whatsapp"))
+
+
+def own_account(persona) -> str:
+    """A conta de WhatsApp da persona; '' quando ela não tem número.
+
+    Ponto único do "ela tem um número?": exige ``direct_whatsapp=True`` e
+    ``whatsapp_account`` preenchido. Quem só tem a conta no cadastro (registro
+    antigo) ou só o booleano fica sem conta — nunca se empresta a conta do
+    assistente.
+    """
+    if not direct_whatsapp(persona):
+        return ""
+    return _text(persona.get("whatsapp_account"))
+
+
+def assistant_account() -> str:
+    """A conta direta do assistente principal, lida viva ('' se nada pareado).
+
+    O Gino não é persona: o número dele é a conta pareada como principal.
+    Nenhum número é hardcoded aqui.
+    """
+    return _main_account_name()
+
+
 def _validate_personality(value) -> str:
     text = str(value if value is not None else "").strip()
     if len(text) > MAX_PERSONALITY:
@@ -189,6 +345,46 @@ def _validate_personality(value) -> str:
             "personalidade não pode conter segredos (api_key, password, "
             "token, sk-...)")
     return text
+
+
+def _validate_role(value) -> str:
+    """Cargo falável: uma linha, sem segredo. Vazio é permitido."""
+    text = str(value if value is not None else "").strip()
+    if len(text) > MAX_ROLE:
+        raise ValueError(
+            f"cargo acima de {MAX_ROLE} caracteres ({len(text)})")
+    if _contains_secret(text):
+        raise ValueError("cargo não pode conter segredos (api_key, token...)")
+    return text
+
+
+def _clean_role(value) -> str:
+    """Non-raising variant for records loaded from disk."""
+    try:
+        return _validate_role(value)
+    except ValueError:
+        return ""
+
+
+def resolve_role(persona) -> str:
+    """O cargo de uma persona: o cadastro vence; depois a tabela do dono.
+
+    Aceita o registro, o id ou o nome. Quem não existe devolve '' — cargo
+    nunca é inventado.
+    """
+    if isinstance(persona, (str, int)):
+        record = get(persona) or {"name": str(persona)}
+    elif isinstance(persona, dict):
+        record = persona
+    else:
+        return ""
+    role = _clean_role(record.get("role"))
+    if role:
+        return role
+    for key in (_slugify(record.get("id")), _slugify(record.get("name"))):
+        if key and key in DEFAULT_ROLES:
+            return DEFAULT_ROLES[key]
+    return ""
 
 
 def _available_skills() -> list[str]:
@@ -307,6 +503,7 @@ def _fallback_catalog() -> list[dict]:
             "displayName": display,
             "isFree": True,
             "priceFactor": 0.0,
+            "priceFactorKnown": True,
             "originalPriceFactor": 0.0,
             "availableContextWindows": [],
             "maxInputTokens": None,
@@ -362,6 +559,9 @@ def _catalog_entry(raw) -> dict | None:
     is_free = raw.get("isFree", raw.get("is_free"))
     if is_free is None:
         is_free = factor <= 0.0
+    known = raw.get("priceFactorKnown", raw.get("price_factor_known"))
+    if known is None:
+        known = raw.get("priceFactor", raw.get("price_factor")) is not None
     max_input = _as_int(
         raw.get("maxInputTokens", raw.get("max_input_tokens")))
     efforts = _effort_list(raw.get("efforts"))
@@ -375,6 +575,7 @@ def _catalog_entry(raw) -> dict | None:
                              or raw.get("display_name") or value),
         "isFree": bool(is_free),
         "priceFactor": factor,
+        "priceFactorKnown": bool(known),
         "originalPriceFactor": original,
         "availableContextWindows": _int_list(
             raw.get("availableContextWindows")
@@ -409,6 +610,305 @@ def find_model(value) -> dict | None:
         if (model["value"].casefold() == wanted
                 or model["displayName"].casefold() == wanted):
             return model
+    return None
+
+
+# ── cascata de modelos: melhor → pior, grátis sempre ────────────────────────
+
+_EXHAUSTED: dict[str, float] = {}
+_EXHAUSTION_WHY: dict[str, str] = {}
+
+
+def _cascade_rank() -> dict[str, int]:
+    """Nome (value ou displayName, em minúsculas) → posição na cascata."""
+    rank: dict[str, int] = {}
+    for index, name in enumerate(MODEL_CASCADE):
+        rank[_slugify(name)] = index
+        rank.setdefault(name.casefold(), index)
+    return rank
+
+
+def _rank_of(entry: dict) -> int:
+    rank = _cascade_rank()
+    for key in (entry.get("value"), entry.get("displayName")):
+        text = _text(key)
+        hit = rank.get(_slugify(text)) or rank.get(text.casefold())
+        if hit is not None:
+            return hit
+    # Fora da lista do dono: entra no fim, na ordem do próprio catálogo.
+    return len(MODEL_CASCADE)
+
+
+def cascade_models() -> list[dict]:
+    """O catálogo inteiro, ordenado do melhor para o pior.
+
+    Não filtra nada: é a ordem que o dono definiu, servida para a UI e para o
+    relatório da cascata mostrarem também quem está caro ou esgotado.
+    """
+    out = list(model_catalog())
+    out.sort(key=lambda entry: (_rank_of(entry),
+                                _text(entry.get("displayName")).casefold()))
+    return out
+
+
+def model_is_free(entry) -> bool:
+    """Grátis é multiplicador 0.0 no catálogo vivo. Preço desconhecido não é.
+
+    ``isFree`` do catálogo sozinho não basta: um modelo em promoção continua
+    cobrando quando o multiplicador sobe, e a ordem do dono é não gastar.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("priceFactorKnown") is False:
+        return False
+    return _as_float(entry.get("priceFactor"), 1.0) <= 0.0
+
+
+def _entry_name(model) -> str:
+    """Nome falável de um modelo: aceita o registro do catálogo ou o nome."""
+    if isinstance(model, dict):
+        return _text(model.get("displayName") or model.get("value"))
+    return _text(model)
+
+
+def mark_model_exhausted(model, reason: str = "",
+                         ttl_s: float = EXHAUSTION_TTL_S) -> None:
+    """Registra "limite de uso atingido" de um modelo por um tempo."""
+    name = _text(_entry_name(model)).casefold()
+    if not name:
+        return
+    seconds = _as_float(ttl_s, EXHAUSTION_TTL_S)
+    if seconds <= 0:
+        seconds = EXHAUSTION_TTL_S
+    with _LOCK:
+        _EXHAUSTED[name] = time.monotonic() + seconds
+        _EXHAUSTION_WHY[name] = _text(reason) or "limite de uso"
+
+
+def model_exhausted(model) -> bool:
+    """True enquanto o modelo está com o limite de uso estourado."""
+    name = _text(_entry_name(model)).casefold()
+    if not name:
+        return False
+    with _LOCK:
+        until = _EXHAUSTED.get(name)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            _EXHAUSTED.pop(name, None)
+            _EXHAUSTION_WHY.pop(name, None)
+            return False
+        return True
+
+
+def exhaustion_reason(model) -> str:
+    name = _text(_entry_name(model)).casefold()
+    with _LOCK:
+        return _text(_EXHAUSTION_WHY.get(name))
+
+
+def clear_model_exhaustion(model=None) -> None:
+    """Esquece esgotamentos (todos, ou só o de ``model``). Também em teste."""
+    with _LOCK:
+        if model is None:
+            _EXHAUSTED.clear()
+            _EXHAUSTION_WHY.clear()
+            return
+        name = _text(_entry_name(model)).casefold()
+        _EXHAUSTED.pop(name, None)
+        _EXHAUSTION_WHY.pop(name, None)
+
+
+def cascade_available(preferred=None, exclude=()) -> list[dict]:
+    """Da melhor para a pior: só o que está grátis e dentro do limite."""
+    blocked = {_text(name).casefold() for name in exclude if _text(name)}
+    out: list[dict] = []
+    for entry in cascade_models():
+        names = {_text(entry.get("displayName")).casefold(),
+                 _text(entry.get("value")).casefold()}
+        if names & blocked:
+            continue
+        if not model_is_free(entry) or model_exhausted(entry):
+            continue
+        out.append(entry)
+    preferred_name = _text(preferred).casefold()
+    if preferred_name:
+        # A preferência do cadastro abre a fila quando ela mesma é aproveitável.
+        head = [entry for entry in out if preferred_name in (
+            _text(entry.get("displayName")).casefold(),
+            _text(entry.get("value")).casefold())]
+        if head:
+            rest = [entry for entry in out
+                    if _text(entry.get("displayName")).casefold()
+                    != preferred_name]
+            out = head + rest
+    return out
+
+
+def next_free_model(preferred=None, exclude=()) -> dict | None:
+    """Primeiro modelo aproveitável da cascata; None quando nada é grátis."""
+    usable = cascade_available(preferred=preferred, exclude=exclude)
+    return usable[0] if usable else None
+
+
+def in_cascade(persona) -> bool:
+    """Esta persona usa a cascata (ordem do dono: Aisha, Bernardo, Ariel)."""
+    if not isinstance(persona, dict):
+        persona = get(persona) or {}
+    slug = _slugify(persona.get("id") or persona.get("name"))
+    return bool(slug) and slug in CASCADE_PERSONAS
+
+
+def model_for(persona=None, *, exclude=()) -> dict:
+    """O modelo que a persona vai usar AGORA, depois de checar a cascata.
+
+    Devolve ``{"model", "previous", "switched", "reason"}``. Uma persona da
+    cascata começa na cascata: o modelo do cadastro é a ponta da fila quando é
+    gratuito e está disponível, e vira o próximo aproveitável quando não for.
+    Quem está fora da cascata mantém o cadastro — a cascata não troca nome de
+    persona sem ela ter pedido.
+    """
+    record = persona if isinstance(persona, dict) else (
+        get(persona) or {} if persona else {})
+    wanted = _text(record.get("model")) if record else ""
+    entry = find_model(wanted) if wanted else None
+    current = _entry_name(entry) if entry else ""
+    if record and not in_cascade(record):
+        usable = entry if (entry and model_is_free(entry)
+                           and not model_exhausted(entry)) else None
+        return {
+            "model": usable or entry,
+            "previous": None,
+            "switched": False,
+            "reason": "fora da cascata: cadastro respeitado" if usable else
+                      "fora da cascata",
+        }
+    usable = next_free_model(preferred=current or None, exclude=exclude)
+    if usable is None:
+        return {
+            "model": None,
+            "previous": current or None,
+            "switched": False,
+            "reason": "nenhum modelo gratuito disponível na cascata",
+        }
+    chosen = _entry_name(usable)
+    if current and chosen.casefold() != current.casefold():
+        why = (f"{current} não está gratuito"
+               if entry and not model_is_free(entry)
+               else f"{current} com o limite de uso atingido")
+        return {"model": usable, "previous": current, "switched": True,
+                "reason": f"{why}; cascata escolheu {chosen}"}
+    return {"model": usable, "previous": None, "switched": False,
+            "reason": f"cascata: {chosen} está gratuito e disponível"}
+
+
+def cascade_report(preferred=None) -> list[dict]:
+    """A cascata como o dono quer ver: cada nome, seu preço e seu estado."""
+    out = []
+    for entry in cascade_models():
+        if not model_is_free(entry):
+            state = "pago"
+        elif model_exhausted(entry):
+            state = f"esgotado ({exhaustion_reason(entry)})"
+        else:
+            state = "livre"
+        row = {
+            "model": _entry_name(entry),
+            "value": _text(entry.get("value")),
+            "multiplier": format_multiplier(entry.get("priceFactor")),
+            "state": state,
+        }
+        out.append(row)
+    wanted = _text(preferred).casefold()
+    if wanted:
+        for row in out:
+            if wanted in (_text(row["model"]).casefold(),
+                          _text(row["value"]).casefold()):
+                row["preferred"] = True
+    return out
+
+
+# ── voz: validação do voice_id antes de gravar ──────────────────────────────
+
+def _fish_api_key() -> str:
+    """A chave do Fish Audio, lida do cérebro de economia. Nunca é impressa."""
+    try:
+        from memory import config_manager
+        cfg = config_manager.get_plugin_config("brain")
+    except Exception:
+        return ""
+    return _text(cfg.get("fish_api_key") if isinstance(cfg, dict) else "")
+
+
+def fish_voice_lookup(voice_id: str, key: str = "",
+                      timeout: float = FISH_TIMEOUT):
+    """Confirma no Fish Audio se ``voice_id`` existe.
+
+    ``(True, título)`` quando o serviço mostra a voz, ``(False, motivo)``
+    quando ele diz que não há nada naquele id, ``(None, motivo)`` quando não
+    deu para perguntar (sem chave, rede, chave recusada). Nenhuma resposta
+    devolve a chave: ela só sai no cabeçalho da requisição.
+    """
+    vid = _text(voice_id)
+    if not vid:
+        return False, "voice_id vazio"
+    api_key = key or _fish_api_key()
+    if not api_key:
+        return None, "sem chave do Fish Audio"
+    try:
+        import requests
+        r = requests.get(f"{FISH_API_BASE}/model/{vid}",
+                         headers={"Authorization": f"Bearer {api_key}"},
+                         timeout=timeout)
+    except Exception as exc:
+        return None, f"Fish Audio inacessível ({type(exc).__name__})"
+    status = getattr(r, "status_code", 0)
+    if status == 200:
+        title = ""
+        try:
+            title = _text(r.json().get("title"))
+        except Exception:
+            title = ""
+        return True, title or vid
+    if status == 404:
+        return False, "não encontrada no Fish Audio (404)"
+    if status == 401:
+        return None, "chave do Fish Audio recusada (401)"
+    if status == 403:
+        return None, "voz fora do alcance desta chave (403)"
+    if status in (429, 500, 502, 503, 504):
+        return None, f"Fish Audio indisponível ({status})"
+    return None, f"Fish Audio respondeu {status}"
+
+
+def validate_voice_id(voice_id: str, *, key: str = "") -> str:
+    """Confirma a voz antes de gravar; levanta ValueError nomeando o id.
+
+    Devolve uma nota quando não deu para confirmar (sem chave/rede): o cadastro
+    não para por defeito do serviço, mas a nota vai na resposta para o dono ver
+    que aquela voz entrou sem checagem.
+    """
+    vid = _text(voice_id)
+    if not vid:
+        raise ValueError("voice_id do Fish Audio é obrigatório")
+    exists, detail = fish_voice_lookup(vid, key=key)
+    if exists is False:
+        raise ValueError(
+            f"voice_id {vid!r} {detail}; pegue outro id no site do Fish Audio")
+    if exists is None:
+        return f"voz {vid} não verificada: {detail}"
+    return ""
+
+
+def find_by_voice_id(voice_id) -> dict | None:
+    """A persona dona daquela voz (pelo ``voice_id`` exato); None quando é a
+    voz do Gino ou de ninguém. É o gancho do fallback de fala no brain."""
+    wanted = _text(voice_id)
+    if not wanted:
+        return None
+    for persona in list_personas():
+        if _text(persona.get("voice_id")) == wanted:
+            return persona
     return None
 
 
@@ -524,15 +1024,47 @@ def _whatsapp_accounts() -> list[dict]:
         return []
 
 
+def _main_account_name() -> str:
+    """The paired account the assistant himself uses, read live (never a number).
+
+    The settings' ``default_account`` wins (``default_account_name``); the
+    ``default`` flag published by the account list is the fallback for older
+    configs. Empty when nothing is paired — no name is ever invented.
+    """
+    accounts = _whatsapp_accounts()
+    try:
+        from core import whatsapp as _wa
+        chosen = _text(_wa.default_account_name())
+    except Exception:
+        chosen = ""
+    if chosen:
+        return chosen
+    for account in accounts:
+        if account.get("default"):
+            name = _text(account.get("name"))
+            if name:
+                return name
+    return ""
+
+
 def whatsapp_account_choices() -> list[str]:
-    """Pairing names the persona form offers (empty string = main account)."""
+    """Pairing names the persona form offers (empty string = no number)."""
     return [_text(account.get("name")) for account in _whatsapp_accounts()
             if _text(account.get("name"))]
 
 
 def _resolve_whatsapp_account(value: str) -> str:
-    """Canonical account name for ``value`` (a name or the account uuid)."""
-    wanted = _text(value).casefold()
+    """Canonical account name for ``value`` (a name, an uuid or "principal").
+
+    Owner rule (07/11/2026): **empty means none**. An empty or undeclared
+    ``whatsapp_account`` no longer stands for the main account — the main
+    account is only hers when the caller says "principal" in full, and that
+    word resolves to the live paired default, never to a hardcoded number.
+    """
+    raw = _text(value)
+    wanted = raw.casefold()
+    if not wanted:
+        return ""
     accounts = _whatsapp_accounts()
     for key in ("name", "uuid"):
         for account in accounts:
@@ -540,6 +1072,15 @@ def _resolve_whatsapp_account(value: str) -> str:
                 name = _text(account.get("name"))
                 if name:
                     return name
+    if wanted in MAIN_ACCOUNT_WORDS:
+        # "principal" dito por extenso, sem conta literalmente chamada assim:
+        # vale a conta pareada como principal AGORA (lida do config).
+        name = _main_account_name()
+        if name:
+            return name
+        raise ValueError(
+            f"WhatsApp {value!r} não está pareado (disponíveis: "
+            f"{', '.join(whatsapp_account_choices()) or 'nenhuma conta pareada'})")
     available = ", ".join(whatsapp_account_choices()) or "nenhuma conta pareada"
     raise ValueError(
         f"WhatsApp {value!r} não está pareado (disponíveis: {available})")
@@ -615,6 +1156,21 @@ def _clean_persona(raw) -> dict | None:
     # Old records have no field at all: [] keeps the previous behaviour
     # (persona reads everywhere).
     persona["allowed_dirs"] = _clean_allowed_dirs(raw.get("allowed_dirs"))
+    # direct_whatsapp is read on every load: an old record (field absent) has
+    # no number, exactly like a persona whose account was removed — and an
+    # account left behind by an old record can never be hers without the flag
+    # (the store stays honest; nothing here upgrades a persona by guessing).
+    persona["direct_whatsapp"] = _normalize_direct_whatsapp(
+        raw.get("direct_whatsapp"))
+    persona["whatsapp_account"] = own_account(persona)
+    # Cargo: registro antigo sem o campo continua com o cargo de origem do
+    # dono (DEFAULT_ROLES) quando for um dos nomes dele; o load nunca inventa
+    # cargo de quem não está na tabela.
+    role = _clean_role(raw.get("role"))
+    if role:
+        persona["role"] = role
+    else:
+        persona.pop("role", None)
     return persona
 
 
@@ -846,9 +1402,9 @@ def delete(id_or_name, retired_status: str = "left") -> bool:
 
 # ── upsert ──────────────────────────────────────────────────────────────────
 
-_FIELDS = ("name", "gender", "voice_id", "personality", "skills", "stacks",
-           "model", "reasoning", "context_size", "whatsapp_account",
-           "allowed_dirs")
+_FIELDS = ("name", "gender", "voice_id", "role", "personality", "skills",
+           "stacks", "model", "reasoning", "context_size", "whatsapp_account",
+           "direct_whatsapp", "allowed_dirs")
 
 
 def _merge_fields(base: dict, fields: dict) -> dict:
@@ -860,8 +1416,15 @@ def _merge_fields(base: dict, fields: dict) -> dict:
 
 
 def upsert(fields: dict, confirm_paid: bool = False,
-           max_price_factor: float = 1.0) -> dict:
-    """Create or update a persona; raises ValueError with a spoken reason."""
+           max_price_factor: float = 1.0, check_voice: bool = True) -> dict:
+    """Create or update a persona; raises ValueError with a spoken reason.
+
+    Quantas personas existem não tem teto (ordem do dono, 09/11/2026): o que é
+    limitado é o que se pede ao mesmo tempo, em
+    :mod:`core.persona_ops.limits`. Com ``check_voice`` o ``voice_id`` é
+    confirmado no Fish Audio ANTES de gravar — id que não existe bloqueia o
+    cadastro e é nomeado na mensagem; a chave nunca é ecoada.
+    """
     if not isinstance(fields, dict):
         raise ValueError("campos da persona inválidos")
 
@@ -874,9 +1437,6 @@ def upsert(fields: dict, confirm_paid: bool = False,
     with _LOCK:
         data = _read_store()
         existing = data["personas"].get(target_id)
-        if existing is None and len(data["personas"]) >= MAX_PERSONAS:
-            raise ValueError(
-                f"limite de {MAX_PERSONAS} personas atingido; remova uma antes")
 
         merged = _merge_fields(existing or {}, fields)
         name = _text(merged.get("name"))
@@ -892,6 +1452,20 @@ def upsert(fields: dict, confirm_paid: bool = False,
             raise ValueError("voice_id do Fish Audio é obrigatório")
         if len(voice_id) > 200 or _contains_secret(voice_id):
             raise ValueError("voice_id inválido")
+
+        # O dono quer cadastro, não aposta: a voz é conferida no serviço antes
+        # de entrar no quadro. Repetir a checagem de uma voz já confirmada só
+        # faria cada edição pagar uma ida à API.
+        voice_check = ""
+        already_ok = (_text((existing or {}).get("voice_check")) == "ok"
+                      and _text((existing or {}).get("voice_id")) == voice_id)
+        if check_voice and not already_ok:
+            voice_check = validate_voice_id(voice_id) or "ok"
+        elif already_ok:
+            voice_check = "ok"
+
+        role = _validate_role(merged.get("role")) or resolve_role(
+            {"id": target_id, "name": name})
 
         personality = _validate_personality(merged.get("personality"))
         skills = _ensure_required_skills(
@@ -922,9 +1496,26 @@ def upsert(fields: dict, confirm_paid: bool = False,
         reasoning = _reasoning(model, merged.get("reasoning"))
         context_size = _validate_context(merged.get("context_size"), model)
 
+        # direct_whatsapp: o declarado manda. Sem declaração, quem acaba de
+        # receber uma conta preenchida tem número (é assim que o assistente
+        # define uma persona nova com whats numa frase só). Vazio ou
+        # não-declarado é FALSO — sem número, nunca a conta principal.
+        declared_account = bool(_text(fields.get("whatsapp_account")))
+        direct = _normalize_direct_whatsapp(merged.get("direct_whatsapp"),
+                                           default=declared_account)
         wa_account = _text(merged.get("whatsapp_account"))
         if wa_account:
             wa_account = _resolve_whatsapp_account(wa_account)
+        if not direct:
+            # Sem número não existe conta dela: apagar aqui é o "remova os
+            # whats da Aline" num passo só, sem deixar conta fantasma no
+            # cadastro para o roteamento do WhatsApp achar que é dela.
+            wa_account = ""
+        elif not wa_account:
+            raise ValueError(
+                "direct_whatsapp=true exige a conta dela preenchida; diga "
+                "qual conta (e para a principal diga \"principal\" por "
+                "extenso)")
 
         now = _now()
         old_name = _text((existing or {}).get("name"))
@@ -949,6 +1540,8 @@ def upsert(fields: dict, confirm_paid: bool = False,
             "name": name,
             "gender": gender,
             "voice_id": voice_id,
+            "voice_check": voice_check,
+            "role": role,
             "personality": personality,
             "skills": skills,
             "stacks": stacks,
@@ -957,6 +1550,7 @@ def upsert(fields: dict, confirm_paid: bool = False,
             "reasoning": reasoning,
             "context_size": context_size,
             "whatsapp_account": wa_account,
+            "direct_whatsapp": direct,
             "allowed_dirs": allowed_dirs,
             "aliases": aliases,
             "history": entries,

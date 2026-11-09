@@ -18,15 +18,16 @@ import re
 
 from core import personas as persona_store
 from core import projects
+from core.persona_ops import delegation, limits
 
 _SECRET_RE = re.compile(
     r"(?i)(api[_\-\s]?key|access[_\-\s]?key|secret[_\-\s]?key|password|"
     r"passwd|senha|token|bearer\s+[a-z0-9]+|sk-[a-z0-9]{4,})"
 )
 
-_FIELD_KEYS = ("id", "name", "gender", "voice_id", "personality", "skills",
-               "stacks", "model", "reasoning", "context_size",
-               "whatsapp_account", "allowed_dirs")
+_FIELD_KEYS = ("id", "name", "gender", "voice_id", "role", "personality",
+               "skills", "stacks", "model", "reasoning", "context_size",
+               "whatsapp_account", "direct_whatsapp", "allowed_dirs")
 
 _ACTION_ALIASES = {
     "criar": "create", "crie": "create", "nova": "create",
@@ -38,6 +39,9 @@ _ACTION_ALIASES = {
     "resolver": "resolve", "resolva": "resolve", "nome_antigo": "resolve",
     "historico": "history", "histórico": "history", "memoria": "history",
     "aposentar": "retire", "aposentada": "retire", "aposentado": "retire",
+    "cascata": "cascade", "fila_de_modelos": "cascade", "modelos_free": "cascade",
+    "delegar": "delegate", "delega": "delegate", "quem_cuida": "delegate",
+    "limites": "limits", "limite": "limits", "concorrencia": "limits",
 }
 
 
@@ -88,17 +92,34 @@ def _multiplier(persona_or_model) -> str:
     return persona_store.format_multiplier(value)
 
 
+def _voice_note(persona: dict) -> str:
+    """O aviso de quando a voz entrou sem ser conferida no Fish Audio."""
+    check = str(persona.get("voice_check") or "").strip()
+    if not check or check == "ok":
+        return ""
+    return check
+
+
+def _message_with_voice(prefix: str, persona: dict) -> str:
+    note = _voice_note(persona)
+    return f"{prefix} Atenção: {note}." if note else prefix
+
+
 def _summary(persona: dict) -> dict:
     return {
         "id": persona.get("id"),
         "name": persona.get("name"),
         "gender": persona.get("gender"),
         "address": persona_store.address(persona),
+        "role": persona_store.resolve_role(persona),
+        "voice_id": persona.get("voice_id"),
+        "voice_check": _voice_note(persona),
         "model": persona.get("model"),
         "multiplier": _multiplier(persona),
         "reasoning": persona.get("reasoning"),
         "context_size": persona.get("context_size"),
-        "whatsapp_account": persona.get("whatsapp_account") or "",
+        "whatsapp_account": persona_store.own_account(persona),
+        "direct_whatsapp": persona_store.direct_whatsapp(persona),
         "allowed_dirs": list(persona.get("allowed_dirs") or []),
         "skills": list(persona.get("skills") or []),
         "stacks": list(persona.get("stacks") or []),
@@ -188,9 +209,11 @@ def _create(parameters: dict) -> dict:
         "status": "created",
         "persona": persona,
         "multiplier": _multiplier(persona),
-        "message": (f"Persona {persona['name']} criada "
-                    f"({persona_store.address(persona)}), modelo "
-                    f"{persona['model']} {_multiplier(persona)}."),
+        "voice_check": _voice_note(persona),
+        "message": _message_with_voice(
+            f"Persona {persona['name']} criada "
+            f"({persona_store.address(persona)}), modelo "
+            f"{persona['model']} {_multiplier(persona)}.", persona),
     }
 
 
@@ -220,7 +243,9 @@ def _update(parameters: dict) -> dict:
         "status": "updated",
         "persona": persona,
         "multiplier": _multiplier(persona),
-        "message": f"Persona {persona['name']} atualizada.",
+        "voice_check": _voice_note(persona),
+        "message": _message_with_voice(
+            f"Persona {persona['name']} atualizada.", persona),
     }
 
 
@@ -313,7 +338,10 @@ def _list() -> dict:
     return {
         "status": "ok",
         "count": len(items),
-        "limit": persona_store.MAX_PERSONAS,
+        # Não há teto de cadastro (ordem do dono): o limitado é o que se pede
+        # ao mesmo tempo — e esses números vêm da configuração ajustável.
+        "limits": limits.read_limits(),
+        "active": limits.working([p.get("id") for p in items]),
         "personas": [_summary(persona) for persona in items],
     }
 
@@ -388,6 +416,78 @@ def _link_project(parameters: dict) -> dict:
     }
 
 
+def _cascade(parameters: dict) -> dict:
+    """A fila de modelos (melhor → pior) e o que cada persona vai usar agora."""
+    preferred = str(parameters.get("model") or "").strip()
+    wanted = str(parameters.get("persona") or parameters.get("id")
+                 or parameters.get("name") or "").strip()
+    report = persona_store.cascade_report(preferred=preferred)
+    free = [row["model"] for row in report if row["state"] == "livre"]
+    persona = persona_store.get(wanted) if wanted else None
+    if persona:
+        choice = persona_store.model_for(persona)
+        entry = choice.get("model") or {}
+        chosen = str(entry.get("value") or "").strip()
+        use = {
+            "persona": persona.get("id"),
+            "model": chosen or None,
+            "switched": bool(choice.get("switched")),
+            "reason": choice.get("reason"),
+        }
+        message = (f"{persona['name']} vai usar {chosen}." if chosen else
+                   f"Nada grátis na cascata para {persona['name']}: "
+                   f"{choice.get('reason')}.")
+    else:
+        use = None
+        message = ("Cascata do melhor para o pior, com o preço de cada um; "
+                   f"{len(free)} gratuitos agora.")
+    return {
+        "status": "ok",
+        "in_cascade": list(persona_store.CASCADE_PERSONAS),
+        "count": len(report),
+        "free": free,
+        "cascade": report,
+        "use": use,
+        "message": message,
+    }
+
+
+def _delegate(parameters: dict) -> dict:
+    """De quem é o assunto: o plano pronto de quem o Gino vai pedir."""
+    task = str(parameters.get("task") or parameters.get("text") or "").strip()
+    if not task:
+        raise ValueError("informe task (o pedido do dono)")
+    path = str(parameters.get("path") or "").strip()
+    result = delegation.plan(task, persona_store.list_personas(),
+                             path=path).as_dict()
+    if result.get("delegated"):
+        result["message"] = (result.get("lead")
+                             or f"Vou pedir para {result.get('name')} ver.")
+    else:
+        result["message"] = (f"Isso é comigo mesmo ({result.get('reason')}); "
+                             f"não delego.")
+    return result
+
+
+def _limits(parameters: dict) -> dict:
+    """Quantos pedidos ao mesmo tempo — e o ajuste, se vier valor."""
+    concurrent = parameters.get("max_concurrent_personas")
+    per_persona = parameters.get("max_tasks_per_persona")
+    if concurrent is None and per_persona is None:
+        saved = limits.read_limits()
+    else:
+        saved = limits.save_limits(concurrent=concurrent, per_persona=per_persona)
+    return {
+        "status": "ok",
+        "limits": saved,
+        "active": limits.slots().snapshot(),
+        "message": (f"Posso pedir a no máximo "
+                    f"{saved['max_concurrent_personas']} personas ao mesmo "
+                    f"tempo, e cada uma roda até "
+                    f"{saved['max_tasks_per_persona']} tasks juntas."),
+    }
+
+
 _DISPATCH = {
     "create": lambda p: _create(p),
     "update": lambda p: _update(p),
@@ -398,6 +498,9 @@ _DISPATCH = {
     "list": lambda p: _list(),
     "show": lambda p: _show(p),
     "models": lambda p: _models(),
+    "cascade": lambda p: _cascade(p),
+    "delegate": lambda p: _delegate(p),
+    "limits": lambda p: _limits(p),
     "for_project": lambda p: _for_project(p),
     "link_project": lambda p: _link_project(p),
 }
@@ -413,8 +516,8 @@ def personas(parameters: dict, player=None, speak=None,
         return _json({
             "status": "error",
             "error": "action inválida; use create, update, delete, resolve, "
-                     "history, retire, list, show, models, for_project ou "
-                     "link_project",
+                     "history, retire, list, show, models, cascade, delegate, "
+                     "limits, for_project ou link_project",
         })
     try:
         return _json(handler(p))
@@ -442,11 +545,20 @@ TOOL = {
         "aposentado, o assistente principal (não a persona antiga) se despede "
         "em personagem usando a personalidade e o status do registro, depois "
         "responde o pedido. Toda persona tem nome, gênero (f/m/n), voice_id do "
-        "Fish Audio, personalidade, skills, stacks, modelo, reasoning e "
-        "contexto, além dos diretórios de leitura permitidos (vazio = lê "
-        "tudo). Modelo pago só é salvo com confirmação explícita: mostre o "
-        "multiplicador ao dono e chame de novo com confirm_paid=true depois do "
-        "'pode'. Nunca grave segredos na personalidade."
+        "Fish Audio, cargo (role), personalidade, skills, stacks, modelo, "
+        "reasoning e contexto, além dos diretórios de leitura permitidos "
+        "(vazio = lê tudo). O voice_id é checado no Fish Audio antes de "
+        "salvar: id que não existe derruba o cadastro dizendo qual id. O "
+        "assistente principal (Gino) é persona do quadro, com cargo "
+        "Orquestrador: action=delegate diz de quem é o assunto e devolve o "
+        "pedido pronto para persona_ask — quando existe persona para o tema, "
+        "ele delega em vez de executar; action=cascade mostra a fila de "
+        "modelos do melhor para o pior, marcando o que é grátis e o que já "
+        "estourou; action=limits lê (e ajusta) quantas personas podem receber "
+        "pedidos ao mesmo tempo e quantas tasks cada uma roda junto. Modelo "
+        "pago só é salvo com confirmação explícita: mostre o multiplicador ao "
+        "dono e chame de novo com confirm_paid=true depois do 'pode'. Nunca "
+        "grave segredos na personalidade."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -454,8 +566,8 @@ TOOL = {
             "action": {
                 "type": "STRING",
                 "enum": ["create", "update", "delete", "resolve", "history",
-                         "retire", "list", "show", "models", "for_project",
-                         "link_project"],
+                         "retire", "list", "show", "models", "cascade",
+                         "delegate", "limits", "for_project", "link_project"],
                 "description": "Ação a executar.",
             },
             "id": {
@@ -472,7 +584,17 @@ TOOL = {
             },
             "voice_id": {
                 "type": "STRING",
-                "description": "reference_id da voz no Fish Audio.",
+                "description": "reference_id da voz no Fish Audio. É conferido "
+                               "no serviço ANTES de salvar: id que não existe "
+                               "bloqueia o cadastro e é nomeado no erro (a "
+                               "chave nunca aparece).",
+            },
+            "role": {
+                "type": "STRING",
+                "description": "Cargo da persona (ex.: 'Designer de "
+                               "Interface'). Vazio usa o cargo de origem; o "
+                               "Gino é 'Orquestrador'. Máx. 120 chars, sem "
+                               "segredos.",
             },
             "personality": {
                 "type": "STRING",
@@ -509,8 +631,19 @@ TOOL = {
             "whatsapp_account": {
                 "type": "STRING",
                 "description": "Nome da conta WhatsApp pareada que esta persona "
-                               "usa como dela (ex.: 'trabalho'); vazio = conta "
-                               "principal.",
+                               "usa como dela (ex.: 'trabalho'). Vazio = NENHUMA "
+                               "conta; para a conta principal diga 'principal' "
+                               "por extenso. Só tem efeito com "
+                               "direct_whatsapp=true.",
+            },
+            "direct_whatsapp": {
+                "type": "BOOLEAN",
+                "description": "True = a persona tem número WhatsApp próprio "
+                               "(recebe e responde pela conta dela). False "
+                               "(padrão, vazio) = sem número: ela continua "
+                               "respondendo quando o dono a chama pelo nome no "
+                               "chat do assistente, mas não recebe nem envia por "
+                               "conta nenhuma — e apaga a whatsapp_account dela.",
             },
             "allowed_dirs": {
                 "type": "STRING",
@@ -542,6 +675,21 @@ TOOL = {
                 "type": "BOOLEAN",
                 "description": "True somente depois que o dono confirmou o "
                                "multiplicador de um modelo pago.",
+            },
+            "task": {
+                "type": "STRING",
+                "description": "O pedido do dono, para action=delegate dizer "
+                               "quem cuida dele.",
+            },
+            "max_concurrent_personas": {
+                "type": "INTEGER",
+                "description": "action=limits: quantas personas podem receber "
+                               "pedidos ao mesmo tempo (padrão 4).",
+            },
+            "max_tasks_per_persona": {
+                "type": "INTEGER",
+                "description": "action=limits: quantas tasks cada persona roda "
+                               "por vez (padrão 4).",
             },
         },
         "required": ["action"],
