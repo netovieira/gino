@@ -23,11 +23,12 @@ pytest.importorskip("neonize")
 from neonize.proto.Neonize_pb2 import Message  # noqa: E402
 from neonize.utils import build_jid  # noqa: E402
 
-from core import whatsapp, whatsapp_watch  # noqa: E402
+from core import group_policy, whatsapp, whatsapp_watch  # noqa: E402
 
 OWNER = "5517981792464"       # número do dono = conta pareada "principal"
 ASSISTANT = "5517992101133"   # número de saída = conta "trabalho"
 THIRD = "5511888888888"
+FRIEND = "5521888887777"      # terceiro COM autorização na allow-list
 GROUP = "120363000000000000@g.us"
 
 
@@ -79,6 +80,43 @@ class CaptureCase:
                 self.account.inbox_file.read_text().splitlines() if line]
 
 
+def _bodies(lines: list[dict]) -> list[str]:
+    """Os corpos que viraram inbox — é exatamente isso que a lei nega."""
+    return [str(line.get("text") or "") for line in lines]
+
+
+# A resposta de grupo (``whatsapp_watch._process_group`` -> veredito ->
+# ``core/group_reply`` -> Brain -> ``whatsapp.send``) roda na thread DAEMON da
+# fila da conta: ela sobrevive ao fim do teste e enviaria pelo client que
+# estiver vivo NAQUELE momento — foi assim que um "*Gino:" de teste apareceu em
+# `tests/test_whatsapp_delivery.py`. Este módulo é do que CHEGA AO DISCO, então
+# aqui a rota de grupo é apenas REGISTRADA; a rota em si é travada em
+# `tests/test_group_allowlist.py` (veredito) e em
+# `tests/test_remote_owner_voice.py` (o que o grupo nunca alcança).
+_GROUP_ROUTE: list[tuple[str, dict]] = []
+
+
+def _stub_group_route(account: str, item: dict) -> bool:
+    _GROUP_ROUTE.append((account, item))
+    return False
+
+
+def _owner_in_group(chat: str, present: bool | None) -> None:
+    """Preenche (ou limpa) a prova de presença do dono naquele grupo.
+
+    As DUAS faces do JID entram no cache de propósito: o `build_jid` do
+    fixture não separa o servidor "@g.us", então `_chat_identity` devolve só os
+    dígitos, enquanto no aparelho real o chat chega com o sufixo. A chave do
+    cache é o chat do item — o caso não pode depender desse detalhe do neonize.
+    """
+    base = str(chat or "").split("@")[0]
+    for key in {chat, base, f"{base}@g.us"}:
+        if present is None:
+            whatsapp._group_owner_cache.pop(key, None)
+        else:
+            whatsapp._group_owner_cache[key] = (present, time.time())
+
+
 @pytest.fixture
 def wire(tmp_path, monkeypatch):
     calls: list[tuple[str, dict]] = []
@@ -93,8 +131,15 @@ def wire(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "memory.config_manager.get_plugin_setting",
         lambda _ns, key, default=None: OWNER if key == "owner_chat" else default)
+    # `note_owner_sighting` escreve no cache de presença do dono no grupo, e
+    # essa prova é global: sem isolar aqui, um módulo seguinte herdaria "o dono
+    # está naquele chat" sem nunca ter consultado o aparelho.
+    monkeypatch.setattr(group_policy, "_presence_cache",
+                        dict(group_policy._presence_cache))
 
     whatsapp_watch.reset()
+    _GROUP_ROUTE.clear()
+    monkeypatch.setattr(whatsapp_watch, "_process_group", _stub_group_route)
     whatsapp_watch.start(lambda account, item: calls.append((account, item))
                          or True,
                          logger=lambda _m: None, assistant_name="Gino",
@@ -262,22 +307,127 @@ def test_third_party_naming_the_assistant_still_triggers(wire, tmp_path):
 
 
 def test_group_message_naming_the_assistant_is_ignored(wire, tmp_path):
-    """Grupo NUNCA vira turno — nem com o nome (decisão do dono)."""
+    """Grupo nunca chega ao handler do 1:1: a rota dele é outra.
+
+    (Lei de 09/11/2026: grupo voltou a ser LIDO e pode virar turno pela rota
+    ``whatsapp_watch._process_group`` -> veredito -> ``core/group_reply``. O
+    que este caso trava é o que não mudou: o ``handler`` registrado em
+    ``whatsapp_watch.start`` — o turno do app, com voz privilegiada do dono —
+    continua sem ser chamado por mensagem de grupo.)
+    """
     case = CaptureCase(tmp_path, "trabalho", ASSISTANT)
     case.deliver(make_event(GROUP, "Gino, olha isso", from_me=False,
                             group=True, sender=OWNER))
     assert wire == []
 
 
-def test_group_event_is_not_logged(wire, tmp_path, monkeypatch):
-    """Sem rastro de conversa de grupo no log: grupo não é monitorado."""
+# ORDEM QUE MUDOU ESTE CASO — escrita aqui porque o teste afirmava o contrário.
+# Este caso se chamava `test_group_event_is_not_logged` e exigia `logs == []`,
+# isto é, "grupo não é monitorado": a regra 4 do dono de 01/11 e 02/11/2026
+# (skills/whatsapp/SKILL.md:14, "Grupo NUNCA é lido nem respondido"). Ele
+# REVOGOU essa regra na rodada de decisões do plano de 07/11, registrada com
+# data no vault
+# ``Documentos/Obsidian Vault/PLANO-2026-11-07-fluxo-plano-aprovacao-tarefa-e-vault-de-obras.md:70``:
+# "AGORA VOCE VAI PODER LER GRUPOS, MAS RESPONDER APENAS PESSOAS AUTORIZADAS"
+# (e a linha 69 do mesmo arquivo mostra que a pergunta era exatamente essa:
+# "Revogar a SUA regra vigente sobre grupos"). A lei codificada em
+# ``core/group_policy.py:5-7`` e ``core/whatsapp_watch.py:13-25`` diz o
+# corolário: quem lê grupo tem que dizer no log o que decidiu e por quê —
+# "Silêncio é sempre veredito negativo com motivo no log". Exigir zero linhas
+# de log era, portanto, exigir o cumprimento da regra morta.
+#
+# O que continua proibido — e agora está travado com mais força aqui, no lugar
+# certo — é o que a regra de privacidade realmente protege (mesmo arquivo,
+# linha 82: "SE EU NAO ESTIVER NO CHAT, VOCE NEM VAI VER O CHAT"): o CORPO da
+# conversa de grupo não pode virar corpus em disco sem o crivo da allow-list
+# (DEF-20261109-155823, travado em
+# ``test_group_third_party_body_is_never_persisted_in_the_inbox``), o rastro não
+# pode citar o que foi dito, e grupo não vira turno pelo caminho do 1:1.
+def test_group_event_is_traced_without_the_body_and_never_turns(wire, tmp_path,
+                                                                monkeypatch):
+    """Grupo é lido: uma linha de rastro, sem o corpo, e nenhum turno do 1:1."""
     logs: list[str] = []
     monkeypatch.setattr(whatsapp, "_logger", logs.append)
+    monkeypatch.setattr(whatsapp, "_group_owner_cache", {})
     case = CaptureCase(tmp_path, "trabalho", ASSISTANT)
-    case.deliver(make_event(GROUP, "Gino, olha isso", from_me=False,
-                            group=True, sender=OWNER))
-    assert logs == []
+    lines = case.deliver(make_event(GROUP, "Gino, olha isso", from_me=False,
+                                    group=True, sender=OWNER))
+    # O rastro existe (é a prova de que o evento chegou ao Python, o buraco que
+    # a lei nova não pode reabrir) e não cita o que foi dito: nem o corpo, nem
+    # o nome do assistente aparecem na linha.
+    assert len(logs) == 1
+    assert "grupo" in logs[0] and "lida de" in logs[0]
+    assert all("olha isso" not in line and "Gino" not in line for line in logs)
+    # Turno pelo caminho do 1:1: nunca. O item entra pela rota de grupo
+    # (registrada acima, `_stub_group_route`) e o handler do app não é chamado.
     assert wire == []
+    assert [acct for acct, _ in _GROUP_ROUTE] == ["trabalho"]
+    # Controle do portão — o gate não é censura de grupo nenhum: a fala do
+    # DONO num grupo onde ele está (escrever ali é a prova de presença, e ele é
+    # irrevogável na allow-list) continua persistida, para ele poder perguntar
+    # depois o que disse onde.
+    assert _bodies(lines) == ["Gino, olha isso"]
+
+
+def test_group_third_party_body_is_never_persisted_in_the_inbox(wire, tmp_path,
+                                                                monkeypatch):
+    """DEF-20261109-155823: conversa alheia de grupo não entra no disco.
+
+    Ler grupo foi liberado (vault
+    ``PLANO-2026-11-07-fluxo-plano-aprovacao-tarefa-e-vault-de-obras.md:70``),
+    responder só a contato da allow-list, e sem o dono no chat "voce nem vai
+    ver o chat" (mesmo arquivo, linha 82). Antes, `_append_inbox` rodava para
+    TODA mensagem fresca e corpo + remetente de terceiro ficavam em
+    `memory/whatsapp_inbox*.jsonl`. Cada gate tem aqui o SEU caso e um controle
+    positivo, para nenhum deles virar bloco que aprova tudo por acidente.
+    """
+    allow = tmp_path / "group_allowlist.json"
+    allow.write_text(json.dumps({"version": 1, "contatos": [
+        {"jid": OWNER, "nome": "Dono", "tipo": "contato", "dono": True},
+        {"jid": FRIEND, "nome": "Vida", "tipo": "contato"},
+    ]}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(group_policy, "_PATH", allow)
+    monkeypatch.setattr(whatsapp, "_group_owner_cache", {})
+    monkeypatch.setattr(whatsapp, "list_accounts", lambda: [])
+    # A rota de resposta de grupo está registrada, não ativa (fixture `wire`):
+    # este caso é de DISCO — o que o inbox persista — e nenhum item daqui pode
+    # chegar ao veredito de verdade, que chamaria o Brain e enviaria pelo
+    # client do módulo seguinte. Os textos são narração de propósito: mesmo que
+    # alguém religar a rota, "narracao" é silêncio.
+    room = "120363000000000007@g.us"
+    case = CaptureCase(tmp_path, "trabalho", ASSISTANT)
+    # O inbox é cumulativo: `seen` é o que a lei autorizou até cada linha, e
+    # cada recusa tem que deixar a lista EXATAMENTE como estava.
+    seen: list[str] = []
+
+    # 1) Presença provada, autor FORA da allow-list: nada no disco.
+    _owner_in_group(room, True)
+    assert _bodies(case.deliver(make_event(
+        room, "o Anthero sumiu hoje", from_me=False,
+        group=True, sender=THIRD))) == seen
+    # 2) Controle positivo: o MESMO grupo, autor DENTRO da allow-list -> entra.
+    seen.append("Gino, cheguei agora aqui")
+    assert _bodies(case.deliver(make_event(
+        room, "Gino, cheguei agora aqui", from_me=False,
+        group=True, sender=FRIEND))) == seen
+    # 3) Autor autorizado, presença NÃO provada: falha fechada, nada entra
+    #    (a consulta cara ao aparelho é do veredito, no worker da conta).
+    _owner_in_group(room, None)
+    assert _bodies(case.deliver(make_event(
+        room, "Gino, estou no portao", from_me=False,
+        group=True, sender=FRIEND))) == seen
+    # 4) Allow-list corrompida fecha o grupo inteiro (arquivo ilegível não
+    #    decide nada) mesmo com presença provada e contato autorizado.
+    allow.write_text("{ isto nao e json", encoding="utf-8")
+    _owner_in_group(room, True)
+    assert _bodies(case.deliver(make_event(
+        room, "Gino, estou no portao", from_me=False,
+        group=True, sender=FRIEND))) == seen
+    # 5) Controle fora da lei de grupos: o 1:1 do MESMO contato continua
+    #    persistido — é assim que "a Maria mandou foto?" é respondido.
+    seen.append("sem meu nome aqui")
+    assert _bodies(case.deliver(make_event(FRIEND, "sem meu nome aqui",
+                                           from_me=False))) == seen
 
 
 def test_group_message_without_the_name_is_ignored(wire, tmp_path):

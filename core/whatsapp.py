@@ -822,6 +822,76 @@ def qr_age(account: str | None = None) -> float:
 
 # ── inbox ────────────────────────────────────────────────────────────────────
 
+def _owner_seen_in_group(chat: str, sender: str = "") -> bool:
+    """Presença do dono no grupo provada SEM RPC (thread do neonize não espera).
+
+    ``owner_in_group`` consulta o aparelho pareado e por isso é caminho do
+    worker da conta (o veredito), nunca do dispatch. Aqui só vale fato já
+    medido: o cache de participantes (TTL ``GROUP_INFO_TTL_S``) ou o dono
+    escrevendo neste grupo agora — a mesma prova que
+    ``group_policy.note_owner_sighting`` registra, e que acabou de rodar no
+    ``_on_message``. Sem prova: ``False`` (falha fechada, ordem 6 da lei de
+    grupos: "se eu não estiver no chat, você nem vai ver o chat").
+    """
+    try:
+        from core import group_policy
+    except Exception:
+        return False
+    if sender and group_policy.is_owner(sender):
+        return True
+    raw = str(chat or "").strip()
+    if not raw:
+        return False
+    with _lock:
+        hit = _group_owner_cache.get(raw)
+    return bool(hit and hit[0] is True
+                and time.time() - (hit[1] or 0.0) < GROUP_INFO_TTL_S)
+
+
+def _inbox_refusal(item: dict) -> str:
+    """'' quando o corpo pode ser persistido; senão o MOTIVO da recusa.
+
+    Chat individual (do dono ou de terceiro) é o fluxo de sempre: é assim que
+    "a Maria mandou foto?" é respondido, e nada aqui muda isso.
+
+    GRUPO obedece à lei de 09/11/2026 (vault
+    ``PLANO-2026-11-07-fluxo-plano-aprovacao-tarefa-e-vault-de-obras.md:70``
+    — "AGORA VOCE VAI PODER LER GRUPOS, MAS RESPONDER APENAS PESSOAS
+    AUTORIZADAS" — e ``:82``, "SE EU NAO ESTIVER NO CHAT, VOCE NEM VAI VER O
+    CHAT"). Ler o grupo é permitido; gravar corpo e remetente em
+    ``memory/whatsapp_inbox*.jsonl`` é VER a conversa com memória, então entra
+    pelo mesmo crivo do veredito, na mesma ordem: allow-list legível (arquivo
+    corrompido ou vazio fecha tudo), dono presente (prova barata, sem RPC) e
+    autor na allow-list por contato. Era o DEF-20261109-155823: `_append_inbox`
+    rodava para toda mensagem fresca de grupo sem consultar nenhum dos três e
+    a fala de terceiro ficava persistida em disco.
+
+    A recusa é silenciosa de propósito (nenhuma resposta, nenhum aviso na
+    sala); o motivo sai no rastro de leitura do grupo, uma linha por mensagem.
+    """
+    try:
+        from core import group_policy
+    except Exception:
+        # Sem política carregável o grupo fecha e o 1:1 segue: falha fechada.
+        if item.get("group") or str(item.get("chat") or "").endswith("g.us"):
+            return "politica de grupos indisponivel"
+        return ""
+    if not group_policy.is_group_message(item):
+        return ""
+    gate = group_policy.allowlist_status()
+    if not gate.get("ok"):
+        return f"allow-list indisponivel: {gate.get('reason') or '?'}"
+    group = str(item.get("chat") or "")
+    if not _owner_seen_in_group(group, str(item.get("sender") or "")):
+        return "dono nao esta provado no grupo"
+    sender = group_policy.sender_jid(item)
+    if not sender:
+        return "remetente do grupo nao identificado"
+    if not group_policy.is_allowed(sender):
+        return "remetente nao esta na allow-list"
+    return ""
+
+
 def _append_inbox(item: dict, acct: _Account) -> None:
     try:
         # The password command is consumed by main.py before the model, but
@@ -2250,8 +2320,11 @@ def _on_message(client, ev, acct: _Account) -> None:
         # Rastro mínimo de que o evento chegou ao Python. Sem esta linha um
         # MessageEv perdido era indistinguível de uma conexão muda. Grupo
         # também é lido (ordem do dono, 09/11/2026) — o que continua proibido é
-        # responder a quem não está na allow-list. O LID vai junto
-        # porque é ele que aparece no celular do dono.
+        # responder a quem não está na allow-list E gravar no inbox a fala de
+        # quem não tem autorização (o motivo sai na própria linha). O LID vai
+        # junto porque é ele que aparece no celular do dono.
+        refusal = ""
+        fresh = abs(time.time() - stamp) < FRESH_TS_S
         if not group:
             _log(f"[{acct.name}] evento {item['id'] or '(sem id)'} de {chat}"
                  + (f"/{lid}" if lid else "")
@@ -2261,9 +2334,12 @@ def _on_message(client, ev, acct: _Account) -> None:
             # pelo dono em 09/11/2026). Ver o dono escrever aqui é a prova mais
             # barata de que ele está no grupo — e presença dele é o pré-req de
             # qualquer resposta (regra de privacidade geral).
+            if fresh:
+                refusal = _inbox_refusal(item)
             _log(f"[{acct.name}] grupo {chat}: lida de "
                  f"{item['sender_name'] or item['sender'] or '?'}"
-                 f"{' (eco)' if from_me else ''}")
+                 f"{' (eco)' if from_me else ''}"
+                 + (f" — inbox negado ({refusal})" if refusal else ""))
             try:
                 from core import group_policy as _group_policy
                 _group_policy.note_owner_sighting(chat, item["sender"])
@@ -2285,7 +2361,9 @@ def _on_message(client, ev, acct: _Account) -> None:
         # só o que é recente de verdade, senão o inbox local vira um arquivo de
         # histórico alheio ao que o usuário veio perguntar. (Com o timestamp
         # certo isto volta a valer para TODA mensagem — ver `_stamp_seconds`.)
-        if abs(time.time() - stamp) < FRESH_TS_S:
+        # E só o que a lei autoriza: grupo sem allow-list lida, sem dono provado
+        # ou de contato não autorizado não entra no disco (`_inbox_refusal`).
+        if fresh and not refusal:
             _append_inbox(item, acct)
 
         # O link da mídia morre: quem quer o arquivo tem que pedir agora.
