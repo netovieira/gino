@@ -620,6 +620,73 @@ def _sonda_dossie_imparcial() -> tuple[str, str]:
     return OK, ""
 
 
+def _sonda_casa_apelidos() -> tuple[str, str]:
+    """Casa (config): o mapa de apelidos do dono carrega do disco e tem nomes.
+
+    Sondagem DE CONFIG: só nomes e entity ids — nenhum segredo, nenhum valor
+    de aparelho. O arquivo é lido pelo próprio plugin (mesmo caminho da
+    chamada viva), então a sonda prova o que a chamada prova. Ausente ou
+    corrompido é ``falha``: a regra do dono (09/11/2026) é nome ensinado virar
+    arquivo, e sem arquivo o nome morre na conversa de novo.
+    """
+    try:
+        from actions import home_control as hc
+    except Exception as exc:
+        return NV, f"actions/home_control.py ilegivel: {type(exc).__name__}"
+    try:
+        entries, warning = hc.alias_entries()
+        status = hc.aliases_status()
+    except Exception as exc:
+        return NV, f"mapa de apelidos ilegivel: {type(exc).__name__}"
+    if not status.get("ok"):
+        return FALHA, f"mapa de apelidos sem carregar ({status.get('estado')})"
+    if not entries:
+        return FALHA, "mapa de apelidos vazio: nenhum nome ensinado persistiu"
+    chaves = {hc.fold_name(entry.get("apelido")) for entry in entries}
+    if "luz" not in chaves or "luz do quarto" not in chaves:
+        return FALHA, "o apelido da luz do quarto sumiu do mapa"
+    for entry in entries:
+        alvo = str(entry.get("entidade") or "")
+        if "." not in alvo or " " in alvo:
+            return FALHA, f"apelido '{entry.get('apelido')}' sem entidade valida"
+    if warning:
+        return FALHA, f"mapa com entrada quebrada: {_sanitize(warning)}"
+    return OK, ""
+
+
+def _sonda_casa_resolucao() -> tuple[str, str]:
+    """Casa (estática): "luz do quarto" passa pelo mapa, não pelo domínio chutado.
+
+    Prova OFFLINE — nenhum discurso ao vivo, nenhuma rede: os estados abaixo
+    simulam a casa real do dono (ZERO entidade ``light``; a luz é cena), o
+    formato exato que produziu o "a casa não tem luz nenhuma" de 09/11/2026.
+    O mapa é o do disco. Se a resolução voltar a cair na recusa por domínio,
+    ou se inventar uma entidade com estados vazios, a sonda pega.
+    """
+    try:
+        from actions import home_control as hc
+    except Exception as exc:
+        return NV, f"actions/home_control.py ilegivel: {type(exc).__name__}"
+    entries, _warning = hc.alias_entries()
+    entry, _conflict = hc.alias_for("luz do quarto", entries)
+    if entry is None:
+        return NV, "sem apelido gravado para 'luz do quarto' (nada a conferir)"
+    alvo = str(entry.get("entidade") or "")
+    estados = [{"entity_id": alvo, "state": "off",
+                "attributes": {"friendly_name": entry.get("nome") or "Luz"}}]
+    entity, error = hc.resolve("luz do quarto", estados)
+    if entity is None:
+        return FALHA, f"resolucao nao achou o apelido: {_sanitize(error)}"
+    if str(entity.get("entity_id")) != alvo:
+        return FALHA, f"resolveu para {entity.get('entity_id')}, esperado {alvo}"
+    _, erro_vazio = hc.resolve("luz do banheiro", [])
+    if "dominio" in str(erro_vazio).lower():
+        return FALHA, "recusa por dominio ainda viva no caminho de resolucao"
+    if not erro_vazio:
+        return FALHA, "resolucao inventou entidade com estados vazios"
+    return OK, ""
+
+
 def _sonda_skill_escopo() -> tuple[str, str]:
     """Escopo do pedido (estática): a SKILL existe e é referida no bloco por turno.
 
@@ -784,6 +851,13 @@ for _a in (
     Assertion("persona.sem-numero",
               "direct_whatsapp manda na conta: cadastro, rota de entrada e saida",
               "estatica", _sonda_persona_sem_numero),
+    Assertion("casa.apelidos-mapa",
+              "o mapa de apelidos do dono carrega do disco com nomes validos",
+              "config", _sonda_casa_apelidos),
+    Assertion("casa.resolucao-nome",
+              "resolucao de nome passa pelo mapa e por todos os domínios, "
+              "nunca pela recusa por domínio chutado",
+              "estatica", _sonda_casa_resolucao),
 ):
     register(_a)
 
