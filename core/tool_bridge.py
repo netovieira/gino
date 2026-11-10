@@ -43,6 +43,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from core import tool_receipts as _receipts
+# As duas portas do dono, nomeadas por constante (nunca o valor do segredo):
+# decisão 14 dele, 10/11/2026 — "a confirmação por voz minha e por senha
+# confirma e permite qualquer coisa". Toda recusa cita as duas.
+from core.owner_auth import doors as _owner_doors
 
 # ── risk tiers ───────────────────────────────────────────────────────────────
 #
@@ -821,9 +825,9 @@ class ToolBridge:
                     cancelled = self._remember_denial(name, args, tier)
                     if cancelled is not None:
                         return cancelled
-                    message = (f"Action '{name}' was not authorized by the owner's "
-                               f"voice yet. Ask the owner to say 'pode' or 'pode "
-                               f"enviar' out loud; there is no popup to click.")
+                    message = (f"Action '{name}' was not authorised yet. Ask "
+                               f"the owner for either of his two doors: "
+                               f"{_owner_doors('en')}.")
                     self._audit_action(name, args, tier, approved=False,
                                        result=message, status="denied",
                                        origin=origin_logged)
@@ -1082,12 +1086,14 @@ class ToolBridge:
             message = (f"Action '{name}' was parked and the request expired "
                        f"after {lifetime} without the owner's authorisation. "
                        f"It will not be sent; ask the owner for a fresh "
-                       f"request.")
+                       f"request, authorised by either of his two doors: "
+                       f"{_owner_doors('en')}.")
             status_tag = "pending_expired"
         else:
             message = (f"Action '{name}' was cancelled after {limit} refusals. "
                        f"It will not be retried; ask the owner for a fresh "
-                       f"request.")
+                       f"request, authorised by either of his two doors: "
+                       f"{_owner_doors('en')}.")
             status_tag = "pending_cancelled"
         if audit:
             self._audit_action(name, {}, tier, approved=False, result=message,
@@ -1146,10 +1152,10 @@ class ToolBridge:
         self._rearm_voice_pending(entry)
         attempts = int(entry.get("attempts") or 0) + 1
         message = (
-            f"Action '{name}' is still awaiting the owner's spoken "
-            f"authorisation (repeat {attempts} suppressed). The "
-            f"request was not reopened; do not ask again or retry "
-            f"— wait for the owner to say 'pode'.")
+            f"Action '{name}' is still awaiting the owner's authorisation "
+            f"(repeat {attempts} suppressed). The request was not reopened; "
+            f"do not ask again or retry — wait for either of his two doors: "
+            f"{_owner_doors('en')}.")
         self._audit_action(name, args, tier, approved=False,
                            result=message, status="denied_repeat")
         return JSONResponse(

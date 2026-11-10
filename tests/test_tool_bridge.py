@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 from fastapi.testclient import TestClient
 
+from core import owner_auth
 from core import rootgate
 from core import actiongate
 from core.brain import LOCAL_CHAT_DISABLED
@@ -781,7 +782,14 @@ class DenialMemoryTests(unittest.TestCase):
         self.assertTrue(body["repeated"])
         self.assertTrue(body["awaiting_voice"])
         self.assertEqual(body["status"], "denied")
-        self.assertIn("awaiting the owner's spoken", body["message"])
+        # Redacao da decisao 14 (dono, 10/11/2026): toda recusa nomeia as DUAS
+        # portas, no mesmo pe -- a voz dele ou a senha digitada. O que este
+        # teste prova nao mudou: a repeticao identica e suprimida sem reabrir
+        # a janela (assercoes abaixo); a frase so diz COMO o dono responde.
+        self.assertIn("still awaiting the owner's authorisation",
+                      body["message"])
+        self.assertIn(owner_auth.FACTOR_VOICE, body["message"])
+        self.assertIn(owner_auth.FACTOR_TEXT, body["message"])
         self.assertEqual(self.dispatch.calls, [])
         # No new prompt: the parked request is exactly the first one.
         self.assertEqual(actiongate.pending(), parked)

@@ -590,8 +590,9 @@ class RestartManager:
         if self._confirm_cb is not None and not self.dry_run:
             try:
                 self._confirm_cb(
-                    f"Ask the user to say '{request.phrase}' out loud to restart "
-                    f"the {kind}.")
+                    f"Ask the user to say '{request.phrase}' out loud, or to "
+                    f"type his password in the app or his own WhatsApp, to "
+                    f"restart the {kind}.")
             except Exception as e:
                 with self._lock:
                     if self._pending is request:
@@ -675,8 +676,9 @@ class RestartManager:
                 if self._pending is None:
                     self._pending = p
                     self._save_file(p)
-            return (f"Restart not confirmed: the user must say the exact phrase "
-                    f"'{p.phrase}' out loud. Nothing was done.")
+            return (f"Restart not confirmed: the owner must say the exact "
+                    f"phrase '{p.phrase}' out loud or give his typed password "
+                    f"(his two doors). Nothing was done.")
 
         if p.kind == "assistant":
             return self._run_assistant(p)

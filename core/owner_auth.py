@@ -36,6 +36,27 @@ REDACTED = "[senha oculta]"
 FACTOR_VOICE = "voz do dono"
 FACTOR_TEXT = "senha digitada"
 FACTORS = (FACTOR_VOICE, FACTOR_TEXT)
+
+
+# ── As DUAS portas nomeadas em toda recusa (decisão 14, dono, 10/11/2026) ───
+# "A confirmação por voz minha e por senha confirma e permite qualquer coisa
+# que você imaginar ... ela é como é a senha master e a minha voz é a voz do
+# criador." Consequência prática: TODO texto de recusa de portão que exige a
+# confirmação do dono nomeia as duas portas, no mesmo pé, em qualquer canal —
+# envio, e-mail, reinício/energia, suspensão, publicação. Um portão que cita
+# só a voz mente sobre a lei dele.
+# A frase nomeia os FATORES (as constantes acima), nunca o valor do segredo;
+# por isso é segura para ir ao log, à fala do modelo e ao corpo 403.
+def doors(lang: str = "pt") -> str:
+    """A frase curta das duas portas do dono. Nunca contém o segredo."""
+    if str(lang or "pt").lower().startswith("en"):
+        return (f"{FACTOR_VOICE} (say 'pode' out loud — there is no popup to "
+                f"click) or {FACTOR_TEXT} (typed in the app or in his own "
+                "WhatsApp)")
+    return (f"{FACTOR_VOICE} (ele diz 'pode' em voz alta) ou "
+            f"{FACTOR_TEXT} (ele digita no app ou no WhatsApp dele)")
+
+
 # Accepted typed forms: "senha: X", "senha=X", "autorizar: X", "/autorizar X".
 PASSWORD_RE = re.compile(
     r"^\s*(?:(?:/|\.)autorizar\s+|(?:autorizar|senha)\s*[:=]\s*)"

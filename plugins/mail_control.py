@@ -13,9 +13,12 @@ action=read, e só depois de o dono pedir. Nada disso vira fala sem passar pelo
 guarda de fala (core/speech_guard.py) — ver `core.email.safe_line`.
 
 ENVIO: `send` NÃO envia. Ele estaciona o pedido e devolve a frase que o modelo
-deve repetir: o dono precisa dizer em voz alta "confirmo enviar o e-mail". Só o
-portão de voz do main.py confirma, e só com a voz do dono reconhecida. Texto
-digitado nunca envia e-mail.
+deve repetir: o dono confirma com uma das DUAS portas dele — a voz ("confirmo
+enviar o e-mail" dito em voz alta) ou a senha digitada (no app, no WhatsApp
+dele, ou no próprio e-mail dele com a senha no assunto/corpo, decisão 14 de
+10/11/2026). O portão é o veredito único de `core/owner_auth.py`; texto
+digitado SEM senha nunca envia e-mail, e o valor da senha nunca é lido,
+repetido ou gravado.
 
     "tem e-mail novo?"                      → action: unread
     "lê o e-mail do banco"                  → action: read, query: banco
@@ -28,6 +31,7 @@ import re
 import time
 
 from core import email as mail
+from core.owner_auth import doors as mail_doors
 
 NS = "mail"
 
@@ -238,8 +242,9 @@ def _do_pending() -> tuple[str, str]:
     if not pending:
         return ("nenhum envio de e-mail esperando confirmação", "nada pendente")
     line = (f"e-mail para {pending.get('to')} com o assunto "
-            f"«{pending.get('subject') or '(sem assunto)'}» esperando a sua voz "
-            f"dizer «{mail.CONFIRM_MARKER} o e-mail»")
+            f"«{pending.get('subject') or '(sem assunto)'}» esperando a "
+            f"confirmação do dono — {mail_doors()} — dizendo "
+            f"«{mail.CONFIRM_MARKER} o e-mail»")
     return line, line
 
 
@@ -381,7 +386,9 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             title = "E-MAIL — leitura"
         elif action in ("send", "enviar", "manda", "mandar"):
             spoken, body_out = _do_send(to, subject, body, account)
-            title = "E-MAIL — envio (esperando a voz do dono)"
+            # As duas portas nomeadas no título que a UI mostra (decisão 14):
+            # um painel que só promete a voz esconde metade da lei dele.
+            title = f"E-MAIL — envio (esperando: {mail_doors()})"
         elif action in ("cancel", "cancelar"):
             spoken, body_out = _do_cancel()
             title = "E-MAIL — envio cancelado"
@@ -428,10 +435,13 @@ PLUGIN = {
         "read — fetch the body of ONE message that matches a word "
         "('lê o email da Maria'); the body is only fetched when the user asks; "
         "send — prepare a new e-mail with to/subject/body. "
-        "IMPORTANT: send NEVER sends. It parks the message and returns a "
-        "sentence asking the owner to say, out loud, 'confirmo enviar o e-mail'. "
-        "Only the owner's recognised voice can release it; you cannot confirm "
-        "and neither can typed text. Repeat the parked sentence and do not "
+        "IMPORTANT: send NEVER sends by itself. It parks the message and "
+        "returns a sentence asking the owner to confirm with either of his "
+        "two doors: " + mail_doors() + ". You cannot confirm it yourself. "
+        "His own e-mail carrying his password (subject or body) is request "
+        "AND approval in the same e-mail (decision 14, 10/11/2026) — the "
+        "value of the secret is never read aloud, logged or repeated. Repeat "
+        "the parked sentence and do not "
         "claim the e-mail was sent before the result says it was. "
         "NEVER include the body of a message in a spoken answer unless the user "
         "asked to read it: alerts are sender + subject only. "
@@ -454,8 +464,9 @@ PLUGIN = {
             "action": {
                 "type": "STRING",
                 "description": "unread (what arrived) | read (body of one "
-                               "message) | send (park, then the owner's voice "
-                               "confirms) | accounts | status | test | cancel "
+                               "message) | send (park, then either of the "
+                               "owner's two doors confirms) | accounts | "
+                               "status | test | cancel "
                                "| pending | filters | set_filter "
                                "| clear_filters",
             },

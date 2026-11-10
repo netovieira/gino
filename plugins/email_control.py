@@ -501,13 +501,15 @@ def read(query: str, values: dict | None = None, account: str = "") -> tuple[str
 
 def send(to: str, subject: str, body: str, values: dict | None = None,
          account: str = "") -> tuple[str, str]:
-    """Envio pela camada NOVA — e só com a voz do dono.
+    """Envio pela camada NOVA — e só com uma das DUAS portas do dono.
 
     Este plugin nasceu antes de core/email.py e mandava direto pelo SMTP. A
-    regra do dono é que e-mail é irreversível e exige a voz dele, então aqui só
-    estacionamos o pedido na mesma fila de core.email.request_send; o SMTP real
-    (send_now) só é alcançado pelo portão de voz do main.py. `values` não é
-    usado: a ferramenta nunca manda senha nenhuma, só o que o dono ditou.
+    regra do dono é que e-mail é irreversível e exige a confirmação dele, então
+    aqui só estacionamos o pedido na mesma fila de core.email.request_send; o
+    SMTP real (send_now) só é alcançado pelo portão dele no main.py — pela voz
+    ou pela senha digitada, os dois fatores plenos do veredito único
+    (core/owner_auth.authorized_factor, decisão 14 de 10/11/2026). `values` não
+    é usado: a ferramenta nunca manda senha nenhuma, só o que o dono ditou.
     """
     from core import email as _mail
     try:

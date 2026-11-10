@@ -1809,6 +1809,15 @@ _MAIL_CANCEL_RE = re.compile(
     r"^\s*(?:por\s+favor\s+)?(?:cancela|cancelar|aborta|abortar|descarta|"
     r"descartar|desiste|desistir)\b",
     re.IGNORECASE)
+# Decisão 14 do dono (10/11/2026): "se eu te mandar um e-mail pedindo para
+# você me retornar esse e-mail e no corpo dele tiver a senha ou no assunto ...
+# foi solicitado e aprovado no mesmo e-mail e me mandar a resposta". Isto só
+# reconhece o PEDIDO DE RESPOSTA; quem autoriza é a senha conferida pelo
+# portão (core/email.py), nunca esta regex.
+_MAIL_REPLY_RE = re.compile(
+    r"\b(retorne|retorna(?:r)?|responda|responde|resposta|reply|reenvie|"
+    r"reenvia|me\s+(?:mande|envie|d\xea)\s+(?:uma\s+)?resposta)\b",
+    re.IGNORECASE)
 
 # Owner rule (02/11/2026 ~19h, said twice): when the OWNER himself orders an
 # action, his order is the authorisation — he does not repeat the key phrase.
@@ -3012,6 +3021,10 @@ class JarvisLive:
         except Exception as e:
             print(f"[E-mail] aviso de boot não falado: {e}")
         try:
+            _mail.set_owner_mail_hook(self._mail_owner_authorization)
+        except Exception as e:
+            print(f"[E-mail] gancho de autorização por e-mail indisponível: {e}")
+        try:
             _mail.start(self._mail_new_message)
         except Exception as e:
             print(f"[E-mail] varredura de não lidos indisponível: {e}")
@@ -3270,6 +3283,84 @@ class JarvisLive:
                 pass
             return
         self._say_now(line, log=True, origin="email")
+
+    # ── Decisão 14: o e-mail dele com a senha é pedido E aprovação ──────────
+    def _mail_owner_authorization(self, payload) -> None:
+        """Trata o e-mail do dono que já veio com a senha (paridade de canal).
+
+        Chamado por ``core.email._authorize_owner_mail`` na thread da
+        varredura, SÓ quando o remetente é endereço do dono e a senha dele foi
+        conferida localmente (``owner_auth.authorized_factor``). O payload já
+        vem redigido: nenhum campo dele contém o valor do segredo — por isso
+        este método pode gravar, falar e mandar resposta sem risco de vazar.
+
+        O que acontece, na ordem, sempre pelos mecanismos que já existem:
+
+          1. ``_owner_password_grant()`` — o PONTO ÚNICO da senha digitada:
+             abre a janela de ação, a de envio, a de sudo, a do job e confirma
+             o que estava estacionado (reinício, energia, envio de e-mail);
+          2. o pedido expresso no e-mail vira turno do dono no cérebro vivo
+             (``_inject_user_turn``, o mesmo canal do ``plugin_say``), marcado
+             como autorizado por e-mail;
+          3. se o próprio e-mail pede a resposta ("retorne este e-mail"), a
+             resposta sai POR E-MAIL, para o endereço dele, pelo caminho já
+             existente (``core.email.send_now``) — sem segunda janela.
+
+        Fecho para quem não é ele: este gancho só é chamado com fator do dono;
+        endereço de terceiro, voz desconhecida, persona ou terceiro em grupo
+        não chegam aqui (``core.email.is_owner_mail`` é a porta fechada).
+        """
+        ev = payload if isinstance(payload, dict) else {}
+        factor = str(ev.get("factor") or "")
+        instruction = str(ev.get("instruction") or "").strip()
+        sender = str(ev.get("sender") or "").strip()
+        subject = str(ev.get("subject") or "").strip()
+        if factor != _owner_auth.FACTOR_TEXT:
+            return
+        try:
+            secs, root_secs, confirmados = self._owner_password_grant()
+        except Exception as e:
+            print(f"[E-mail] autorização por e-mail não abriu nada: {e}")
+            return
+        minutes = int(round(_OWNER_TEXT_TTL_S / 60.0))
+        try:
+            # Linha de rastro SEM segredo, SEM endereço: só o veredito.
+            self.ui.write_log(
+                "SYS: e-mail do dono com a senha — pedido aprovado no mesmo "
+                f"e-mail (senha digitada; sessão por texto {minutes} min; "
+                f"janela de ação {secs:.0f}s; janela de administrador "
+                f"{root_secs:.0f}s"
+                + (f"; confirmados: {', '.join(confirmados)}"
+                   if confirmados else "") + ").")
+        except Exception:
+            pass
+        print("[E-mail] pedido aprovado pelo próprio e-mail do dono "
+              f"(confirmados: {', '.join(confirmados) or 'nada'})")
+        if instruction:
+            try:
+                self._inject_user_turn(
+                    "ORDEM DO DONO, autorizada por senha no e-mail dele "
+                    "(veredito local, decisão 14 de 10/11/2026): "
+                    + instruction[:1200])
+            except Exception as e:
+                print(f"[E-mail] turno do pedido por e-mail falhou: {e}")
+        if not sender or not _MAIL_REPLY_RE.search(instruction):
+            return
+        body = ("Autorizei pelo seu próprio e-mail (senha conferida localmente"
+                f", fator: {_owner_auth.FACTOR_TEXT})."
+                + ("\nConfirmados: " + ", ".join(confirmados) + "."
+                   if confirmados else "\nNão havia pedido estacionado."))
+        if instruction:
+            body += "\nPedido recebido neste e-mail: " + instruction[:600]
+        body += ("\nAs janelas abertas: ação de risco, envio, administrador e "
+                 f"resposta a planos, por {minutes} minutos. O valor da senha "
+                 "não é lido, gravado nem repetido em lugar nenhum.")
+        try:
+            from core import email as _mail
+            ok, _message = _mail.send_now(sender, f"Re: {subject}"[:140], body)
+            print(f"[E-mail] resposta ao dono por e-mail: ok={ok}")
+        except Exception as e:
+            print(f"[E-mail] resposta por e-mail falhou: {e}")
 
     # ── Wake word: state machine ─────────────────────────────────────────────
 
@@ -14123,7 +14214,8 @@ class JarvisLive:
             except Exception:
                 pass
             self._say_now("Não reconheci a sua voz como dono; o e-mail não foi "
-                          "enviado. Repita a frase em voz alta.")
+                          "enviado. Confirme por uma das suas duas portas: "
+                          + _owner_auth.doors() + ".")
             print(f"[E-mail] envio não autorizado ({detail})")
             return True
         try:

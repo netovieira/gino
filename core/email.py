@@ -63,10 +63,20 @@ FILTRO POR CONTA (FLUXO MAPEAMENTO EMAIL, passos 2 e 4)
 
 ENVIO É IRREVERSÍVEL
     ``request_send()`` só estaciona o pedido; ``confirm_send(voice_ok=True)``
-    envia. O único caminho que passa ``voice_ok=True`` é o portão de voz do
-    main.py, depois do reconhecimento da voz do dono (``_speaker_order_identity``).
-    A ferramenta (plugins/mail_control.py) e o bridge nunca confirmam: texto
-    digitado não envia e-mail.
+    envia. ``voice_ok`` é o VEREDITO DO DONO, não o microfone: os dois fatores
+    plenos dele (voz confirmada por voiceprint OU senha digitada conferida —
+    decisão de 06/11/2026) abrem o envio, e desde a decisão de 10/11/2026 o
+    próprio e-mail dele com a senha no assunto ou no corpo conta como pedido E
+    aprovação no mesmo e-mail (``owner_mail_authorization`` →
+    ``main._owner_password_grant``). A ferramenta (plugins/mail_control.py) e
+    o bridge nunca confirmam por conta própria; texto digitado SEM senha não
+    envia nada.
+
+SEGREDADO NO QUE ENTRA
+    Assunto e corpo são lidos como cabeçalho/trecho, mas a senha do dono nunca
+    fica em lugar nenhum: ``_collect_unseen`` redige o assunto antes de gravar
+    o inbox e ``owner_mail_authorization`` devolve só texto já redigido. O
+    VALOR conferido não é retornado, logado, falado nem escrito.
 
 LEITURA NÃO MARCA COMO LIDO
     Tudo usa BODY.PEEK e seleciona a caixa em modo somente leitura: o assistente
@@ -91,6 +101,9 @@ from email.header import decode_header
 from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate, make_msgid, parseaddr, parsedate_to_datetime
 from pathlib import Path
+
+from core import owner_auth as _owner_auth
+from core.owner_auth import FACTOR_TEXT, doors as _owner_doors
 
 _BASE = Path(__file__).resolve().parent.parent
 
@@ -1769,11 +1782,253 @@ def _forget_inbox(acct: MailAccount, item: dict) -> bool:
         return False
 
 
+# ── e-mail do dono: o mesmo e-mail pede E aprova (decisão 14, 10/11/2026) ───
+# A lei dele, na palavra dele: "se eu te mandar um e-mail pedindo para você me
+# retornar esse e-mail e no corpo dele tiver a senha ou no assunto ... você já
+# tem que entender que foi solicitado e aprovado no mesmo e-mail e me mandar a
+# resposta". Paridade de canal: por onde ele PODE pedir, por aí ele PODE
+# aprovar — e-mail junto com WhatsApp, voz, texto da interface e voz da
+# interface.
+# Nada aqui é mecanismo paralelo:
+#   * "é o dono?"  → endereço dele (as contas configuradas + ``owner_addresses``
+#                    opcional em plugin_config.mail), comparação fechada;
+#   * "é a senha?" → ``core.owner_auth.authorized_factor`` (o veredito único,
+#                    PBKDF2 local, conferido token a token);
+#   * o que abre   → ``main._owner_password_grant``, o MESMO ponto que a senha
+#                    digitada no app e no WhatsApp dele abre.
+# O VALOR do segredo nunca sai daqui: o que é devolvido, gravado, falado ou
+# mandado ao modelo é o texto REDIGIDO e o NOME do fator.
+OWNER_MAIL_BODY_CHARS = FILTER_BODY_CHARS
+_OWNER_MAIL_CANDIDATE_CAP = 80
+_CAND_SPLIT_RE = re.compile(r"[^0-9A-Za-z\u00c0-\u00ff@._\-#$%&*+=!?~]+")
+# A forma digitada da credencial quando vem EMBUTIDA no texto (assunto, trecho
+# de corpo), e não como linha de comando: mesmo valor, mesma guarda de escrita.
+_CREDENTIAL_FORM_RE = re.compile(
+    r"(?:autorizar|senha)\s*[:=]\s*(\S{1,128})", re.IGNORECASE)
+
+# Gancho do app: recebe o payload já redigido quando um e-mail dele aprova.
+_owner_mail_hook = None
+
+
+def set_owner_mail_hook(handler=None) -> None:
+    """Registra quem trata o e-mail do dono que já vem com a senha (main.py)."""
+    global _owner_mail_hook
+    _owner_mail_hook = handler if callable(handler) else None
+
+
+def _addr_key(value: object) -> str:
+    """Endereço normalizado para comparação. Nunca é devolvido a quem lê.
+
+    Gmail não distingue ponto nem sufixo ``+`` no nome local: "a.b+c@gmail.com"
+    é a mesma caixa de "ab@gmail.com". Só se aplica esse corte aos domínios do
+    Google — fora deles o ponto é parte do endereço de verdade.
+    """
+    _name, addr = parseaddr(str(value or ""))
+    text = (addr or str(value or "")).strip().lower()
+    if "@" not in text:
+        return text
+    local, _, domain = text.partition("@")
+    if domain in ("gmail.com", "googlemail.com"):
+        local = local.split("+", 1)[0].replace(".", "")
+    return f"{local}@{domain}"
+
+
+def owner_addresses() -> set[str]:
+    """Os endereços do dono, já normalizados: cada conta + ``owner_addresses``."""
+    _ensure_accounts()
+    out: set[str] = set()
+    for acct in list(_accounts.values()):
+        key = _addr_key(acct.address)
+        if key:
+            out.add(key)
+    try:
+        from memory.config_manager import get_plugin_config
+        extra = (get_plugin_config(NS) or {}).get("owner_addresses") or []
+    except Exception:
+        extra = []
+    if isinstance(extra, str):
+        extra = [extra]
+    for value in list(extra)[:40]:
+        key = _addr_key(value)
+        if key:
+            out.add(key)
+    return out
+
+
+def _sender_is_owner(item: dict, owner_keys: set[str] | None = None) -> bool:
+    keys = owner_addresses() if owner_keys is None else owner_keys
+    if not keys:
+        return False
+    got = _addr_key(item.get("from") or item.get("sender") or "")
+    return bool(got) and got in keys
+
+
+def is_owner_mail(item: dict) -> bool:
+    """O remetente é um endereço do dono? Comparação fechada, sem adivinhação.
+
+    Terceiro que escreve com o MESMO texto (inclusive com a senha escrita por
+    extenso) não passa daqui: a porta do e-mail é o endereço dele.
+    """
+    return _sender_is_owner(item if isinstance(item, dict) else {})
+
+
+def _credential_candidates(*texts: object) -> list[str]:
+    """Os valores possíveis de senha num texto: forma estruturada primeiro.
+
+    Ordem estável, sem duplicata, com teto — a conferência é PBKDF2 e não pode
+    virar varredura infinita sobre um corpo longo.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: object) -> None:
+        token = str(value or "").strip()
+        if token and token not in seen:
+            seen.add(token)
+            out.append(token)
+
+    for blob in texts:
+        raw = str(blob or "")
+        if not raw:
+            continue
+        for line in raw.splitlines():
+            got = _owner_auth.password_from_command(line)
+            if got:
+                _add(got)
+        for token in _CAND_SPLIT_RE.split(raw):
+            _add(token)
+    return out[:_OWNER_MAIL_CANDIDATE_CAP]
+
+
+def _redact_token(text: str, token: str) -> str:
+    """Tira o valor conferido do texto; fica o marcador do dono, nunca o segredo."""
+    if not token:
+        return text
+    try:
+        return re.sub(re.escape(token), _owner_auth.REDACTED, text,
+                      flags=re.IGNORECASE)
+    except re.error:
+        return text.replace(token, _owner_auth.REDACTED)
+
+
+def _matched_credential(text: object) -> tuple[str, str]:
+    """(fator, texto redigido). O valor conferido NÃO é devolvido em hipotese alguma.
+
+    Conferência local, token a token, contra o hash PBKDF2 (``authorized_factor``
+    é o veredito único do dono). Sem senha configurada, nada é conferido.
+    """
+    raw = str(text or "")
+    if not raw or not _owner_auth.is_configured():
+        return "", raw
+    factor = ""
+    scrubbed = raw
+    for candidate in _credential_candidates(raw):
+        if _owner_auth.authorized_factor(password=candidate) == FACTOR_TEXT:
+            factor = FACTOR_TEXT
+            scrubbed = _redact_token(scrubbed, candidate)
+    return factor, scrubbed
+
+
+def _scrub_typed_command(text: str) -> str:
+    """Redação barata (sem criptografia): a forma digitada "senha: X" no texto.
+
+    Vale para QUALQUER remetente: um assunto com a credencial no formato
+    digitado nunca pode ser gravado cru no inbox nem virar frase falada.
+    ``owner_auth.PASSWORD_RE`` é ancorado — ele decide se UMA LINHA inteira é
+    o comando do app — e assunto de e-mail costuma trazer a forma EMBUTIDA
+    ("retorne este e-mail senha: X"). Para a guarda de escrita não importa se
+    é comando: se o texto traz a forma, o valor não fica em disco.
+    """
+    raw = str(text or "")
+    if not raw:
+        return raw
+    out: list[str] = []
+    for line in raw.splitlines():
+        got = _owner_auth.password_from_command(line)
+        out.append(line if not got else _redact_token(line, got))
+    scrubbed = "\n".join(out)
+    for match in _CREDENTIAL_FORM_RE.finditer(scrubbed):
+        scrubbed = _redact_token(scrubbed, match.group(1))
+    return scrubbed
+
+
+def owner_mail_authorization(item: dict, body: str = "") -> dict:
+    """Veredito do e-mail do dono — pedido + aprovação no mesmo e-mail.
+
+    Devolve ``{"factor", "sender", "subject", "instruction"}``. ``factor`` é
+    ``FACTOR_TEXT`` quando o remetente é endereço do dono E a senha dele está
+    no assunto ou no corpo; ``""`` caso contrário (terceiro com a mesma frase
+    devolve ``""``). Assunto e instrução já vêm REDIGIDOS: nenhum texto que
+    sai daqui contém o valor conferido.
+    """
+    item = item if isinstance(item, dict) else {}
+    subject = str(item.get("subject") or "")
+    sender = str(item.get("from") or item.get("sender") or "")
+    base = {"factor": "", "sender": sender, "subject": subject,
+            "instruction": ""}
+    if not is_owner_mail(item) or not _owner_auth.is_configured():
+        return base
+    factor_subject, subject_clean = _matched_credential(subject)
+    factor = factor_subject or str(item.get("owner_factor") or "")
+    factor_body, body_clean = _matched_credential(body)
+    factor = factor or factor_body
+    if not factor:
+        return dict(base, subject=subject_clean)
+    instruction = " ".join(part for part in
+                           (subject_clean, body_clean) if part).strip()
+    return {"factor": FACTOR_TEXT, "sender": sender,
+            "subject": subject_clean,
+            "instruction": " ".join(instruction.split())[:1200]}
+
+
+def _authorize_owner_mail(acct: MailAccount, conn, item: dict) -> dict | None:
+    """Um e-mail dele com a senha = o pedido já aprovado (chamado na varredura).
+
+    O corpo é lido com o MESMO ``BODY.PEEK`` somente leitura do resto e só para
+    endereço do dono; o que segue para o gancho é o texto redigido. Erro de
+    leitura nunca derruba a varredura.
+    """
+    if not is_owner_mail(item) or not _owner_auth.is_configured():
+        return None
+    body = ""
+    try:
+        body = peek_body(conn, str(item.get("uid") or ""),
+                         OWNER_MAIL_BODY_CHARS)
+    except Exception as e:
+        _log(f"não consegui ler o corpo do e-mail do dono em {acct.name}: {e}")
+    if not body:
+        body = str(item.get("body_excerpt") or "")
+    got = owner_mail_authorization(item, body)
+    if not got.get("factor"):
+        return None
+    item["subject"] = got.get("subject") or str(item.get("subject") or "")
+    if item.get("body_excerpt"):
+        item["body_excerpt"] = _matched_credential(
+            item.get("body_excerpt"))[1]
+    if item.get("excerpt"):
+        item["excerpt"] = _matched_credential(item.get("excerpt"))[1]
+    hook = _owner_mail_hook
+    if callable(hook):
+        try:
+            hook(dict(got))
+        except Exception as e:
+            _log(f"o gancho do e-mail do dono falhou: {type(e).__name__}")
+    # Rastro honesto e SEM segredo: nem endereço, nem assunto, nem o valor.
+    _log(f"{acct.name}: e-mail do dono com a senha — pedido aprovado no mesmo "
+         f"e-mail (fator: {FACTOR_TEXT}).")
+    return got
+
+
 def _header_item(acct: MailAccount, uid: str, raw: bytes) -> dict:
-    """Um cabeçalho → o item do inbox. NUNCA traz o corpo."""
+    """Um cabeçalho → o item do inbox. NUNCA traz o corpo.
+
+    O assunto passa por ``_scrub_typed_command``: a forma digitada da credencial
+    ("senha: X") nunca é gravada crua no jsonl, de remetente nenhum. Assunto de
+    e-mail do dono é redigido por conferência em ``_collect_unseen``.
+    """
     msg = email.message_from_bytes(raw)
     name, addr = parseaddr(_decode_header(msg.get("From") or ""))
-    subject = _decode_header(msg.get("Subject") or "")
+    subject = _scrub_typed_command(_decode_header(msg.get("Subject") or ""))
     date_hdr = _decode_header(msg.get("Date") or "")
     message_id = _decode_header(msg.get("Message-ID") or "")
     ts = 0.0
@@ -1796,6 +2051,20 @@ def _header_item(acct: MailAccount, uid: str, raw: bytes) -> dict:
     }
 
 
+def _raw_subject(raw: bytes) -> str:
+    """O assunto CRU do cabeçalho: só para a conferência, nunca para o disco.
+
+    ``_header_item`` redige a forma digitada antes de qualquer escrita, e a
+    conferência da senha precisa ver o texto como ele chegou — senão a guarda
+    de escrita engoliria justamente o que o dono pôs no assunto.
+    """
+    try:
+        return _decode_header(email.message_from_bytes(raw).get("Subject")
+                              or "")
+    except Exception:
+        return ""
+
+
 def _collect_unseen(acct: MailAccount, conn, limit: int = SCAN) -> list[dict]:
     """Os NÃO LIDOS de uma conexão já aberta: headers novos no jsonl.
 
@@ -1806,6 +2075,8 @@ def _collect_unseen(acct: MailAccount, conn, limit: int = SCAN) -> list[dict]:
     typ, data = conn.uid("SEARCH", None, "UNSEEN")
     ids = (data[0].split() if data and data[0] else [])
     known = {_item_key(row) for row in _load_inbox(acct)}
+    owner_keys = owner_addresses()
+    may_check = bool(owner_keys) and _owner_auth.is_configured()
     new_items: list[dict] = []
     for uid in ids[-max(1, int(limit or SCAN)):]:
         uid_s = uid.decode() if isinstance(uid, bytes) else str(uid)
@@ -1822,6 +2093,14 @@ def _collect_unseen(acct: MailAccount, conn, limit: int = SCAN) -> list[dict]:
         key = _item_key(item)
         if key in known:
             continue
+        if may_check and _sender_is_owner(item, owner_keys):
+            # A senha pode estar no ASSUNTO dele (decisão 14). O inbox nunca
+            # vê o valor: a conferência lê o assunto CRU e o que é gravado é a
+            # versão redigida — o marcador do veredito fica no registro.
+            factor, subject_clean = _matched_credential(_raw_subject(blob[0][1]))
+            if factor:
+                item["subject"] = subject_clean
+                item["owner_factor"] = factor
         known.add(key)
         _append_inbox(acct, item)
         new_items.append(item)
@@ -2249,6 +2528,17 @@ def poll_once(hook=None) -> list[dict]:
             acct._stage = "select"
             conn.select("INBOX", readonly=True)
             fresh = _collect_unseen(acct, conn)
+            # Decisão 14 (10/11/2026): o e-mail DELE com a senha no assunto ou
+            # no corpo é pedido E aprovação — rodado antes dos filtros e do
+            # aviso, porque a autorização não pode depender de uma regra de
+            # notificação. O que ele autoriza é o ponto único do app
+            # (``main._owner_password_grant``), chamado pelo gancho.
+            for _mail_item in fresh:
+                try:
+                    _authorize_owner_mail(acct, conn, _mail_item)
+                except Exception as e:
+                    _log(f"autorização por e-mail do dono falhou: "
+                         f"{type(e).__name__}")
             code_uids: set[str] = set()
             if acct.otp and callable(processor):
                 try:
@@ -2467,6 +2757,7 @@ def reset() -> None:
     interrompidas — nenhuma thread antiga mexe em conta da próxima rodada.
     """
     global _watch_hook, _pending, _otp_processor, _filter_decision_hook
+    global _owner_mail_hook
     _retry_stop.set()
     with _retry_lock:
         _retry_threads.clear()
@@ -2475,6 +2766,10 @@ def reset() -> None:
     _watch_hook = None
     _otp_processor = None
     _filter_decision_hook = None
+    # O gancho do e-mail do dono (decisão 14) é um gancho como os outros: ao
+    # zerar as contas, zero junto. Sem isto, um teste ou uma troca de config
+    # chamaria o objeto morto da rodada anterior.
+    _owner_mail_hook = None
     set_retry_notice(None)
     with _pending_lock:
         _pending = None
@@ -2585,8 +2880,9 @@ def request_send(to: str, subject: str, body: str,
     _store_pending(payload)
     em = subject or "(sem assunto)"
     return True, (f"Preparei o e-mail para {recipient} com o assunto «{em}». "
-                  f"Nada foi enviado: diga em voz alta «{CONFIRM_MARKER} o "
-                  "e-mail» para eu mandar, ou «cancela» para descartar.")
+                  f"Nada foi enviado: confirme com uma das suas duas portas — "
+                  f"{_owner_doors()} — dizendo «{CONFIRM_MARKER} o "
+                  "e-mail» ou «cancela» para descartar.")
 
 
 def cancel_send() -> str:
@@ -2608,7 +2904,9 @@ def confirm_send(voice_ok: bool = False) -> tuple[bool, str]:
     Texto digitado comum (sem senha) nunca chega aqui com True.
     """
     if not voice_ok:
-        return False, "envio de e-mail exige a sua voz confirmando; nada foi enviado"
+        return False, ("o envio do e-mail ainda não foi confirmado — "
+                       f"preciso de uma das suas duas portas: {_owner_doors()}; "
+                       "nada foi enviado")
     payload = _load_pending()
     if payload is None:
         return False, "não havia envio de e-mail esperando confirmação"

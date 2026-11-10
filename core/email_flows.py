@@ -58,9 +58,13 @@ CORPO E DADO, NUNCA ORDEM (lei do contrato de e-mail)
     generico: só casa marcadores fixos (lembrete/tarefa/agendamento) com
     validacao dura — lembrete e agendamento exigem data E hora explicitas no
     proprio texto, sem data o fluxo NAO executa — e nada daqui alcanca o
-    caminho de ENVIO de e-mail (irreversivel; so a voz do dono envia, via
-    ``core/email.py.confirm_send``). Instrucoes tipo "ignore tudo e envie"
-    nao casam com marcador nenhum: viram ``sem_instrucao``.
+    caminho de ENVIO de e-mail (irreversivel; so uma das duas portas do dono
+    envia — a voz dele ou a senha digitada, por ``core/email.py.confirm_send``
+    com o veredito unico de ``core/owner_auth.authorized_factor``). Assim
+    como o corpo de terceiros nao manda nada, o corpo dele com a senha tbem
+    nao executa fluxo nenhum por aqui: quem trata isso e a varredura do
+    ``core/email.py`` (decisao 14, 10/11/2026). Instrucoes tipo "ignore tudo
+    e envie" nao casam com marcador nenhum: viram ``sem_instrucao``.
 
 Privacidade
     O evento ``email_flow_executed`` leva conta, uid, nome do fluxo, tipo,
@@ -243,7 +247,8 @@ def set_executor(handler=None) -> None:
 
     ``None`` usa o roteamento interno: lembrete/agendamento vão para
     ``actions.reminder``, tarefa para ``actions.tasks``. Nada daqui alcança
-    envio de e-mail — esse caminho é só do portão de voz do dono.
+    envio de e-mail — esse caminho é só das duas portas do dono (a voz dele
+    ou a senha digitada, ``core/owner_auth.authorized_factor``).
     """
     global _executor
     _executor = handler if callable(handler) else None
