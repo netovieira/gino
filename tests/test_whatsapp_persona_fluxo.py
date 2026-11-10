@@ -101,10 +101,21 @@ class SourceTests(WatchHarness):
         self.assertEqual(len(self.calls), 1)
 
     def test_mensagem_na_conta_atribuida_e_persona_sem_exigir_nome(self):
+        """Rota por conta SEM nome: o criador no número da persona (R2b).
+
+        Terceiro no mesmo número não recebe resposta nenhuma — a porta do
+        número julga o autor antes do handler (regra do dono de 10/11/2026,
+        travada em ``tests/test_persona_door_r2b.py``).
+        """
         whatsapp_watch.set_personas_source(lambda: [_persona("Aline", "trabalho")])
         self.assertTrue(whatsapp_watch.handle(
-            "trabalho", wa_item("chegou o pedido do cliente")))
+            "trabalho", wa_item("chegou o pedido do cliente",
+                                chat=OWNER_CHAT, name="Dono")))
         self.assertEqual([a for a, _ in self.calls], ["trabalho"])
+        self.calls.clear()
+        self.assertFalse(whatsapp_watch.handle(
+            "trabalho", wa_item("chegou o pedido de um terceiro")))
+        self.assertEqual(self.calls, [])
 
     def test_conta_atribuida_nao_altera_a_rota_da_conta_principal(self):
         whatsapp_watch.set_personas_source(lambda: [_persona("Aline", "trabalho")])

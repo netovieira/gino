@@ -299,6 +299,26 @@ def _persona_own_account(persona) -> str:
         return ""
 
 
+def persona_for_account(account: str) -> dict | None:
+    """O cadastro da ÚNICA persona dona desta conta (None se zero ou várias).
+
+    É a resposta pública da pergunta "este número é o número de uma persona?".
+    O fator ``conta_atribuida`` da rota e a porta do número
+    (:mod:`core.persona_door`, regra do dono de 10/11/2026) consultam daqui,
+    para não existir segunda leitura do cadastro que possa divergir. Conta sem
+    nome, zero personas ou duas personas no mesmo número: None — ninguém é dono
+    do número, e a rota normal decide como sempre decidiu.
+    """
+    acct = str(account or "").strip().casefold()
+    if not acct:
+        return None
+    assigned = [p for p in _live_personas()
+                if _persona_own_account(p) == acct]
+    if len(assigned) != 1:
+        return None
+    return assigned[0] or None
+
+
 def addressed_persona(text: object, account: str = "") -> dict | None:
     """A persona cadastrada a quem esta mensagem individual se dirige.
 
@@ -324,14 +344,9 @@ def addressed_persona(text: object, account: str = "") -> dict | None:
         return None
     if hit is not None:
         return {"slug": hit.slug, "name": hit.name, "factor": "vocativo"}
-    acct = str(account or "").strip().casefold()
-    if not acct:
+    persona = persona_for_account(account)
+    if persona is None:
         return None
-    assigned = [p for p in personas
-                if _persona_own_account(p) == acct]
-    if len(assigned) != 1:
-        return None
-    persona = assigned[0]
     slug = str(persona.get("id") or persona.get("name") or "").strip()
     if not slug:
         return None
@@ -580,6 +595,10 @@ def is_candidate(item: dict, account: str = "") -> bool:
       como ORDEM quando nomeia o assistente; sem o nome é resposta própria.
       Nota de voz (eco ou recebida) é candidata sempre: o nome é ouvido no
       transcript pelo handler, que decide turno ou silêncio.
+    - Candidata NÃO é autorização: quem responde é decidido em ``_process``,
+      onde a porta do número da persona (:func:`_persona_door_allows`) julga o
+      AUTOR antes de qualquer handler — no número de uma persona, terceiro não
+      recebe resposta (regra do dono de 10/11/2026).
     """
     if not isinstance(item, dict):
         return False
@@ -700,6 +719,63 @@ def handle(account: str, item: dict) -> bool:
     return _process(account, item)
 
 
+def _persona_door_allows(account: str, item: dict, *,
+                         direct: bool = False) -> bool:
+    """A porta do número da persona (regra do dono, 10/11/2026).
+
+    "Se eu receber uma mensagem no seu número de WhatsApp de um cliente, você
+    não pode responder esse cliente; se eu for direto no seu chat e mandar, você
+    tem permissão para responder." No número registrado de uma persona, o autor
+    é julgado antes da resposta: criador ou permitido DAQUELE número passa;
+    terceiro morre aqui, sem resposta e com trilha (decisão, motivo, quem,
+    conta). Chat que não é número de persona não tem porta nenhuma — a rota
+    normal decide como sempre decidiu — e o chat direto do dono nunca passa por
+    aqui (a entrada dele é a ordem de 09/11/2026, não uma licença).
+
+    Sem política legível a porta fecha para terceiros (falha fechada); o criador
+    continua dentro porque a identidade dele vem do número pareado, não do
+    arquivo.
+    """
+    try:
+        from core import persona_door
+    except Exception as e:                      # pragma: no cover - import roto
+        _log(f"[porta persona] politica indisponivel: {e}; sem porta, sem "
+             f"resposta autonoma.")
+        return False
+    verdict = persona_door.decide(account, item, direct=direct)
+    if not verdict.applies:
+        return True
+    if not verdict.allowed:
+        _log(persona_door.describe(verdict))
+        return False
+    # R4 do mesmo dia: a janela de escuta é da PESSOA que chamou. Aqui fica
+    # registrado por autor (o mesmo sender_jid da allow-list de grupos), nunca
+    # pelo chat — é a trilha que prova que o "obrigado" seguinte é de quem
+    # nomeou, e é o que uma recusa posterior mostra.
+    if calls_assistant(item, account) or addressed_persona(item.get("text"),
+                                                           account):
+        note_vocative(account, item)
+    _log(persona_door.describe(verdict))
+    return True
+
+
+def note_vocative(account: str, item: dict) -> bool:
+    """Marca que ESTA pessoa (sender_jid) me chamou pelo nome agora.
+
+    A chave é do canal e da pessoa (:func:`core.vocative_ledger.whatsapp_key`);
+    o frescor global que não sabe quem falou não existe mais como identidade de
+    ninguém.
+    """
+    try:
+        from core import group_policy, vocative_ledger
+    except Exception:
+        return False
+    sender = group_policy.sender_jid(item)
+    if not sender:
+        return False
+    return vocative_ledger.note(vocative_ledger.whatsapp_key(sender, account))
+
+
 def _process(account: str, item: dict) -> bool:
     """Processa uma mensagem; True quando a resposta autônoma foi pedida."""
     account = str(account or "").strip()
@@ -724,6 +800,8 @@ def _process(account: str, item: dict) -> bool:
         return False
 
     direct = _is_direct(account, item)
+    if not _persona_door_allows(account, item, direct=direct):
+        return False
     who = str(item.get("name") or item.get("chat") or "")
     key = _rate_key(account, item)
     if not direct and not _rate_left(key):

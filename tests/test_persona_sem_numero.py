@@ -267,8 +267,16 @@ def test_persona_com_numero_continua_roteada_pela_conta(watch):
     hit = whatsapp_watch.addressed_persona("bom dia", "TRABALHO")
     assert hit == {"slug": "aline", "name": "Aline",
                    "factor": "conta_atribuida"}
-    assert whatsapp_watch.handle("trabalho", item("chegou o pedido")) is True
+    # A conta atribuída dispensa o nome — do criador. No número de uma persona
+    # a porta é o autor (regra do dono, 10/11/2026): terceiro não recebe
+    # resposta nenhuma, e o handler do app nem é chamado.
+    assert whatsapp_watch.handle(
+        "trabalho", item("chegou o pedido dele", chat=OWNER_CHAT,
+                         name="Dono")) is True
     assert [account for account, _ in watch] == ["trabalho"]
+    assert whatsapp_watch.handle(
+        "trabalho", item("chegou o pedido de um cliente")) is False
+    assert len(watch) == 1
 
 
 def test_persona_sem_numero_responde_por_vocativo_no_chat_do_gino(watch):

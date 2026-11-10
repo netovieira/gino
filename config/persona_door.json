@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "_comment": "Porta do numero de cada persona (ordem do dono, 10/11/2026): no numero registrado de uma persona, so o criador ou quem ele permitir PARA AQUELE numero abre a porta de resposta; terceiro nao recebe resposta nenhuma. 'numeros' e indexado pela conta do cadastro da persona (whatsapp_account). Lista VAZIA ou arquivo ausente = so o criador — e assim que o mecanismo nasce: quem abre a porta para alguem e a caneta dele, por voz confirmada ou senha (core/persona_door.authorize). Formato de uma entrada: {\"jid\": \"5517999999999\", \"nome\": \"Cliente X\", \"autorizado_por\": \"senha digitada\", \"data\": \"2026-11-10\", \"dono\": false}.",
+  "regra": "porta do numero de cada persona: so o criador, ou quem o criador permitir para AQUELE numero",
+  "atualizado_em": "",
+  "numeros": {}
+}

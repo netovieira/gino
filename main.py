@@ -91,6 +91,7 @@ from core import voice_device_enroll as _device_enroll
 from core import series_gate as _series_gate_mod
 from core import silence_gate as _silence_gate_mod
 from core import silence_code as _silence_code_mod
+from core import vocative_ledger as _vocative
 from core.ghost_filter import GhostFilter as _GhostFilter
 from core import chat_memory as _chat_memory
 from core import personas as _personas
@@ -14967,6 +14968,8 @@ class JarvisLive:
     # Follow-up window for the name filter: ONLY when what JARVIS just said
     # ends in a question mark is the next utterance accepted without the name,
     # and only for this long. After a statement the filter applies at once.
+    # E só para a PESSOA que fez a pergunta (regra do dono, 10/11/2026): o
+    # "obrigado" de quem nunca disse o nome não entra por esta porta.
     _FOLLOWUP_AFTER_QUESTION_S = 25.0
 
     def set_speaking(self, value: bool):
@@ -15369,16 +15372,74 @@ class JarvisLive:
                 return True
         return False
 
-    def _in_followup_window(self) -> bool:
-        """True only when JARVIS's last reply ended in a question and it
-        finished saying it less than _FOLLOWUP_AFTER_QUESTION_S ago."""
-        last = (getattr(self, "_last_out_logged", "") or "").strip()
-        if not last.endswith(("?", "?\"", "?»", "?)")):
+    # ── A janela de escuta é da PESSOA (regra do dono, 10/11/2026) ──────────
+    def _voice_person_id(self, pcm: bytes | None) -> str:
+        """A chave de quem falou ESTA fala, para a janela de escuta (R4).
+
+        "a permissão de escuta de cinco minutos ela tem que ser referente ao
+        usuário que te fez a pergunta" — então a primeira pergunta do turno é
+        "quem falou?". A fonte é o veredito já calculado do portão progressivo
+        para exatamente este PCM (``_series_decision_for``: uma lock e uma
+        cópia de dict, sem embedder no caminho da conversa).
+
+        ``''`` quando não há como distinguir pessoas (portão de voz desligado,
+        texto digitado, canal sem áudio): o ledger cai no balde
+        ``vocative_ledger.NO_IDENTITY``, que é o comportamento de sempre e não
+        afirma identidade de ninguém. Portão ligado e voz não reconhecida é
+        ``desconhecido`` — quem não foi identificado não herda a janela de
+        outro. A diarização (``self._last_speaker``) não serve aqui: ela roda
+        depois deste portão, dentro de ``_qoder_turn``, e nesta altura ainda
+        guarda a fala ANTERIOR.
+        """
+        try:
+            decision = self._series_decision_for(pcm)
+        except Exception:
+            return ""
+        if not decision:
+            return ""
+        name = str(decision.get("speaker") or "").strip()
+        if not name and self._only_owner_enrolled():
+            # Uma voz só cadastrada: o teto é do dono, e um score ruim é
+            # problema de microfone — a mesma indulgência que o voiceprint já
+            # aplica três linhas adiante, não uma porta nova.
+            name = str(getattr(self._speaker, "owner_name", "") or "").strip()
+        if not name:
+            return _vocative.voice_key("desconhecido")
+        return _vocative.voice_key(name)
+
+    def _vocative_key(self, person_id: str = "") -> str:
+        """A chave do ledger para esta fala (sem identidade = balde próprio)."""
+        return person_id or _vocative.voice_key(_vocative.NO_IDENTITY)
+
+    def _note_vocative(self, person_id: str = "") -> bool:
+        """Registra que FULANO me chamou pelo nome agora: a janela passa a ser
+        dele, e só dele."""
+        try:
+            return _vocative.note(self._vocative_key(person_id))
+        except Exception:
             return False
-        ended = getattr(self, "_reply_ended_at", 0.0)
-        if not ended:
+
+    def _followup_verdict(self, person_id: str = "") -> dict:
+        """Se a pessoa pode me responder sem repetir o nome, e por quê."""
+        return _vocative.listening_ok(
+            self._vocative_key(person_id),
+            last_reply=(getattr(self, "_last_out_logged", "") or ""),
+            ended_at=getattr(self, "_reply_ended_at", 0.0),
+            window_s=self._FOLLOWUP_AFTER_QUESTION_S)
+
+    def _in_followup_window(self, person_id: str = "") -> bool:
+        """True only when JARVIS's last reply ended in a question, it finished
+        saying it less than _FOLLOWUP_AFTER_QUESTION_S ago AND that window
+        belongs to the person now speaking (owner rule, 10/11/2026).
+
+        Antes da regra do dono a resposta era ``bool`` de estado global: a
+        pergunta era de um e o "obrigado" aprovado era o de quem chegasse
+        depois. A identidade entra por ``person_id`` (``_voice_person_id``).
+        """
+        try:
+            return bool(self._followup_verdict(person_id)["ok"])
+        except Exception:
             return False
-        return (time.monotonic() - ended) <= self._FOLLOWUP_AFTER_QUESTION_S
 
     @staticmethod
     def _squash(text: str) -> str:
@@ -15850,19 +15911,31 @@ class JarvisLive:
                 # at 20% for the rest of the session after one "que horas são".
                 _duck.up()
                 return
+        # Quem falou esta fala é a chave da janela de escuta (regra do dono,
+        # 10/11/2026): "o obrigado do outro você não pode responder, porque ele
+        # não falou Gino, só eu falei Gino".
+        _person = self._voice_person_id(pcm)
         if get_name_gate_enabled() and not self._addressed_to_me(text):
-            if self._in_followup_window():
+            _window = self._followup_verdict(_person)
+            if _window["ok"]:
+                # A janela desliza para a MESMA pessoa que a abriu: quem fez a
+                # pergunta continua sendo o interlocutor da resposta.
+                self._note_vocative(_person)
                 try:
                     self.ui.write_log("SYS: (entendido como resposta para mim — sem precisar do nome)")
                 except Exception:
                     pass
             else:
                 try:
-                    self.ui.write_log(f"SYS: Ignorado (não foi para {self._asst_name}): «{text[:60]}»")
+                    self.ui.write_log(f"SYS: Ignorado (não foi para {self._asst_name}): "
+                                      f"«{text[:60]}» (janela: {_window['motivo']})")
                 except Exception:
                     pass
                 _duck.up()
                 return
+        elif self._addressed_to_me(text):
+            # Quem me chamou pelo nome passa a ser o dono da janela.
+            self._note_vocative(_person)
         # The owner's real speech opens the subject epoch. Compute it before
         # recording the turn; reminders and status turns never reach here.
         _epoch = self._begin_user_epoch()

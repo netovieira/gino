@@ -784,12 +784,20 @@ def _sonda_persona_sem_numero() -> tuple[str, str]:
         return NV, "core/whatsapp_watch.py ilegivel"
     addressed = _find_func(watch, "addressed_persona")
     helper = _find_func(watch, "_persona_own_account")
+    owner = _find_func(watch, "persona_for_account")
     if addressed is None or helper is None:
         return FALHA, "addressed_persona nao tem filtro de numero proprio"
     if "own_account" not in " ".join(_calls_in(helper)):
         return FALHA, "o filtro de conta nao usa o leitor do cadastro"
-    if "_persona_own_account" not in " ".join(_calls_in(addressed)):
-        return FALHA, "a rota de conta ainda compara a chave crua do cadastro"
+    # O filtro do número pode morar em `persona_for_account` (a leitura pública
+    # de "de quem é este número", que a porta da persona também consulta): o
+    # que a lei não aceita é a rota de conta comparar a chave crua do cadastro.
+    route_calls = " ".join(_calls_in(addressed))
+    if "_persona_own_account" not in route_calls:
+        if owner is None or "persona_for_account" not in route_calls:
+            return FALHA, "a rota de conta ainda compara a chave crua do cadastro"
+        if "_persona_own_account" not in " ".join(_calls_in(owner)):
+            return FALHA, "persona_for_account nao filtra pelo leitor do cadastro"
     sender = _tree("core/whatsapp.py")
     if sender is None:
         return NV, "core/whatsapp.py ilegivel"
