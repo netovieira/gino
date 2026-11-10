@@ -986,9 +986,14 @@ _QODER_COMPACT_SECTIONS = {
         "category='identity', key='language'). If [ALSO REMEMBERED] lists "
         "something and the owner asks about it, call recall_memory before "
         "saying you do not know. On undo/revert/cancel that, call the undo "
-        "tool. restart/shutdown/toggle_wifi only park a button: a "
-        "[CONFIRMATION_PENDING] means ask one short sentence to confirm on "
-        "screen and never say it is done. shutdown_jarvis only when the owner "
+        "tool. Restarting YOUR OWN PROCESS (restart_assistant action='assistant') "
+        "is your own power since the owner's order of 10/11/2026: no phrase, no "
+        "confirmation window, anyone who asks triggers it — but never say it "
+        "happened before the tool returned it, and it postpones itself when a "
+        "background task is running or this answer has not finished leaving. "
+        "The COMPUTER (action='pc'), shutdown and toggle_wifi still only park a "
+        "button: a [CONFIRMATION_PENDING] means ask one short sentence to "
+        "confirm on screen and never say it is done. shutdown_jarvis only when the owner "
         "explicitly ends the session.\n"
         "Security: never read secrets, passwords or keys aloud and never "
         "expose them. Destructive commands and sensitive confirmations (send, "
@@ -6030,6 +6035,7 @@ class JarvisLive:
                 self._restart = _restart.RestartManager(logger=print)
                 self._restart.bind(shutdown_cb=self._restart_shutdown,
                                    pc_restart=self._pc_restart_confirmed,
+                                   delivering_cb=self._restart_is_delivering,
                                    expire_cb=lambda line: self._say_now(
                                        line, log=True, origin="aviso"))
                 _restart_action.bind(self._restart)
@@ -6379,6 +6385,11 @@ class JarvisLive:
             time.sleep(15)
             if getattr(self, "_qoder_shutting_down", False):
                 break
+            # O reinício do próprio processo que ficou adiado (guarda de
+            # tarefa viva ou resposta no ar) tem aqui o seu ponto de efeito:
+            # um tick depois de a entrega ter acabado. O método confere as
+            # guardas de novo antes de executar.
+            self._restart_self_tick()
             try:
                 self._task_watch_step()
             except Exception as e:
@@ -6530,14 +6541,18 @@ class JarvisLive:
             started = datetime.fromtimestamp(_PROCESS_STARTED_WALL)
             pending = (self._restart.pending()
                        if getattr(self, "_restart", None) is not None else None)
-            state = ("Há UM pedido de reinício aguardando a frase de confirmação "
-                     "do dono neste processo." if pending else
+            state = ("Há UM pedido de reinício DO COMPUTADOR aguardando a "
+                     "frase de confirmação do dono neste processo."
+                     if pending else
                      "NÃO há pedido de reinício pendente. Qualquer pedido de "
                      "reinício que apareça no histórico está CONCLUÍDO.")
             text += (
                 "\n\n[ESTADO NO BOOT]\n"
                 f"Este processo começou em {started.strftime('%d/%m/%Y %H:%M')} e "
                 f"já está rodando o código do disco. {state} "
+                "Reiniciar o teu próprio processo é poder teu (dono, "
+                "10/11/2026): não pede frase nem janela; a frase do dono só "
+                "vale para o computador. "
                 "Nunca diga que há reinício pendente por causa do histórico, da "
                 "memória ou de uma fala sua anterior: antes de falar do tema, "
                 "confira com restart_assistant action='status'. Não peça ao dono "
@@ -14345,10 +14360,12 @@ class JarvisLive:
             except Exception:
                 pass
             return False
-        if self._background_job_running():
+        if self._background_job_running() and not wants_assistant:
             # A restart kills the background agent mid-work (skills/execution).
             # The order falls through to the model, which says it waits for the
-            # task instead of executing immediately.
+            # task instead of executing immediately. Para o PRÓPRIO processo a
+            # mesma guarda existe, mas dentro de RestartManager.self_restart:
+            # ela adia em vez de deixar a ordem cair no modelo.
             return False
         pcm = pcm if pcm is not None else getattr(self, "_current_pcm", None)
         if not pcm:
@@ -14363,15 +14380,21 @@ class JarvisLive:
         is_owner, known, detail = self._speaker_order_identity(
             pcm, device=device)
         kind = "assistant" if wants_assistant else "pc"
+        if wants_assistant:
+            # Dono, 10/11/2026: reiniciar o PRÓPRIO PROCESSO é poder do
+            # assistente — a ordem dele, à letra: "qualquer pessoa pode pedir
+            # para você fazer... reiniciar você mesmo, você pode ter essa
+            # autonomia a partir de agora". Sem frase e sem janela de
+            # confirmação, para ele ou para outra voz. A máquina (kind "pc")
+            # continua exatamente onde estava: estaciona e espera a frase.
+            return self._restart_own_process(
+                text, is_owner=is_owner, known=known, detail=detail)
         if not is_owner:
             if known:
                 # An enrolled guest asked: nothing runs, the request rises to
                 # the owner, who alone can confirm it with the phrase.
                 try:
-                    if wants_assistant:
-                        self._restart.request_assistant("pedido de voz não-dona")
-                    else:
-                        self._restart.request_pc("pedido de voz não-dona")
+                    self._restart.request_pc("pedido de voz não-dona")
                     self.ui.write_log(
                         "SYS: reinício pedido por voz que não é o dono — "
                         f"aguardando confirmação do dono ({detail}).")
@@ -14429,6 +14452,71 @@ class JarvisLive:
         else:
             self._say_now("Não consegui reiniciar agora. Nada foi feito.")
         print(f"[Restart] reinício por comando detectado — {out}")
+        return True
+
+    def _restart_own_process(self, text: str, *, is_owner: bool,
+                             known: bool, detail: str) -> bool:
+        """Reiniciar o PRÓPRIO processo por voz: poder próprio, sem frase.
+
+        Dono (voz confirmada) e qualquer voz cadastrada do lado físico abrem o
+        mesmo caminho; o que muda é só o rótulo na trilha ("dono" / "outra
+        voz"). Uma voz NÃO cadastrada não tem esse poder: ruído de TV, eco e
+        voz desconhecida continuam sem abrir nada, porque a ordem do dono fala
+        de pessoas, não de som qualquer.
+
+        As guardas (executor vivo, resposta ainda saindo) e o teto de 5
+        minutos ficam em RestartManager; aqui só se escolhe quem pediu e se
+        diz o resultado ao dono.
+        """
+        if not (is_owner or known):
+            try:
+                self.ui.write_log(
+                    "SYS: reinício do processo pedido por voz não "
+                    f"reconhecida — nada executado ({detail}).")
+            except Exception:
+                pass
+            print(f"[Restart] voz não reconhecida — {detail}")
+            return False
+        self._log_heard(text)
+        if is_owner:
+            self._note_owner_speech("fala sobre reinício")
+            # A fala dele tem o piso: corta a resposta em curso, como sempre.
+            self._qoder_ignore = True
+            try:
+                if getattr(self, "_qoder_live", None) is not None:
+                    self._qoder_live.interrupt()
+            except Exception:
+                pass
+            try:
+                self.interrupt()
+            except Exception:
+                pass
+        runner = getattr(self._restart, "self_restart", None)
+        if not callable(runner):
+            self._say_now("Não consegui reiniciar agora. Nada foi feito.")
+            return True
+        who = (_restart.REQUESTER_OWNER if is_owner
+               else _restart.REQUESTER_VOICE)
+        try:
+            out = runner(reason=("ordem falada do dono" if is_owner
+                                 else "pedido de voz cadastrada"),
+                         requester=who)
+        except Exception as e:
+            print(f"[Restart] reinício do processo falhou: {e}")
+            self._say_now("Não consegui reiniciar agora. Nada foi feito.")
+            return True
+        low = str(out).lower()
+        if "restarting the assistant" in low or "[dry run]" in low:
+            self._say_now("Reiniciando o meu processo agora.")
+        elif "adiado" in low:
+            self._say_now("Vou reiniciar o meu processo assim que isso "
+                          "terminar; nada foi reiniciado ainda.")
+        elif "rate-limited" in low or "limitad" in low:
+            self._say_now("Não reiniciei: o limite de reinícios está ativo. "
+                          "Nada foi feito.")
+        else:
+            self._say_now("Não consegui reiniciar agora. Nada foi feito.")
+        print(f"[Restart] reinício do processo ({who}) — {out}")
         return True
 
     def _owner_direct_power(self, text: str,
@@ -14531,6 +14619,41 @@ class JarvisLive:
             return bool(_qoder_jobs.is_busy())
         except Exception:
             return False
+
+    def _restart_is_delivering(self) -> bool:
+        """Guarda 2: a resposta atual ainda está saindo (fala ou fila de saída).
+
+        Reiniciar aqui cortaria o que o dono acabou de pedir — por isso o
+        reinício do próprio processo é adiado e sai no tick seguinte, quando
+        a boca esvaziou e o turno terminou.
+        """
+        try:
+            with self._speaking_lock:
+                if self._is_speaking:
+                    return True
+        except Exception:
+            pass
+        return bool(getattr(self, "_reply_active", False))
+
+    def _restart_self_tick(self) -> None:
+        """Efeito do reinício adiado, chamado pelo watch da fila de tarefas."""
+        manager = getattr(self, "_restart", None)
+        flush = getattr(manager, "flush_self_restart", None)
+        if not callable(flush):
+            return
+        try:
+            out = flush()
+        except Exception as e:
+            print(f"[Restart] flush adiado falhou: {e}")
+            return
+        if not out:
+            return
+        print(f"[Restart] reinício do processo (adiado) — {out}")
+        try:
+            self.ui.write_log(f"SYS: reinício do processo adiado executado — "
+                              f"{_restart._short(out, 160)}")
+        except Exception:
+            pass
 
     def _pc_restart_confirmed(self) -> str:
         """The manager calls this only after the spoken confirmation."""

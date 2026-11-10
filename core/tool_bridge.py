@@ -143,9 +143,13 @@ ACTION_TIERS: dict[str, str] = {
     "qoder_job": TIER_HIGH,
     "personas": TIER_HIGH,
     "phrase_blocklist": TIER_HIGH,
-    # Parking a restart is not the restart: the owner's spoken phrase is the
-    # only thing that executes it. The confirmation action is refused by the
-    # tool itself, so the bridge does not need a second, unusable gate.
+    # Restarting the assistant's OWN process is its own power since the
+    # owner's order of 10/11/2026 — reversible by definition (the app comes
+    # back and the conversation continues), so the bridge adds no window on
+    # top; core/restart.py carries the guards (no restart while a background
+    # job lives, never mid-answer, one per five minutes) and the trail.
+    # The MACHINE is untouched: parking a PC restart still needs the owner's
+    # exact spoken phrase, which no tool call can give.
     "restart_assistant": TIER_LOW,
     "restart_pc": TIER_HIGH,
 }
@@ -693,6 +697,10 @@ class ToolBridge:
 
         @app.post("/restart/assistant", dependencies=auth)
         async def restart_assistant(payload: RestartRequest):
+            # Poder próprio do assistente sobre o próprio processo (dono,
+            # 10/11/2026): executa sem frase e sem janela. A guarda de tarefa
+            # em segundo plano e o teto de 5 minutos vivem em
+            # RestartManager.self_restart, não aqui.
             fn = self._find_method(self._restart, ("assistant", "restart_assistant", "restart"))
             if fn is None:
                 return self._not_configured("restart", "Restart bridge is not configured.")
@@ -700,6 +708,9 @@ class ToolBridge:
 
         @app.post("/restart/pc", dependencies=auth)
         async def restart_pc(payload: RestartRequest):
+            # A máquina continua no portão antigo: este endpoint só ESTACIONA
+            # o pedido. Só a frase exata do dono (ou a senha digitada dele) o
+            # executa, e nenhum chamada de ferramenta confirma por ele.
             fn = self._find_method(self._restart, ("pc", "restart_pc", "computer"))
             if fn is None:
                 return self._not_configured("restart", "Restart bridge is not configured.")

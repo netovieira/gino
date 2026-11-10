@@ -84,9 +84,28 @@ class FakeRestart:
         self.requested = []
         self.confirmed = []
         self.confirmed_owner = []
+        self.self_restarts = []
 
     def pending(self):
         return self.pending_value
+
+    def self_restart(self, reason="", requester="iniciativa propria"):
+        """Reinício do próprio processo (dono, 10/11/2026): sem frase.
+
+        Reproduz a guarda de tarefa viva lendo o mesmo sinal que lê o
+        RestartManager de verdade, para o teste continuar falando do portão
+        e não do mock.
+        """
+        self.self_restarts.append((requester, reason))
+        try:
+            busy = bool(main._qoder_jobs.is_busy())
+        except Exception:
+            busy = False
+        if busy:
+            return ("Reinício do processo ADIADO: tarefa de fundo em "
+                    "execução. Nada foi reiniciado ainda.")
+        self.pending_value = None
+        return "Restarting the assistant now."
 
     def confirm_owner(self, kind="assistant", reason=""):
         self.confirmed_owner.append((kind, reason))
@@ -196,17 +215,19 @@ class OwnerDirectRestartTests(unittest.TestCase):
         obj = _obj()
         self.assertTrue(main.JarvisLive._owner_direct_action_gate(
             obj, "Reinicie você", OWNER_PCM))
-        self.assertEqual(obj._restart.confirmed_owner,
-                         [("assistant", restart_mod.AUTO_DETECTION_REASON)])
+        # Poder próprio, sem frase e sem estacionar nada (dono, 10/11/2026).
+        self.assertEqual(obj._restart.self_restarts,
+                         [("dono", "ordem falada do dono")])
+        self.assertEqual(obj._restart.confirmed_owner, [])
         self.assertEqual(obj._restart.confirmed, [])
         self.assertEqual(obj._restart.requested, [])
-        self.assertIn("Confirmado. Reiniciando o assistente agora.", obj.said)
+        self.assertIn("Reiniciando o meu processo agora.", obj.said)
 
     def test_owner_own_sentence_from_the_rule_restarts(self):
         obj = _obj()
         self.assertTrue(main.JarvisLive._owner_direct_action_gate(
             obj, "eu quero que você reinicie", OWNER_PCM))
-        self.assertEqual(obj._restart.confirmed_owner[0][0], "assistant")
+        self.assertEqual(obj._restart.self_restarts[0][0], "dono")
 
     def test_owner_pc_order_restarts_the_computer(self):
         obj = _obj()
@@ -218,7 +239,7 @@ class OwnerDirectRestartTests(unittest.TestCase):
         obj = _obj()
         obj._qoder_lock = None       # reaching the model would raise TypeError
         main.JarvisLive._qoder_turn(obj, "Reinicie você", OWNER_PCM)
-        self.assertEqual(obj._restart.confirmed_owner[0][0], "assistant")
+        self.assertEqual(obj._restart.self_restarts[0][0], "dono")
 
     def test_owner_order_beats_a_stale_pending_power_request(self):
         power = FakePower()
@@ -228,14 +249,30 @@ class OwnerDirectRestartTests(unittest.TestCase):
         main.JarvisLive._qoder_turn(obj, "Suspende o computador", OWNER_PCM)
         self.assertEqual(power.executed[0][0], "suspend")
 
-    def test_guest_order_does_not_execute_and_rises_to_the_owner(self):
+    def test_guest_order_executes_the_process_without_a_window(self):
+        """Dono, 10/11/2026: "qualquer pessoa pode pedir para você fazer".
+
+        Uma voz cadastrada do lado físico acende o reinício do processo com o
+        mesmo caminho do dono; o que muda é só o rótulo na trilha.
+        """
         obj = _obj(speaker=guest_speaker())
         self.assertTrue(main.JarvisLive._owner_direct_action_gate(
             obj, "Reinicie você", OWNER_PCM))
+        self.assertEqual(obj._restart.self_restarts,
+                         [("outra voz", "pedido de voz cadastrada")])
         self.assertEqual(obj._restart.confirmed_owner, [])
-        self.assertEqual(obj._restart.confirmed, [])
+        self.assertEqual(obj._restart.requested, [])
+        self.assertIn("Reiniciando o meu processo agora.", obj.said)
+
+    def test_guest_pc_order_still_rises_to_the_owner(self):
+        """A máquina não mudou: voz cadastrada só estaciona o pedido."""
+        obj = _obj(speaker=guest_speaker())
+        self.assertTrue(main.JarvisLive._owner_direct_action_gate(
+            obj, "Reinicie o computador", OWNER_PCM))
+        self.assertEqual(obj._restart.self_restarts, [])
+        self.assertEqual(obj._restart.confirmed_owner, [])
         self.assertEqual(obj._restart.requested,
-                         [("assistant", "pedido de voz não-dona")])
+                         [("pc", "pedido de voz não-dona")])
         self.assertTrue(any("Só o dono pode confirmar um reinício." in said
                             for said in obj.said))
 
@@ -243,10 +280,11 @@ class OwnerDirectRestartTests(unittest.TestCase):
         obj = _obj(speaker=tv_speaker())
         self.assertFalse(main.JarvisLive._owner_direct_action_gate(
             obj, "Reinicie você", OWNER_PCM))
+        self.assertEqual(obj._restart.self_restarts, [])
         self.assertEqual(obj._restart.confirmed_owner, [])
         self.assertEqual(obj._restart.requested, [])
-        self.assertTrue(any("voz não confirmada como dono" in line
-                            for line in obj.ui.logs))
+        self.assertTrue(any("voz não reconhecida" in line
+                            for line in obj.ui.logs), obj.ui.logs)
 
     def test_question_about_restart_does_not_restart(self):
         obj = _obj()
@@ -269,15 +307,15 @@ class OwnerDirectRestartTests(unittest.TestCase):
         obj = _obj()
         self.assertTrue(main.JarvisLive._owner_direct_action_gate(
             obj, "preciso que você reinicie", OWNER_PCM))
-        self.assertEqual(obj._restart.confirmed_owner,
-                         [("assistant", restart_mod.AUTO_DETECTION_REASON)])
+        self.assertEqual(obj._restart.self_restarts,
+                         [("dono", "ordem falada do dono")])
 
     def test_imperative_order_to_the_assistant_still_executes(self):
         obj = _obj()
         self.assertTrue(main.JarvisLive._owner_direct_action_gate(
             obj, "reinicia o assistente", OWNER_PCM))
-        self.assertEqual(obj._restart.confirmed_owner,
-                         [("assistant", restart_mod.AUTO_DETECTION_REASON)])
+        self.assertEqual(obj._restart.self_restarts,
+                         [("dono", "ordem falada do dono")])
 
     def test_denial_does_not_restart(self):
         obj = _obj()
@@ -301,13 +339,30 @@ class OwnerDirectRestartTests(unittest.TestCase):
             obj, "Reinicie você", OWNER_PCM))
         self.assertEqual(obj._restart.confirmed_owner, [])
 
-    def test_background_job_holds_the_restart(self):
+    def test_background_job_postpones_the_process_restart(self):
+        """Limite 1: nunca reiniciar com executor vivo — o pedido é adiado.
+
+        Antes a ordem caía no modelo com tarefa de fundo rodando. Agora o
+        turno é tratado e o reinício fica adiado pela guarda, com trilha.
+        """
+        obj = _obj()
+        with mock.patch.object(main._qoder_jobs, "is_busy", return_value=True):
+            self.assertTrue(main.JarvisLive._owner_direct_action_gate(
+                obj, "Reinicie você", OWNER_PCM))
+        self.assertEqual(obj._restart.self_restarts,
+                         [("dono", "ordem falada do dono")])
+        self.assertEqual(obj._restart.confirmed_owner, [])
+        self.assertEqual(obj._restart.requested, [])
+        self.assertTrue(any("Vou reiniciar o meu processo assim que isso "
+                            "terminar" in said for said in obj.said), obj.said)
+
+    def test_background_job_still_holds_the_pc_restart(self):
         obj = _obj()
         with mock.patch.object(main._qoder_jobs, "is_busy", return_value=True):
             self.assertFalse(main.JarvisLive._owner_direct_action_gate(
-                obj, "Reinicie você", OWNER_PCM))
+                obj, "Reinicie o computador", OWNER_PCM))
+        self.assertEqual(obj._restart.self_restarts, [])
         self.assertEqual(obj._restart.confirmed_owner, [])
-        self.assertEqual(obj._restart.requested, [])
 
     def test_background_job_holds_shutdown_but_not_lock(self):
         obj = _obj()

@@ -132,7 +132,7 @@ def _espera_conclusao(events: list[str], *, segundos: float = 2.0) -> list[str]:
 def test_execucao_viva_emite_execution_complete_uma_unica_vez(
         sem_janela_do_dono):
     rt, events = _runtime()
-    plan = rt.start_turn("t1", "reinicia o assistente aí")
+    plan = rt.start_turn("t1", "desliga o computador aí")
     assert plan is not None and plan.active
 
     concl = _espera_conclusao(events)
@@ -153,7 +153,7 @@ def test_execucao_viva_emite_execution_complete_uma_unica_vez(
 def test_ciclo_repetido_do_portao_nao_duplica_a_notificacao(
         sem_janela_do_dono):
     rt, events = _runtime()
-    plan = rt.start_turn("t1", "reinicia o assistente aí")
+    plan = rt.start_turn("t1", "desliga o computador aí")
     assert plan is not None
     assert _espera_conclusao(events)
 
@@ -184,7 +184,7 @@ def test_portao_que_levanta_notifica_como_falha(sem_janela_do_dono, monkeypatch)
 
     # ANTES do turno: é o único jeito de o thread do portão encontrar o erro.
     monkeypatch.setattr(rt.orchestrator.executor, "run", _boom)
-    plan = rt.start_turn("t1", "reinicia o assistente aí")
+    plan = rt.start_turn("t1", "desliga o computador aí")
     assert plan is not None
 
     concl = _espera_conclusao(events)
@@ -207,7 +207,7 @@ def test_caminho_morto_run_plan_nao_participa_da_execucao_viva(
         return original(*a, **k)
 
     rt.orchestrator.run_plan = espiado
-    plan = rt.start_turn("t1", "reinicia o assistente aí")
+    plan = rt.start_turn("t1", "desliga o computador aí")
     assert plan is not None
     assert len(_espera_conclusao(events)) == 1
     assert called == [], "o vivo não passa por run_plan"
@@ -217,7 +217,7 @@ def test_caminho_morto_run_plan_nao_participa_da_execucao_viva(
 def test_kill_switch_log_events_desliga_a_notificacao_viva(
         sem_janela_do_dono):
     rt, events = _runtime(log_events=False)
-    plan = rt.start_turn("t1", "reinicia o assistente aí")
+    plan = rt.start_turn("t1", "desliga o computador aí")
     assert plan is not None
     _espera_conclusao(events, segundos=0.3)
     assert _concl(events) == []
@@ -232,7 +232,7 @@ def test_notificacao_quebra_mas_nao_derruba_o_portao(sem_janela_do_dono,
         raise RuntimeError("alto-falante entupido")
 
     monkeypatch.setattr(rt.orchestrator, "notify_execution_complete", _explode)
-    plan = rt.start_turn("t1", "reinicia o assistente aí")
+    plan = rt.start_turn("t1", "desliga o computador aí")
     assert plan is not None
     deadline = time.monotonic() + 2.0
     while not any("execution_complete falhou" in e for e in events) \

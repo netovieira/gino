@@ -11,7 +11,9 @@ WHY A SECOND CONFIRMATION MODULE
          say the phrase out loud. Nothing runs.
       2. ``confirm(phrase)`` runs only when the phrase contains
          "confirmo reiniciar". A request the model makes on its own does not
-         execute.
+         execute. Since the owner's order of 10/11/2026 this gate covers the
+         MACHINE only: the assistant's own process is restarted by
+         ``self_restart()``, with no phrase (see SELF RESTART below).
       3. ``cancel()`` throws the pending request away.
 
     The phrase is a gate, not a proof of identity: the voiceprint check belongs
@@ -54,12 +56,42 @@ RATE LIMIT
     mode of self-improvement: the assistant edits itself, restarts, crashes,
     restarts, and the user cannot reach it to stop it. The PC restart is not
     rate-limited because it does not come back by itself.
+
+SELF RESTART IS A POWER, NOT A REQUEST (owner, 10/11/2026, audio)
+    "Eu gostaria de te dar autonomia de se reiniciar... qualquer pessoa pode
+    pedir para você fazer... reiniciar o computador não — mas reiniciar você
+    mesmo, você pode ter essa autonomia a partir de agora."
+
+    ``self_restart()`` is that power: restarting the assistant's OWN process
+    needs no spoken phrase, from anyone — the owner, another enrolled voice at
+    the machine, or the assistant's own initiative in a test. ``restart_pc``
+    keeps the old protocol exactly as it was: only the owner's exact phrase
+    releases the machine. There is no ``kind`` parameter in the new path and it
+    never reaches ``_run_pc``, which is what keeps the machine behind the gate.
+
+    Three limits the owner's order does not remove, encoded here as guards:
+
+      * GUARD 1 — never kill a running executor/subagent. While
+        ``core/qoder_jobs`` is busy the restart is postponed, never dropped.
+      * GUARD 2 — never restart in the middle of an answer. While the app is
+        still delivering (TTS queue or the outgoing chat note), the restart is
+        postponed. The effect happens in ``flush_self_restart()``, which the
+        app calls when the current answer finished leaving.
+      * GUARD 3 — one restart per ceiling. The five-minute rate limit is the
+        ceiling (it survives the boot it guards, through
+        ``memory/restart_last.json``), and a single deferred slot means one
+        delivery batch can only ever queue one restart.
+
+    Every decision writes one line to ``memory/restart_trail.jsonl``: who
+    asked, why, and which guard postponed it. The trail is redacted — no
+    secret and no contact number ever lands there.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -80,6 +112,41 @@ LAST_PATH = BASE_DIR / "memory" / "restart_last.json"
 # The last request that timed out. Kept so a late confirmation can be renewed
 # with the original kind/reason instead of being re-parked as a blank request.
 ARCHIVE_PATH = BASE_DIR / "memory" / "restart_last_pending.json"
+# Trilha de toda decisão de reinício do próprio processo (limite 4 do dono).
+TRAIL_PATH = BASE_DIR / "memory" / "restart_trail.jsonl"
+TRAIL_MAX_LINES = 200
+# Guarda 3: o teto anti-loop é o RATE_LIMIT_SECONDS de sempre (5 minutos,
+# persistido em restart_last.json) — um reinício-auto por janela, nunca em
+# loop. O abaixo só limita QUANTO TEMPO um reinício adiado fica esperando.
+SELF_DEFER_TTL_SECONDS = 900.0
+_TRAIL_MAX_CHARS = 120
+_TRAIL_NUMBER_RE = re.compile(r"\+?(?:\d[\s().-]){7,}\d")
+# "senha=xyz", "token: xyz", "api_key = xyz": a trilha guarda o fato de que
+# alguém escreveu uma chave, nunca o valor dela.
+_TRAIL_SECRET_RE = re.compile(
+    r"(?i)\b(senha|password|passwd|token|secret|api[_-]?key|apikey|chave|"
+    r"otp|pin)\b\s*[:=]\s*[^\s,;]+")
+_TRAIL_REDACTED = "[retido]"
+
+# Quem pediu o reinício do processo. A trilha só conhece estes três rótulos
+# mais "origem nao declarada": nada aqui pode virar nome, número ou segredo.
+REQUESTER_OWNER = "dono"
+REQUESTER_VOICE = "outra voz"
+REQUESTER_SELF = "iniciativa propria"
+REQUESTER_UNKNOWN = "origem nao declarada"
+REQUESTER_LABELS = (REQUESTER_OWNER, REQUESTER_VOICE, REQUESTER_SELF,
+                    REQUESTER_UNKNOWN)
+_REQUESTER_ALIASES = {
+    "dono": REQUESTER_OWNER, "owner": REQUESTER_OWNER,
+    "outra voz": REQUESTER_VOICE, "outra": REQUESTER_VOICE,
+    "voz cadastrada": REQUESTER_VOICE, "voz nao dona": REQUESTER_VOICE,
+    "voice": REQUESTER_VOICE, "guest": REQUESTER_VOICE,
+    "person": REQUESTER_VOICE, "anyone": REQUESTER_VOICE,
+    "iniciativa propria": REQUESTER_SELF, "self": REQUESTER_SELF,
+    "modelo": REQUESTER_SELF, "model": REQUESTER_SELF,
+    "teste": REQUESTER_SELF, "autonomous": REQUESTER_SELF,
+    "own initiative": REQUESTER_SELF,
+}
 
 # Wall clock of this process. A request saved by a PREVIOUS process is stale by
 # definition — the assistant already restarted, so asking again after boot is
@@ -146,12 +213,47 @@ def recorded_origin(reason: str = "", previous: str = "") -> str:
     return received
 
 
+def normalize_requester(value: object) -> str:
+    """Quem pediu, reduzido a um dos rótulos da trilha.
+
+    Chamador nenhum é credível para si mesmo: "dono" só vale quando quem
+    chama é o portão de voz que acabou de conferir a voz dele. O modelo e a
+    ponte passam "iniciativa propria"; nada aqui copia texto livre.
+    """
+    return _REQUESTER_ALIASES.get(_normalize(value), REQUESTER_UNKNOWN)
+
+
+def _redact_for_trail(text: object) -> str:
+    """Motivo/guarda como vão entrar na trilha: curto e sem segredo."""
+    raw = _short(str(text or ""), _TRAIL_MAX_CHARS)
+    if not raw:
+        return ""
+    try:
+        from core.guide_panel import redact
+        raw = str(redact(raw))
+    except Exception:
+        pass
+    raw = _TRAIL_SECRET_RE.sub(lambda m: f"{m.group(1)}={_TRAIL_REDACTED}", raw)
+    raw = _TRAIL_NUMBER_RE.sub(_TRAIL_REDACTED, raw)
+    return " ".join(raw.split())
+
+
+def _jobs_busy() -> bool:
+    """Guarda 1, no código: existe executor/subagente vivo agora?"""
+    try:
+        from core import qoder_jobs
+        return bool(qoder_jobs.is_busy())
+    except Exception:
+        return False
+
+
 @dataclass
 class _PendingRequest:
     kind:     str            # "assistant" | "pc"
     reason:   str
     phrase:   str
     at:       float          # time.monotonic(), for expiry
+    requester: str = ""      # quem pediu o reinício do próprio processo
 
 
 def _normalize(text: object) -> str:
@@ -254,25 +356,34 @@ class RestartManager:
         self.archive_path = (self.state_path.with_name(
                                 "restart_last_pending.json")
                              if state_path is not None else ARCHIVE_PATH)
+        # Trilha do poder próprio: no mesmo lugar do resto do estado, e em
+        # arquivo separado quando o chamador isolou o estado (testes).
+        self.trail_path = (self.state_path.with_name("restart_trail.jsonl")
+                           if state_path is not None else TRAIL_PATH)
 
         self._lock = threading.RLock()
         self._pending: Optional[_PendingRequest] = None
         self._expired: Optional[dict] = None
         self._last_assistant_at: Optional[float] = None
         self._last_reason: str = ""
+        # Reinício do próprio processo adiado por guarda (limites 1 e 2).
+        # Um único slot: um lote de trabalho nunca acumula mais de um.
+        self._self_deferred: Optional[_PendingRequest] = None
         self._load_last()
 
         self._shutdown_cb: Optional[Callable[[], None]] = None
         self._confirm_cb: Optional[Callable[[str], None]] = None
         self._expire_cb: Optional[Callable[[str], None]] = None
         self._pc_restart: Optional[Callable[[], object]] = None
+        self._delivering_cb: Optional[Callable[[], bool]] = None
 
     # ── wiring ──────────────────────────────────────────────────────────────
 
     def bind(self, shutdown_cb: Optional[Callable[[], None]] = None,
              confirm_cb: Optional[Callable[[str], None]] = None,
              pc_restart: Optional[Callable[[], object]] = None,
-             expire_cb: Optional[Callable[[str], None]] = None) -> None:
+             expire_cb: Optional[Callable[[str], None]] = None,
+             delivering_cb: Optional[Callable[[], bool]] = None) -> None:
         """Wire the manager to the app.
 
         shutdown_cb: called with no arguments to end the app cleanly.
@@ -285,11 +396,15 @@ class RestartManager:
         pc_restart:  the callable that reboots the machine; defaults to
                      actions.computer_settings.restart_computer at execution
                      time, never at import time.
+        delivering_cb: True while the current answer is still leaving (TTS
+                     queue or the outgoing chat note). Guarda 2 do reinício do
+                     próprio processo: o reinício espera a entrega acabar.
         """
         self._shutdown_cb = shutdown_cb if callable(shutdown_cb) else None
         self._confirm_cb = confirm_cb if callable(confirm_cb) else None
         self._expire_cb = expire_cb if callable(expire_cb) else None
         self._pc_restart = pc_restart if callable(pc_restart) else None
+        self._delivering_cb = delivering_cb if callable(delivering_cb) else None
 
     def _log(self, message: str) -> None:
         try:
@@ -612,6 +727,168 @@ class RestartManager:
             f"do not claim it happened."
         )
 
+    # ── poder próprio: reiniciar o PRÓPRIO processo ─────────────────────────
+
+    def _trail(self, decision: str, requester: str, reason: str,
+               guard: str = "") -> None:
+        """Uma linha por decisão de reinício — nunca levanta o turno.
+
+        ``decision``: executado | adiado | recusado | descartado. Quem pediu é
+        um dos rótulos fixos; o motivo passa por redação. Sem segredo e sem
+        número de contato, mesmo que o texto recebido tivesse um.
+        """
+        record = {
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "pid": os.getpid(),
+            "alvo": "processo",
+            "decisao": decision,
+            "quem": requester or REQUESTER_UNKNOWN,
+            "motivo": _redact_for_trail(reason),
+            "guarda": _redact_for_trail(guard),
+        }
+        try:
+            self._log(f"reinício do processo {decision} — quem: "
+                      f"{record['quem']}"
+                      + (f" — guarda: {record['guarda']}"
+                         if record["guarda"] else ""))
+            if not self._persist:
+                return
+            self.trail_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.trail_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self._trim_trail()
+        except Exception as e:
+            self._log(f"trilha de reinício falhou — {e}")
+
+    def _trim_trail(self) -> None:
+        """Mantém as últimas TRAIL_MAX_LINES linhas; falha é silenciosa."""
+        try:
+            lines = self.trail_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return
+        if len(lines) <= TRAIL_MAX_LINES:
+            return
+        tmp = self.trail_path.with_suffix(".trim")
+        try:
+            tmp.write_text("\n".join(lines[-TRAIL_MAX_LINES:]) + "\n",
+                           encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.trail_path)
+        except OSError as e:
+            self._log(f"trilha não coube — {e}")
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _self_guard(self) -> str:
+        """Motivo que impede o reinício AGORA; "" quando nada impede.
+
+        Guarda 1 (executor/subagente vivo) é verificada no código, sem
+        depender de quem chama. Guarda 2 (resposta ainda saindo) vem do app
+        por callback, porque só o app sabe se a fala dele terminou de sair.
+        """
+        if _jobs_busy():
+            return "tarefa de fundo em execução"
+        cb = self._delivering_cb
+        if cb is not None:
+            try:
+                if cb():
+                    return "resposta ainda em entrega"
+            except Exception as e:
+                self._log(f"guarda de entrega indisponível — {e}")
+        return ""
+
+    def self_restart(self, reason: str = "",
+                     requester: str = REQUESTER_SELF) -> str:
+        """Reinicia o processo do assistente — poder próprio, sem frase.
+
+        Não existe parâmetro de alvo aqui de propósito: este método só sabe
+        reiniciar o processo e nunca chama ``_run_pc``. A máquina continua no
+        protocol antigo (``request_pc`` + a frase exata do dono).
+
+        Ordem dos chequeiros: teto (recusa), depois guardas (adia), depois
+        executa. Adiar nunca derruba o pedido — ele sai em
+        ``flush_self_restart`` quando a entrega/executor liberar.
+        """
+        who = normalize_requester(requester)
+        why = recorded_origin(reason)
+        ceiling = self._rate_limited()
+        if ceiling:
+            self._trail("recusado", who, why, guard="teto de reinício")
+            return ceiling
+        guard = self._self_guard()
+        if guard:
+            with self._lock:
+                # Um reinício por lote: o slot já cheio não acumula o segundo.
+                if self._self_deferred is None:
+                    self._self_deferred = _PendingRequest(
+                        kind="assistant", reason=why, phrase="",
+                        at=time.monotonic(), requester=who)
+            self._trail("adiado", who, why, guard=guard)
+            return (f"Reinício do processo ADIADO: {guard}. Acontece sozinho "
+                    f"quando isso terminar — nada foi reiniciado ainda.")
+        return self._run_self(_PendingRequest(kind="assistant", reason=why,
+                                              phrase="", at=time.monotonic(),
+                                              requester=who))
+
+    def _run_self(self, request: _PendingRequest) -> str:
+        """Executa o reinício do processo e grava a trilha do que houve."""
+        with self._lock:
+            self._self_deferred = None
+        out = self._run_assistant(request)
+        low = str(out).lower()
+        decided = ("recusado" if "nothing was done" in low
+                   or "cannot restart" in low or "could not schedule" in low
+                   else "executado")
+        self._trail(decided, request.requester, request.reason)
+        return out
+
+    def flush_self_restart(self) -> str:
+        """Ponto de efeito do reinício adiado: chame quando a resposta saiu.
+
+        O app chama isto quando a entrega terminou e nenhum executor está
+        vivo (a fila de saída esvaziou). Ainda assim o método confere as
+        guardas de novo — se algo voltou a ocupá-las, o pedido continua
+        adiado em vez de cortar o trabalho no meio.
+        """
+        with self._lock:
+            request = self._self_deferred
+            if request is None:
+                return ""
+            age = time.monotonic() - request.at
+        if age > SELF_DEFER_TTL_SECONDS:
+            with self._lock:
+                if self._self_deferred is request:
+                    self._self_deferred = None
+            self._trail("descartado", request.requester, request.reason,
+                        guard="adiamento venceu")
+            return ("The deferred assistant restart aged out. Nothing was "
+                    "restarted.")
+        ceiling = self._rate_limited()
+        if ceiling:
+            with self._lock:
+                if self._self_deferred is request:
+                    self._self_deferred = None
+            self._trail("recusado", request.requester, request.reason,
+                        guard="teto de reinício")
+            return ceiling
+        guard = self._self_guard()
+        if guard:
+            return ""
+        return self._run_self(request)
+
+    def deferred_self_restart(self) -> Optional[dict]:
+        """O reinício do processo que está aguardando a guarda liberar."""
+        with self._lock:
+            request = self._self_deferred
+            if request is None:
+                return None
+            age = int(max(time.monotonic() - request.at, 0.0))
+            return {"kind": request.kind, "reason": request.reason,
+                    "requester": request.requester, "age_seconds": age,
+                    "guard": self._self_guard()}
+
     def confirm_owner(self, kind: str = "assistant",
                       reason: str = "") -> str:
         """Run a restart the OWNER just ordered out loud.
@@ -841,9 +1118,15 @@ class RestartManager:
 
     # The Qoder tool bridge looks for these names (see core/tool_bridge.py).
     def assistant(self, reason: str = "") -> str:
-        return self.request_assistant(reason=reason)
+        """Ponte/agente pedindo o reinício do próprio processo: é poder
+        próprio (dono, 10/11/2026), não um pedido a confirmar. A origem
+        registrada é a de sempre em qualquer chamada de ferramenta:
+        iniciativa do assistente — uma chamada de ferramenta nunca prova que
+        foi o dono quem falou."""
+        return self.self_restart(reason=reason, requester=REQUESTER_SELF)
 
     def pc(self, reason: str = "") -> str:
+        """A máquina continua no portão antigo: estaciona e espera a frase."""
         return self.request_pc(reason=reason)
 
     def status(self) -> Optional[dict]:

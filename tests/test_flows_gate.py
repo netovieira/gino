@@ -60,7 +60,9 @@ def test_live_turn_sends_confirm_action_to_the_gate():
         _config(), speak=lambda _t: None, log=logs.append,
         executor_runner=lambda tool, args: calls.append(tool) or {"ok": True},
         start_expiry_thread=False)
-    runtime.start_turn("t1", "reinicia o assistente")
+    # "desliga o computador" continua no portão (dono, 10/11/2026): só o
+    # reinício do próprio processo perdeu a janela.
+    runtime.start_turn("t1", "desliga o computador")
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
         if any("portão de ferramenta" in line for line in logs):

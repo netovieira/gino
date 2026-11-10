@@ -196,19 +196,41 @@ class RemoteOwnerVoiceArmsTests(unittest.TestCase):
         self.assertTrue(actiongate.authorized())
 
     def test_owner_voice_direct_restart_order_needs_no_key_phrase(self):
+        """Dono, 10/11/2026: o processo é poder próprio — nem ele espera frase.
+
+        A nota dele no chat direto abre `self_restart` (sem janela) e a
+        máquina continua em `confirm_owner`, que é o portão antigo.
+        """
         obj = _obj()
         obj._restart_enabled = True
         obj._restart = mock.Mock()
         obj._restart.pending.return_value = None
-        obj._restart.confirm_owner.return_value = "Restarting the assistant"
+        obj._restart.self_restart.return_value = "Restarting the assistant"
         obj._background_job_running = lambda: False
         obj._qoder_live = None
         obj.interrupt = mock.Mock()
         main.JarvisLive._owner_direct_action_gate(
             obj, "eu quero que você reinicie", OWNER_PCM)
+        obj._restart.self_restart.assert_called_once()
+        obj._restart.confirm_owner.assert_not_called()
+        self.assertEqual(obj._restart.self_restart.call_args.kwargs["requester"],
+                         "dono")
+
+    def test_owner_voice_pc_restart_order_still_uses_the_machine_gate(self):
+        obj = _obj()
+        obj._restart_enabled = True
+        obj._restart = mock.Mock()
+        obj._restart.pending.return_value = None
+        obj._restart.confirm_owner.return_value = "Restarting the computer"
+        obj._background_job_running = lambda: False
+        obj._qoder_live = None
+        obj.interrupt = mock.Mock()
+        main.JarvisLive._owner_direct_action_gate(
+            obj, "reinicia o computador agora", OWNER_PCM)
+        obj._restart.self_restart.assert_not_called()
         obj._restart.confirm_owner.assert_called_once()
         self.assertEqual(obj._restart.confirm_owner.call_args.kwargs["kind"],
-                         "assistant")
+                         "pc")
 
     def test_unknown_voice_note_authorises_nothing_and_is_logged(self):
         obj = _obj(speaker=guest_speaker())

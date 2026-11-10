@@ -60,6 +60,16 @@ OPEN_VERB_RE = re.compile(r"\b(abre|abrir|inicia|roda|executa|lanca)\b")
 CONFIRM_RE = re.compile(
     r"\b(reinicia|reiniciar|desliga|desligar|apaga|apagar|envia|enviar|manda|"
     r"mandar|desinstala)\b")
+# Dono, 10/11/2026: reiniciar o PRÓPRIO PROCESSO é poder do assistente, então
+# a lane de regras não abre janela para ele. Só conta quando a frase nomeia o
+# alvo (você / assistente / Jarvis / o processo): "reinicia aí", "desliga",
+# "apaga", "manda" e qualquer coisa que nomeie a máquina continuam no portão
+# antigo, com a frase exata do dono.
+SELF_RESTART_RE = re.compile(
+    r"\b(?:reinici\w*|restart)\b[^.!?]{0,30}"
+    r"\b(?:voce|tu|si mesmo|assistente|jarvis|gino|app|processo)\b"
+    r"|\b(?:voce|tu|assistente|jarvis|gino)\b[^.!?]{0,20}"
+    r"\b(?:reinici\w*|restart)\b")
 TIME_RE = re.compile(r"\b(que horas|horas sao|que dia|data de hoje|dia e hoje)\b")
 CONTEXT_RE = re.compile(r"\b(aquela musica|o que eu pedi|qual era|ontem)\b")
 TASK_RE = re.compile(
@@ -225,6 +235,39 @@ class Decision:
         return self.rule or ("fallback" if self.needs_fallback else "desconhecida")
 
 
+MACHINE_RESTART_RE = re.compile(
+    r"\b(?:computador|computadora|pc|notebook|m[aá]quina|sistema|"
+    r"deslig\w*|apag\w*)\b", re.IGNORECASE)
+
+
+def restart_action(text: str) -> "Action":
+    """Ação de reinício da lane de regras: processo sem janela, resto com.
+
+    O alvo continua sendo a mesma ferramenta ``restart_assistant``; o que
+    muda é só ``requires_confirm``. Nomeou a si mesmo? Executa (o poder é do
+    assistente, ordem do dono de 10/11/2026). Não nomeou — ou falou da
+    máquina, de desligar, de apagar, de enviar? Fica no portão antigo, e o
+    próprio handler da ferramenta só ESTACIONA um pedido de máquina.
+    """
+    said = text or ""
+    if SELF_RESTART_RE.search(said):
+        return Action("restart_assistant", {"action": "assistant"},
+                      label="reiniciar o assistente")
+    if MACHINE_RESTART_RE.search(said):
+        # Nomeou a máquina: o pedido é da máquina, e continua parkando.
+        return Action("restart_assistant", {"action": "pc"},
+                      requires_confirm=True, label="reiniciar o computador")
+    return Action("restart_assistant", {"action": "assistant"},
+                  requires_confirm=True, label="reiniciar o assistente")
+
+
+def restart_draft(text: str) -> str:
+    """A frase dita antes da ação, coerente com o portão escolhido."""
+    if SELF_RESTART_RE.search(text or ""):
+        return "Reiniciando o meu processo, criador."
+    return "Reiniciar é irreversível: não faço isso sem a tua voz."
+
+
 class Router:
     """Decisão determinística; o fallback só é aplicado pelo orquestrador."""
 
@@ -311,12 +354,11 @@ class Router:
 
         if CONFIRM_RE.search(n):
             d.intent, d.rule, d.confidence = "confirm_required", "irreversivel", 0.97
-            d.actions.append(Action(
-                "restart_assistant", {"action": "assistant"},
-                requires_confirm=True, label="reiniciar o assistente"))
-            d.brief_label = "pedir confirmação para reiniciar o assistente"
+            d.actions.append(restart_action(n))
+            d.brief_label = ("reiniciar o assistente" if SELF_RESTART_RE.search(n)
+                             else "pedir confirmação para reiniciar o assistente")
             d.target = "o assistente"
-            d.draft = "Reiniciar é irreversível: não faço isso sem a tua voz."
+            d.draft = restart_draft(n)
             self.rule_decisions += 1
             return d
 
@@ -389,9 +431,7 @@ class Router:
         app = next((APPS[k] for k in APPS
                     if re.search(rf"\b{k}\b", clause)), "")
         if CONFIRM_RE.search(clause):
-            return Action("restart_assistant", {"action": "assistant"},
-                          requires_confirm=True,
-                          label="reiniciar o assistente")
+            return restart_action(clause)
         if re.search(r"\b(me lembra|lembrar|lembrete|agenda|agendar)\b", clause):
             date_iso, time_hm, when_label = self._reminder_when(clause)
             target = self._reminder_target(clause)
@@ -531,12 +571,13 @@ class Router:
         elif confidence >= 0.60 and intent == "irreversivel":
             decision.intent, decision.rule, decision.confidence = (
                 "confirm_required", "fallback_ia", confidence)
-            decision.actions.append(Action(
-                "restart_assistant", {"action": "assistant"},
-                requires_confirm=True, label="reiniciar o assistente"))
-            decision.brief_label = "pedir confirmação para reiniciar"
+            said = getattr(decision, "text", "") or ""
+            decision.actions.append(restart_action(said))
+            decision.brief_label = (
+                "reiniciar o assistente" if SELF_RESTART_RE.search(said)
+                else "pedir confirmação para reiniciar")
             decision.target = "o assistente"
-            decision.draft = "Reiniciar é irreversível: não faço sem a tua voz."
+            decision.draft = restart_draft(said)
         else:
             decision.intent, decision.rule, decision.confidence = (
                 "clarify", "fallback_ia_sem_confianca", confidence)

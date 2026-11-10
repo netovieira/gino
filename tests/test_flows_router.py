@@ -62,10 +62,27 @@ def test_cancel_draft_does_not_assert_result():
 
 
 def test_irreversible_requires_confirmation():
-    decision = Router().parse("reinicia o assistente aí")
+    decision = Router().parse("desliga o computador aí")
     action = decision.actions[0]
     assert action.tool == "restart_assistant"
     assert action.requires_confirm is True
+
+
+def test_own_process_restart_has_no_window():
+    """Dono, 10/11/2026: reiniciar a si mesmo é poder, não pedido.
+
+    A lane de regras não abre janela quando a frase nomeia o alvo (você /
+    assistente / o processo). Nomear a máquina, ou não nomear nada, deixa o
+    portão exatamente como estava.
+    """
+    for said in ("reinicia o assistente aí", "reinicia você",
+                 "reinicia o teu processo"):
+        action = Router().parse(said).actions[0]
+        assert action.tool == "restart_assistant"
+        assert action.requires_confirm is False, said
+
+    for said in ("reinicia a maquina", "desliga o computador", "reinicia aí"):
+        assert Router().parse(said).actions[0].requires_confirm is True, said
 
 
 def test_untrusted_never_routes_to_action():

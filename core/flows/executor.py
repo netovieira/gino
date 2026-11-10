@@ -351,6 +351,12 @@ class ExecutorResult:
 def pending_phrase(tool: str, args: dict[str, Any] | None = None) -> str:
     args = args or {}
     if tool == "restart_assistant":
+        # Dono, 10/11/2026: o reinício do próprio processo não tem frase
+        # (poder próprio). Quando a lane de regras ainda parka um reinício,
+        # a frase que falta é a do alvo realmente pedido.
+        if str(args.get("action") or "").strip().lower() in (
+                "pc", "computer", "computador", "machine", "restart_pc"):
+            return "confirmo reiniciar o computador"
         return "confirmo reiniciar o assistente"
     if tool in ("send_message", "whatsapp_control", "email_control",
                 "mail_control"):

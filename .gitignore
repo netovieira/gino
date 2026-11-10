@@ -69,6 +69,9 @@ config/api_keys.json.bak-*
 memory/tasks.json.bak-*
 # Estado de retomada de um restart, recriado a cada boot:
 memory/restart_last_pending.json
+# Trilha local das decisões de reinício do próprio processo (sem segredo,
+# mas é estado de runtime, não código):
+memory/restart_trail.jsonl
 # Estado por conta de e-mail (config/mail/ acima já cobre o diretório inteiro;
 # esta linha sobrevive a um eventual afrouxamento daquela regra):
 config/mail/*/state.json

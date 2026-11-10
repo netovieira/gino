@@ -142,12 +142,14 @@ def test_cancel_before_execution_aborts_without_calling_runner():
 
 def test_confirmation_never_executes_the_tool():
     orch, runner, _ = _orchestrator()
-    plan = orch.begin("t1", "reinicia o assistente aí")
+    # A máquina continua parkando (dono, 10/11/2026); o que perdeu a
+    # janela foi o reinício do próprio processo.
+    plan = orch.begin("t1", "desliga o computador aí")
     results = orch.run_plan(plan)
     assert runner.calls == []
     assert results[0].pending_confirm
     fact = results[0].facts[0]
-    assert fact["pending_confirm"] == "confirmo reiniciar o assistente"
+    assert fact["pending_confirm"] == "confirmo reiniciar o computador"
     assert fact["assertion"] is False
 
 

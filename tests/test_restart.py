@@ -562,11 +562,16 @@ def test_live_pc_restart_failure_does_not_claim_success(monkeypatch, tmp_path):
 
 
 def test_bridge_aliases_reach_the_same_protocol(manager):
+    """Dono, 10/11/2026: a ponte acende o poder do processo; a máquina parka.
+
+    O alias `assistant` deixou de ser um pedido a confirmar; `pc` continua no
+    portão antigo, que é o que separa os dois caminhos.
+    """
     result = manager.assistant(reason="ponte")
-    assert "[CONFIRMATION_PENDING]" in result
+    assert "[DRY RUN]" in result
+    assert "[CONFIRMATION_PENDING]" not in result
     status = manager.status()
-    assert status is not None and status["kind"] == "assistant"
-    manager.cancel()
+    assert status is None
     assert manager.pc(reason="ponte").startswith("[CONFIRMATION_PENDING]")
 
 
@@ -588,27 +593,32 @@ def test_action_status_and_unknown_action(manager):
     assert "Nothing was done" in result
 
 
-def test_action_request_then_confirm_with_phrase(manager, no_popen):
+def test_action_assistant_is_a_power_and_pc_keeps_the_phrase(manager, no_popen):
+    """Reinício do processo: executa, sem frase. Da máquina: parka e espera."""
     action.bind(manager)
 
     result = action.restart_assistant(
         {"action": "assistant", "reason": "auto-melhoria"})
-    assert "[CONFIRMATION_PENDING]" in result
-    assert "confirmo reiniciar o assistente" in result
+    assert result.startswith("[DRY RUN]")
+    assert "confirmo reiniciar" not in result
+    assert manager.pending() is None
 
-    status = action.restart_assistant({"action": "status"})
-    assert "assistant restart" in status
-    assert "awaiting" in status
+    # O teto de 5 minutos é o que trava o próximo, não uma janela de "sim".
+    limited = action.restart_assistant({"action": "assistant"})
+    assert "rate-limited" in limited
+    assert manager.pending() is None
 
+    # O modelo continua sem poder confirmar nada pelo dono.
     rejected = action.restart_assistant({"action": "confirm", "phrase": "sim"})
     assert "owner-factor-only" in rejected.lower()
 
-    # The pending request survives a wrong phrase.
-    assert manager.pending() is not None
-    assert "awaiting" in action.restart_assistant({"action": "status"})
+    parked = action.restart_assistant({"action": "pc", "reason": "kernel"})
+    assert "confirmo reiniciar o computador" in parked
+    status = action.restart_assistant({"action": "status"})
+    assert "pc restart" in status and "awaiting" in status
 
-    # The owner's voice applies it; the model's tool never confirms.
-    done = manager.confirm("confirmo reiniciar o assistente")
+    # A fala exata do dono é o que libera a máquina.
+    done = manager.confirm("confirmo reiniciar o computador")
     assert done.startswith("[DRY RUN]")
     assert manager.pending() is None
     no_popen.assert_not_called()

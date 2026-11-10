@@ -318,7 +318,7 @@ def test_confirmacao_pendente_gera_evento_sem_executar_a_ferramenta(
         no_owner_window):
     """Lei (b): nada executou, mas o despacho terminou — o cérebro é avisado."""
     orch, runner, _, events, _ = _harness()
-    plan = orch.begin("t1", "reinicia o assistente aí")
+    plan = orch.begin("t1", "desliga o computador aí")
 
     results = orch.run_plan(plan)
     assert runner.calls == []

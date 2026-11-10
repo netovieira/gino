@@ -1,10 +1,14 @@
 """
-The spoken-confirmation restart gate, as a tool.
+The restart tool: own-process restart is a power, the machine is a gate.
 
-The actual protocol lives in core/restart.py: a request is only parked, and
-only an explicit "confirmo reiniciar" runs it. This file is a thin, safe shell
-around that manager so both the Live model (through auto-discovery) and the
-Qoder bridge can reach it.
+The actual protocol lives in core/restart.py. Since the owner's order of
+10/11/2026 restarting the assistant's OWN process needs no phrase — this tool
+calls ``RestartManager.self_restart``, which carries the guards (never kill a
+running background task, never cut an answer in flight, one restart per five
+minutes) and writes the trail. The COMPUTER is unchanged: ``request_pc`` parks
+the request and only the owner's exact phrase runs it. This file is a thin,
+safe shell around that manager so both the Live model (through auto-discovery)
+and the Qoder bridge can reach it.
 
 The module-level manager is bound once by main.py:
 
@@ -44,6 +48,11 @@ def _status_text(manager: RestartManager) -> str:
     if p is not None:
         return (f"The {p['kind']} restart is awaiting the spoken phrase "
                 f"'{p['phrase']}' ({p['expires_in']}s left). Nothing has restarted.")
+    deferred_fn = getattr(manager, "deferred_self_restart", None)
+    deferred = deferred_fn() if callable(deferred_fn) else None
+    if deferred:
+        return (f"An assistant PROCESS restart is postponed ({deferred['guard']}) "
+                f"and will run by itself when that ends. Nothing has restarted yet.")
     expired_fn = getattr(manager, "last_expired", None)
     expired = expired_fn() if callable(expired_fn) else None
     if expired:
@@ -66,8 +75,13 @@ def restart_assistant(parameters: dict, player=None, speak=None,
     reason = str(p.get("reason") or "").strip()
 
     if action in _ASSISTANT_ACTIONS:
-        return _manager.request_assistant(reason=reason)
+        # Dono, 10/11/2026: reiniciar o PRÓPRIO PROCESSO é poder do
+        # assistente. Nenhuma frase, nenhuma janela de confirmação. A
+        # origem da trilha é sempre "iniciativa propria": uma chamada de
+        # ferramenta nunca prova que foi o dono quem falou.
+        return _manager.self_restart(reason=reason)
     if action in _PC_ACTIONS:
+        # A máquina não mudou: estaciona e só sai com a frase exata dele.
         return _manager.request_pc(reason=reason)
     if action in _CONFIRM_ACTIONS:
         # Confirmation belongs to the owner's factors, not to the model.
@@ -89,15 +103,21 @@ def restart_assistant(parameters: dict, player=None, speak=None,
 TOOL = {
     "name": "restart_assistant",
     "description": (
-        "Restart the assistant itself or the computer. Never happens on the "
-        "first call: action='assistant' or action='pc' only parks a request and "
-        "asks the owner to say the phrase out loud ('confirmo reiniciar') or "
-        "to type his password. The confirmation is owner-factor-only (voice "
-        "or verified typed password — decision of 06/11/2026); you cannot "
-        "confirm it yourself. Never "
-        "claim a restart happened before the owner speaks the phrase. "
-        "action='cancel' drops a pending request; action='status' reports one. "
-        "Never use the PC restart as part of an automatic improvement."
+        "Two different powers, one tool. action='assistant' restarts YOUR OWN "
+        "PROCESS: since the owner's order of 10/11/2026 that is your own power, "
+        "so it runs without any phrase and without asking — yours to take when "
+        "a test needs a clean boot, and anyone who asks for it triggers the "
+        "same thing. It never restarts the machine. It is postponed (and "
+        "happens by itself later) if a background task is still running or the "
+        "current answer has not finished leaving; one restart per five minutes. "
+        "action='pc' is the COMPUTER and has not changed: it only parks a "
+        "request, and nothing runs until the owner says the exact phrase "
+        "('confirmo reiniciar o computador') or types his password. That "
+        "confirmation is owner-factor-only (decision of 06/11/2026) — you "
+        "cannot confirm it yourself, and you must never claim the machine "
+        "restarted. action='cancel' drops a pending PC request; "
+        "action='status' reports what is pending or postponed. Tell the owner "
+        "in one short sentence which of the two you did."
     ),
     "parameters": {
         "type": "OBJECT",
