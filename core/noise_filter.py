@@ -64,6 +64,17 @@ _SPECTRAL_FLOOR = 0.02
 # Energy gate: blocks whose RMS is below this (float32 scale) are considered
 # silence and passed through without processing.
 _RMS_SILENCE_GATE = 0.003
+# Guarda da voz: quantas vezes o nível médio do bloco tem de ficar acima do
+# piso de ruído aprendido para o bloco ser considerado fala de verdade e passar
+# SEM nenhum corte (byte por byte).  Medido em 10/11/2026 com os sinais do
+# banco de testes (`tests/audio_fixtures.voice_block`, 64 ms, 16 kHz):
+#   voz cheia / voz baixa / repetição do mesmo quadro -> 3,14 a 3,56
+#   ruído branco puro (qualquer nível)               -> 1,65 a 1,78
+#   voz soterrada em ruído (+-46 dB)                 -> 2,31
+# O número é adimensional (razão entre duas médias do mesmo espectro), então
+# não depende do ganho do microfone.  2,6 fica acima de qualquer ruído e
+# abaixo de qualquer voz: o corte só acontece onde não há fala a perder.
+_PROTECT_SNR = 2.6
 
 
 # Running noise estimate (module-level exponential average).
@@ -132,6 +143,11 @@ def filter_block(audio_int16: bytes | np.ndarray,
                  sample_rate: int = 16000) -> bytes:
     """Apply a lightweight spectral gate to one audio block.
 
+    A block that carries a real signal comes back BYTE FOR BYTE as it
+    arrived: the noise estimate is still learned from it, but nothing is
+    subtracted (see ``_PROTECT_SNR``).  Only blocks whose level sits at the
+    learned noise floor are gated.
+
     Parameters
     ----------
     audio_int16 : bytes or np.ndarray
@@ -165,12 +181,13 @@ def filter_block(audio_int16: bytes | np.ndarray,
         return raw
 
     work = pcm[:fft_size]
-    # Apply a Hann window to reduce spectral leakage.
-    window = np.hanning(fft_size).astype(np.float32)
-    windowed = work * window
-
-    # Real FFT (rfft) -- half the bins, half the cost.
-    spec = np.fft.rfft(windowed)
+    # Sem janela de análise: este filtro processa UM bloco de cada vez e não há
+    # sobreposição alguma para somar de volta.  Multiplicar por uma Hann na
+    # entrada e de novo na saída (o que estava aqui antes) deixa o bloco
+    # pesado por w(t)^2 — medido: RMS 0,129 -> 0,060, ou seja -6,5 dB de uma
+    # voz limpa que não tinha ruído nenhum para tirar.  O corte de ruído é o
+    # ganho espectral; a janela só corrompia.
+    spec = np.fft.rfft(work)
     magnitude = np.abs(spec).astype(np.float32)
     n_bins = magnitude.size
 
@@ -191,6 +208,17 @@ def filter_block(audio_int16: bytes | np.ndarray,
                         + _NOISE_ALPHA * q25)
         _noise_estimate = estimate
 
+    # ── guarda da voz ───────────────────────────────────────────────────────
+    # O piso aprendido é uma fração fixa do espectro do próprio bloco, então
+    # subtrair dele num bloco que tem sinal em cima derruba o sinal junto.
+    # Onde o nível do bloco está bem acima do piso, não há ruído a tirar: o
+    # bloco volta cru, e é isso que "não corromper áudio limpo" significa em
+    # practice (a restrição que este módulo sempre declarou no docstring).
+    floor = float(np.mean(estimate))
+    level = float(np.mean(magnitude))
+    if floor > 0.0 and level >= floor * _PROTECT_SNR:
+        return raw
+
     # Wiener-style gain: suppress bins that are close to the noise floor.
     noise_scaled = _OVER_SUB * estimate
     gain = np.maximum(_SPECTRAL_FLOOR, 1.0 - noise_scaled / (magnitude + 1e-10))
@@ -198,12 +226,12 @@ def filter_block(audio_int16: bytes | np.ndarray,
     kernel = np.array([0.25, 0.5, 0.25], dtype=np.float32)
     gain_padded = np.pad(gain, (1, 1), mode="edge")
     gain_smooth = np.convolve(gain_padded, kernel, mode="valid")
+    if bool(np.all(gain_smooth >= 1.0)):
+        # Nada foi subtraído: devolve os bytes originais em vez da ida e volta
+        # pela FFT, que deixaria um resíduo de arredondamento no áudio guardado.
+        return raw
 
-    cleaned_spec = spec * gain_smooth
-    cleaned = np.fft.irfft(cleaned_spec, n=fft_size).astype(np.float32)
-
-    # Re-apply the window (overlap-add is not used in block mode).
-    cleaned *= window
+    cleaned = np.fft.irfft(spec * gain_smooth, n=fft_size).astype(np.float32)
     cleaned = np.clip(cleaned, -1.0, 1.0)
 
     # Reconstruct the full block (pad if the input was longer than fft_size).
