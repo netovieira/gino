@@ -100,18 +100,28 @@ def _free_choices() -> dict[str, str]:
 MODELS = _free_choices()
 
 
-def free_model(model: str | None) -> str:
+def free_model(model: str | None, *, configured: bool = True) -> str:
     """Resolve ``model`` to a model the catalog marks as free.
 
     A configured paid model is replaced by the first free model, and the
     switch is announced once through core.free_models listeners.
+
+    ``configured=False`` é o caso "o usuário não configurou nada": o nome é o
+    default DECLARADO no código, e ele é entregue como declarado — sem
+    consultar o catálogo vivo a cada chamada (decisão D3 do dono,
+    09/11/2026: "os 2"). A lei do gratuito não afrouxa aqui: um nome declarado
+    que não esteja na allowlist de último recurso ``FREE_MODELS`` é resolvido
+    pelo catálogo do mesmo jeito. Um default declarado que hoje é pago tem de
+    ser corrigido no código, e é isso que a allowlist trava em teste.
     """
+    m = str(model or "").strip()
+    if not configured and m in FREE_MODELS:
+        return m
     try:
         from core import free_models as _free
         chosen, _previous = _free.resolve(model or HEAVY_MODEL, "qoder")
         return chosen
     except Exception:
-        m = str(model or "").strip()
         return m if m in FREE_MODELS else HEAVY_MODEL
 
 # The answer to "why is the proxy not there": these two do not get better by
@@ -481,18 +491,23 @@ def ask(prompt: str, st: dict | None = None, model: str | None = None,
 def ask_with_file(prompt: str, attachment: str | os.PathLike,
                   st: dict | None = None, model: str | None = None,
                   max_tokens: int = 600,
-                  timeout: float | None = None) -> str:
+                  timeout: float | None = None,
+                  model_configured: bool = True) -> str:
     """One prompt + one attached file (an image), answered from what it sees.
 
     CLI-only, on purpose: the proxy speaks chat-completions without an
     attachment field, so falling back there would answer from the prompt alone —
     a description of an image nobody looked at. One attempt; a failure is raised
     with the CLI's own message so the caller can say what went wrong.
+
+    `model_configured=False` diz que o nome vem do default declarado do
+    chamador (visão sem configuração do dono): ele é entregue como declarado,
+    desde que esteja na allowlist gratuita — ver `free_model`.
     """
     st = st or settings()
     return _ask_cli(prompt, st, model=model, max_tokens=max_tokens,
                     timeout=timeout, attachment=str(attachment),
-                    tools_arg="")
+                    tools_arg="", model_configured=model_configured)
 
 
 def _find_cli() -> str | None:
@@ -564,7 +579,8 @@ def _ask_cli(prompt: str, st: dict, model: str | None = None,
              timeout: float | None = None,
              cwd: str | os.PathLike | None = None,
              attachment: str | None = None,
-             tools_arg: str | None = None) -> str:
+             tools_arg: str | None = None,
+             model_configured: bool = True) -> str:
     """One non-interactive `qoder -p` turn, returned as text.
 
     FULL ACCESS — deliberate, and asked for by the user. `--tools default` gives
@@ -583,7 +599,7 @@ def _ask_cli(prompt: str, st: dict, model: str | None = None,
     if not cli:
         raise RuntimeError("qoder CLI não encontrado no PATH nem em ~/.qodersec/bin")
     full = prompt if not system else f"{system}\n\n---\n\n{prompt}"
-    model = free_model(model or st["model"])
+    model = free_model(model or st["model"], configured=model_configured)
     thinking = st.get("thinking") or CLI_DEFAULT_THINKING
     if tools_arg is None:
         tools_arg = str(st.get("tools") if st.get("tools") is not None else "default")

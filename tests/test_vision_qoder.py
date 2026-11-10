@@ -12,9 +12,11 @@ import os
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from core import brain, qoder, vision
+from core import free_models as qoder_free_models
 
 
 class SettingsTest(unittest.TestCase):
@@ -22,7 +24,7 @@ class SettingsTest(unittest.TestCase):
         st = vision.settings({})
         self.assertEqual(st["vision_provider"], "qoder")
         self.assertTrue(st["vision_enabled"])
-        self.assertEqual(st["vision_qoder_model"], "Qwen3.8-Flash")
+        self.assertEqual(st["vision_qoder_model"], vision.DEFAULT_MODEL)
         self.assertEqual(st["vision_timeout"], vision.DEFAULT_TIMEOUT)
 
     def test_off_disables_vision(self):
@@ -69,6 +71,30 @@ class DescribeTest(unittest.TestCase):
                                "is_error": False,
                                "result": "um retângulo vermelho com o texto JARVIS"}))
 
+    def setUp(self):
+        # D3 do dono (09/11/2026, "os 2"): o catálogo vivo de
+        # `memory/models.json` não decide mais o que este teste vê — o
+        # catálogo é INJETADO aqui, apontando para um arquivo controlado.
+        self._tmp = tempfile.TemporaryDirectory()
+        self._catalog = Path(self._tmp.name) / "models.json"
+        self._orig_read = qoder_free_models.CATALOG_PATH
+        qoder_free_models.CATALOG_PATH = self._catalog
+        self._write_catalog({"Qwen3.8-Flash": False, "Efficient": True})
+        qoder_free_models.reset()
+
+    def tearDown(self):
+        qoder_free_models.CATALOG_PATH = self._orig_read
+        qoder_free_models.reset()
+        self._tmp.cleanup()
+
+    def _write_catalog(self, free_by_name: dict[str, bool]) -> None:
+        models = [{"value": name.lower().replace(".", "").replace("-", "").replace("38", "3.8")
+                   if False else f"m{i}", "displayName": name,
+                   "isFree": free, "priceFactor": 0.0 if free else 0.04,
+                   "isVl": True}
+                  for i, (name, free) in enumerate(free_by_name.items())]
+        self._catalog.write_text(json.dumps({"models": models}))
+
     def test_image_is_attached_and_the_answer_parsed(self):
         seen = {}
 
@@ -91,12 +117,61 @@ class DescribeTest(unittest.TestCase):
         self.assertIn("--attachment", cmd)
         self.assertTrue(seen["attachment"].endswith(".png"))
         self.assertEqual(seen["bytes"], b"\x89PNG\r\n\x1a\nfake")
-        self.assertEqual(cmd[cmd.index("--model") + 1], "Qwen3.8-Flash")
+        # O default declarado é o que vai, SEM resolução pelo catálogo vivo —
+        # mas o default declarado é, ele mesmo, um nome gratuito.
+        self.assertEqual(cmd[cmd.index("--model") + 1], vision.DEFAULT_MODEL)
+        self.assertIn(vision.DEFAULT_MODEL, qoder.FREE_MODELS)
         # Vision must not be able to act: no tools in this turn.
         self.assertEqual(cmd[cmd.index("--tools") + 1], "")
         self.assertEqual(seen["kwargs"]["timeout"], 30)
         # The temp file does not survive the call.
         self.assertFalse(os.path.exists(seen["attachment"]))
+
+    def test_default_is_delivered_as_declared_even_when_the_catalog_disagrees(self):
+        """Sem configuração do usuário: o catálogo vivo não troca o modelo.
+
+        É a metade (ii) da D3. O catálogo injetado aqui diz que TODOS os
+        modelos são pagos — mesmo assim o `describe` sem config manda o
+        default declarado, porque resolver `free_model` sem configuração
+        nenhum era o que fazia o modelo efetivo depender de um arquivo vivo.
+        """
+        self._write_catalog({name: False for name in
+                             ("Qwen3.8-Flash", "Efficient")})
+        qoder_free_models.reset()
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            return self._run()
+
+        with mock.patch("core.qoder.find_cli", return_value="/usr/bin/qoder"), \
+             mock.patch("core.qoder._find_cli", return_value="/usr/bin/qoder"), \
+             mock.patch("core.qoder.subprocess.run", side_effect=fake_run):
+            vision.describe(b"x", "image/png", "descreva")
+        self.assertEqual(seen["cmd"][seen["cmd"].index("--model") + 1],
+                         vision.DEFAULT_MODEL)
+
+    def test_a_configured_model_still_gets_forced_to_free(self):
+        """Configurado, continua a lei do gratuito: pago no catálogo vira free.
+
+        O catálogo injetado marca só "Efficient" como gratuito; um modelo
+        configurado "Qwen3.8-Flash" (pago nele) é forçado para o gratuito.
+        """
+        self._write_catalog({"Qwen3.8-Flash": False, "Efficient": True})
+        qoder_free_models.reset()
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            return self._run()
+
+        with mock.patch("core.qoder.find_cli", return_value="/usr/bin/qoder"), \
+             mock.patch("core.qoder._find_cli", return_value="/usr/bin/qoder"), \
+             mock.patch("core.qoder.subprocess.run", side_effect=fake_run):
+            vision.describe(b"x", "image/png", "descreva",
+                            model="Qwen3.8-Flash")
+        self.assertEqual(seen["cmd"][seen["cmd"].index("--model") + 1],
+                         "Efficient")
 
     def test_missing_cli_is_an_honest_failure(self):
         with mock.patch("core.qoder.find_cli", return_value=None):
@@ -135,7 +210,10 @@ class DispatchTest(unittest.TestCase):
             out = brain.vision_describe(b"img", "image/png", "pergunta", st)
         self.assertEqual(out, "um retângulo")
         describe.assert_called_once()
-        self.assertEqual(describe.call_args.kwargs["model"], "Qwen3.8-Flash")
+        # O modelo passado adiante é o da configuração (`vision_qoder_model`),
+        # cujo default declarado é `vision.DEFAULT_MODEL`.
+        self.assertEqual(describe.call_args.kwargs["model"],
+                         vision.DEFAULT_MODEL)
 
     def test_local_route_keeps_the_ollama_backend(self):
         st = brain._vision_settings({"vision_provider": "local"})

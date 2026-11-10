@@ -48,9 +48,17 @@ from core import qoder
 
 PROVIDERS = ("qoder", "local", "off")
 DEFAULT_PROVIDER = "qoder"
-# Qwen3.8-Flash is on the CLI's free allowlist and reads images natively (proven
-# with a real PNG: it named the red rectangle and the text in it).
-DEFAULT_MODEL = qoder.FAST_MODEL
+# O default DECLARADO da visão: um nome que a allowlist gratuita de
+# `core.qoder.FREE_MODELS` conhece e que o catálogo medido em 10/11/2026
+# (`memory/models.json`, lido com o sidecar no ar) marca como gratuito E com
+# leitura de imagem: "Efficient" (priceFactor 0, isVl true).
+# Era `qoder.FAST_MODEL` = "Qwen3.8-Flash", e o catálogo hoje diz que esse é
+# PAGO (priceFactor 0,04): o `free_model` de cada chamada o trocava por
+# "Efficient" às escondidas — o modelo efetivo dependia de um arquivo vivo, e
+# o teste que cobrava a linha do `--model` ficava vermelho quando o catálogo
+# mudava (F7). Decisão D3 do dono (09/11/2026, "os 2"): declarar o default
+# certo e parar de resolver `free_model` quando o usuário não configurou nada.
+DEFAULT_MODEL = "Efficient"
 DEFAULT_TIMEOUT = 120.0
 TIMEOUT_MIN = 10.0
 TIMEOUT_MAX = 600.0
@@ -149,6 +157,12 @@ def describe(image: bytes, mime: str, question: str, *,
     if not image:
         raise RuntimeError("nenhuma imagem para descrever")
     prompt = str(question or "").strip() or "Descreva esta imagem em uma frase."
+    # O nome que chega por parâmetro é o que o usuário CONFIGUROU
+    # (`vision_qoder_model`, lido por quem chama): esse ainda é forçado a
+    # gratuito pelo catálogo. Sem parâmetro, é o default declarado desta
+    # módulo e ele vai como declarado — decisão D3 do dono, 09/11/2026.
+    requested = str(model or "").strip()
+    use_model = requested or DEFAULT_MODEL
     if not qoder.find_cli():
         raise RuntimeError(
             "qoder CLI não encontrado — a visão em nuvem (--attachment) precisa "
@@ -160,7 +174,8 @@ def describe(image: bytes, mime: str, question: str, *,
             fh.write(data)
         try:
             text = qoder.ask_with_file(
-                prompt, path, model=model or DEFAULT_MODEL,
+                prompt, path, model=use_model,
+                model_configured=bool(requested),
                 max_tokens=600,
                 timeout=timeout if timeout is not None else DEFAULT_TIMEOUT)
         except RuntimeError:
