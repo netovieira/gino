@@ -109,13 +109,11 @@ class OwnerFloorTest(unittest.TestCase):
     """O piso do dono: VAD de voz humana, nunca o retorno do nosso TTS."""
 
     def _obj(self, *, echo_user: bool, vad_speech: bool,
-             barge_in: bool = True, cancel_gate: bool = False):
+             barge_in: bool = True):
         obj = object.__new__(main.JarvisLive)
         obj._voice_barge_in = barge_in
         obj._echo = _FakeEcho(echo_user)
         obj._barge_vad = _FakeVad(vad_speech)
-        obj._cancel = (type("C", (), {"last_gate": cancel_gate})()
-                       if cancel_gate else None)
         obj._tail_until = 0.0
         obj._owner_voice_until = 0.0
         return obj
@@ -131,11 +129,6 @@ class OwnerFloorTest(unittest.TestCase):
         obj = self._obj(echo_user=True, vad_speech=True)
         block = np.full(1024, 9000, dtype=np.int16)
         self.assertTrue(main.JarvisLive._owner_voice_block(obj, block, True))
-
-    def test_machine_only_block_does_not_take_the_floor_while_listening(self):
-        obj = self._obj(echo_user=False, vad_speech=True, cancel_gate=True)
-        block = np.full(1024, 9000, dtype=np.int16)
-        self.assertFalse(main.JarvisLive._owner_voice_block(obj, block, False))
 
     def test_barge_in_disabled_never_takes_the_floor(self):
         obj = self._obj(echo_user=True, vad_speech=True, barge_in=False)

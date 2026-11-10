@@ -416,19 +416,6 @@ _BARGE_STOP_RE = re.compile(
     r"cancela|interrompe|desliga)\b", re.IGNORECASE)
 
 
-def _mic_is_aec_source(name: str) -> bool:
-    """Is this input microphone already echo-cancelled by the system?
-
-    A PipeWire module-echo-cancel source (node.name ``echo_cancel_source``,
-    description "Microfone AEC …") subtracts from the mic everything the
-    default sink plays — TTS, music, the browser. Feeding that signal to
-    core/playback_cancel.py would stack a second canceller whose room-gain
-    model was calibrated for the RAW Webcam mic and no longer describes it.
-    """
-    low = str(name or "").strip().lower()
-    return ("echo_cancel" in low or "echo-cancel" in low
-            or "microfone aec" in low or low == "aec")
-
 # Erring early is the safe direction. A viewer tolerates a mouth that moves
 # slightly before the sound far better than one that moves after it — the
 # broadcast limits are about 45 ms of lag against 125 ms of lead — so where
@@ -2604,7 +2591,6 @@ class JarvisLive:
             _duck.register_speech_probe(self._duck_probe_speaking)
         except Exception:
             pass
-        self._cancel               = None    # core.playback_cancel, opened with the mic
         # `stream.write()` returns when the buffer accepts the audio, not when the
         # speaker has finished with it, so sound is still in the room after the
         # speaking flag drops. Streaming the microphone during that gap is how an
@@ -15235,8 +15221,8 @@ class JarvisLive:
         sobreposição com o que eu disse. Eco é a transcrição BATER com uma
         fala minha ativa ou recentíssima (``EchoTextGuard.matches``, já limitada
         à janela das falas realmente audíveis), e não ser a citação que eu
-        pedi para o dono repetir. O cancelador de eco da captura não muda
-        aqui; muda só parar de chamar de eco uma frase que não corresponde a
+        pedi para o dono repetir. Nada aqui mexe na captura do microfone;
+        muda só parar de chamar de eco uma frase que não corresponde a
         nada que eu falei.
         """
         if not self._echo_guard_window(pcm):
@@ -18940,15 +18926,6 @@ class JarvisLive:
                 return False
         except Exception:
             return False
-        if not jarvis_speaking:
-            # Music or a video this machine plays is not the owner: the
-            # canceller already replaced machine-only blocks with silence.
-            # Once the floor is up, however, his voice outweighs that guess —
-            # the monitor can still be returning the TTS tail during it.
-            cancel = self._cancel
-            if (cancel is not None and getattr(cancel, "last_gate", False)
-                    and not self._owner_has_floor()):
-                return False
         return True
 
     def _owner_takes_floor(self) -> None:
@@ -20658,8 +20635,8 @@ class JarvisLive:
     def _audio_audit_feed(self, state: dict | None, raw, verdict="") -> None:
         """Classifica o bloco REAL e o enfileira no ledger único.
 
-        ``raw`` é o bloco como o stream o entregou / antes do cancelador da
-        aplicação — o som da sala, não um buffer já processado. Nunca levanta:
+        ``raw`` é o bloco como o stream do microfone o entregou — o som da
+        sala, não um buffer já processado. Nunca levanta:
         um defeito aqui não pode custar a audição.
         """
         if state is None or raw is None:
@@ -20749,19 +20726,12 @@ class JarvisLive:
             # unplugged for a moment. Without this timestamp the app simply
             # stops hearing, forever, with the process perfectly healthy.
             self._last_block_at = time.monotonic()
-            # The raw block is kept for the owner-floor test: the canceller
-            # may replace a quiet but real voice with silence while the TTS
-            # tail is still in the monitor, and that is exactly the block
-            # carrying his first word.
-            raw = indata
-            # ── Playback cancellation ───────────────────────────────────
-            # What the speakers play reaches the microphone together with the
-            # user, and Whisper transcribes a running song as if it were
-            # speech. The canceller subtracts from each block the monitor
-            # slice that matches it, so every gate below — wake, segmenter,
-            # echo tail — sees the machine's own sound as residual noise.
-            if self._cancel is not None:
-                indata = self._cancel.clean(indata)
+            # Fonte única de captura (ordem do dono, 2026-11-10: "aborto esse
+            # negócio de usar vários microfones"). O bloco é o do microfone
+            # configurado, cru: nenhuma segunda fonte (monitor de playback)
+            # entra aqui. O que a máquina toca continua tratado pelos portões
+            # abaixo — echo tail, wake word, ducking e o classificador do
+            # ghost_filter — que seguem exatamente como estavam.
             # ── Wake-word gate ───────────────────────────────────────────────
             # While asleep, the mic audio NEVER goes to Gemini (nothing is
             # streamed, so JARVIS can't respond to speech not addressed to it and
@@ -20831,7 +20801,8 @@ class JarvisLive:
             if self.ui.muted or self._phone_active:
                 self._close_orphan_stt(
                     "microfone mutado" if self.ui.muted else "chamada no telefone")
-            owner_voice = bool(mic_open) and self._owner_voice_block(raw, jarvis_speaking)
+            owner_voice = bool(mic_open) and self._owner_voice_block(
+                indata, jarvis_speaking)
             if owner_voice:
                 _now = time.monotonic()
                 if _now >= getattr(self, "_owner_voice_until", 0.0):
@@ -20855,17 +20826,15 @@ class JarvisLive:
             if jarvis_speaking:
                 if owner_voice and self._groq is not None:
                     try:
-                        self._groq.feed(raw)
+                        self._groq.feed(indata)
                     except Exception:
                         pass
                 if owner_voice and self._barge_run >= _BARGE_CONFIRM_BLOCKS:
                     self._barge_run = 0
                     loop.call_soon_threadsafe(self._owner_takes_floor)
                 if not owner_voice and self._groq is not None:
-                    # Our own voice is in the monitor: only the ring runs. It
-                    # gets the canceller-cleaned block, so the TTS tail does
-                    # not become the opening of the barge-in, while a block
-                    # carrying the owner passes untouched (core/playback_cancel).
+                    # Sem prova de voz do dono: só o pré-rolo corre, para a fala
+                    # dele não abrir turno enquanto a resposta fala.
                     self._groq.feed(indata, preroll_only=True)
                 return
 
@@ -20905,10 +20874,7 @@ class JarvisLive:
                 # while asleep, muted, or (with push-to-talk) unheld.
                 if self._groq is not None:
                     try:
-                        # While the owner has the floor, the raw block goes to
-                        # the segmenter: the canceller may still be silencing
-                        # the TTS tail, and his words live in those blocks.
-                        self._groq.feed(raw if self._owner_has_floor() else indata)
+                        self._groq.feed(indata)
                         self.ui.set_audio_level(_pcm_level(indata))
                     except Exception:
                         pass
@@ -20925,33 +20891,6 @@ class JarvisLive:
                     self.ui.set_audio_level(_pcm_level(indata))
                 except Exception:
                     pass
-
-        # The canceller follows the microphone, not the startup snapshot: a
-        # device change (headset plugged/unplugged, source switched in the
-        # desktop panel) reopens this stream and re-decides the canceller.
-        if self._cancel is not None:
-            self._cancel.stop()
-            self._cancel = None
-
-        def _start_canceller(mic_name: str, aec: bool, generation: int) -> None:
-            try:
-                if generation != getattr(self, "_mic_generation", 0):
-                    return          # a newer stream already owns the canceller
-                if aec or _mic_is_aec_source(mic_name):
-                    # One canceller, not two: the PipeWire AEC already removed
-                    # the playback from this microphone (measured 38-44 dB of
-                    # ERLE live). The app's monitor gate is for a raw mic; on
-                    # the AEC signal it only adds a calibration that no longer
-                    # applies.
-                    print("[Audio] AEC do PipeWire no microfone — "
-                          "cancelador do monitor desligado")
-                    return
-                from core import playback_cancel as _pbk
-                if self._cancel is not None:
-                    self._cancel.stop()
-                self._cancel = _pbk.start_if_possible()
-            except Exception as e:
-                print(f"[Audio] playback canceller unavailable: {e}")
 
         try:
             def _open_mic(dev, cb=None):
@@ -20981,11 +20920,6 @@ class JarvisLive:
             while True:
                 _mic_name = get_input_device()
                 _route = self._refresh_mic_route()
-                self._mic_generation = getattr(self, "_mic_generation", 0) + 1
-                _generation = self._mic_generation
-                if self._cancel is not None:
-                    self._cancel.stop()
-                    self._cancel = None
 
                 # Which microphone. resolve() returns None for "system default"
                 # and for a saved device that is no longer present — so a
@@ -21129,12 +21063,6 @@ class JarvisLive:
                     self._multi_mic = None
                     continue
 
-                # Opening two PulseAudio streams back-to-back trips a PortAudio
-                # mainloop assertion and aborts the process, so the monitor is
-                # opened only after the mic stream has settled.
-                _loop_h = asyncio.get_running_loop()
-                _loop_h.call_later(3.0, _start_canceller, _mic_name,
-                                   bool(_route.get("aec")), _generation)
                 # Um microfone: o mesmo registro contínuo do caminho multi —
                 # só o stream, a comparação é que não existe. Classificador e
                 # ledger nascem AQUI, fora do callback.
@@ -21168,7 +21096,7 @@ class JarvisLive:
                         if getattr(self, "_mic_route_dirty", False):
                             self._mic_route_dirty = False
                             print("[JARVIS] 🔀 Microfone ativo mudou — reabrindo "
-                                  "stream e cancelador")
+                                  "stream")
                             await asyncio.to_thread(self._audio_audit_switch)
                             break          # closes the `with`, reopens above
                         idle = time.monotonic() - getattr(self, "_last_block_at", 0.0)

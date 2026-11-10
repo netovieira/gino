@@ -5,7 +5,7 @@ description: Documentação técnica do caminho de voz (captura, VAD, endpointin
 
 # Voice Pipeline
 
-1. Captura em blocos de 64 ms; o cancelador de playback remove o eco da própria voz.
+1. Captura em blocos de 64 ms, **fonte única = microfone configurado** (dono, 2026-11-10: "aborto esse negócio de usar vários microfones, deixa quieto isso daí"). Não há segunda captura: o monitor de playback (`alsa_output.*.monitor`) e o `PlaybackCanceller` (`core/playback_cancel.py`, parec filho) saíram do pipeline — o cancelamento deles foi apagado com o módulo. O eco do próprio TTS segue tratado a jusante, sem mudar: echo tail medido do dispositivo, `EchoTextGuard`, wake word, ghost_filter e ducking.
 2. Silero VAD detecta fala; Smart Turn v3.2 decide se a pausa encerra o turno ou se o próximo trecho deve ser fundido.
 3. STT local (faster-whisper) transcreve; Groq é apenas plano B quando configurado.
 4. Diarização por utterance rotula `[FALANTE: nome]` antes de entregar ao Qoder.
