@@ -48,6 +48,20 @@ O que este módulo é:
   nada explode e nada é inventado -- tarefa velha vira ``pendente`` sem fase
   declarada, nunca "concluída" por suposição.
 
+* A BRANCH DE TRABALHO (ordem do dono, 10/11/2026: "já implementa no fluxo de
+  trabalho para as fases e tasks criadas ter lá qual branch elas devem
+  trabalhar... você define a branch daquele plano ou daquela fase.. fica mais
+  fácil gerir a worktree"). Vocabulário fechado (:data:`BRANCH_PADRAO_PREFIXO`
+  + slug, :data:`BRANCHES_HISTORICAS`, ``""``), validado em
+  :func:`validar_branch` com slug no espírito de ``core/obsidian.py``.
+  :func:`registrar_plano` já nasce com ``plano/<slug>``,
+  :func:`quebrar_plano` grava ramo por fase e por tarefa sem pisar o que está
+  registrado, :func:`concluir_tarefa` expõe de onde o commit veio (sem ramo
+  declarado é trilha dizendo "branch não declarada", nunca exceção --
+  precedente: ``actiongate.ORIGIN_UNDECLARED``) e :func:`definir_branch`
+  corrige endereço com nota. O :func:`quadro` e o :func:`resumo` contam por
+  branch para a pergunta "o que está em que branch" ter resposta no disco.
+
 O que este módulo NÃO é (e é decisão, não esquecimento):
 
 * Não aprova nada sozinho. :func:`aprovar_plano` exige ``quem=`` com o nome de
@@ -70,6 +84,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -118,11 +133,36 @@ _COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
 #: Rótulo de fase: curto, de uma linha, lido no celular do dono.
 _FASE_MAX_CHARS = 80
 
+#: A BRANCH DE TRABALHO (ordem do dono, WhatsApp 10/11/2026: "ja implementa no
+#: fluxo de trabalho para as fases e tasks criadas ter la qual branch elas
+#: devem trabalhar... voce define a branch daquele plano ou daquela fase.. fica
+#: mais facil gerir a worktree"). Vocabulário FECHADO de propósito, como o do
+#: status: ``plano/<slug-do-plano>`` (a convenção, sempre válida), ``main``
+#: (fato histórico -- foi nela que entraram as conclusões anteriores a este
+#: campo) e ``""`` (não declarado). ``feature/login``, ``hotfix-urgente`` e
+#: afins são recusa, não criatividade: quem define a lei do repo é o dono, e um
+#: vocabulário aberto transformaria o quadro em depósito de nome que ninguém
+#: consegue parear com uma worktree.
+BRANCH_PADRAO_PREFIXO = "plano/"
+BRANCHES_HISTORICAS = ("main",)
+#: O ramo NÃO declarado tem de aparecer na cara do dono, não sumir: os dois
+#: rótulos abaixo são o cesto do quadro e a linha da trilha. Precedente no
+#: repo: ``actiongate.ORIGIN_UNDECLARED`` (``actions/home_control.py:419``).
+RAMO_SEM_DECLARACAO = "(branch não declarada)"
+TRILHA_SEM_RAMO = "branch não declarada"
+#: Slug no mesmo espírito de ``core/obsidian.py`` (``ascii_slug``): ASCII, sem
+#: acento, sem espaço, hífen simples, limite -- aqui o limite do plano
+#: (``PLAN_SLUG_MAX_CHARS``) mais o prefixo.
+_BRANCH_SLUG_MAX_CHARS = 60
+_BRANCH_MAX_CHARS = 80
+_BRANCH_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
 #: Formato do estado. ``1`` = plano, fase do plano e tarefa plana; ``2`` =
-#: tarefa com fase/status/commit/evidencia + ``fases`` no plano + ``fila``.
-#: A leitura normaliza o 1 para o 2 em memória (:func:`_carregar`), então um
-#: estado velho nunca derruba o portão e nunca perde chave.
-VERSAO_ESTADO = 2
+#: tarefa com fase/status/commit/evidencia + ``fases`` no plano + ``fila``;
+#: ``3`` = branch por plano/fase/tarefa (``branch``, ``branch_por_fase``).
+#: A leitura normaliza o 1 e o 2 para o 3 em memória (:func:`_carregar`), então
+#: um estado velho nunca derruba o portão e nunca perde chave.
+VERSAO_ESTADO = 3
 
 #: Quem NÃO pode constar como aprovador: o assistente não se autoaprova.
 _APELADOS_DO_ASSISTENTE = {"gino", "jarvis", "assistente", "modelo", "agente",
@@ -327,6 +367,93 @@ def _validar_status(texto: Any, o_que_e: str) -> str:
     return bruto
 
 
+def _slug_de_branch(texto: Any, limite: int = _BRANCH_SLUG_MAX_CHARS) -> str:
+    """Slug ASCII de um nome livre, no espírito de ``core/obsidian.py:ascii_slug``.
+
+    Sem acento (NFKD + fora os combining), minúsculo, sem espaço, hífen
+    simples, e corte no hífen mais próximo do limite para não deixar palavra
+    partida nem ``-`` sobrando. Devolve "" quando não sobra nada: quem chama
+    decide o que fazer com o vazio (recusa, no portão), nunca inventa nome.
+    """
+    folded = unicodedata.normalize("NFKD", str(texto or ""))
+    folded = "".join(ch for ch in folded
+                     if not unicodedata.combining(ch)).lower()
+    folded = re.sub(r"[^a-z0-9]+", "-", folded).strip("-")
+    if len(folded) > limite:
+        head = folded[:limite]
+        folded = head.rsplit("-", 1)[0] if "-" in head else head
+        folded = folded.strip("-")
+    return folded
+
+
+def _ramo_utilizable(bruto: str) -> bool:
+    """O nome já bate no vocabulário fechado? (sem mensagem, só veredito)"""
+    if bruto in BRANCHES_HISTORICAS:
+        return True
+    if not bruto.startswith(BRANCH_PADRAO_PREFIXO):
+        return False
+    slug = bruto[len(BRANCH_PADRAO_PREFIXO):]
+    return bool(slug and _BRANCH_SLUG_RE.match(slug)
+                and len(bruto) <= _BRANCH_MAX_CHARS)
+
+
+def _recusa_de_ramo(texto: Any, o_que_e: str) -> ValueError:
+    return ValueError(
+        f"branch {str(texto)!r} de {o_que_e} fora do vocabulário fechado: "
+        f"{BRANCH_PADRAO_PREFIXO}<slug-do-plano> (slug ASCII, minúsculo, sem "
+        f"acento, sem espaço, até {_BRANCH_SLUG_MAX_CHARS} chars), "
+        f"{', '.join(BRANCHES_HISTORICAS)} (histórico) ou \"\" (não "
+        f"declarado) -- fora daqui é recusa, não interpretação, porque o nome "
+        f"do ramo é o que faz a worktree ser gerível")
+
+
+def validar_branch(texto: Any, o_que_e: str) -> str:
+    """Branch dentro do vocabulário fechado, ou recusa nomeando o vocabulário.
+
+    ``""`` É vocabulário: significa "não declarado", não "esqueci de passar".
+    Exposição pública porque :func:`quebrar_plano`, :func:`concluir_tarefa` e
+    :func:`definir_branch` validam pela mesma porta -- um nome torto escrito
+    num canto e bonito noutro é como o quadro deixa de responder "o que está
+    em que branch".
+    """
+    bruto = _normalizar(texto)
+    if not bruto:
+        return ""
+    if not _ramo_utilizable(bruto):
+        raise _recusa_de_ramo(texto, o_que_e)
+    return bruto
+
+
+_validar_branch = validar_branch
+
+
+def _ramo_de_leitura(texto: Any) -> str:
+    """Leitura nunca levanta: ramo utilizável ou "" (o cesto do quadro).
+
+    Irmão do :func:`_commit_seguro`: um ``"branch": "tudo em mim"`` colado à
+    mão no estado não derruba o portão, volta ao vazio e aparece como
+    "não declarada" na cara do dono.
+    """
+    bruto = _normalizar(texto)
+    return bruto if _ramo_utilizable(bruto) else ""
+
+
+def branch_do_plano(plano) -> str:
+    """A convenção do dono para o plano: ``plano/<slug-do-plano>``.
+
+    Derivado do id, nunca do título livre: o id já é o que o portão usa como
+    chave, então a branch derivada dele pareia com o plano em qualquer quadro.
+    Nome que não produz slug ASCII é recusa nomeando o que falta.
+    """
+    pid = _validar_id(plano, "id de plano")
+    slug = _slug_de_branch(pid)
+    if not slug:
+        raise ValueError(f"plano {str(plano)!r} não produz slug de branch: a "
+                         f"convenção é {BRANCH_PADRAO_PREFIXO}<slug> e o slug "
+                         "precisa de letra ou número ASCII (sem acento)")
+    return f"{BRANCH_PADRAO_PREFIXO}{slug}"
+
+
 def _normalizar_tarefa(dado: Any, tid: str = "") -> dict[str, Any]:
     """Uma tarefa velha (id + título) vira a tarefa completa, sem invenção.
 
@@ -348,6 +475,9 @@ def _normalizar_tarefa(dado: Any, tid: str = "") -> dict[str, Any]:
         "id": ident,
         "titulo": str(bruto.get("titulo") or ""),
         "fase": fase,
+        # estado velho não tinha branch: "" é o nome honesto disso, nunca
+        # "main" por suposição (a suposição inventaria origem de commit).
+        "branch": _ramo_de_leitura(bruto.get("branch")),
         "status": status,
         "commit": _commit_seguro(bruto.get("commit")),
         "evidencia": str(bruto.get("evidencia") or "")[:160],
@@ -374,6 +504,7 @@ def _normalizar_plano(plano: dict[str, Any]) -> dict[str, Any]:
     registro = dict(plano)
     registro["id"] = str(registro.get("id") or "")
     registro["fase"] = str(registro.get("fase") or "")
+    registro["branch"] = _ramo_de_leitura(registro.get("branch"))
     fases = registro.get("fases")
     if isinstance(fases, list):
         vistos: list[str] = []
@@ -384,6 +515,17 @@ def _normalizar_plano(plano: dict[str, Any]) -> dict[str, Any]:
         registro["fases"] = vistos
     else:
         registro["fases"] = []
+    # branch por fase: dicionário {rótulo: ramo}. ``fases`` continua lista de
+    # rótulos (o quadro e os testes leem isto assim desde 910e568); o ramo
+    # mora ao lado para a reinscrição não precisar virar objeto.
+    ramos: dict[str, str] = {}
+    bruto_ramos = registro.get("branch_por_fase")
+    if isinstance(bruto_ramos, dict):
+        for rotulo, valor in bruto_ramos.items():
+            ramo = _ramo_de_leitura(valor)
+            if rotulo and ramo:
+                ramos[str(rotulo)] = ramo
+    registro["branch_por_fase"] = ramos
     tarefas = registro.get("tarefas")
     norm: dict[str, Any] = {}
     if isinstance(tarefas, dict):
@@ -594,12 +736,19 @@ def _redigido(texto: Any, teto: int = 160) -> str:
 
 def registrar_plano(plano, titulo: str = "", *, arquivo: Any = "",
                     fase: str = "aguardando_aprovacao", tarefas=(),
-                    quando: str | None = None) -> dict[str, Any]:
+                    branch: str = "", quando: str | None = None
+                    ) -> dict[str, Any]:
     """Cadastra (ou atualiza) um plano no estado do portão e devolve o registro.
 
     Fase inicial é ``aguardando_aprovacao``: plano recém-escrito NUNCA entra
     já aprovado, e ``fase="aprovado"`` aqui não é atalho -- aprovação se faz
     com :func:`aprovar_plano`, com nome e data de quem aprovou.
+
+    A branch é a outra novidade que o dono pediu (10/11/2026): sem ``branch=``
+    o plano já nasce com a convenção ``plano/<slug-do-plano>``, então
+    "qual branch deste plano" tem resposta antes da primeira tarefa.
+    Reinserção não pisa ramo já registrado; ``branch=""`` aqui NÃO significa
+    "apague o ramo" (para isso existe :func:`definir_branch`, com trilha).
     """
     if fase not in FASES:
         raise ValueError(f"fase {fase!r} fora do conjunto fechado: "
@@ -624,6 +773,10 @@ def registrar_plano(plano, titulo: str = "", *, arquivo: Any = "",
             "aprovado_em": str(anterior.get("aprovado_em") or ""),
             "tarefas": dict(anterior.get("tarefas") or {}),
             "fases": list(anterior.get("fases") or []),
+            "branch_por_fase": dict(anterior.get("branch_por_fase") or {}),
+            "branch": (_validar_branch(branch, f"plano {pid}")
+                       or str(anterior.get("branch") or "")
+                       or branch_do_plano(pid)),
             "criado_em": str(anterior.get("criado_em") or hora),
             "atualizado_em": hora,
         })
@@ -631,10 +784,12 @@ def registrar_plano(plano, titulo: str = "", *, arquivo: Any = "",
             registrar_tarefa(pid, tarefa, quando=quando, _estado=(estado, registro))
         estado["planos"][pid] = registro
         _registrar(estado, "plano_registrado", pid, fase=registro["fase"],
-                   arquivo=registro["arquivo"])
+                   arquivo=registro["arquivo"],
+                   branch=registro["branch"] or TRILHA_SEM_RAMO)
         _salvar(estado)
     _log_event("workflow_gate", decisao="registro", gate="plano_existe",
-               plano_id=pid, fase=registro["fase"])
+               plano_id=pid, fase=registro["fase"],
+               branch=registro["branch"] or TRILHA_SEM_RAMO)
     return registro
 
 
@@ -729,7 +884,8 @@ def definir_fase(plano, fase: str, *, quando: str | None = None) -> dict[str, An
 def registrar_tarefa(plano, tarefa, titulo: str = "", *,
                      quando: str | None = None, fase: str = "",
                      status: str = "", commit: str = "", evidencia: str = "",
-                     nota: str = "", _estado=None) -> dict[str, Any]:
+                     nota: str = "", branch: str = "",
+                     _estado=None) -> dict[str, Any]:
     """Prende uma tarefa a um plano, para o portão responder pelo id da tarefa.
 
     Aceita o id solto, ``("id", "título")`` ou ``{"id"|"tarefa", "titulo"}`` --
@@ -750,6 +906,7 @@ def registrar_tarefa(plano, tarefa, titulo: str = "", *,
     bruto = tarefa
     campo_fase, campo_status = fase, status
     campo_commit, campo_evidencia, campo_nota = commit, evidencia, nota
+    campo_ramo = branch
     if isinstance(tarefa, dict):
         titulo = titulo or str(tarefa.get("titulo") or tarefa.get("descricao") or "")
         bruto = tarefa.get("id") or tarefa.get("tarefa") or tarefa.get("task_id") or ""
@@ -758,6 +915,7 @@ def registrar_tarefa(plano, tarefa, titulo: str = "", *,
         campo_commit = commit or tarefa.get("commit") or ""
         campo_evidencia = evidencia or tarefa.get("evidencia") or ""
         campo_nota = nota or tarefa.get("nota") or ""
+        campo_ramo = branch or str(tarefa.get("branch") or "")
     elif isinstance(tarefa, (tuple, list)) and tarefa:
         titulo = titulo or str(tarefa[1] if len(tarefa) > 1 else "")
         bruto = tarefa[0]
@@ -799,10 +957,15 @@ def registrar_tarefa(plano, tarefa, titulo: str = "", *,
         # primeira, em vez de sumir com o rótulo que o dono ia ler.
         declaradas.append(rotulo)
     anterior = dict((registro.get("tarefas") or {}).get(tid) or {})
+    ramo = _validar_branch(campo_ramo, f"tarefa {tid}")
+    if not ramo:
+        # sem opinião dita, a tarefa trabalha onde o plano trabalha
+        ramo = str(anterior.get("branch") or registro.get("branch") or "")
     registro.setdefault("tarefas", {})[tid] = _mesclar_tarefa(
         anterior, {
             "id": tid, "titulo": _redigido(titulo) or anterior.get("titulo", ""),
             "fase": rotulo or anterior.get("fase", ""),
+            "branch": ramo,
             "status": novo_status, "commit": prova,
             "evidencia": evid, "nota": _redigido(campo_nota),
             "desde": anterior.get("desde") or hora,
@@ -812,7 +975,8 @@ def registrar_tarefa(plano, tarefa, titulo: str = "", *,
     if _estado is None:
         estado["planos"][registro["id"]] = registro
         _registrar(estado, "tarefa_registrada", registro["id"], tarefa=tid,
-                   fase=rotulo, status=registro["tarefas"][tid]["status"])
+                   fase=rotulo, status=registro["tarefas"][tid]["status"],
+                   branch=registro["tarefas"][tid].get("branch") or "")
         _salvar(estado)
     return registro
 
@@ -823,13 +987,17 @@ def _mesclar_tarefa(atual: dict[str, Any], novo: dict[str, Any]) -> dict[str, An
     A regra que o dono pode cobrar: ``concluida`` não se pisa, não se rebaixa
     e não perde o commit -- reinscrever o mapa de um plano é correção de
     mapa, não reescrita de história. Campo vazio em ``novo`` é "sem opinião",
-    nunca "apaga".
+    nunca "apaga". A branch segue a mesma lei: já registrada não some, e a
+    reinscrição só acrescenta (é assim que o estado do dono ganha o ramo
+    histórico das conclusões anteriores ao campo).
     """
     base = _normalizar_tarefa(atual if atual else novo,
                               str(novo.get("id") or ""))
     if not atual:
         return base
     if base.get("status") == "concluida":
+        if novo.get("branch") and not base.get("branch"):
+            base["branch"] = novo["branch"]
         return base
     for campo in ("titulo", "nota", "evidencia", "commit", "concluida_em",
                   "concluida_por"):
@@ -837,6 +1005,8 @@ def _mesclar_tarefa(atual: dict[str, Any], novo: dict[str, Any]) -> dict[str, An
             base[campo] = novo[campo]
     if novo.get("fase") and not base.get("fase"):
         base["fase"] = novo["fase"]
+    if novo.get("branch"):
+        base["branch"] = novo["branch"]
     if novo.get("status"):
         base["status"] = novo["status"]
     if not base.get("desde"):
@@ -924,10 +1094,22 @@ def _juntar_fases(atuais: list[str], novos: list[str]) -> list[str]:
     return juntas
 
 
-def _fase_e_tarefas(item: Any, posicao: int) -> tuple[str, list[Any]]:
-    """Uma entrada de ``quebrar_plano``: rótulo da fase + lista de tarefas."""
+def _fase_e_tarefas(item: Any, posicao: int
+                    ) -> tuple[str, str | None, list[Any]]:
+    """Uma entrada de ``quebrar_plano``: rótulo, branch e lista de tarefas.
+
+    A branch sai ``None`` quando a fase não disse nada (herda o plano) e
+    ``""`` quando ela disse explicitamente "não declarado" -- os dois têm de
+    ser distinguíveis, senão corrigir um ramo escrito à mão no mapa viraria
+    adivinhação. É o mesmo acordo da chave ``status``: presente é opinião,
+    ausente é omissão.
+    """
+    ramo: str | None = None
     if isinstance(item, dict):
         rotulo = _validar_rotulo(item, f"fase {posicao + 1}")
+        if "branch" in item:
+            ramo = _validar_branch(item.get("branch"),
+                                   f"branch da fase {posicao + 1}")
         tarefas = item.get("tarefas") if item.get("tarefas") is not None else (
             item.get("tasks") if item.get("tasks") is not None else [])
     elif isinstance(item, (tuple, list)) and len(item) == 2:
@@ -952,7 +1134,7 @@ def _fase_e_tarefas(item: Any, posicao: int) -> tuple[str, list[Any]]:
         raise ValueError(f"tarefas da fase {rotulo!r} em formato inutilizável "
                          f"({type(tarefas).__name__}): passe lista de ids, "
                          "(id, título) ou dicionários")
-    return rotulo, list(tarefas)
+    return rotulo, ramo, list(tarefas)
 
 
 def _tarefa_de_fase(item: Any, rotulo: str, plano_id: str) -> dict[str, Any]:
@@ -979,6 +1161,10 @@ def _tarefa_de_fase(item: Any, rotulo: str, plano_id: str) -> dict[str, Any]:
         status = "pendente"
     commit = _validar_commit(bruto.get("commit"), f"commit da tarefa {tid}")
     evidencia = _redigido(bruto.get("evidencia"))
+    # ``None`` = a tarefa não disse o ramo (herda da fase/plano); ``""`` =
+    # disse "não declarado". Distinção idêntica à do status acima.
+    ramo = (_validar_branch(bruto.get("branch"), f"branch da tarefa {tid}")
+            if "branch" in bruto else None)
     if status == "concluida":
         quem = _normalizar(bruto.get("quem") or bruto.get("concluida_por"))
         if not quem:
@@ -994,6 +1180,7 @@ def _tarefa_de_fase(item: Any, rotulo: str, plano_id: str) -> dict[str, Any]:
         "id": tid,
         "titulo": _redigido(bruto.get("titulo") or bruto.get("descricao")),
         "fase": rotulo,
+        "branch": ramo,
         "status": status,
         "commit": commit,
         "evidencia": evidencia,
@@ -1004,8 +1191,9 @@ def _tarefa_de_fase(item: Any, rotulo: str, plano_id: str) -> dict[str, Any]:
     }
 
 
-def quebrar_plano(plano, fases, *, quando: str | None = None) -> dict[str, Any]:
-    """Grava o mapa fase → tarefa → status dentro do plano. Idempotente.
+def quebrar_plano(plano, fases, *, branch: str = "",
+                  quando: str | None = None) -> dict[str, Any]:
+    """Grava o mapa fase → tarefa → status (e branch) dentro do plano. Idempotente.
 
     Ordem do dono, WhatsApp 10/11/2026: "quebrar em fases e tasks e
     executar" e a cobrança "CADE!?". É o que faltava no módulo: ``fase`` só
@@ -1017,6 +1205,13 @@ def quebrar_plano(plano, fases, *, quando: str | None = None) -> dict[str, Any]:
     soltos, e um dicionário ``{rótulo: [tarefas]}``. Cada tarefa aceita id
     solto, ``(id, título)`` ou dicionário com ``titulo``, ``status``,
     ``commit``, ``evidencia``, ``nota``, ``quem``/``quando``.
+
+    Branch (ordem do dono de 10/11/2026): o mapa pode dizer ``branch=`` no
+    plano, ``"branch": ...`` na fase e ``"branch": ...`` na tarefa. Quem não
+    fala herda a fase, e quem não fala de fase herda o plano -- então
+    "qual branch esta fase/tarefa deve trabalhar" tem resposta sem eu
+    inventar nada. Chave ``branch`` ausente = herança; ``branch=""`` dito =
+    "não declarado", que é vocabulário.
 
     As três garantias que fazem o re-rodar ser seguro no estado do dono:
 
@@ -1049,14 +1244,16 @@ def quebrar_plano(plano, fases, *, quando: str | None = None) -> dict[str, Any]:
                          "fases com suas tarefas (ou o plano fica plano, que "
                          "é o defeito DEF-20261110-104454)")
     rotulos: list[str] = []
+    ramos_de_fase: dict[str, str | None] = {}
     mapa: list[tuple[str, dict[str, Any]]] = []
     vistos: set[str] = set()
     for posicao, item in enumerate(entradas):
-        rotulo, tarefas = _fase_e_tarefas(item, posicao)
+        rotulo, ramo_fase, tarefas = _fase_e_tarefas(item, posicao)
         if rotulo in rotulos:
             raise ValueError(f"fase {rotulo!r} declarada duas vezes: junte as "
                              "tarefas numa só fase")
         rotulos.append(rotulo)
+        ramos_de_fase[rotulo] = ramo_fase
         for bruto in tarefas:
             tarefa = _tarefa_de_fase(bruto, rotulo, pid)
             if tarefa["id"] in vistos:
@@ -1073,6 +1270,19 @@ def quebrar_plano(plano, fases, *, quando: str | None = None) -> dict[str, Any]:
         if registro is None:
             raise ValueError(f"{MENSAGEM_SEM_PLANO}: plano {pid} não cadastrado "
                              "-- registre o plano antes de quebrá-lo em fases")
+        # Branch do plano: o mapa pode declarar, mas reescrever um ramo já
+        # registrado por aqui seria apagar a origem das tarefas que estão
+        # nele. Correção de ramo é ato com trilha (definir_branch).
+        ramo_decl = _validar_branch(branch, f"plano {pid}")
+        ramo_atual = str(registro.get("branch") or "")
+        if ramo_decl and ramo_atual and ramo_decl != ramo_atual:
+            raise ValueError(
+                f"plano {pid} já trabalha na branch {ramo_atual!r} e o mapa "
+                f"pede {ramo_decl!r}: isto reescreveria o endereço de todas "
+                "as tarefas registradas -- corrija com definir_branch("
+                f"{pid!r}, {ramo_decl!r}) para a trilha guardar as duas "
+                "pontas")
+        ramo_base = ramo_decl or ramo_atual
         # O mapa pode ter tarefa pendente e bloqueada em qualquer fase -- ter
         # o mapa não é executar. Mas status de ENTREGA (concluida,
         # em_progresso) escrito pelo mapa é a mesma afirmação que
@@ -1089,8 +1299,16 @@ def quebrar_plano(plano, fases, *, quando: str | None = None) -> dict[str, Any]:
                 f"({', '.join(pedidas[:6])})")
         registro["fases"] = _juntar_fases(list(registro.get("fases") or []),
                                           rotulos)
+        registro["branch"] = ramo_base
+        ramos_grifados = registro.setdefault("branch_por_fase", {})
+        for rotulo, ramo_fase in ramos_de_fase.items():
+            if ramo_fase is not None:
+                ramos_grifados[rotulo] = ramo_fase
         registro.setdefault("tarefas", {})
         for _, tarefa in mapa:
+            if tarefa.get("branch") is None:
+                herdado = ramos_de_fase.get(str(tarefa.get("fase") or ""))
+                tarefa["branch"] = ramo_base if herdado is None else herdado
             anterior = registro["tarefas"].get(tarefa["id"])
             if anterior and str((anterior or {}).get("status") or "") \
                     == "concluida":
@@ -1107,13 +1325,22 @@ def quebrar_plano(plano, fases, *, quando: str | None = None) -> dict[str, Any]:
         estado["planos"][pid] = registro
         _registrar(estado, "plano_quebrado", pid,
                    fases=len(rotulos), tarefas=len(mapa), novas=len(novas),
-                   atualizadas=len(atualizadas), preservadas=len(preservadas))
+                   atualizadas=len(atualizadas), preservadas=len(preservadas),
+                   branch=ramo_base or TRILHA_SEM_RAMO,
+                   ramos=len({str(dado.get("branch") or "")
+                              for dado in registro["tarefas"].values()}))
         _salvar(estado)
     _log_event("workflow_gate", decisao="quebrar", gate="fases_e_tarefas",
                plano_id=pid, fases=len(rotulos), tarefas=len(mapa),
-               novas=len(novas), preservadas=len(preservadas))
+               novas=len(novas), preservadas=len(preservadas),
+               branch=ramo_base or TRILHA_SEM_RAMO)
     return {"plano": pid, "titulo": str(registro.get("titulo") or pid),
             "fase_do_plano": str(registro.get("fase") or ""),
+            "branch": ramo_base,
+            "branch_do_plano": str(registro.get("branch") or ""),
+            "branch_por_fase": dict(registro.get("branch_por_fase") or {}),
+            "ramos": sorted({str(dado.get("branch") or "")
+                             for dado in (registro["tarefas"] or {}).values()}),
             "fases": rotulos, "tarefas": len(registro["tarefas"]),
             "novas": novas, "atualizadas": atualizadas,
             "preservadas": preservadas,
@@ -1152,7 +1379,8 @@ def iniciar_tarefa(referencia, *, quando: str | None = None) -> dict[str, Any]:
         estado["planos"][pid] = registro
         estado["tarefa_ativa"] = f"{pid}:{tid}"[:120]
         _registrar(estado, "tarefa_iniciada", pid, tarefa=tid,
-                   fase=tarefa.get("fase") or "", quando=hora)
+                   fase=tarefa.get("fase") or "",
+                   branch=tarefa.get("branch") or "", quando=hora)
         _salvar(estado)
     _log_event("workflow_gate", decisao="iniciar", gate="status_tarefa",
                plano_id=pid, tarefa_id=tid, status="em_progresso")
@@ -1161,7 +1389,7 @@ def iniciar_tarefa(referencia, *, quando: str | None = None) -> dict[str, Any]:
 
 def concluir_tarefa(referencia, *, commit: str = "", evidencia: str = "",
                     quem: str = "", quando: str | None = None,
-                    nota: str = "") -> dict[str, Any]:
+                    nota: str = "", branch: str = "") -> dict[str, Any]:
     """Carimba ``concluida`` com quem, quando e prova. Sem prova, recusa.
 
     É a alavanca que faltava para a pergunta do dono ("o que foi feito
@@ -1169,6 +1397,13 @@ def concluir_tarefa(referencia, *, commit: str = "", evidencia: str = "",
     evidência do que a fecha, e a recusa nomeia exatamente o que falta.
     Conclusão não se faz por :func:`registrar_tarefa` nem por
     :func:`quebrar_plano` sem ``quem`` -- e num plano não aprovado, nem com.
+
+    A branch entra junto do hash (ordem do dono de 10/11/2026): o commit só
+    quer dizer algo se soubermos de onde ele veio. Quem chama sem ``branch=``
+    não quebra -- o que já estava declarado no mapa fica, e o que não está
+    vira ``""`` com a trilha dizendo "branch não declarada", no mesmo
+    espírito de ``actiongate.ORIGIN_UNDECLARED``. Não herdo o ramo do plano
+    calado aqui: a branch de onde o commit VEIO é fato, não convenção.
     """
     aprovador = _normalizar(quem)
     if not aprovador:
@@ -1196,13 +1431,40 @@ def concluir_tarefa(referencia, *, commit: str = "", evidencia: str = "",
                 f"concluir de novo em {prova} apagaria a evidência antiga -- "
                 "reabra com mudar_status(..., \"pendente\", nota=<motivo>) e "
                 "conclua em seguida, para o histórico guardar as duas pontas")
+        ramo = _validar_branch(branch, f"branch da tarefa {tid}")
+        ramo_antes = str(tarefa.get("branch") or "")
+        if se_ja and ramo and ramo_antes and ramo != ramo_antes:
+            raise ValueError(
+                f"tarefa {tid} já declarou conclusão na branch "
+                f"{ramo_antes!r} e você aponta {ramo!r}: a origem do commit "
+                "não se reescreve em silêncio -- corrija com definir_branch"
+                f"({pid!r}, {ramo!r}, tarefa={tid!r}, nota=<motivo>)")
         if se_ja:
-            # idempotente: repetir a conclusão com a mesma prova não reescreve
-            # nada; o que muda é o texto do commit novo, e esse caso já foi
-            # recusado acima.
+            if not ramo or ramo == ramo_antes:
+                # idempotente: repetir a conclusão com a mesma prova não
+                # reescreve nada; o que muda é o texto do commit novo, e esse
+                # caso já foi recusado acima.
+                return tarefa
+            # ramo que ainda não existia: acrescentar o endereço de onde o
+            # commit veio NÃO reescreve a conclusão -- é exatamente o que o
+            # campo novo precisa conseguir no estado que já tinha "feito"
+            # sem branch nenhuma (as 22 conclusões históricas do dono).
+            tarefa["branch"] = ramo
+            registro["tarefas"][tid] = tarefa
+            registro["atualizado_em"] = hora
+            estado["planos"][pid] = registro
+            _registrar(estado, "tarefa_ramo_acrescentado", pid, tarefa=tid,
+                       branch=ramo, commit=str(tarefa.get("commit") or ""),
+                       quando=_agora(tarefa.get("concluida_em") or hora))
+            _salvar(estado)
+            _log_event("workflow_gate", decisao="ramo", gate="status_tarefa",
+                       plano_id=pid, tarefa_id=tid, branch=ramo,
+                       status="concluida")
             return tarefa
         tarefa["status"] = "concluida"
         tarefa["commit"] = prova or tarefa.get("commit", "")
+        if ramo:
+            tarefa["branch"] = ramo
         if _normalizar(evidencia):
             tarefa["evidencia"] = _redigido(evidencia)
         if _normalizar(nota):
@@ -1214,12 +1476,95 @@ def concluir_tarefa(referencia, *, commit: str = "", evidencia: str = "",
         estado["planos"][pid] = registro
         _registrar(estado, "tarefa_concluida", pid, tarefa=tid,
                    commit=prova, quem=aprovador, quando=hora,
+                   branch=ramo or ramo_antes or TRILHA_SEM_RAMO,
                    evidencia=str(tarefa.get("evidencia") or "")[:80])
         _salvar(estado)
     _log_event("workflow_gate", decisao="concluir", gate="status_tarefa",
                plano_id=pid, tarefa_id=tid, status="concluida", commit=prova,
-               quem=aprovador)
+               branch=ramo or ramo_antes or TRILHA_SEM_RAMO, quem=aprovador)
     return tarefa
+
+
+def definir_branch(plano, branch, *, fase: str = "", tarefa: str = "",
+                   nota: str = "", quando: str | None = None
+                   ) -> dict[str, Any]:
+    """Declara ou corrige a branch do plano, de uma fase ou de uma tarefa.
+
+    Existe porque consertar um ENDEREÇO não é concluir nem rebaixar status:
+    :func:`concluir_tarefa` recusa hash trocado e :func:`mudar_status` recusa
+    reabrir sem nota, e nenhum dos dois serve para "esta fase passa a
+    trabalhar em ``plano/x``". Corrigir um ramo já registrado exige ``nota``
+    dizendo o porquê -- a mesma lei da reabertura, porque é o mesmo risco:
+    reescrever rastro sem motivo.
+
+    ``branch=""`` é vocabulário ("não declarado"), não apagar nada: as
+    tarefas passam a aparecer no cesto :data:`RAMO_SEM_DECLARACAO` do
+    :func:`quadro`, que é o jeito honesto de o dono ver o buraco.
+    """
+    pid = _validar_id(plano, "id de plano")
+    ramo = _validar_branch(branch, f"plano {pid}")
+    rotulo = _validar_rotulo(fase, "fase") if fase else ""
+    tid = _validar_id(tarefa, "id de tarefa") if tarefa else ""
+    motivo = _redigido(nota)
+    hora = _agora(quando)
+    with _LOCK:
+        estado = _carregar()
+        registro = estado["planos"].get(pid)
+        if registro is None:
+            raise ValueError(f"{MENSAGEM_SEM_PLANO}: plano {pid} não cadastrado "
+                             "para declarar branch")
+        declaradas = [str(item) for item in (registro.get("fases") or [])]
+        antes = ""
+        alvo = ""
+        if tid:
+            dado = (registro.get("tarefas") or {}).get(tid)
+            if dado is None:
+                raise ValueError(
+                    f"tarefa {tid} não está no plano {pid}: declare-a "
+                    "(quebrar_plano) ou registre com registrar_tarefa antes "
+                    "de apontar branch")
+            antes = str(dado.get("branch") or "")
+            alvo = tid
+            if antes and ramo and antes != ramo and not motivo:
+                raise ValueError(f"tarefa {tid} já trabalha na branch "
+                                 f"{antes!r} e você aponta {ramo!r}: mude com "
+                                 "nota=<motivo> para a trilha guardar as duas "
+                                 "pontas")
+            dado["branch"] = ramo
+            registro["tarefas"][tid] = dado
+        elif rotulo:
+            if rotulo not in declaradas:
+                raise ValueError(f"fase {rotulo!r} não está nas fases "
+                                 f"declaradas do plano {pid}: "
+                                 f"{', '.join(declaradas) or '(nenhuma)'} — "
+                                 "quebre o plano primeiro")
+            grifados = registro.setdefault("branch_por_fase", {})
+            antes = str(grifados.get(rotulo) or "")
+            alvo = rotulo
+            if antes and ramo and antes != ramo and not motivo:
+                raise ValueError(f"a fase {rotulo!r} já trabalha na branch "
+                                 f"{antes!r} e você aponta {ramo!r}: mude com "
+                                 "nota=<motivo>")
+            grifados[rotulo] = ramo
+        else:
+            antes = str(registro.get("branch") or "")
+            if antes and ramo and antes != ramo and not motivo:
+                raise ValueError(f"plano {pid} já trabalha na branch "
+                                 f"{antes!r} e você aponta {ramo!r}: mude com "
+                                 "nota=<motivo>")
+            registro["branch"] = ramo
+        registro["atualizado_em"] = hora
+        estado["planos"][pid] = registro
+        _registrar(estado, "branch_definida", pid,
+                   branch=ramo or TRILHA_SEM_RAMO, antes=antes,
+                   nivel=tid and "tarefa" or (rotulo and "fase" or "plano"),
+                   alvo=alvo, motivo=motivo[:80], quando=hora)
+        _salvar(estado)
+    _log_event("workflow_gate", decisao="branch", gate="ramo_de_trabalho",
+               plano_id=pid, branch=ramo or TRILHA_SEM_RAMO, alvo=alvo)
+    return {"plano": pid, "branch": ramo, "antes": antes,
+            "nivel": tid and "tarefa" or (rotulo and "fase" or "plano"),
+            "alvo": alvo}
 
 
 def mudar_status(referencia, status: str, *, nota: str = "",
@@ -1269,8 +1614,32 @@ def mudar_status(referencia, status: str, *, nota: str = "",
     return tarefa
 
 
+def _balde_de_ramo() -> dict[str, int]:
+    """Um balde de contagem por branch: os quatro status + o total."""
+    balde = {chave: 0 for chave in STATUS_DE_TAREFA}
+    balde["tarefas"] = 0
+    return balde
+
+
+def _contar_por_ramo(ramos: dict[str, dict[str, int]],
+                     linha: dict[str, Any]) -> None:
+    """Conta uma linha do quadro no balde da sua branch.
+
+    O cesto :data:`RAMO_SEM_DECLARACAO` existe pela mesma razão do
+    :data:`SEM_FASE`: "não declarado" é um fato que o dono precisa VER, não
+    uma linha que desaparece da contagem.
+    """
+    chave = str(linha.get("branch") or "") or RAMO_SEM_DECLARACAO
+    balde = ramos.setdefault(chave, _balde_de_ramo())
+    status = str(linha.get("status") or "pendente")
+    balde[status] = balde.get(status, 0) + 1
+    balde["tarefas"] = balde.get("tarefas", 0) + 1
+
+
 def quadro(plano_id) -> dict[str, Any]:
-    """A árvore fase → tarefa → status do plano: o que o dono lê no celular."""
+    """A árvore fase → tarefa → status (e branch) do plano: o que o dono lê
+    no celular. ``por_branch`` responde "o que está em que branch".
+    """
     estado = _carregar()
     bruto = _normalizar(plano_id) or str(estado.get("tarefa_ativa") or "")
     registro = _plano_do_estado(bruto, estado) if bruto else None
@@ -1280,13 +1649,20 @@ def quadro(plano_id) -> dict[str, Any]:
                          "quadro")
     pid = str(registro.get("id") or "")
     declaradas = [str(item) for item in (registro.get("fases") or [])]
+    ramo_do_plano = str(registro.get("branch") or "")
+    bruto_grifados = registro.get("branch_por_fase")
+    grifados: dict[str, str] = {
+        str(chave): str(valor) for chave, valor in bruto_grifados.items()
+        if chave and valor} if isinstance(bruto_grifados, dict) else {}
     galhos: dict[str, list[dict[str, Any]]] = {rotulo: [] for rotulo in declaradas}
     por_status = {chave: 0 for chave in STATUS_DE_TAREFA}
+    por_branch: dict[str, dict[str, int]] = {}
     sem_fase: list[dict[str, Any]] = []
     for tid, dado in sorted((registro.get("tarefas") or {}).items()):
         rotulo = str(dado.get("fase") or "")
         linha = {"id": tid, "titulo": str(dado.get("titulo") or ""),
                  "fase": rotulo,
+                 "branch": _ramo_de_leitura(dado.get("branch")),
                  "status": str(dado.get("status") or "pendente"),
                  "commit": str(dado.get("commit") or ""),
                  "evidencia": str(dado.get("evidencia") or ""),
@@ -1297,11 +1673,13 @@ def quadro(plano_id) -> dict[str, Any]:
                  "concluida_em": str(dado.get("concluida_em") or ""),
                  "concluida_por": str(dado.get("concluida_por") or "")}
         por_status[linha["status"]] = por_status.get(linha["status"], 0) + 1
+        _contar_por_ramo(por_branch, linha)
         if rotulo in galhos:
             galhos[rotulo].append(linha)
         else:
             sem_fase.append(linha)
     fases = [{"fase": rotulo, "tarefas": galhos[rotulo],
+              "branch": grifados.get(rotulo) or ramo_do_plano,
               "total": len(galhos[rotulo]),
               "concluidas": sum(1 for linha in galhos[rotulo]
                                 if linha["status"] == "concluida")}
@@ -1313,6 +1691,8 @@ def quadro(plano_id) -> dict[str, Any]:
                                         if linha["status"] == "concluida")})
     return {"plano": pid, "titulo": str(registro.get("titulo") or pid),
             "fase_do_plano": str(registro.get("fase") or ""),
+            "branch": ramo_do_plano, "branch_por_fase": grifados,
+            "por_branch": por_branch, "ramos": sorted(por_branch),
             "arquivo": str(registro.get("arquivo") or ""),
             "aprovado_por": str(registro.get("aprovado_por") or ""),
             "aprovado_em": str(registro.get("aprovado_em") or ""),
@@ -1423,22 +1803,39 @@ def resumo() -> dict[str, Any]:
     estado = _carregar()
     por_fase = {fase: 0 for fase in FASES}
     por_status = {chave: 0 for chave in STATUS_DE_TAREFA}
+    por_branch: dict[str, dict[str, int]] = {}
+    planos_por_branch: dict[str, list[str]] = {}
     tarefas = 0
     fases_de_obra = 0
     sem_fase = 0
+    sem_branch = 0
     for plano in estado["planos"].values():
         por_fase[str(plano.get("fase") or "")] = \
             por_fase.get(str(plano.get("fase") or ""), 0) + 1
         fases_de_obra += len(plano.get("fases") or [])
+        ramo_do_plano = str(plano.get("branch") or "")
+        planos_por_branch.setdefault(
+            ramo_do_plano or RAMO_SEM_DECLARACAO, []).append(
+            str(plano.get("id") or ""))
         for dado in (plano.get("tarefas") or {}).values():
             tarefas += 1
             status = str(dado.get("status") or "pendente")
             por_status[status] = por_status.get(status, 0) + 1
             if not dado.get("fase"):
                 sem_fase += 1
+            ramo = _ramo_de_leitura(dado.get("branch"))
+            if not ramo:
+                sem_branch += 1
+            _contar_por_ramo(por_branch, {"branch": ramo, "status": status})
+    saida_por_branch = {chave: por_branch[chave] for chave in sorted(por_branch)}
     return {"planos": len(estado["planos"]), "por_fase": por_fase,
             "tarefa_ativa": estado.get("tarefa_ativa", ""),
             "tarefas": tarefas, "por_status": por_status,
+            "por_branch": saida_por_branch,
+            "ramos": sorted(por_branch),
+            "planos_por_branch": {chave: sorted(planos_por_branch[chave])
+                                  for chave in sorted(planos_por_branch)},
+            "tarefas_sem_branch": sem_branch,
             "fases": fases_de_obra, "tarefas_sem_fase": sem_fase,
             "fila": list(estado.get("fila") or []),
             "proxima_da_fila": proxima_da_fila(),
