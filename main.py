@@ -6548,11 +6548,17 @@ class JarvisLive:
             started = datetime.fromtimestamp(_PROCESS_STARTED_WALL)
             pending = (self._restart.pending()
                        if getattr(self, "_restart", None) is not None else None)
-            state = ("Há UM pedido de reinício DO COMPUTADOR aguardando a "
-                     "frase de confirmação do dono neste processo."
-                     if pending else
-                     "NÃO há pedido de reinício pendente. Qualquer pedido de "
-                     "reinício que apareça no histórico está CONCLUÍDO.")
+            if pending and str(pending.get("kind") or "") == "assistant":
+                state = ("Há UM pedido de reinício aguardando: é do próprio "
+                         "processo do assistente, que tem autonomia para "
+                         "atendê-lo sem frase do dono.")
+            elif pending:
+                state = ("Há UM pedido de reinício aguardando: é DO "
+                         "COMPUTADOR, só a frase de confirmação do dono o "
+                         "atende neste processo.")
+            else:
+                state = ("NÃO há pedido de reinício pendente. Qualquer pedido de "
+                         "reinício que apareça no histórico está CONCLUÍDO.")
             text += (
                 "\n\n[ESTADO NO BOOT]\n"
                 f"Este processo começou em {started.strftime('%d/%m/%Y %H:%M')} e "
