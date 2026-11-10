@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from actions import home_control as hc
+from core import actiongate, voice_identity
 
 #: A casa do dono de verdade: NENHUMA entidade ``light``, a luz é uma cena.
 CASA_DO_DONO = [
@@ -100,6 +101,29 @@ def casa(monkeypatch, tmp_path, request):
     fake.mapa = mapa
     fake.alias = mapa
     return fake
+
+
+@pytest.fixture(autouse=True)
+def _portao_limpo():
+    """Identidade de voz e janelas são estado DE PROCESSO: limpas antes e
+    depois de cada teste, nenhum teste herda a voz (ou a janela) do anterior
+    — e nenhum teste deixa a voz do dono ligada para o módulo seguinte."""
+    voice_identity.clear()
+    actiongate.close()
+    yield
+    voice_identity.clear()
+    actiongate.close()
+
+
+def _voz_do_dono() -> None:
+    """A voz do dono confirmada por voiceprint — o fator que ensina nomes.
+
+    É exatamente o que ``main`` grava no slot quando o voiceprint confirma a
+    fala dele; os testes de RECUSA (terceiro, automação, janela) estão em
+    ``tests/test_home_alias_gate.py``.
+    """
+    voice_identity.set_recent(who="owner", person="dono", privileged=True,
+                              confirmed_by="voiceprint_owner")
 
 
 def _gravar_mapa(path: Path, apelidos: list[dict]) -> None:
@@ -272,6 +296,7 @@ def test_prevencao_apelido_duplicado_para_entidades_diferentes_e_conflito(casa):
 
 def test_prevencao_registro_aponta_para_entidade_inexistente_recusa_ancora(casa):
     """Apelido nasce ancorado em entidade real: alvo falso não entra no mapa."""
+    _voz_do_dono()
     out = hc.home_control({"action": "apelido", "alias": "luz da varanda",
                           "entidade": "luz da varanda"})
     assert "Não anotei" in out
@@ -298,6 +323,7 @@ def test_prevencao_trocar_exigido_para_mudar_o_apontamento(casa):
 
 def test_registrar_apelido_pelo_nome_humano_ancora_na_entidade_real(casa):
     """'a luz do quarto é a cena Luz do teto' → mapa com o id verdadeiro."""
+    _voz_do_dono()
     out = hc.home_control({"action": "apelido", "alias": "luz do quarto",
                           "entidade": "Luz do teto"})
     assert "Anotado" in out and "scene.fan_backlight" in out
@@ -305,6 +331,9 @@ def test_registrar_apelido_pelo_nome_humano_ancora_na_entidade_real(casa):
     assert entry["apelido"] == "luz do quarto"
     assert entry["entidade"] == "scene.fan_backlight"
     assert entry["nome"] == "Luz do teto"
+    # A origem é de verdade: o dono ensinou pela voz dele, hoje.
+    assert entry["origem"] == "dono" and entry["quem"] == "dono"
+    assert entry["fator"] == "voz_do_dono"
 
 
 def test_apelido_registrado_resolve_sem_reiniciar_o_processo(casa):
@@ -320,6 +349,7 @@ def test_apelido_registrado_resolve_sem_reiniciar_o_processo(casa):
 
 def test_registrar_apelido_idempotente_nao_duplica(casa):
     """Dois registros do mesmo nome e mesma entidade = uma entrada."""
+    _voz_do_dono()
     hc.home_control({"action": "apelido", "alias": "luz",
                      "entidade": "scene.fan_backlight"})
     hc.home_control({"action": "apelido", "alias": "luz",
@@ -329,6 +359,7 @@ def test_registrar_apelido_idempotente_nao_duplica(casa):
 
 def test_mapa_guarda_so_nome_e_entidade_nunca_segredo(casa):
     """O arquivo é config, não cofre: só as chaves conhecidas entram."""
+    _voz_do_dono()
     hc.home_control({"action": "apelido", "alias": "luz",
                      "entidade": "scene.fan_backlight"})
     doc = _ler_mapa(casa.mapa)
@@ -341,12 +372,18 @@ def test_mapa_guarda_so_nome_e_entidade_nunca_segredo(casa):
 
 
 def test_listar_e_esquecer_apelido_pelo_plugin(casa):
-    """"quais são meus apelidos" e "esquece a luz" respondem e gravam."""
+    """"quais são meus apelidos" e "esquece a luz" respondem e gravam —
+    o esquecimento depois de o dono confirmar (nada apaga sem ele)."""
+    _voz_do_dono()
     hc.home_control({"action": "apelido", "alias": "luz",
                      "entidade": "scene.fan_backlight"})
     out = hc.home_control({"action": "apelidos"})
     assert "luz → Luz do teto (scene.fan_backlight)" in out
-    esquecido = hc.home_control({"action": "esquecer_apelido", "alias": "luz"})
+    pergunta = hc.home_control({"action": "esquecer_apelido", "alias": "luz"})
+    assert "Confirma" in pergunta
+    assert hc.alias_entries()[0] != []
+    esquecido = hc.home_control({"action": "esquecer_apelido", "alias": "luz",
+                                 "confirmar": True})
     assert "não é mais atalho" in esquecido
     assert hc.alias_entries()[0] == []
 

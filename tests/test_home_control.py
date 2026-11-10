@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from actions import home_control as hc
+from core import actiongate, voice_identity
 
 #: A forma prometida ao modelo. Não é fotografia: é a porta da frente. Remover
 #: ou renomear uma ação, ou mexer no tipo/nome de um parâmetro, quebra aqui; e
@@ -29,6 +30,7 @@ PARAM_TYPES = {
     "alias": "STRING",
     "entidade": "STRING",
     "trocar": "BOOLEAN",
+    "confirmar": "BOOLEAN",
     "domain": "STRING",
     "params": "OBJECT",
     "value": "STRING",
@@ -238,7 +240,11 @@ class AliasActionTests(unittest.TestCase):
     ``apelido`` grava, ``apelidos`` lê o que está no disco, ``esquecer_apelido``
     reescreve. Zero rede: ``_api`` é um alarme e ``_states`` é a fixture. O mapa
     vive num arquivo temporário — o ``config/home_aliases.json`` do dono não é
-    lido nem escrito aqui (a porta dele é o teste de cima).
+    lido nem escrito aqui (a porta dele é o teste de cima). Ensinar é caneta do
+    dono desde a decisão 2 (09/11/2026), então o slot de identidade do processo
+    é posto como a voz dele (e limpo antes e depois — os portões são estado de
+    processo e nunca vazam para o teste seguinte; os casos de RECUSA do portão
+    estão em ``tests/test_home_alias_gate.py``).
     """
 
     def setUp(self):
@@ -250,6 +256,12 @@ class AliasActionTests(unittest.TestCase):
                   patch.object(hc, "_api", side_effect=self._rede)):
             p.start()
             self.addCleanup(p.stop)
+        voice_identity.clear()
+        actiongate.close()
+        self.addCleanup(voice_identity.clear)
+        self.addCleanup(actiongate.close)
+        voice_identity.set_recent(who="owner", person="dono", privileged=True,
+                                  confirmed_by="voiceprint_owner")
 
     @staticmethod
     def _rede(*args, **kwargs):
@@ -302,11 +314,17 @@ class AliasActionTests(unittest.TestCase):
                       "(switch.tomada_do_escritorio)", out)
 
     def test_esquecer_apelido_reescreve_o_arquivo(self):
-        """Esquecer tira a linha do arquivo e deixa as outras."""
+        """Esquecer tira a linha do arquivo e deixa as outras — com a
+        confirmação do dono: nada apaga apelido existente sem ele confirmar."""
         self._ensinar("luz do quarto", "Luz do Quarto")
         self._ensinar("tomada", "Tomada do Escritório")
+        pergunta = hc.home_control({"action": "esquecer_apelido",
+                                    "alias": "luz do quarto"})
+        self.assertIn("Confirma", pergunta)
+        self.assertEqual([entry["apelido"] for entry in self._doc()["apelidos"]],
+                         ["luz do quarto", "tomada"])
         out = hc.home_control({"action": "esquecer_apelido",
-                               "alias": "luz do quarto"})
+                               "alias": "luz do quarto", "confirmar": True})
         self.assertIn("não é mais atalho", out)
         self.assertEqual([entry["apelido"] for entry in self._doc()["apelidos"]],
                          ["tomada"])

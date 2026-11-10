@@ -27,6 +27,12 @@ from disk on EVERY call — a new alias takes effect without a restart (same
 precedent as ``config/flows.json`` and ``config/workflow_gate.json``). The map
 holds names and entity ids only; it never contains a secret.
 
+Writes to that map have a gate (decision 2 of the owner, 09/11/2026: "outras
+vozes precisam de minha permissão ou autorização momentânea") — see
+:func:`_portao_do_apelido`: only his voice, his typed password, a permission
+he granted beforehand, or a momentary window he opened may teach a name, and
+each entry records who taught it, through which port, and when.
+
 Every network call has a 5 s timeout and every failure becomes a sentence the
 assistant can speak instead of a traceback.
 """
@@ -49,6 +55,8 @@ try:
 except Exception:  # pragma: no cover - requests is a project dependency
     requests = None
 
+from core import actiongate, voice_grants, voice_identity
+
 BASE_URL = "http://127.0.0.1:8123"
 TIMEOUT = 5.0
 VAULT_NAMESPACE = "home_assistant_secrets"
@@ -60,7 +68,35 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_ALIAS_PATH = BASE_DIR / "config" / "home_aliases.json"
 ENV_ALIAS_PATH = "JARVIS_HOME_ALIASES"
 #: O que o arquivo pode guardar por entrada (falha fechada contra segredo).
-ALIAS_FIELDS = ("apelido", "entidade", "nome", "dominio", "desde", "origem")
+#: ``quem`` é rótulo NOMINAL (o dono ou a pessoa), nunca id de voz, embedding,
+#: telefone ou dado pessoal; ``fator`` diz o porto exato; ``ensinado_em`` é a
+#: data do último ensino (``desde`` segue sendo a primeira vez).
+ALIAS_FIELDS = ("apelido", "entidade", "nome", "dominio", "desde", "origem",
+                "quem", "fator", "ensinado_em")
+
+# ── Portão de quem ensina apelido (decisão 2 do dono, 09/11/2026) ───────────
+#
+# "Outras vozes precisam de minha permissão ou autorização momentânea."
+# Os mecanismos são os que JÁ existem — nenhum portão paralelo:
+#   * fator do dono NA HORA: ``voice_identity.is_owner_turn()`` — voz
+#     confirmada por voiceprint OU senha digitada (paridade de 06/11/2026);
+#   * permissão prévia EXPLÍCITA: grant de ``core/voice_grants`` (criado só
+#     por ele, com ``confirmed_by`` de dono) cobrindo o escopo nominal
+#     ``execucao/``:data:`ALIAS_GRANT_SCOPE`;
+#   * autorização momentânea NAQUELE turno: a janela de ação de 120 s de
+#     ``core/actiongate`` — aberta só pela voz dele ou pela senha dele
+#     (``window_factor()`` é vazio quando a janela não é dele).
+# Sem nenhum dos três, a escrita é recusada ANTES de qualquer leitura de
+# entidade (visitar não usa o ensino como sonda do que existe) e o pedido
+# fica estacionado em ``actiongate.mark_pending`` com o rótulo nominal de
+# quem pediu — a trilha da falha fechada.
+ALIAS_GRANT_SCOPE = "apelidos_da_casa"
+#: Porto gravado em ``origem``: fator do dono na hora (voz ou senha — o fator
+#: exato fica em ``fator``), grant dele criado antes, ou janela momentânea
+#: que ele abriu. Entradas antigas já gravadas como "dono" continuam valendo.
+ORIGEM_ALIAS_DONO = "dono"
+ORIGEM_ALIAS_GRANT = "permissao_do_dono"
+ORIGEM_ALIAS_JANELA = "autorizacao_momentanea"
 
 # Domains the action will toggle. Anything else (sensor, automation, script,
 # group, …) is refused before a service call is built.
@@ -380,7 +416,10 @@ def alias_entries() -> tuple[list[dict], str]:
             "nome": str(item.get("nome") or "").strip(),
             "dominio": entity.split(".", 1)[0],
             "desde": str(item.get("desde") or ""),
-            "origem": str(item.get("origem") or "dono"),
+            "origem": str(item.get("origem") or actiongate.ORIGIN_UNDECLARED),
+            "quem": str(item.get("quem") or ""),
+            "fator": str(item.get("fator") or ""),
+            "ensinado_em": str(item.get("ensinado_em") or ""),
         })
     reason = ""
     if dropped:
@@ -495,13 +534,21 @@ def _write_alias_doc(doc: dict) -> bool:
 
 
 def save_alias(alias: object, entity_id: object, nome: str = "", *,
-               origem: str = "dono", trocar: bool = False,
-               now: date | None = None) -> dict:
+               origem: str = "", trocar: bool = False,
+               now: date | None = None, quem: str = "",
+               fator: str = "") -> dict:
     """Grava ``apelido -> entidade``. Idempotente; conflito só muda com trocar.
 
     Um apelido = uma entrada. Regravar o mesmo nome para a MESMA entidade só
     renova o texto; para outra entidade é conflito e precisa de ``trocar`` —
     sorteio entre dois alvos é exatamente o que o dono não perdoa.
+
+    A origem é o que o portão (:func:`_portao_do_apelido`) apurou de verdade:
+    ``origem``/``quem``/``fator`` dizem quem ensinou, por qual porto e com que
+    fator, e ``ensinado_em`` a data deste ensino (``desde`` segue a primeira).
+    Chamado SEM origem (caminho cru, sem portão), o registro não inventa dono:
+    mantém a origem que já havia ou grava ``nao_declarada`` — o mapa nunca
+    mente sobre quem ensinou.
     """
     key = str(alias or "").strip()
     entity = str(entity_id or "").strip().lower()
@@ -541,7 +588,11 @@ def save_alias(alias: object, entity_id: object, nome: str = "", *,
                       or str(old.get("nome") or "").strip()),
              "dominio": entity.split(".", 1)[0],
              "desde": str(old.get("desde") or moment),
-             "origem": str(old.get("origem") or origem or "dono")}
+             "origem": str(origem or old.get("origem")
+                           or actiongate.ORIGIN_UNDECLARED),
+             "quem": str(quem or old.get("quem") or ""),
+             "fator": str(fator or old.get("fator") or ""),
+             "ensinado_em": moment}
     others = [item for item in entries
               if _fold(item.get("apelido")) != folded]
     doc["apelidos"] = others + [entry]
@@ -1206,8 +1257,68 @@ def _alias_of(parameters: dict) -> str:
     return ""
 
 
+def _portao_do_apelido(*, apagar: bool = False) -> dict:
+    """QUEM pode escrever no mapa — decisão 2 do dono, 09/11/2026, à letra:
+    "outras vozes precisam de minha permissão ou autorização momentânea".
+
+    Consulta, nesta ordem, só mecanismos que JÁ existem (nenhum portão
+    paralelo): o fator do dono NA HORA (voz por voiceprint ou senha digitada —
+    os dois fatores plenos de ``core/owner_auth``, já refletidos em
+    ``voice_identity``); a permissão prévia EXPLÍCITA dele (grant nominal de
+    ``core/voice_grants``, que só ele cria); e a autorização momentânea
+    NAQUELE turno (a janela de ação de ``core/actiongate``, que só a voz dele
+    ou a senha dele abre). APAGAR é caneta dele e de mais ninguém: nem grant
+    nem janela substituem o dono na eliminação ("nada apaga apelido existente
+    sem ele confirmar").
+
+    Devolve ``{"ok", "origem", "quem", "fator", "resposta"}``. Na recusa,
+    ``resposta`` nomeia quem pediu (rótulo nominal) e o pedido fica
+    estacionado em ``actiongate.mark_pending`` — a trilha da falha fechada;
+    quando o dono autorizar, a janela dele abre e o pedido pode ser repetido
+    dentro do prazo. O ``pending`` do dono não é sobrescrito por terceiro.
+    """
+    snap = voice_identity.recent()
+    if voice_identity.is_owner_turn():
+        por_texto = str(snap.get("confirmed_by") or "") in (
+            "senha_digitada", "owner_password")
+        return {"ok": True, "origem": ORIGEM_ALIAS_DONO, "quem": "dono",
+                "fator": "owner_password" if por_texto else "voz_do_dono",
+                "resposta": ""}
+    quem = voice_grants.person_key(snap.get("person") or "")
+    if not apagar and quem and voice_grants.allows(
+            quem, voice_grants.Scope(voice_grants.SCOPE_EXECUTE,
+                                     ALIAS_GRANT_SCOPE)):
+        return {"ok": True, "origem": ORIGEM_ALIAS_GRANT, "quem": quem,
+                "fator": "permissao_do_dono", "resposta": ""}
+    if not apagar and actiongate.window_factor():
+        return {"ok": True, "origem": ORIGEM_ALIAS_JANELA,
+                "quem": quem or "visitante", "fator": "janela_do_dono",
+                "resposta": ""}
+    rotulo = voice_identity.describe(snap)
+    if apagar:
+        return {"ok": False, "origem": actiongate.ORIGIN_UNDECLARED,
+                "quem": quem or "visitante", "fator": "",
+                "resposta": ("o mapa da casa só se apaga pelo dono — nem "
+                             f"permissão antiga nem janela momentânea apagam "
+                             f"({rotulo})")}
+    if not actiongate.has_pending():
+        # Trilha sem pisar no pedido pendente do PROPRIO dono: um slot só.
+        actiongate.mark_pending(
+            "home_control",
+            f"ensinar apelido da casa — {rotulo}")
+    return {"ok": False, "origem": actiongate.ORIGIN_UNDECLARED,
+            "quem": quem or "visitante", "fator": "",
+            "resposta": ("o mapa da casa é ensinado só pelo dono; pedi a "
+                         f"autorização dele ({rotulo})")}
+
+
 def _register_alias(parameters: dict) -> str:
-    """Grava ``apelido -> entidade`` no arquivo. A regra do dono vira config."""
+    """Grava ``apelido -> entidade`` no arquivo. A regra do dono vira config.
+
+    O portão vem ANTES da resolução da entidade: visitante não usa o ensino
+    como sonda do que existe na casa — e o que o dono ensina pela boca grava
+    com a origem real (quem, porto, fator, quando).
+    """
     alias = _alias_of(parameters)
     if not alias:
         return ("Diga o apelido e a entidade, ex.: apelido='luz do quarto', "
@@ -1226,6 +1337,9 @@ def _register_alias(parameters: dict) -> str:
         return (f"'{alias}' está anotado como {entry['nome'] or '?'} "
                 f"({entry['entidade']}).")
 
+    portao = _portao_do_apelido()
+    if not portao["ok"]:
+        return f"Não anotei '{alias}': {portao['resposta']}"
     states = _states()
     entity, error = resolve(alvo, states)
     if entity is None:
@@ -1233,7 +1347,9 @@ def _register_alias(parameters: dict) -> str:
         return f"Não anotei '{alias}': {error}"
     trocar = bool(parameters.get("trocar") or parameters.get("replace")
                   or parameters.get("substituir"))
-    got = save_alias(alias, entity["entity_id"], _name(entity), trocar=trocar)
+    got = save_alias(alias, entity["entity_id"], _name(entity), trocar=trocar,
+                     origem=portao["origem"], quem=portao["quem"],
+                     fator=portao["fator"])
     if not got["ok"]:
         return f"Não anotei '{alias}': {got['reason']}"
     entry = got["entry"]
@@ -1242,7 +1358,23 @@ def _register_alias(parameters: dict) -> str:
 
 
 def _forget_alias(parameters: dict) -> str:
+    """Esquece um apelido — caneta do dono, com confirmação para o existente.
+
+    Ordem fixa: portão (só o fator do dono apaga), depois a pergunta — nada é
+    apagado sem ele confirmar, precedente do ``scheduler.cancelar``.
+    """
     alias = _alias_of(parameters) or str(_target(parameters) or "").strip()
+    portao = _portao_do_apelido(apagar=True)
+    if not portao["ok"]:
+        return f"Não esqueci '{alias}': {portao['resposta']}"
+    confirmar = bool(parameters.get("confirmar") or parameters.get("confirm")
+                     or parameters.get("confirma"))
+    if not confirmar:
+        entries, _reason = alias_entries()
+        existente, _conflict = alias_for(alias, entries)
+        if existente is not None:
+            return (f"Vou esquecer '{alias}' ({existente['entidade']}). "
+                    "Confirma? Repita o pedido com confirmação.")
     got = remove_alias(alias)
     if not got["ok"]:
         return f"Não esqueci '{alias}': {got['reason']}"
@@ -1305,14 +1437,17 @@ def auto_authorized(parameters: dict | None = None) -> bool:
     """True for the simple house actions that need no spoken confirmation.
 
     The bridge uses this as a narrow standing grant: only the actions this
-    tool actually implements qualify. Destructive Home Assistant operations
+    tool actually implement qualify. Destructive Home Assistant operations
     (deleting automations, editing configuration) are not implemented here at
     all, so there is nothing else to grant.
 
-    ``apelido``/``esquecer_apelido`` write ONE local file of names and entity
-    ids — no device, no secret. The owner's rule is that a taught name has to
-    stick the moment it is said, so asking him to confirm his own vocabulary
-    would be the friction this map exists to remove.
+    ``apelido``/``esquecer_apelido`` stay pre-authorized so the owner's own
+    teaching phrase writes on the spot — asking him to confirm his vocabulary
+    would be the friction this map exists to remove. That standing grant
+    covers DISPATCH only: WHO may write is decided inside the handler by
+    :func:`_portao_do_apelido` (decision 2, 09/11/2026 — "outras vozes
+    precisam de minha permissão ou autorização momentânea"), so a call from
+    any other voice reaches the map's gate and is refused there with a trail.
     """
     action = str((parameters or {}).get("action") or "status").strip().lower()
     return _ACTION_ALIASES.get(action, action) in {
@@ -1339,8 +1474,12 @@ TOOL = {
         "has no X' from one empty domain. When the owner teaches a name "
         "('a luz do quarto é a cena Luz do teto'), persist it with "
         "action='apelido' — that rule is his, and a name that is not written "
-        "down is lost. action='apelidos' lists the map, "
-        "action='esquecer_apelido' removes one. Use action='status' for "
+        "down is lost. Only the owner's voice or typed password (or a "
+        "permission he granted beforehand, or a momentary window he opened) "
+        "may teach a name; other voices are refused with a trail, and only "
+        "he erases (action='esquecer_apelido' needs his confirmation for an "
+        "existing alias). action='apelidos' lists the map. "
+        "Use action='status' for "
         "'quais luzes estão ligadas?' and action='list' with a domain for "
         "'lista as tomadas'. This action cannot change Home Assistant "
         "configuration or delete automations; do not promise that."
@@ -1383,6 +1522,12 @@ TOOL = {
                 "type": "BOOLEAN",
                 "description": ("For action='apelido': replace an alias that "
                                 "already points somewhere else."),
+            },
+            "confirmar": {
+                "type": "BOOLEAN",
+                "description": ("For action='esquecer_apelido': the owner's "
+                                "confirmation to forget an EXISTING alias — "
+                                "nothing is erased without it."),
             },
             "domain": {
                 "type": "STRING",
