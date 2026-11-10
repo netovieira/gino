@@ -154,6 +154,62 @@ def test_evento_tv_inclui_label():
     assert f._events[-1]["label"] == TV  # type: ignore[attr-defined]
 
 
+# ── passa-altas de análise (ordem do dono, 10/11/2026) ───────────────────────
+
+def test_o_classificador_recebe_o_passa_altas_da_sessao():
+    """Uma fone de estado por filtro: o classify do turno é julgado limpo."""
+    from core.source_class import HighPass
+
+    f = _filter()
+    pcm = np.zeros(48000, dtype=np.int16)
+    with patch("core.ghost_filter._classify_source",
+               return_value=_reading(PERSON, 0.9)) as mock:
+        f.check("abre o terminal", pcm=pcm)
+        f.check("que horas sao", pcm=pcm)
+    primeiro = mock.call_args_list[0].kwargs["highpass"]
+    segundo = mock.call_args_list[1].kwargs["highpass"]
+    assert isinstance(primeiro, HighPass)
+    assert primeiro is segundo, "o estado do filtro se perdeu entre turnos"
+    assert primeiro.cutoff_hz == 120.0
+
+
+def test_passa_altas_desligado_chega_none_ao_classificador():
+    f = _filter(highpass_hz=0)
+    pcm = np.zeros(48000, dtype=np.int16)
+    with patch("core.ghost_filter._classify_source",
+               return_value=_reading(PERSON, 0.9)) as mock:
+        f.check("abre o terminal", pcm=pcm)
+    assert mock.call_args.kwargs["highpass"] is None
+
+
+def test_o_pcm_do_caller_sai_intacto_o_stt_recebe_audio_cru():
+    """Prova da arquitetura: o filtro julga uma CÓPIA.
+
+    O mesmo bytes/ndarray que chegou aqui é o que o STT já ouviu e o que o
+    ledger grava. Se algum dia o GhostFilter reescrever o buffer do caller,
+    este teste quebra.
+    """
+    f = _filter()
+    int16 = (np.clip(np.linspace(-0.4, 0.4, 48000), -1, 1)
+             * 32767).astype(np.int16)
+    original = int16.copy()
+    f.check("abre o terminal", pcm=int16.tobytes())
+    np.testing.assert_array_equal(int16, original)
+    view = original.reshape(-1, 1)
+    antes = view.copy()
+    f.check("outra frase", pcm=view)
+    np.testing.assert_array_equal(view, antes)
+
+
+def test_passa_altas_real_nao_inventa_pessoa_na_sala_quieta():
+    """Fim da linha: com o filtro ligado, sala silenciosa não vira fala."""
+    f = _filter()
+    silencioso = np.zeros(48000, dtype=np.int16)
+    r = f.check("palavra que o whisper inventou", pcm=silencioso.tobytes())
+    assert r["action"] == "accept", "bloco mudo não pode calar o dono"
+    assert r["label"] != PERSON or r["confidence"] < 0.55
+
+
 # ── texto vazio ──────────────────────────────────────────────────────────────
 
 def test_texto_vazio_passa_sem_repeticao():

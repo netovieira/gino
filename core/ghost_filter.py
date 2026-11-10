@@ -11,6 +11,10 @@ O que decide, e como:
      ``tv`` / ``musica`` / ``ruido`` -> descarta. ``pessoa`` / ``silencio``
      continua; ``ruido`` com baixa confiança também passa (é o piso de
      segurança: um bloco sem informação não pode calar o dono).
+     O PCM julgado passa por um passa-altas de 120 Hz (estado contínuo do
+     filtro, uma cópia só para a análise) porque os picos fixos de 31/120 Hz
+     da sala desenhavam "música" sobre a voz grave do dono. O áudio que foi
+     para o STT não é filtrado: aqui só se julga uma cópia.
 
   2. **Filtro de repetição**:
      frase idêntica (folded) que apareceu nos últimos ``repeat_window_s``
@@ -33,7 +37,14 @@ import unicodedata
 from collections import deque
 from typing import Any, Callable
 
-from core.source_class import classify as _classify_source, MUSIC, NOISE, TV
+from core.source_class import (
+    HighPass,
+    classify as _classify_source,
+    configured_highpass_hz,
+    MUSIC,
+    NOISE,
+    TV,
+)
 
 # ── rótulos que podem descartar a fala ──────────────────────────────────────
 #: Fontes não-humanas: quando o classificador tem certeza, descarta.
@@ -61,6 +72,10 @@ class GhostFilter:
 
     ``repeat_window_s``  : janela de detecção de repetição (s).
     ``repeat_min_count`` : número de ocorrências para considerar repetição.
+    ``highpass_hz``      : corte do passa-altas de ANÁLISE (default do config,
+                           120 Hz; 0 desliga). Ele só existe dentro do
+                           ``classify`` abaixo — o PCM que o dono mandou para o
+                           STT nunca é tocado aqui.
     ``on_classify``      : callback opcional para o evento ``audio_classified``;
                            recebe o payload dict.
     """
@@ -71,17 +86,40 @@ class GhostFilter:
         sample_rate: int = 16_000,
         repeat_window_s: float = _DEFAULT_REPEAT_WINDOW_S,
         repeat_min_count: int = _DEFAULT_REPEAT_MIN_COUNT,
+        highpass_hz: float | None = None,
         on_classify: Callable[[dict[str, Any]], None] | None = None,
         logger: Callable[[str], None] | None = None,
     ) -> None:
         self._sample_rate = int(sample_rate or 16_000)
         self._repeat_window_s = float(repeat_window_s)
         self._repeat_min_count = max(2, int(repeat_min_count))
+        self._highpass_hz = (configured_highpass_hz() if highpass_hz is None
+                             else float(highpass_hz))
+        self._highpass: HighPass | None = None
         self._on_classify = on_classify or (lambda _p: None)
         self._log_fn = logger or (lambda _m: None)
         self._lock = threading.Lock()
         # deque[(t_monotonic, folded_text)]
         self._recent: deque[tuple[float, str]] = deque(maxlen=200)
+
+    # ── passa-altas da análise ───────────────────────────────────────────────
+
+    def _analysis_highpass(self) -> HighPass | None:
+        """Um filtro por sessão de captura, criado na primeira fala julgada.
+
+        O estado é contínuo de um turno para o outro de propósito: o
+        passa-altas reiniciado a cada bloco injeta um transitório em cada
+        borda, e é o transitório repetido que devolve os picos ao espectro.
+        Criá-lo aqui (e não no ``__init__``) mantém o import eventual do
+        scipy fora da inicialização do assistente.
+        """
+        if self._highpass is None and self._highpass_hz > 0.0:
+            try:
+                self._highpass = HighPass(self._highpass_hz, self._sample_rate)
+            except Exception as exc:                      # filtro nunca trava
+                self._highpass_hz = 0.0                   # a fala segue cru
+                self._log(f"[Ghost] passa-altas indisponivel: {exc}")
+        return self._highpass
 
     # ── consulta principal ───────────────────────────────────────────────────
 
@@ -109,7 +147,10 @@ class GhostFilter:
         # 1. Classificação de fonte (se PCM disponível)
         if pcm is not None:
             try:
-                reading = _classify_source(pcm, sample_rate=self._sample_rate)
+                # Cópia filtrada SÓ para o julgamento: ``pcm`` segue intocado
+                # para lá, e o STT nunca recebe áudio passado pelo filtro.
+                reading = _classify_source(pcm, sample_rate=self._sample_rate,
+                                           highpass=self._analysis_highpass())
                 label = str(reading.label)
                 confidence = float(reading.confidence)
             except Exception as exc:
