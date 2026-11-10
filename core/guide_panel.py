@@ -156,15 +156,65 @@ def _vault_dirs() -> list[Path]:
     return dirs
 
 
-def find_vault_doc(filename: str) -> Path | None:
-    """Achou o documento do vault? Procura os cofres conhecidos (sem varrer o disco)."""
-    for base in _vault_dirs():
-        hit = base / filename
-        if hit.exists():
-            return hit
-        hits = sorted(base.glob(f"*/{filename}"))
-        if hits:
-            return hits[0]
+#: Os documentos do vault que o painel abre, como (legenda, TIPO, título,
+#: data do conteúdo, aliases antigos).
+#:
+#: O nome CANÔNICO não é literal congelado: ele sai do validador de nomes
+#: (:func:`core.obsidian.build_name`, a REGRA do dono de 07/11) calculado em
+#: tempo de render. Renomear um documento do cofre -- que é exatamente o que a
+#: REGRA manda quando o nome está fora do padrão -- passa a ser trocar esta
+#: linha, e não caçar um string escondido.
+#:
+#: Os nomes antigos ficam como ALIASES de reserva: o painel continua abrindo o
+#: documento se o cofre ainda estiver com o nome velho (renomeio e citações não
+#: são atômicos do ponto de vista do processo vivo) e em máquinas onde a rodada
+#: de renomeio ainda não passou.
+VAULT_DOCS = (
+    ("Contrato do dono no vault", "REGRA", "fluxos", "2026-11-05",
+     ("FLUXOS.md",)),
+    ("Ordens do dono", "REGRA", "ordens do dono", "2026-11-05",
+     ("ORDENS-DO-DONO-2026-11-05.md",)),
+    ("Tarefas unificadas", "TAREFA", "tarefas unificadas", "2026-11-05",
+     ("TAREFAS-UNIFICADAS.md",)),
+)
+
+
+def vault_doc_names(tipo: str, titulo: str, day: str,
+                    aliases: Iterable[str] = ()) -> tuple[str, ...]:
+    """Nomes em que procurar: o canônico pelo validador, depois os aliases.
+
+    Se o validador não estiver disponível (ou reprovar o par tipo+título), o
+    ponteiro não morre: cai nos aliases. Nome fora do padrão nunca é inventado
+    aqui -- quem monta o nome é a mesma função que valida o resto do cofre.
+    """
+    names: list[str] = []
+    try:
+        from core.obsidian import build_name
+        names.append(build_name(tipo, titulo, day))
+    except Exception:
+        pass
+    names.extend(a for a in aliases if a and a not in names)
+    return tuple(names)
+
+
+def find_vault_doc(filename: str | Iterable[str]) -> Path | None:
+    """Achou o documento do vault? Procura os cofres conhecidos (sem varrer o disco).
+
+    Aceita um nome ou uma lista de nomes na ordem de preferência (canônico
+    primeiro, aliases depois). A preferência é pelo NOME, não pelo cofre: o
+    nome canônico é tentado nos dois cofres antes de se recorrer a um alias.
+    """
+    names = (filename,) if isinstance(filename, str) else tuple(filename)
+    for name in names:
+        if not name:
+            continue
+        for base in _vault_dirs():
+            hit = base / name
+            if hit.exists():
+                return hit
+            hits = sorted(base.glob(f"*/{name}"))
+            if hits:
+                return hits[0]
     return None
 
 
@@ -319,13 +369,11 @@ def sections(base_dir: Path) -> list[dict]:
             links.append(_link(it["label"], it["path"], exists=not it["missing"]))
     fluxos_repo = base / "skills" / "fluxos" / "FLUXOS.md"
     links.append(_link("Contrato (cópia literal no projeto)", fluxos_repo))
-    for fname, label in (
-        ("FLUXOS.md", "Contrato do dono no vault"),
-        ("ORDENS-DO-DONO-2026-11-05.md", "Ordens do dono"),
-        ("TAREFAS-UNIFICADAS.md", "Tarefas unificadas"),
-    ):
-        found = find_vault_doc(fname)
-        links.append(_link(label, found if found else f"(ausente no vault: {fname})",
+    for label, tipo, titulo, day, aliases in VAULT_DOCS:
+        names = vault_doc_names(tipo, titulo, day, aliases)
+        found = find_vault_doc(names)
+        links.append(_link(label,
+                           found if found else f"(ausente no vault: {', '.join(names)})",
                            exists=found is not None))
 
     return [
