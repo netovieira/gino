@@ -30,6 +30,24 @@ O que este módulo é:
   ``logs/activity.log`` com veredito, ids e motivo. Nunca conteúdo de conversa
   e nunca segredo: só referência, fase, quem aprovou e o nome do arquivo.
 
+* AS FASES E TAREFAS DENTRO DO PLANO (defeito ``DEF-20261110-104454``, ordem
+  do dono de 10/11/2026: "quebrar em fases e tasks e executar" -- e a cobrança
+  dele, à letra: "o estranho é que nao tem FASES E TASKS de NADA QUE FEZ
+  HOJE.. GINO EU DEI A ORDEM DIRETA DE CRIAR FASES E TAREFAS E VOCE DISSE QUE
+  IRIA FAZER ISSO.. CADE!???"). A raiz medida no código: ``fase`` só existia no
+  nível do PLANO, como ciclo de vida, e a tarefa não tinha fase própria,
+  status, commit nem evidência -- o portão sabia que "plano aprovado" e nada
+  sobre o que o plano TEM. Hoje a tarefa tem ``fase`` (rótulo dentro do plano),
+  ``status`` (:data:`STATUS_DE_TAREFA`), ``commit``, ``evidencia``, ``nota``,
+  ``quem``/quando da conclusão; :func:`quebrar_plano` grava a árvore toda
+  idempotente, :func:`iniciar_tarefa` / :func:`concluir_tarefa` movem status,
+  :func:`quadro` devolve fase → tarefa → status e :func:`resumo` conta por
+  status. A Fila (:func:`empurrar_para_fila` / :func:`proxima_da_fila`) existe
+  porque ele manda jogar plano na fila -- a ordem é dele, nunca minha.
+  Estado antigo, sem esses campos, é lido e normalizado (:func:`_carregar`):
+  nada explode e nada é inventado -- tarefa velha vira ``pendente`` sem fase
+  declarada, nunca "concluída" por suposição.
+
 O que este módulo NÃO é (e é decisão, não esquecimento):
 
 * Não aprova nada sozinho. :func:`aprovar_plano` exige ``quem=`` com o nome de
@@ -85,6 +103,26 @@ MENSAGEM_SEM_PLANO = "Preciso de um plano pra isso"
 FASES = ("rascunho", "aguardando_aprovacao", "aprovado", "executando",
          "encerrado")
 FASES_APROVADAS = ("aprovado", "executando", "encerrado")
+
+#: Status fechado da TAREFA dentro do plano (defeito DEF-20261110-104454).
+#: Vocabulário fechado de propósito: "quase pronta", "feita depois" e
+#: "em andamentozinho" são o que deixou a casa sem saber o que foi entregue
+#: hoje. Fora daqui é recusa, não interpretação.
+STATUS_DE_TAREFA = ("pendente", "em_progresso", "concluida", "bloqueada")
+#: Rótulo do cesto das tarefas velhas que nasceram sem fase declarada. Não é
+#: fase inventada: é o nome honesto do buraco que o estado antigo tem.
+SEM_FASE = "(sem fase)"
+#: O commit curto ou longo que fecha uma tarefa. Texto livre aqui seria o
+#: caminho mais curto para um "feito" sem prova entrar no estado.
+_COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+#: Rótulo de fase: curto, de uma linha, lido no celular do dono.
+_FASE_MAX_CHARS = 80
+
+#: Formato do estado. ``1`` = plano, fase do plano e tarefa plana; ``2`` =
+#: tarefa com fase/status/commit/evidencia + ``fases`` no plano + ``fila``.
+#: A leitura normaliza o 1 para o 2 em memória (:func:`_carregar`), então um
+#: estado velho nunca derruba o portão e nunca perde chave.
+VERSAO_ESTADO = 2
 
 #: Quem NÃO pode constar como aprovador: o assistente não se autoaprova.
 _APELADOS_DO_ASSISTENTE = {"gino", "jarvis", "assistente", "modelo", "agente",
@@ -217,8 +255,152 @@ def problema_config() -> str:
 
 
 def _vazio() -> dict[str, Any]:
-    return {"versao": 1, "tarefa_ativa": "", "planos": {},
-            "historico": [], "atualizado": ""}
+    return {"versao": VERSAO_ESTADO, "tarefa_ativa": "", "planos": {},
+            "fila": [], "historico": [], "atualizado": ""}
+
+
+# ── normalização retrocompatível (defeito DEF-20261110-104454) ──────────────
+
+#: O ciclo de vida do PLANO e a fase de EXECUÇÃO da tarefa têm o mesmo nome
+#: na boca do dono ("fase"). Um valor do ciclo colado na tarefa não é fase de
+#: obra: é a confusão que o portão tem de recusar em vez de engolir.
+_CICLO_DO_PLANO = frozenset(FASES)
+
+
+def _rotulo_de_fase(item: Any) -> str:
+    """O rótulo de uma fase, vindo de texto ou de ``{"fase"|"rotulo"|"titulo"}``."""
+    if isinstance(item, dict):
+        bruto = (item.get("fase") or item.get("rotulo") or item.get("titulo")
+                 or item.get("nome") or "")
+    else:
+        bruto = item
+    return _normalizar(bruto)[:_FASE_MAX_CHARS]
+
+
+def _validar_rotulo(item: Any, o_que_e: str = "fase") -> str:
+    """Rótulo utilizável ou recusa com o nome do que falta (nunca adivinha)."""
+    bruto = _rotulo_de_fase(item)
+    if not bruto:
+        raise ValueError(f"{o_que_e} sem rótulo: passe o nome da fase, ex. "
+                         "\"F1 — nucleo do agendador\" (o dono lê isto no "
+                         "celular)")
+    if bruto.lower() in _CICLO_DO_PLANO:
+        raise ValueError(
+            f"{o_que_e} {bruto!r} é fase do CICLO DO PLANO (rascunho / "
+            "aguardando_aprovacao / aprovado / executando / encerrado), não "
+            f"fase de execução dentro do {o_que_e}: dê um rótulo à fase da "
+            "obra, ex. \"F1 — nucleo do agendador\"")
+    if bruto == SEM_FASE or bruto.startswith("("):
+        raise ValueError(f"{o_que_e} {bruto!r} é o cesto de leitura, não um "
+                         "rótulo declarável")
+    return bruto
+
+
+def _commit_seguro(texto: Any) -> str:
+    """Hash de commit normalizado, ou "" quando não parece hash.
+
+    Leitura nunca levanta: um ``"commit": "feito, viu?"`` colado por engano no
+    estado velho volta ao vazio e aparece como falta no :func:`quadro`.
+    """
+    bruto = str(texto or "").strip().lower()
+    return bruto if _COMMIT_RE.match(bruto) else ""
+
+
+def _validar_commit(texto: Any, o_que_e: str) -> str:
+    bruto = str(texto or "").strip()
+    if not bruto:
+        return ""
+    alvo = _commit_seguro(bruto)
+    if not alvo:
+        raise ValueError(f"{o_que_e} {bruto!r} não é hash de commit (7 a 40 "
+                         "hex, minúsculo): evidência de conclusão é commit "
+                         "verificável com `git show`, não frase")
+    return alvo
+
+
+def _validar_status(texto: Any, o_que_e: str) -> str:
+    bruto = str(texto or "").strip().lower().replace(" ", "_").strip("_")
+    if bruto not in STATUS_DE_TAREFA:
+        raise ValueError(f"status {texto!r} de {o_que_e} fora do conjunto "
+                         f"fechado: {', '.join(STATUS_DE_TAREFA)} "
+                         "(fora daqui é recusa, não interpretação)")
+    return bruto
+
+
+def _normalizar_tarefa(dado: Any, tid: str = "") -> dict[str, Any]:
+    """Uma tarefa velha (id + título) vira a tarefa completa, sem invenção.
+
+    O que o estado antigo NÃO dizia não se deduz: ``status`` de tarefa sem
+    status é ``pendente`` (ninguém marcou o contrário), ``fase`` é ``""``
+    (o cesto :data:`SEM_FASE` diz isto na cara do :func:`quadro`), commit e
+    evidência ficam vazios. Marcara ``concluida`` por suposição era pior que
+    o buraco: o dono perguntaria "o que foi feito hoje" e eu responderia com
+    uma dedução.
+    """
+    bruto = dict(dado) if isinstance(dado, dict) else {}
+    ident = str(bruto.get("id") or tid or "").strip()
+    fase = _rotulo_de_fase(bruto.get("fase"))
+    status = str(bruto.get("status") or "").strip().lower().replace(" ", "_")
+    if status not in STATUS_DE_TAREFA:
+        # leitura não recusa: estado velho volta ao que é verdade por omissão.
+        status = "pendente"
+    tarefa = {
+        "id": ident,
+        "titulo": str(bruto.get("titulo") or ""),
+        "fase": fase,
+        "status": status,
+        "commit": _commit_seguro(bruto.get("commit")),
+        "evidencia": str(bruto.get("evidencia") or "")[:160],
+        "nota": str(bruto.get("nota") or "")[:160],
+        "desde": str(bruto.get("desde") or ""),
+        "concluida_em": str(bruto.get("concluida_em") or ""),
+        "concluida_por": str(bruto.get("concluida_por") or ""),
+    }
+    if bruto.get("em_progresso_desde"):
+        tarefa["em_progresso_desde"] = str(bruto["em_progresso_desde"])
+    # Chaves que eu não conheço continuam onde estavam: normalizar não é
+    # podar o estado do dono.
+    for chave, valor in bruto.items():
+        tarefa.setdefault(chave, valor)
+    return tarefa
+
+
+def _normalizar_plano(plano: dict[str, Any]) -> dict[str, Any]:
+    """Plano do estado antigo (sem ``fases``) ou novo: sempre as duas chaves.
+
+    Aditivo por desenho: ``dict(plano)`` primeiro, campos novos depois. Uma
+    chave que o registro tinha não desaparece porque eu refinei a leitura.
+    """
+    registro = dict(plano)
+    registro["id"] = str(registro.get("id") or "")
+    registro["fase"] = str(registro.get("fase") or "")
+    fases = registro.get("fases")
+    if isinstance(fases, list):
+        vistos: list[str] = []
+        for item in fases:
+            rotulo = _rotulo_de_fase(item)
+            if rotulo and rotulo not in vistos:
+                vistos.append(rotulo)
+        registro["fases"] = vistos
+    else:
+        registro["fases"] = []
+    tarefas = registro.get("tarefas")
+    norm: dict[str, Any] = {}
+    if isinstance(tarefas, dict):
+        for tid, dado in tarefas.items():
+            ident = str(tid or "").strip()
+            if not ident:
+                continue
+            norm[ident] = _normalizar_tarefa(dado, ident)
+    elif isinstance(tarefas, (list, tuple)):
+        # estado que alguém escreveu à mão como lista: ainda é lido.
+        for dado in tarefas:
+            bruto = dado if isinstance(dado, dict) else {"id": str(dado)}
+            ident = str(bruto.get("id") or "").strip()
+            if ident:
+                norm[ident] = _normalizar_tarefa(bruto, ident)
+    registro["tarefas"] = norm
+    return registro
 
 
 def _carregar() -> dict[str, Any]:
@@ -226,6 +408,11 @@ def _carregar() -> dict[str, Any]:
 
     Não levanta de propósito: portão que quebra com estado podre é portão que
     ninguém religa. O histórico perdido é custo menor que execução sem plano.
+
+    A leitura é ADITIVA: ``versao`` 1 (tarefa plana, sem fila) sobe para a
+    forma da ``versao`` 2 sem perder plano, tarefa, chave desconhecida nem
+    linha de histórico -- é o que permite mexer no estado REAL do dono com
+    segurança depois de meses de registro.
     """
     caminho = state_path()
     try:
@@ -235,16 +422,28 @@ def _carregar() -> dict[str, Any]:
     if not isinstance(bruto, dict):
         return _vazio()
     estado = _vazio()
-    estado["versao"] = bruto.get("versao", 1)
+    for chave, valor in bruto.items():
+        if chave not in ("versao", "tarefa_ativa", "planos", "fila",
+                        "historico"):
+            estado[chave] = valor
+    estado["versao"] = VERSAO_ESTADO
     estado["tarefa_ativa"] = str(bruto.get("tarefa_ativa") or "")
     planos = bruto.get("planos")
     if isinstance(planos, dict):
         for pid, plano in planos.items():
             if isinstance(plano, dict):
-                estado["planos"][str(pid)] = plano
+                estado["planos"][str(pid)] = _normalizar_plano(plano)
     historico = bruto.get("historico")
     if isinstance(historico, list):
         estado["historico"] = [h for h in historico if isinstance(h, dict)]
+    fila = bruto.get("fila")
+    if isinstance(fila, list):
+        vistos: list[str] = []
+        for item in fila:
+            ident = str(item or "").strip()
+            if ident and ident not in vistos:
+                vistos.append(ident)
+        estado["fila"] = vistos
     return estado
 
 
@@ -414,7 +613,8 @@ def registrar_plano(plano, titulo: str = "", *, arquivo: Any = "",
     with _LOCK:
         estado = _carregar()
         anterior = estado["planos"].get(pid) or {}
-        registro = {
+        registro = dict(anterior)
+        registro.update({
             "id": pid,
             "titulo": _redigido(titulo or anterior.get("titulo") or pid) or pid,
             "arquivo": _normalizar(arquivo or anterior.get("arquivo")),
@@ -423,9 +623,10 @@ def registrar_plano(plano, titulo: str = "", *, arquivo: Any = "",
             "aprovado_por": str(anterior.get("aprovado_por") or ""),
             "aprovado_em": str(anterior.get("aprovado_em") or ""),
             "tarefas": dict(anterior.get("tarefas") or {}),
+            "fases": list(anterior.get("fases") or []),
             "criado_em": str(anterior.get("criado_em") or hora),
             "atualizado_em": hora,
-        }
+        })
         for tarefa in tarefas or ():
             registrar_tarefa(pid, tarefa, quando=quando, _estado=(estado, registro))
         estado["planos"][pid] = registro
@@ -526,21 +727,54 @@ def definir_fase(plano, fase: str, *, quando: str | None = None) -> dict[str, An
 
 
 def registrar_tarefa(plano, tarefa, titulo: str = "", *,
-                     quando: str | None = None, _estado=None) -> dict[str, Any]:
+                     quando: str | None = None, fase: str = "",
+                     status: str = "", commit: str = "", evidencia: str = "",
+                     nota: str = "", _estado=None) -> dict[str, Any]:
     """Prende uma tarefa a um plano, para o portão responder pelo id da tarefa.
 
     Aceita o id solto, ``("id", "título")`` ou ``{"id"|"tarefa", "titulo"}`` --
-    é o que sai das listas de ``steps/tasks/`` do cofre.
+    é o que sai das listas de ``steps/tasks/`` do cofre; os campos novos
+    (``fase``, ``status``, ``commit``, ``evidencia``, ``nota``) podem vir no
+    dicionário ou nas palavras-chave.
+
+    Duas recusas, e são a lei do DEF-20261110-104454 na porta de escrita:
+
+    * plano que JÁ TEM fases declaradas não ganha tarefa fora de fase -- a
+      recusa nomeia as fases disponíveis;
+    * ``status="concluida"`` não se alcança por aqui: conclusão é ato com
+      ``quem``, ``quando`` e prova (:func:`concluir_tarefa`).
+
+    Registrar de novo a mesma tarefa é aditivo: status, commit e evidência já
+    gravados não são pisados por uma reinscrição que não os traz.
     """
     bruto = tarefa
+    campo_fase, campo_status = fase, status
+    campo_commit, campo_evidencia, campo_nota = commit, evidencia, nota
     if isinstance(tarefa, dict):
         titulo = titulo or str(tarefa.get("titulo") or tarefa.get("descricao") or "")
         bruto = tarefa.get("id") or tarefa.get("tarefa") or tarefa.get("task_id") or ""
+        campo_fase = fase or str(tarefa.get("fase") or "")
+        campo_status = status or str(tarefa.get("status") or "")
+        campo_commit = commit or tarefa.get("commit") or ""
+        campo_evidencia = evidencia or tarefa.get("evidencia") or ""
+        campo_nota = nota or tarefa.get("nota") or ""
     elif isinstance(tarefa, (tuple, list)) and tarefa:
         titulo = titulo or str(tarefa[1] if len(tarefa) > 1 else "")
         bruto = tarefa[0]
     tid = _validar_id(bruto, "id de tarefa")
     hora = _agora(quando)
+    rotulo = _validar_rotulo(campo_fase, "fase") if campo_fase else ""
+    novo_status = _validar_status(campo_status, tid) if campo_status else ""
+    if novo_status == "concluida":
+        raise ValueError(f"tarefa {tid} não se conclui por registrar_tarefa: "
+                         "conclusão exige quem, quando e prova — use "
+                         "concluir_tarefa")
+    prova = _validar_commit(campo_commit, f"commit da tarefa {tid}")
+    if prova and novo_status != "concluida":
+        raise ValueError(f"tarefa {tid} traz commit {prova} sem concluir: "
+                         "commit é evidência de conclusão, use "
+                         "concluir_tarefa(commit=)")
+    evid = _redigido(campo_evidencia)
     if _estado is not None:
         estado, registro = _estado
     else:
@@ -549,14 +783,616 @@ def registrar_tarefa(plano, tarefa, titulo: str = "", *,
         registro = estado["planos"].get(pid)
         if registro is None:
             raise ValueError(f"{MENSAGEM_SEM_PLANO}: plano {pid} não cadastrado")
-    registro.setdefault("tarefas", {})[tid] = {
-        "id": tid, "titulo": _redigido(titulo), "desde": hora,
-    }
+    declaradas = [str(item) for item in (registro.get("fases") or [])]
+    if declaradas:
+        if not rotulo:
+            raise ValueError(
+                f"tarefa {tid} sem fase num plano que já tem fases "
+                f"({', '.join(declaradas)}): passe fase=\"...\" ou quebre o "
+                "plano com quebrar_plano (defeito DEF-20261110-104454 é "
+                "exatamente esta lacuna)")
+        if rotulo not in declaradas:
+            raise ValueError(f"fase {rotulo!r} da tarefa {tid} não está nas "
+                             f"fases declaradas do plano: {', '.join(declaradas)}")
+    elif rotulo:
+        # o plano ainda não tem fases declaradas: a fase da tarefa declara a
+        # primeira, em vez de sumir com o rótulo que o dono ia ler.
+        declaradas.append(rotulo)
+    anterior = dict((registro.get("tarefas") or {}).get(tid) or {})
+    registro.setdefault("tarefas", {})[tid] = _mesclar_tarefa(
+        anterior, {
+            "id": tid, "titulo": _redigido(titulo) or anterior.get("titulo", ""),
+            "fase": rotulo or anterior.get("fase", ""),
+            "status": novo_status, "commit": prova,
+            "evidencia": evid, "nota": _redigido(campo_nota),
+            "desde": anterior.get("desde") or hora,
+        })
+    if declaradas:
+        registro["fases"] = declaradas
     if _estado is None:
         estado["planos"][registro["id"]] = registro
-        _registrar(estado, "tarefa_registrada", registro["id"], tarefa=tid)
+        _registrar(estado, "tarefa_registrada", registro["id"], tarefa=tid,
+                   fase=rotulo, status=registro["tarefas"][tid]["status"])
         _salvar(estado)
     return registro
+
+
+def _mesclar_tarefa(atual: dict[str, Any], novo: dict[str, Any]) -> dict[str, Any]:
+    """Junta a tarefa que já existe com a reinscrição, sem apagar conclusão.
+
+    A regra que o dono pode cobrar: ``concluida`` não se pisa, não se rebaixa
+    e não perde o commit -- reinscrever o mapa de um plano é correção de
+    mapa, não reescrita de história. Campo vazio em ``novo`` é "sem opinião",
+    nunca "apaga".
+    """
+    base = _normalizar_tarefa(atual if atual else novo,
+                              str(novo.get("id") or ""))
+    if not atual:
+        return base
+    if base.get("status") == "concluida":
+        return base
+    for campo in ("titulo", "nota", "evidencia", "commit", "concluida_em",
+                  "concluida_por"):
+        if novo.get(campo):
+            base[campo] = novo[campo]
+    if novo.get("fase") and not base.get("fase"):
+        base["fase"] = novo["fase"]
+    if novo.get("status"):
+        base["status"] = novo["status"]
+    if not base.get("desde"):
+        base["desde"] = novo.get("desde") or ""
+    return base
+
+
+def _procurar_tarefa(estado: dict[str, Any], referencia: Any,
+                     ) -> tuple[str, str]:
+    """``(plano_id, tarefa_id)`` da referência; recusa nomeando o que falta.
+
+    Aceita ``plano:tarefa`` (a forma honesta quando um id vive em dois
+    planos), o id solto da tarefa ou uma referência ao plano que a tem.
+    Ambiguidade é dita, nunca resolvida em silêncio: foi assim que a casa
+    confundiu duas tarefas de planos diferentes.
+    """
+    bruto = _normalizar(referencia)
+    if not bruto:
+        raise ValueError("referência de tarefa vazia: passe o id da tarefa ou "
+                         "\"plano:tarefa\"")
+    if ":" in bruto and not Path(bruto).is_absolute():
+        pid, _, tid = bruto.partition(":")
+        pid, tid = (_validar_id(pid, "id de plano"),
+                    _validar_id(tid, "id de tarefa"))
+        registro = estado["planos"].get(pid)
+        if registro is None:
+            raise ValueError(f"{MENSAGEM_SEM_PLANO}: plano {pid} não cadastrado "
+                             f"(referência {bruto!r})")
+        if tid not in (registro.get("tarefas") or {}):
+            raise ValueError(
+                f"tarefa {tid} não está no plano {pid}: declare-a "
+                "(quebrar_plano) ou registre com registrar_tarefa")
+        return pid, tid
+    alvo = _id(bruto)
+    achados: list[tuple[str, str]] = []
+    for registro in estado["planos"].values():
+        pid = str(registro.get("id") or "")
+        for chave, dado in (registro.get("tarefas") or {}).items():
+            nomes = {_id(chave), _id(str((dado or {}).get("id") or ""))}
+            if alvo in nomes:
+                achados.append((pid, str(chave)))
+                break
+    if not achados:
+        raise ValueError(f"nenhuma tarefa {referencia!r} registrada: o portão "
+                         "não carimba o que não tem mapa — declare a tarefa "
+                         "(quebrar_plano) ou registre com registrar_tarefa")
+    if len(achados) > 1:
+        where = ", ".join(f"{pid}:{tid}" for pid, tid in achados)
+        raise ValueError(f"tarefa {alvo} existe em {len(achados)} planos "
+                         f"({where}): passe a forma qualificada <plano>:{alvo} "
+                         "em vez de deixar o portão escolher")
+    return achados[0]
+
+
+def _exigir_plano_aprovado_para_efeito(registro: dict[str, Any],
+                                      acao: str) -> None:
+    """Nada se inicia nem se conclui num plano que o dono não aprovou.
+
+    É o portão do lado da ESCRITA: o ``require_plan_approved`` guarda a
+    execução, e aqui se recusa o carimbo de "feito" antes da aprovação --
+    senão o estado ganharia conclusão que o dono nunca liberou.
+    """
+    fase = str(registro.get("fase") or "")
+    if fase in FASES_APROVADAS:
+        return
+    raise ValueError(
+        f"plano {registro.get('id')} está na fase '{fase or 'sem fase'}': "
+        f"nada se {acao} antes da aprovação do dono (aprovar_plano com "
+        "quem= e quando=)")
+
+
+# ── FASES E TAREFAS DENTRO DO PLANO (defeito DEF-20261110-104454) ───────────
+
+def _juntar_fases(atuais: list[str], novos: list[str]) -> list[str]:
+    """Fases declaradas não se apagam por reinscrição: a ordem é preservada.
+
+    Uma fase sem tarefa continua no mapa e aparece vazia no :func:`quadro` --
+    sumir com o rótulo que o dono leu ontem seria o mesmo defeito de outra
+    porta. Reordenar sozinho, idem: a ordem é dele, não minha.
+    """
+    juntas: list[str] = []
+    for rotulo in list(atuais) + list(novos):
+        if rotulo and rotulo not in juntas:
+            juntas.append(rotulo)
+    return juntas
+
+
+def _fase_e_tarefas(item: Any, posicao: int) -> tuple[str, list[Any]]:
+    """Uma entrada de ``quebrar_plano``: rótulo da fase + lista de tarefas."""
+    if isinstance(item, dict):
+        rotulo = _validar_rotulo(item, f"fase {posicao + 1}")
+        tarefas = item.get("tarefas") if item.get("tarefas") is not None else (
+            item.get("tasks") if item.get("tasks") is not None else [])
+    elif isinstance(item, (tuple, list)) and len(item) == 2:
+        rotulo = _validar_rotulo(item[0], f"fase {posicao + 1}")
+        tarefas = item[1]
+    elif isinstance(item, str):
+        # fase declarada sem tarefa: o mapa pode ter fase vazia (é o que o
+        # dono lê como "ainda não quebrada"), mas nunca tarefa sem fase.
+        rotulo = _validar_rotulo(item, f"fase {posicao + 1}")
+        tarefas = []
+    else:
+        raise ValueError(f"fase {posicao + 1} em formato inutilizável "
+                         f"({type(item).__name__}): use "
+                         "{\"fase\": \"F1 — ...\", \"tarefas\": [...]}, "
+                         "(\"F1 — ...\", [...]) ou o rótulo sozinho")
+    if isinstance(tarefas, dict):
+        tarefas = [dict(valor, id=chave) if isinstance(valor, dict)
+                   else (chave, valor) for chave, valor in tarefas.items()]
+    elif isinstance(tarefas, str):
+        tarefas = [tarefas]
+    if not isinstance(tarefas, (list, tuple)):
+        raise ValueError(f"tarefas da fase {rotulo!r} em formato inutilizável "
+                         f"({type(tarefas).__name__}): passe lista de ids, "
+                         "(id, título) ou dicionários")
+    return rotulo, list(tarefas)
+
+
+def _tarefa_de_fase(item: Any, rotulo: str, plano_id: str) -> dict[str, Any]:
+    """Normaliza e confere UMA tarefa do mapa: fase, status, quem, prova."""
+    if isinstance(item, dict):
+        bruto = item
+    elif isinstance(item, (tuple, list)) and item:
+        bruto = {"id": item[0], "titulo": item[1] if len(item) > 1 else ""}
+    else:
+        bruto = {"id": item}
+    tid = _validar_id(bruto.get("id") or bruto.get("tarefa") or "",
+                      f"id de tarefa do plano {plano_id}")
+    informada = _validar_rotulo(bruto.get("fase"), f"fase da tarefa {tid}") \
+        if bruto.get("fase") else ""
+    if informada and informada != rotulo:
+        raise ValueError(f"tarefa {tid} está na fase {rotulo!r} mas carrega "
+                         f"fase={informada!r}: ambiguidade não se resolve "
+                         "sozinha -- escolha uma das duas")
+    if "status" in bruto:
+        # chave presente é opinião dita: ou está no conjunto fechado, ou é
+        # recusa. Omitir a chave é "não disse" -> pendente por omissão.
+        status = _validar_status(bruto.get("status"), tid)
+    else:
+        status = "pendente"
+    commit = _validar_commit(bruto.get("commit"), f"commit da tarefa {tid}")
+    evidencia = _redigido(bruto.get("evidencia"))
+    if status == "concluida":
+        quem = _normalizar(bruto.get("quem") or bruto.get("concluida_por"))
+        if not quem:
+            raise ValueError(f"tarefa {tid} marcada concluida sem quem: "
+                             "conclusão é ato de alguém (quem= ou "
+                             "concluida_por=), nunca estado padrão")
+        if not commit and not evidencia:
+            raise ValueError(f"tarefa {tid} marcada concluida sem prova: "
+                             "passe commit=<hash> e/ou evidencia=\"arquivo:linha, "
+                             "nota, teste\" (defeito DEF-20261110-104454 é o "
+                             "\"fiz\" sem rastro)")
+    return {
+        "id": tid,
+        "titulo": _redigido(bruto.get("titulo") or bruto.get("descricao")),
+        "fase": rotulo,
+        "status": status,
+        "commit": commit,
+        "evidencia": evidencia,
+        "nota": _redigido(bruto.get("nota") or bruto.get("motivo")),
+        "concluida_em": (_agora(bruto.get("quando") or bruto.get("concluida_em"))
+                         if status == "concluida" else ""),
+        "concluida_por": quem if status == "concluida" else "",
+    }
+
+
+def quebrar_plano(plano, fases, *, quando: str | None = None) -> dict[str, Any]:
+    """Grava o mapa fase → tarefa → status dentro do plano. Idempotente.
+
+    Ordem do dono, WhatsApp 10/11/2026: "quebrar em fases e tasks e
+    executar" e a cobrança "CADE!?". É o que faltava no módulo: ``fase`` só
+    existia no ciclo de vida do plano, então nenhuma entrega podia virar
+    "fase 2, tarefa 2.1, concluída no commit ``x``".
+
+    Formas aceitas (as duas origens reais do mapa): lista de
+    ``{"fase": ..., "tarefas": [...]}``, de ``("fase", [...])``, de rótulos
+    soltos, e um dicionário ``{rótulo: [tarefas]}``. Cada tarefa aceita id
+    solto, ``(id, título)`` ou dicionário com ``titulo``, ``status``,
+    ``commit``, ``evidencia``, ``nota``, ``quem``/``quando``.
+
+    As três garantias que fazem o re-rodar ser seguro no estado do dono:
+
+    1. **não duplica**: tarefa já registrada no mesmo plano é atualizada no
+       lugar, não criada outra vez;
+    2. **não pisa o que está concluído**: status, commit, evidência, quem e
+       quando de uma tarefa ``concluida`` são preservados mesmo se a nova
+       chamada não os menciona ou menciona outra coisa;
+    3. **não apaga**: tarefa fora do mapa continua no plano; se estava sem
+       fase, fica no cesto :data:`SEM_FASE` do :func:`quadro`.
+
+    Recusas (fail-closed): fase sem rótulo, rótulo do ciclo de vida do plano
+    colado como fase de obra, tarefa sem id, status fora de
+    :data:`STATUS_DE_TAREFA`, commit que não é hash, fase que discorda da
+    tarefa, ``concluida`` sem ``quem`` e sem prova.
+    """
+    pid = _validar_id(plano, "id de plano")
+    hora = _agora(quando)
+    if isinstance(fases, dict):
+        entradas = [{**valor, "fase": chave} if isinstance(valor, dict)
+                    else {"fase": chave, "tarefas": valor}
+                    for chave, valor in fases.items()]
+    elif isinstance(fases, (list, tuple)):
+        entradas = list(fases)
+    else:
+        raise ValueError(f"fases de {plano!r} em formato inutilizável "
+                         f"({type(fases).__name__}): passe a lista de fases")
+    if not entradas:
+        raise ValueError(f"quebrar_plano({pid}, []) não quebra nada: passe as "
+                         "fases com suas tarefas (ou o plano fica plano, que "
+                         "é o defeito DEF-20261110-104454)")
+    rotulos: list[str] = []
+    mapa: list[tuple[str, dict[str, Any]]] = []
+    vistos: set[str] = set()
+    for posicao, item in enumerate(entradas):
+        rotulo, tarefas = _fase_e_tarefas(item, posicao)
+        if rotulo in rotulos:
+            raise ValueError(f"fase {rotulo!r} declarada duas vezes: junte as "
+                             "tarefas numa só fase")
+        rotulos.append(rotulo)
+        for bruto in tarefas:
+            tarefa = _tarefa_de_fase(bruto, rotulo, pid)
+            if tarefa["id"] in vistos:
+                raise ValueError(f"tarefa {tarefa['id']} aparece em duas fases "
+                                 f"({rotulo} e outra): uma tarefa, uma fase")
+            vistos.add(tarefa["id"])
+            mapa.append((rotulo, tarefa))
+    novas: list[str] = []
+    preservadas: list[str] = []
+    atualizadas: list[str] = []
+    with _LOCK:
+        estado = _carregar()
+        registro = estado["planos"].get(pid)
+        if registro is None:
+            raise ValueError(f"{MENSAGEM_SEM_PLANO}: plano {pid} não cadastrado "
+                             "-- registre o plano antes de quebrá-lo em fases")
+        # O mapa pode ter tarefa pendente e bloqueada em qualquer fase -- ter
+        # o mapa não é executar. Mas status de ENTREGA (concluida,
+        # em_progresso) escrito pelo mapa é a mesma afirmação que
+        # :func:`concluir_tarefa` exige aprovada: sem aprovação do dono,
+        # recusa. É a porta dos fundos que faltava fechar.
+        pedidas = [t["id"] for _, t in mapa
+                   if t["status"] in ("concluida", "em_progresso")]
+        fase_plano = str(registro.get("fase") or "")
+        if pedidas and fase_plano not in FASES_APROVADAS:
+            raise ValueError(
+                f"plano {pid} está na fase '{fase_plano or 'sem fase'}': "
+                f"nenhuma tarefa se conclui nem inicia antes da aprovação do "
+                f"dono -- {len(pedidas)} pediam status de entrega "
+                f"({', '.join(pedidas[:6])})")
+        registro["fases"] = _juntar_fases(list(registro.get("fases") or []),
+                                          rotulos)
+        registro.setdefault("tarefas", {})
+        for _, tarefa in mapa:
+            anterior = registro["tarefas"].get(tarefa["id"])
+            if anterior and str((anterior or {}).get("status") or "") \
+                    == "concluida":
+                preservadas.append(tarefa["id"])
+            elif anterior:
+                atualizadas.append(tarefa["id"])
+            else:
+                novas.append(tarefa["id"])
+            merged = _mesclar_tarefa(dict(anterior or {}), tarefa)
+            if not merged.get("desde"):
+                merged["desde"] = hora
+            registro["tarefas"][tarefa["id"]] = merged
+        registro["atualizado_em"] = hora
+        estado["planos"][pid] = registro
+        _registrar(estado, "plano_quebrado", pid,
+                   fases=len(rotulos), tarefas=len(mapa), novas=len(novas),
+                   atualizadas=len(atualizadas), preservadas=len(preservadas))
+        _salvar(estado)
+    _log_event("workflow_gate", decisao="quebrar", gate="fases_e_tarefas",
+               plano_id=pid, fases=len(rotulos), tarefas=len(mapa),
+               novas=len(novas), preservadas=len(preservadas))
+    return {"plano": pid, "titulo": str(registro.get("titulo") or pid),
+            "fase_do_plano": str(registro.get("fase") or ""),
+            "fases": rotulos, "tarefas": len(registro["tarefas"]),
+            "novas": novas, "atualizadas": atualizadas,
+            "preservadas": preservadas,
+            "sem_fase": sorted(tid for tid, dado
+                               in (registro["tarefas"] or {}).items()
+                               if not dado.get("fase"))}
+
+
+def iniciar_tarefa(referencia, *, quando: str | None = None) -> dict[str, Any]:
+    """Carimba ``em_progresso`` na tarefa e passa a apontar para ela.
+
+    É o "estou fazendo isto agora" registrado em disco: sem ele, o portão
+    saberia que o plano está aprovado mas não qual pedaço do mapa está vivo.
+    A tarefa ativa é escrita NO MESMO estado desta mudança -- chamar
+    :func:`definir_tarefa_ativa` aqui releria o disco e jogaria fora o que
+    esta função acabou de acumular em memória (bug medido no smoke test: o
+    ``tarefa_ativa`` voltava vazio).
+    """
+    hora = _agora(quando)
+    with _LOCK:
+        estado = _carregar()
+        pid, tid = _procurar_tarefa(estado, referencia)
+        registro = estado["planos"][pid]
+        _exigir_plano_aprovado_para_efeito(registro, "inicie")
+        tarefa = _normalizar_tarefa(registro["tarefas"][tid], tid)
+        if tarefa.get("status") == "concluida":
+            raise ValueError(f"tarefa {tid} já está concluída "
+                             f"(commit {tarefa.get('commit') or 'sem hash'})"
+                             ": iniciar de novo apagaria a conclusão -- "
+                             "reabra com mudar_status(..., \"pendente\", "
+                             "nota=<motivo>)")
+        tarefa["status"] = "em_progresso"
+        tarefa["em_progresso_desde"] = hora
+        registro["tarefas"][tid] = tarefa
+        registro["atualizado_em"] = hora
+        estado["planos"][pid] = registro
+        estado["tarefa_ativa"] = f"{pid}:{tid}"[:120]
+        _registrar(estado, "tarefa_iniciada", pid, tarefa=tid,
+                   fase=tarefa.get("fase") or "", quando=hora)
+        _salvar(estado)
+    _log_event("workflow_gate", decisao="iniciar", gate="status_tarefa",
+               plano_id=pid, tarefa_id=tid, status="em_progresso")
+    return tarefa
+
+
+def concluir_tarefa(referencia, *, commit: str = "", evidencia: str = "",
+                    quem: str = "", quando: str | None = None,
+                    nota: str = "") -> dict[str, Any]:
+    """Carimba ``concluida`` com quem, quando e prova. Sem prova, recusa.
+
+    É a alavanca que faltava para a pergunta do dono ("o que foi feito
+    hoje?") ter resposta em disco: a tarefa passa a levar o commit e a
+    evidência do que a fecha, e a recusa nomeia exatamente o que falta.
+    Conclusão não se faz por :func:`registrar_tarefa` nem por
+    :func:`quebrar_plano` sem ``quem`` -- e num plano não aprovado, nem com.
+    """
+    aprovador = _normalizar(quem)
+    if not aprovador:
+        raise ValueError("conclusão sem quem não existe: passe quem=<nome de "
+                         "quem entregou> (o assistente com nome serve, o dono "
+                         "não é carimbado por dedução)")
+    if not _commit_seguro(commit) and not _normalizar(evidencia):
+        raise ValueError(
+            f"conclusão de {referencia!r} sem prova: passe commit=<hash> "
+            "e/ou evidencia=\"arquivo:linha | nota do vault | teste\" — "
+            "\"está pronto\" não é evidência (defeito DEF-20261110-104454)")
+    hora = _agora(quando)
+    prova = _validar_commit(commit, "commit")
+    with _LOCK:
+        estado = _carregar()
+        pid, tid = _procurar_tarefa(estado, referencia)
+        registro = estado["planos"][pid]
+        _exigir_plano_aprovado_para_efeito(registro, "conclua")
+        tarefa = _normalizar_tarefa(registro["tarefas"][tid], tid)
+        se_ja = (tarefa.get("status") == "concluida")
+        if se_ja and prova and tarefa.get("commit") \
+                and prova != tarefa["commit"]:
+            raise ValueError(
+                f"tarefa {tid} já está concluída no commit {tarefa['commit']}: "
+                f"concluir de novo em {prova} apagaria a evidência antiga -- "
+                "reabra com mudar_status(..., \"pendente\", nota=<motivo>) e "
+                "conclua em seguida, para o histórico guardar as duas pontas")
+        if se_ja:
+            # idempotente: repetir a conclusão com a mesma prova não reescreve
+            # nada; o que muda é o texto do commit novo, e esse caso já foi
+            # recusado acima.
+            return tarefa
+        tarefa["status"] = "concluida"
+        tarefa["commit"] = prova or tarefa.get("commit", "")
+        if _normalizar(evidencia):
+            tarefa["evidencia"] = _redigido(evidencia)
+        if _normalizar(nota):
+            tarefa["nota"] = _redigido(nota)
+        tarefa["concluida_em"] = hora
+        tarefa["concluida_por"] = aprovador[:80]
+        registro["tarefas"][tid] = tarefa
+        registro["atualizado_em"] = hora
+        estado["planos"][pid] = registro
+        _registrar(estado, "tarefa_concluida", pid, tarefa=tid,
+                   commit=prova, quem=aprovador, quando=hora,
+                   evidencia=str(tarefa.get("evidencia") or "")[:80])
+        _salvar(estado)
+    _log_event("workflow_gate", decisao="concluir", gate="status_tarefa",
+               plano_id=pid, tarefa_id=tid, status="concluida", commit=prova,
+               quem=aprovador)
+    return tarefa
+
+
+def mudar_status(referencia, status: str, *, nota: str = "",
+                 quem: str = "", quando: str | None = None) -> dict[str, Any]:
+    """Move status que não têm alavanca própria: ``pendente`` e ``bloqueada``.
+
+    ``concluida`` e ``em_progresso`` passam por :func:`concluir_tarefa` e
+    :func:`iniciar_tarefa`, porque os dois exigem prova ou plano aprovado.
+    Reabrir uma tarefa concluída é permitido com ``nota`` dizendo o motivo --
+    sem nota, recusa: conclusão desfeita por acaso é como se perde rastro.
+    """
+    alvo = _validar_status(status, str(referencia))
+    if alvo in ("concluida", "em_progresso"):
+        raise ValueError(f"status {alvo!r} não se alcança por mudar_status: "
+                         "use concluir_tarefa (com prova) ou iniciar_tarefa")
+    hora = _agora(quando)
+    motivo = _redigido(nota)
+    with _LOCK:
+        estado = _carregar()
+        pid, tid = _procurar_tarefa(estado, referencia)
+        registro = estado["planos"][pid]
+        tarefa = dict(registro["tarefas"][tid])
+        if tarefa.get("status") == "concluida" and not motivo:
+            raise ValueError(f"tarefa {tid} está concluída: reabrir sem nota "
+                             "dizendo o porquê é apagar rastro -- passe "
+                             "nota=<motivo>")
+        if tarefa.get("status") == "concluida":
+            # reabrir apaga a conclusão de propósito, com o motivo na nota:
+            # o histórico do estado guarda a linha da conclusão original.
+            for campo in ("commit", "evidencia", "concluida_em",
+                          "concluida_por"):
+                tarefa[campo] = ""
+        tarefa["status"] = alvo
+        if motivo:
+            tarefa["nota"] = motivo
+        if _normalizar(quem):
+            tarefa["movida_por"] = _normalizar(quem)[:80]
+        tarefa["status_desde"] = hora
+        registro["tarefas"][tid] = tarefa
+        registro["atualizado_em"] = hora
+        estado["planos"][pid] = registro
+        _registrar(estado, "tarefa_status", pid, tarefa=tid, status=alvo,
+                   motivo=motivo[:80], quando=hora)
+        _salvar(estado)
+    _log_event("workflow_gate", decisao="status", gate="status_tarefa",
+               plano_id=pid, tarefa_id=tid, status=alvo)
+    return tarefa
+
+
+def quadro(plano_id) -> dict[str, Any]:
+    """A árvore fase → tarefa → status do plano: o que o dono lê no celular."""
+    estado = _carregar()
+    bruto = _normalizar(plano_id) or str(estado.get("tarefa_ativa") or "")
+    registro = _plano_do_estado(bruto, estado) if bruto else None
+    if registro is None:
+        raise ValueError(f"{MENSAGEM_SEM_PLANO}: não há plano "
+                         f"{plano_id!r} no estado do portão para montar o "
+                         "quadro")
+    pid = str(registro.get("id") or "")
+    declaradas = [str(item) for item in (registro.get("fases") or [])]
+    galhos: dict[str, list[dict[str, Any]]] = {rotulo: [] for rotulo in declaradas}
+    por_status = {chave: 0 for chave in STATUS_DE_TAREFA}
+    sem_fase: list[dict[str, Any]] = []
+    for tid, dado in sorted((registro.get("tarefas") or {}).items()):
+        rotulo = str(dado.get("fase") or "")
+        linha = {"id": tid, "titulo": str(dado.get("titulo") or ""),
+                 "fase": rotulo,
+                 "status": str(dado.get("status") or "pendente"),
+                 "commit": str(dado.get("commit") or ""),
+                 "evidencia": str(dado.get("evidencia") or ""),
+                 "nota": str(dado.get("nota") or ""),
+                 "desde": str(dado.get("desde") or ""),
+                 "status_desde": str(dado.get("status_desde") or ""),
+                 "em_progresso_desde": str(dado.get("em_progresso_desde") or ""),
+                 "concluida_em": str(dado.get("concluida_em") or ""),
+                 "concluida_por": str(dado.get("concluida_por") or "")}
+        por_status[linha["status"]] = por_status.get(linha["status"], 0) + 1
+        if rotulo in galhos:
+            galhos[rotulo].append(linha)
+        else:
+            sem_fase.append(linha)
+    fases = [{"fase": rotulo, "tarefas": galhos[rotulo],
+              "total": len(galhos[rotulo]),
+              "concluidas": sum(1 for linha in galhos[rotulo]
+                                if linha["status"] == "concluida")}
+             for rotulo in declaradas]
+    if sem_fase:
+        fases.append({"fase": SEM_FASE, "tarefas": sem_fase,
+                      "total": len(sem_fase),
+                      "concluidas": sum(1 for linha in sem_fase
+                                        if linha["status"] == "concluida")})
+    return {"plano": pid, "titulo": str(registro.get("titulo") or pid),
+            "fase_do_plano": str(registro.get("fase") or ""),
+            "arquivo": str(registro.get("arquivo") or ""),
+            "aprovado_por": str(registro.get("aprovado_por") or ""),
+            "aprovado_em": str(registro.get("aprovado_em") or ""),
+            "fases": fases, "tarefas": len(registro.get("tarefas") or {}),
+            "por_status": por_status,
+            "na_fila": pid in [str(item) for item in
+                               (estado.get("fila") or [])]}
+
+
+# ── a fila de planos (ordem do dono: "jogue como próximo da fila") ─────────
+
+def fila() -> list[str]:
+    """A fila explícita, na ordem dita. Vazia é fila vazia, não suposição."""
+    return list(_carregar().get("fila") or [])
+
+
+def empurrar_para_fila(plano_id, posicao: int = 0, *,
+                       quando: str | None = None) -> list[str]:
+    """Põe o plano na fila na posição pedida e devolve a fila nova.
+
+    A ORDEM É DELE. Este módulo nunca escolhe prioridade, nunca reordena por
+    data, fase ou tamanho: :func:`proxima_da_fila` devolve o que está no topo
+    porque alguém -- o dono -- mandou pôr ali. ``posicao`` fora do intervalo é
+    recusada, não cortada: "último" dito como número errado tem de dar erro,
+    não um plano em lugar inesperado.
+    """
+    pid = _validar_id(plano_id, "id de plano")
+    with _LOCK:
+        estado = _carregar()
+        if pid not in estado["planos"]:
+            raise ValueError(f"{MENSAGEM_SEM_PLANO}: plano {pid} não cadastrado "
+                             "para entrar na fila")
+        try:
+            alvo = int(posicao)
+        except (TypeError, ValueError):
+            raise ValueError(f"posição {posicao!r} na fila não é número") from None
+        total = len(estado.get("fila") or [])
+        if alvo < 0 or alvo > total:
+            raise ValueError(
+                f"posição {alvo} fora da fila (0 a {total} com {total} itens): "
+                "diga onde o dono quer o plano -- 0 é o próximo da fila")
+        fila_atual = [item for item in (estado.get("fila") or [])
+                      if item != pid]
+        fila_atual.insert(alvo, pid)
+        estado["fila"] = fila_atual
+        _registrar(estado, "fila_mudou", pid, posicao=alvo,
+                   quando=_agora(quando))
+        _salvar(estado)
+    _log_event("workflow_gate", decisao="fila", gate="fila_de_planos",
+               plano_id=pid, posicao=alvo)
+    return fila_atual
+
+
+def tirar_da_fila(plano_id) -> list[str]:
+    """Tira o plano da fila. Ele continua registrado: fila não é arquivo."""
+    pid = _validar_id(plano_id, "id de plano")
+    with _LOCK:
+        estado = _carregar()
+        estado["fila"] = [item for item in (estado.get("fila") or [])
+                          if item != pid]
+        _registrar(estado, "fila_mudou", pid, saiu=True)
+        _salvar(estado)
+    return estado["fila"]
+
+
+def proxima_da_fila() -> str:
+    """O id do próximo da fila, ou "" quando a fila está vazia.
+
+    Id na fila que não bate com plano registrado é pulado e dito no log --
+    fila velha não pode fazer o assistente executar nome que não existe.
+    """
+    estado = _carregar()
+    planos = estado.get("planos") or {}
+    for item in estado.get("fila") or []:
+        if item in planos:
+            return str(item)
+        if item:
+            _log_event("workflow_gate", decisao="fila_fantasma",
+                       gate="fila_de_planos", plano_id=item)
+    return ""
 
 
 def definir_tarefa_ativa(referencia) -> str:
@@ -577,14 +1413,35 @@ def plano_de(referencia) -> dict[str, Any] | None:
 
 
 def resumo() -> dict[str, Any]:
-    """Contagens por fase + a tarefa ativa: para painel e para a auditoria."""
+    """Contagens por fase do plano E por status de tarefa + fila: painel e auditoria.
+
+    As duas leituras que faltavam para a pergunta do dono ter resposta ("quantas
+    fases, quantas tarefas, o que está concluído"): :data:`STATUS_DE_TAREFA`
+    contado tarefa a tarefa e o total de fases declaradas dentro dos planos. A
+    fila aparece porque "próximo da fila" é fato do estado, não da conversa.
+    """
     estado = _carregar()
     por_fase = {fase: 0 for fase in FASES}
+    por_status = {chave: 0 for chave in STATUS_DE_TAREFA}
+    tarefas = 0
+    fases_de_obra = 0
+    sem_fase = 0
     for plano in estado["planos"].values():
         por_fase[str(plano.get("fase") or "")] = \
             por_fase.get(str(plano.get("fase") or ""), 0) + 1
+        fases_de_obra += len(plano.get("fases") or [])
+        for dado in (plano.get("tarefas") or {}).values():
+            tarefas += 1
+            status = str(dado.get("status") or "pendente")
+            por_status[status] = por_status.get(status, 0) + 1
+            if not dado.get("fase"):
+                sem_fase += 1
     return {"planos": len(estado["planos"]), "por_fase": por_fase,
             "tarefa_ativa": estado.get("tarefa_ativa", ""),
+            "tarefas": tarefas, "por_status": por_status,
+            "fases": fases_de_obra, "tarefas_sem_fase": sem_fase,
+            "fila": list(estado.get("fila") or []),
+            "proxima_da_fila": proxima_da_fila(),
             "ativo": ativo(), "arquivo_config": str(config_path()),
             "arquivo_estado": str(state_path())}
 
@@ -709,9 +1566,18 @@ def _decidir(referencia: Any) -> GateResult:
                            mensagem=f"plano {pid} aprovado por "
                                     f"{registro.get('aprovado_por') or '?'} "
                                     f"em {registro.get('aprovado_em') or '?'}; "
-                                    "execute tarefa por tarefa")
+                                    "execute tarefa por tarefa" + (
+                                       f" -- ATENÇÃO: o plano não tem fases "
+                                       f"nem tarefas declaradas "
+                                       f"(quebrar_plano), ordem do dono de "
+                                       f"10/11/2026"
+                                       if not (registro.get("fases")
+                                               or registro.get("tarefas"))
+                                       else ""))
     _log_event("workflow_gate", decisao="liberado", gate="plano_aprovado",
-               referencia=alvo, plano_id=pid, fase=fase)
+               referencia=alvo, plano_id=pid, fase=fase,
+               fases=len(registro.get("fases") or []),
+               tarefas=len(registro.get("tarefas") or {}))
     return resultado
 
 
