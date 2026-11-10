@@ -406,3 +406,249 @@ def load_rules(path: str | Path | None = None, *,
                missing_ok: bool = False) -> RulesTable:
     """Atalho de carga usado pelo despachante quente."""
     return RulesTable.from_file(path, missing_ok=missing_ok)
+
+
+# ── PORTÃO DECLARATIVO DO ADENDO DE 09/11/2026 ─────────────────────────────
+#
+# Item 1 do adendo aprovado (``skills/fluxos/FLUXOS.md``, decisão 10 do plano
+# ``PLANO-2026-11-09-fluxo-agendamento-e-avisos-por-evento``):
+#
+#     "UM PORTAO DECLARATIVO POR TIPO DE FRASE: ORDEM COM HORA OU COM ESTADO
+#      APONTADO NAO EXECUTA NA HORA — VIRA REGISTRO COM RECIBO."
+#
+# Item 4 do mesmo adendo diz ONDE a checagem acontece: antes de abrir
+# execução, o cérebro vê se a frase tem **horário fixo** (→ agendador,
+# mecanismo A) ou **estado apontado** (→ ouvinte, mecanismo B); só o que não
+# tem nenhum dos dois executa na hora.
+#
+# O portão é DADO + CHECAGEM, não mecanismo: ele não agenda, não escuta e não
+# fala. Recebe a frase e o que JÁ EXISTE como registro (a linha do
+# ``core/scheduler.py`` / a escuta do ouvinte) e devolve veredito. Assim o
+# fluxo de fala e o fluxo de trabalho consultam a MESMA regra — o que o portão
+# pode, o fluxo pode (lei C1).
+
+#: Nome do portão nos recibos, na linha de log e na recusa.
+SCHEDULE_GATE = "require_schedule_or_watcher"
+
+#: As três variações que o dono pediu para o ouvinte (item 3 do adendo).
+#: vocabulário fechado: "estado apontado" sem um destes eventos não é escuta.
+EVENTOS_DO_OUVINTE = ("iniciar", "encerrar", "mudou status")
+
+#: O que existe hoje do lado do ouvinte: nada. ``core/event_watcher.py`` é a
+#: tarefa ``backend-ouvinte-eventos`` do mesmo plano. Enquanto ele não existe, o
+#: portão recusa a rota "estado apontado" dizendo exatamente isto — recusa com
+#: recibo, nunca sucesso mudo (lei C4).
+OUVINTE_INDISPONIVEL = ("não existe escuta registrada: o ouvinte de execução "
+                        "(mecanismo B, core/event_watcher.py) ainda não tem "
+                        "backend nesta casa")
+
+#: Quem pede "avisar quando acontecer" — verbo de aviso/agendamento. Sem um
+#: destes na frase, o portão não é chamado a falar: "que horas são?" tem hora
+#: no texto e continua executando na hora. Substantivos soltos ficaram de
+#: fora de propósito ("agenda", "aviso", "chamada" casariam perguntas
+#: inofensivas como "o que tem na agenda hoje?" — falso positivo custaria ao
+#: dono uma ordem legítima travada).
+AVISOS = (
+    "avisa", "avisar", "avise", "lembra", "lembrar", "lembre", "lembrete",
+    "notifica", "notificar", "agendar", "agendei", "programar", "programme",
+    "programa ai", "chamar", "chame", "me fala", "fala quando",
+    "fica de olho", "olha quando", "vigia", "monitora", "monitorar",
+    "escuta", "escutar", "confira quando", "verifica quando",
+    "dispara quando", "roda quando", "execute quando",
+)
+
+#: Hora fixa (mecanismo A): instante marcado no texto. "depois" ficou fora:
+#: sem instante, não é agendamento (regra 1 do dono).
+_HORA_FIXA_RE = (
+    r"\b(?:a[s]s?|pelas?)\s*\d{1,2}(?:[:.]\d{2})?\b"
+    r"|\b\d{1,2}(?:[:.]\d{2})?\s*(?:horas?|h|min(?:utos?)?)\b"
+    r"|\b(?:hoje|amanha|depois de amanha|sexta|sabado|domingo|segunda|"
+    r"terca|quarta|quinta)\b"
+    r"|\bdaqui a\s*\d*\s*(?:minutos?|min|horas?|h|dias?)\b"
+    r"|\bem\s+(?:\d+|uma?|dois?|tres|quatro|cinco|seis?|sete|oito|nove|dez|"
+    r"quinze|vinte|trinta|meia|meio)\s*(?:minutos?|min|horas?|h|dias?)\b"
+)
+
+#: Estado apontado (mecanismo B): o disparo depende de um processo, não de
+#: relógio. "quando terminar", "assim que iniciar", "quando mudar o status".
+_ESTADO_APONTADO_RE = (
+    r"\b(?:quando|assim que|logo que|depois que|no momento que|sempre que)\b"
+    r"[^.;]{0,60}?\b(?:terminar|terminou|acabar|acabou|acabe|finalizar|"
+    r"finaliza|concluir|concluiu|pronto|encerrar|encerra|iniciar|inicia|"
+    r"comecar|comeca|começar|mudar|muda|mudou|alterar|altera|status|estado|"
+    r"estiver|chegar|chegou|receber|recebeu|responder|responde|subir|subiu|"
+    r"baixar|baixou|rodar|rodou|executar|executa|fallhar|falhar|falhou|"
+    r"erro|abrir|abriu|fechar|fechou|disponivel|no ar)\b"
+    r"|\b(?:ao|quando)\s+(?:terminar|acabar|iniciar|finalizar|mudar)\b"
+)
+
+_HORA_FIXA = re.compile(_HORA_FIXA_RE)
+_ESTADO_APONTADO = re.compile(_ESTADO_APONTADO_RE, re.DOTALL)
+
+
+@dataclass(frozen=True)
+class GateVerdict:
+    """Veredito do portão: roda/agenda/escuta + o motivo legível da recusa."""
+
+    ok: bool
+    gate: str = SCHEDULE_GATE
+    rota: str = ""
+    classe: str = "nenhuma"
+    motivo: str = ""
+    faltou: tuple[str, ...] = ()
+    texto: str = ""
+
+    def __bool__(self) -> bool:
+        return bool(self.ok)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"ok": self.ok, "gate": self.gate, "rota": self.rota,
+                "classe": self.classe, "motivo": self.motivo,
+                "faltou": list(self.faltou), "texto": self.texto}
+
+
+def tem_horario_fixo(texto: Any) -> bool:
+    """A frase nomeia um instante? (o parse de hora real é do agendador)."""
+    return bool(_HORA_FIXA.search(norm(texto)))
+
+
+def tem_estado_apontado(texto: Any) -> bool:
+    """A frase aponta um estado de processo em vez de relógio?"""
+    return bool(_ESTADO_APONTADO.search(norm(texto)))
+
+
+def pede_aviso_quando(texto: Any) -> bool:
+    """A frase é um pedido de "avisar quando acontecer" (verbo + gatilho)."""
+    body = norm(texto)
+    if not body:
+        return False
+    return any(word in body for word in AVISOS)
+
+
+def _registros(valor: Any) -> list[dict]:
+    """Aceita um registro, uma lista de registros ou nada ("" / None)."""
+    if valor is None or valor == "" or valor is False:
+        return []
+    items = valor if isinstance(valor, (list, tuple)) else [valor]
+    saida = []
+    for item in items:
+        if isinstance(item, Mapping):
+            saida.append(dict(item))
+    return saida
+
+
+def _agendamento_valido(linha: Mapping[str, Any]) -> tuple[bool, str]:
+    """Regra 2 do dono: não existe agendamento sem gatilho resolvível."""
+    faltam: list[str] = []
+    if not str(linha.get("quando") or "").strip():
+        faltam.append("quando")
+    if linha.get("cancelado_em") or linha.get("disparou_em"):
+        return False, "o agendamento apontado já se encerrou"
+    gatilho = linha.get("gatilho")
+    if not isinstance(gatilho, Mapping) or not gatilho:
+        faltam.append("gatilho")
+    else:
+        tipo = norm(gatilho.get("tipo"))
+        if tipo == "funcao":
+            if not (str(gatilho.get("modulo") or "").strip()
+                    and str(gatilho.get("funcao") or "").strip()):
+                faltam.append("gatilho (modulo+funcao)")
+        elif tipo == "script":
+            if not str(gatilho.get("script") or "").strip():
+                faltam.append("gatilho (script)")
+        else:
+            faltam.append(f"gatilho (tipo {tipo or 'vazio'} não é funcao/script)")
+    if faltam:
+        return False, "faltou no agendamento: " + ", ".join(faltam)
+    return True, ""
+
+
+def _escuta_valida(escuta: Mapping[str, Any]) -> tuple[bool, str]:
+    """Escuta registrada é alvo + evento do vocabulário fechado (item 3)."""
+    if not str(escuta.get("alvo") or "").strip():
+        return False, "faltou na escuta: alvo (processo, porta, arquivo ou fila)"
+    eventos = _as_list(escuta.get("eventos") or escuta.get("evento"))
+    if not eventos:
+        return False, ("faltou na escuta: evento de "
+                       f"{list(EVENTOS_DO_OUVINTE)}")
+    desconhecidos = [e for e in eventos if e not in EVENTOS_DO_OUVINTE]
+    if desconhecidos:
+        return False, (f"evento(s) fora do vocabulário do ouvinte: "
+                       f"{desconhecidos}; o dono definiu {list(EVENTOS_DO_OUVINTE)}")
+    if escuta.get("cancelado_em"):
+        return False, "a escuta apontada foi cancelada"
+    return True, ""
+
+
+def require_schedule_or_watcher(texto: Any = "", *, agendamento: Any = None,
+                                escuta: Any = None) -> GateVerdict:
+    """O portão do adendo: ordem com hora/estado não executa na hora.
+
+    Aceita (``ok=True``):
+
+    * frase que **não** é pedido de aviso, ou é aviso sem hora e sem estado
+      apontado — nada aqui a ver, rota ``executar-agora``;
+    * pedido com hora fixa **e** um agendamento válido (linha real do
+      ``core/scheduler.py``, com ``quando`` + gatilho resolvível);
+    * pedido com estado apontado **e** uma escuta válida (alvo + evento de
+      ``iniciar``/``encerrar``/``mudou status``).
+
+    Recusa (``ok=False``, ``motivo`` nomeia o que faltou — lei C4):
+
+    * aviso com hora fixa sem agendamento registrado;
+    * aviso com estado apontado sem escuta registrada (e hoje nunca há, porque
+      o mecanismo B ainda não tem backend);
+    * registro apontado mas inválido (sem gatilho, já disparado/cancelado,
+      evento fora do vocabulário).
+
+    ``classe``/``rota`` seguem o item 4 do adendo: hora → ``agendador``,
+    estado → ``ouvinte``. Quando a frase tem os dois, a classe é ``hora`` (só o
+    relógio é verificável agora) e a recusa aceita qualquer um dos dois
+    registros — edge case aceito de propósito, declarado aqui.
+    """
+    body = norm(texto)
+    tem_hora = tem_horario_fixo(body)
+    tem_estado = tem_estado_apontado(body)
+    if not pede_aviso_quando(body) or not (tem_hora or tem_estado):
+        return GateVerdict(ok=True, rota="executar-agora", classe="nenhuma",
+                           motivo="a frase não é pedido de aviso com hora nem "
+                                  "com estado apontado: o portão não trava nada",
+                           texto=body)
+    classe = "hora" if tem_hora else "estado"
+    rota = "agendador" if classe == "hora" else "ouvinte"
+    agendamentos = _registros(agendamento)
+    escutas = _registros(escuta)
+    erro_agendamento = ""
+    for linha in agendamentos:
+        valido, motivo = _agendamento_valido(linha)
+        if valido:
+            return GateVerdict(ok=True, rota=rota, classe=classe,
+                               motivo="existe agendamento com gatilho: a ordem "
+                                      "virou registro, não execução na hora",
+                               texto=body)
+        erro_agendamento = motivo or erro_agendamento
+    erro_escuta = ""
+    for registro in escutas:
+        valido, motivo = _escuta_valida(registro)
+        if valido:
+            return GateVerdict(ok=True, rota=rota, classe=classe,
+                               motivo="existe escuta registrada no ouvinte: a "
+                                      "ordem virou registro, não execução na hora",
+                               texto=body)
+        erro_escuta = motivo or erro_escuta
+    if classe == "hora":
+        faltou = ("um agendamento no core/scheduler.py com quando + gatilho "
+                  "(funcao ou script) — sem gatilho é recusa, não 'aviso padrão'")
+        motivo = (f"a ordem tem horário fixo e nada foi agendado: {faltou}. "
+                  "Não executa na hora.")
+    else:
+        faltou = OUVINTE_INDISPONIVEL
+        motivo = (f"a ordem aponta um estado de processo e nada foi escutado: "
+                  f"{faltou}. Não executa na hora.")
+    invalido = erro_agendamento or erro_escuta
+    if invalido and (agendamentos or escutas):
+        motivo = (f"o registro apontado não vale: {invalido}. "
+                  f"Para frase de {classe} é preciso {faltou}.")
+    return GateVerdict(ok=False, rota=rota, classe=classe, motivo=motivo,
+                       faltou=(faltou,) + ((invalido,) if invalido else ()),
+                       texto=body)

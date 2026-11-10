@@ -42,18 +42,21 @@ um quarto laço é o risco 1 do plano.
 
 PONTOS DE EXTENSAO NOMEADOS (decisões que ainda pedem contexto ao dono — nada
 aqui escolhe por ele):
-  * ``PONTO-EXTENSAO-laco-vivo`` — **regra 1/5 do contrato, o laço**: nada
-    aqui abre thread, então ``tick``/``acordar`` só falam quando o laço de
-    hora vivo (``main.py:_task_watch_step``) chamar, e ``ponte()`` só tem boca
-    depois que ``main.py`` ligar voz + WhatsApp. Fiação em ``main.py`` é rota
-    sensível e pede o reinício único dele — pendência declarada, não
-    esquecimento. A action, essa, entra sozinha: ``core/action_loader.py``
-    descobre ``actions/schedule.py`` pelo ``TOOL``.
-  * ``PONTO-EXTENSAO-portao-fluxo`` — **item 1 do adendo aprovado** (gate
-    ``require_schedule_or_watcher``): a checagem declarativa "tem horário
-    fixo? tem estado apontado?" mora no cérebro do fluxo de fala/trabalho
-    (``core/flow_ops/rules.py`` + ``config/flows_rules.json``), não aqui, e
-    depende do mecanismo B — ainda cego.
+  * ``PONTO-EXTENSAO-laco-vivo`` — **ligado em 10/11/2026**: o laço de hora
+    vivo (``main.py:_task_watch`` → ``_task_watch_step`` →
+    ``JarvisLive._scheduler_watch_step``) chama :func:`tick` a cada 15 s e
+    :func:`ponte` com a boca do turno e o WhatsApp do dono. Nada aqui abre
+    thread — foi o combinado. Falta só o que foge do código: o **reinício
+    único do dono**, porque o processo vivo ainda roda o ``main.py`` antigo e
+    por isso ainda não chama. Rota sensível, avisado antes de mexer.
+  * ``PONTO-EXTENSAO-portao-fluxo`` — **item 1 do adendo aprovado**: o portão
+    ``require_schedule_or_watcher`` existe como checagem declarativa em
+    ``core/flow_ops/rules.py`` (frase com hora fixa → agendador, frase com
+    estado apontado → ouvinte, os dois ausentes → execução na hora). Ele é
+    chamado pelo fluxo quando o fluxo tem o registro na mão; ligá-lo no
+    despachante quente (``core/flow_ops/hot.py``) **sem** o mecanismo B existir
+    recusaria todo "avisa quando terminar" sem nada para cair, então a fiação
+    real espera o backend do ouvinte.
   * ``PONTO-EXTENSAO-backend-ouvinte`` — o detector de eventos do mecanismo B
     (polling / gancho no emissor / inotify / waitpid) decisão 1; o GATILHO
     abaixo já é a forma compartilhada, falta só ``core/event_watcher.py``.
@@ -1085,9 +1088,16 @@ def tick(*, agora_dt = None, boca = None, whatsapp = None,
     base = agora_dt or agora()
     global _ja_acordei
     if not _ja_acordei:
-        eventos.append({"tipo": "acordar", **acordar(
-            base=base, boca=boca, whatsapp=whatsapp,
-            grace_seconds=grace_seconds)})
+        # A acordada é registro, não efeito: quebrar aqui não pode derrubar a
+        # passada nem os disparos que ainda vêm nesta mesma volta do laço.
+        try:
+            eventos.append({"tipo": "acordar", **acordar(
+                base=base, boca=boca, whatsapp=whatsapp,
+                grace_seconds=grace_seconds)})
+        except Exception as exc:  # noqa: BLE001 - o laço do dono continua
+            eventos.append({"tipo": "erro", "id": "",
+                            "motivo": f"acordada falhou: "
+                                      f"{type(exc).__name__}: {exc}"})
     for linha in listar():
         quando = task_queue._parse_dt(linha.get("quando"))
         if quando is None:
@@ -1108,10 +1118,20 @@ def tick(*, agora_dt = None, boca = None, whatsapp = None,
         if linha.get("disparou_em") or linha.get("cancelado_em"):
             continue
         linha["disparou_em"] = base.isoformat()
-        _gravar(linha)
-        resultado = executar_gatilho(linha.get("gatilho") or {}, linha=linha,
-                                     boca=boca, whatsapp=whatsapp,
-                                     agora_dt=base)
+        try:
+            _gravar(linha)
+            resultado = executar_gatilho(linha.get("gatilho") or {},
+                                         linha=linha, boca=boca,
+                                         whatsapp=whatsapp, agora_dt=base)
+        except Exception as exc:  # noqa: BLE001 - gatilho quebrado não derruba o laço
+            # Regra do laço vivo (``main.py:_scheduler_watch_step``): um
+            # registro podre é registrado como erro e a passada segue para os
+            # outros. ``disparou_em`` já foi escrito antes, então ele não vira
+            # rajada a cada 15 s.
+            eventos.append({"tipo": "erro", "id": linha.get("id"),
+                            "titulo": linha.get("titulo", ""),
+                            "motivo": f"{type(exc).__name__}: {exc}"})
+            continue
         linha["disparo"] = {"feito": resultado.get("feito", []),
                             "recusa": resultado.get("recusa", ""),
                             "pendente": resultado.get("pendente", "")}
@@ -1120,8 +1140,13 @@ def tick(*, agora_dt = None, boca = None, whatsapp = None,
             # só avisa uma vez por processo (anti-rajada)
             linha["disparou_em"] = ""
             linha["pendente_desde"] = base.isoformat()
-        _gravar(linha)
-        carregar(forcar=True)
+        try:
+            _gravar(linha)
+            carregar(forcar=True)
+        except Exception as exc:  # noqa: BLE001 - o disparo já aconteceu
+            eventos.append({"tipo": "erro", "id": linha.get("id"),
+                            "motivo": f"recibo não gravado: "
+                                      f"{type(exc).__name__}: {exc}"})
         eventos.append({"tipo": "disparo", "id": linha["id"],
                         "titulo": linha.get("titulo", ""), **resultado})
     return eventos

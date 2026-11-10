@@ -99,6 +99,7 @@ from core import voice_note as _voice_note
 from core import memory_index as _memory_index
 from core import sleep as _sleep
 from core import task_queue as _task_queue
+from core import scheduler as _scheduler
 from core import task_mirror as _task_mirror
 from core import wake_announce as _wake_announce
 from core import health as _health
@@ -6381,6 +6382,59 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Sleep] tick: {e}")
 
+    # ── laço vivo do agendador (PONTO-EXTENSAO-laco-vivo) ───────────────────
+    #: O ritmo real do laço, medido no código e não chutado: ``_task_watch``
+    #: dorme ``time.sleep(15)`` antes de cada passada (main.py, laço "task-watch"),
+    #: então o agendador tem resolução de 15 s — nenhum quarto laço foi aberto
+    #: (risco 1 do plano).
+    _SCHEDULER_STEP_SECONDS = 15.0
+
+    def _scheduler_ports(self) -> None:
+        """Liga a boca e o WhatsApp do dono ao agendador (``scheduler.ponte``).
+
+        O agendador não tem boca própria (lei C1): sem ponte, o disparo recusa
+        dizendo o que falta. Reencostar aqui a cada passada é de propósito —
+        o dicionário de portas é do processo e custa duas atribuições, e assim
+        a ponte volta sozinha depois de um teste que a limpou.
+        """
+        _scheduler.ponte(
+            voz=lambda texto: self._say_now(str(texto), log=True,
+                                            origin="agendamento"),
+            whatsapp=lambda texto: threading.Thread(
+                target=self._whatsapp_notify_owner, args=(str(texto),),
+                daemon=True, name="schedule-whatsapp").start())
+
+    def _scheduler_watch_step(self) -> list:
+        """Uma passada do agendador dentro do laço de hora que já existe.
+
+        À prova de exceção nos dois sentidos: nem a ponte nem o ``tick``
+        derrubam o passo que atende o dono (a fila de tarefas continua
+        rodando nesta mesma volta). O ``tick`` já isola cada registro; este
+        try é a cerca de fora, para o caso de o próprio cofre estar no ar.
+        """
+        try:
+            self._scheduler_ports()
+        except Exception as e:
+            print(f"[Agendador] ponte: {e}")
+            return []
+        try:
+            eventos = _scheduler.tick()
+        except Exception as e:
+            print(f"[Agendador] tick: {e}")
+            return []
+        for evento in eventos:
+            if not isinstance(evento, dict):
+                continue
+            tipo = str(evento.get("tipo") or "")
+            if tipo == "disparo":
+                print(f"[Agendador] disparou {evento.get('id')} "
+                      f"({str(evento.get('titulo') or '')[:60]!r}): "
+                      f"{'+'.join(evento.get('feito') or []) or evento.get('recusa') or 'nada'}")
+            elif tipo == "erro":
+                print(f"[Agendador] erro no registro {evento.get('id') or '-'}: "
+                      f"{evento.get('motivo')}")
+        return eventos
+
     def _task_watch(self) -> None:
         # Boot: repara item `running` órfão (pid morto / boot antigo / idade
         # absurda) antes do primeiro tick, senão ele bloqueia toda a fila.
@@ -6411,6 +6465,10 @@ class JarvisLive:
         else is cancelled instead of being read minutes later as if it were
         the current subject.
         """
+        # O laço vivo do agendador (``core/scheduler.py`` + 15 s deste laço).
+        # Entra ANTES das guardas da fila de propósito: hora marcada não pode
+        # depender de a fila estar livre, senão um job longo silencia o aviso.
+        self._scheduler_watch_step()
         if _task_queue.status().get("current"):
             return False
         if not self._qoder_live_ready():

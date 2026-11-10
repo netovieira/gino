@@ -30,7 +30,8 @@ from .hot import HotDecision, HotDispatcher
 from .mouth_guard import MouthSpeech, MouthWriter, speak_guarded
 from .registry import (Expiry, FlowHeartbeat, LifecycleRegistry,
                        LifecycleSnapshot)
-from .rules import Rule, RuleHit, RulesError, RulesTable, load_rules
+from .rules import (GateVerdict, Rule, RuleHit, RulesError, RulesTable,
+                    load_rules, require_schedule_or_watcher)
 
 __all__ = [
     "ColdCoordinator",
@@ -39,6 +40,7 @@ __all__ = [
     "Envelope",
     "Expiry",
     "FlowHeartbeat",
+    "GateVerdict",
     "HotDecision",
     "HotDispatcher",
     "LifecycleRegistry",
@@ -57,5 +59,6 @@ __all__ = [
     "encode",
     "load_rules",
     "make",
+    "require_schedule_or_watcher",
     "speak_guarded",
 ]
