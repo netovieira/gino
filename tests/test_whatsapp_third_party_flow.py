@@ -16,9 +16,12 @@ e nenhuma das partes toca rede, áudio de verdade ou segredo:
       chat, assinada no ponto único (``core.whatsapp.send``), sem aviso
       falado na sala;
   (b) nota de voz individual de terceiro            -> transcreve, sintetiza
-      e envia como ÁUDIO; quando a síntese falha, a MESMA resposta sai em
-      TEXTO exatamente uma vez (nunca os dois); nota SEM nome no transcript
-      -> silêncio total;
+      e envia como ÁUDIO; quando a síntese falha, NADA vai ao chat — nem
+      áudio, nem texto no lugar (a lei do dono de 07/11/2026, commit
+      39e7f48: áudio pedido que não sai não degrada em texto sem a flag
+      explícita) — e a falha não fica muda: o Activity Log registra a linha
+      com ``origin="whatsapp não enviado"`` e ``generated=False``; nota SEM
+      nome no transcript -> silêncio total;
   (c) eco ``from_me`` do dono no chat do terceiro COM o nome -> é ordem e é
       respondida no mesmo chat; sem o nome -> continua eco, zero envio;
   (d) grupo com o nome                              -> zero resposta (a
@@ -137,7 +140,8 @@ class FlowHarness:
         obj._restart_confirmation_pcm = lambda *a, **k: None
         obj._whatsapp_owner_voice = lambda *a, **k: (None, "")
         obj._transcribe_whatsapp_audio = lambda path: self.transcript
-        obj._log_line = lambda text, flags=None: text
+        obj._log_line = lambda text, flags=None: (
+            main.JarvisLive._log_line(obj, text, flags))
         obj._speech_route = lambda text, **k: {"muted": False,
                                                "subject": ""}
 
@@ -250,15 +254,39 @@ def test_third_party_voice_note_is_answered_with_synthesized_audio():
         assert h.sent_audio()[0][1] == THIRD_CHAT
 
 
-def test_when_synthesis_fails_the_same_answer_goes_out_as_text_once():
+def test_when_synthesis_fails_nothing_is_downgraded_and_the_failure_is_logged():
+    """Lei do dono (07/11/2026, commit 39e7f48) no fluxo inteiro.
+
+    Este teste nasceu em 05/11/2026 afirmando o fallback áudio→texto. No dia
+    07/11 o dono decidiu o contrário — "áudio pedido que não sai NÃO degrada
+    em texto: nada é enviado e a falha volta como False" (o comentário de
+    `_send_whatsapp_answer` cita a ordem; `tests/test_whatsapp_direct.py` foi
+    reescrito no mesmo commit) — e este arquivo ficou para trás vermelho,
+    afirmando uma lei revogada. Aqui vale a lei ATUAL:
+
+      * síntese quebrou -> ZERO envio (nem áudio, nem texto);
+      * a falha não fica muda: a linha do Activity Log existe com
+        ``origin="whatsapp não enviado"`` e ``generated=False``;
+      * a resposta existiu e era devida (o turno aconteceu) — o que não
+        aconteceu foi o downgrade silencioso;
+      * o caso legítimo do texto (espelho assumido pela FLAG explícita) já é
+        travado em `tests/test_whatsapp_direct.py`
+        (`test_synthesis_failure_with_explicit_flag_falls_back_to_text_once`).
+    """
+    from core import activity
     with FlowHarness(transcript=f"{NAME}, me conta uma piada curta",
                      synth_fail=True) as h:
         assert h.feed(_item("[mensagem de voz de 5s]", media=_voice_media()))
         assert h.sent_audio() == []
-        texts = h.sent_text()
-        assert len(texts) == 1              # a MESMA resposta, uma única vez
-        assert texts[0][2].startswith(f"*{NAME}:*\n")
-        assert ANSWER in texts[0][2]
+        assert h.sent_text() == []
+        assert h.client.calls == []          # nada foi para o chat
+        assert len(h.turns) == 1             # a resposta existiu e era devida
+        line = next(l for l in h.obj.ui.logs if l.startswith("WHATSAPP Gino:"))
+        meta = activity.parse(line)
+        assert meta is not None
+        assert meta["origin"] == "whatsapp não enviado"
+        assert meta["audio_generated"] is False
+        assert meta["audio_requested"] is True
 
 
 def test_third_party_voice_note_without_the_name_stays_silent():

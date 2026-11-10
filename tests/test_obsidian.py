@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import types
+import datetime as dt
 from pathlib import Path
 from urllib.parse import quote
 
@@ -291,7 +292,11 @@ def test_espelhar_memoria_escreve_indice_e_nota_do_dia(vault):
                "persona": None, "project": None, "kind": "note",
                "source": "voice", "refs": []},
     }}
-    caminhos = obsidian.espelhar_memoria(graph)
+    # O dia vem EXPLÍCITO: "nota do dia" é o dia do relógio de parede do
+    # processo, e um teste que comparava o nome gravado na noite de 09/11
+    # quebrou sozinho à meia-noite de 10/11 (mesma família do estado local de
+    # F3/F4). A data de hoje é provada no teste logo abaixo.
+    caminhos = obsidian.espelhar_memoria(graph, dia="2026-11-09")
     assert [c.parent for c in caminhos] == [root / "Memoria"] * 2
     indice = (root / "Memoria" / "Indice-da-memoria.md").read_text("utf-8")
     assert "[[topico-vault|vault]]" in indice
@@ -300,6 +305,22 @@ def test_espelhar_memoria_escreve_indice_e_nota_do_dia(vault):
     dia = (root / "Memoria" / "dia-2026-11-09.md").read_text("utf-8")
     assert "[15:00]" in dia and "[14:00]" in dia
     assert "[[topico-vault|vault]]" in dia
+
+
+def test_espelhar_memoria_sem_dia_usa_o_hoje_do_processo(vault):
+    """Sem parâmetro, "nota do dia" é o dia do relógio de parede.
+
+    A data esperada é derivada do MESMO relógio que o código usa (e aceita a
+    virada de meia-noite no meio da chamada: o nome tem de estar entre o dia
+    lido antes e o lido depois).
+    """
+    root, _ = vault
+    antes = dt.date.today().isoformat()
+    caminhos = obsidian.espelhar_memoria({"events": {}})
+    depois = dt.date.today().isoformat()
+    indice = caminhos[0].read_text("utf-8")
+    dias_ok = {f"[[dia-{d}]]" for d in {antes, depois}}
+    assert any(d in indice for d in dias_ok), indice[:200]
 
 
 def test_mirror_index_tambem_espeha_a_memoria_e_nao_quebra_sem_ela(vault,

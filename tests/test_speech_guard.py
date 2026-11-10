@@ -7,12 +7,41 @@ byte a byte e que a esteira do main.py grava `sanitized=`/`cut=` no sufixo
 """
 from __future__ import annotations
 
+import shutil
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import main
-from core import activity, speech_guard
+from core import activity, silence_code, silence_gate, speech_guard
+
+
+def _isolate_speech_state(testcase, obj):
+    """Estado de silêncio do processo vivo FORA do teste (F3/F4, 10/11/2026).
+
+    `_say_blocking` decide a fala por `_speech_route`, que consulta o
+    SilenceGate ("silêncio") e a palavra-código — e os dois leem arquivos
+    reais do processo vivo (`memory/silence_code.json`, `memory/silence_queue.json`).
+    Medido hoje: com o modo calado ativo para o projeto TheroTV, a frase de
+    teste "Vou ler /projects/therotv" era RETIDA em vez de sintetizada e os
+    dois testes viam `units == []` por causa do ESTADO DA MÁQUINA, não do
+    código (num checkout limpo passavam). Mesmo isolamento do fixture `live`
+    de `tests/test_silence_mode.py`: tudo em TemporaryDirectory.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="speech-guard-"))
+    testcase.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+    obj._silence_state_file = tmp / "silence_mode.json"
+    obj._silence_queue_file = tmp / "silence_queue.json"
+    obj._silence_code_state_file = tmp / "silence_code.json"
+    obj._silence_mode = silence_gate.SilenceGate(
+        state_path=obj._silence_state_file,
+        queue_path=obj._silence_queue_file)
+    # Palavra-código vazia: a chave real do config do dono nunca é lida aqui.
+    obj._silence_code_mode = silence_code.SilenceCode(
+        code_word="", state_path=obj._silence_code_state_file)
+    return obj
 
 
 def _sanitize(text: str, lang: str = "pt"):
@@ -246,7 +275,7 @@ class SayPipelineTest(unittest.TestCase):
         obj._loop = _Loop()
         obj.ui = _UI()
         obj._wait_for_user_quiet = lambda: True
-        return obj
+        return _isolate_speech_state(self, obj)
 
     def test_tts_receives_sanitized_text_and_log_marks_the_leak(self):
         obj = self._obj()
@@ -398,7 +427,7 @@ class BackgroundAvisoCutNoteTest(unittest.TestCase):
         # `_start_cut_note_watch_locked` abra a thread, que correria com as
         # asserções. O flush é chamado explicitamente.
         obj._speech_cut_watch = threading.current_thread()
-        return obj
+        return _isolate_speech_state(self, obj)
 
     def _age(self, seconds=10.0):
         return lambda obj: [note.update(at=note["at"] - seconds)

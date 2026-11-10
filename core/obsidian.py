@@ -1513,17 +1513,21 @@ def nota_do_dia(graph: dict, *, dia: str | None = None) -> Path:
         return alvo
 
 
-def espelhar_memoria(graph: dict) -> list[Path]:
+def espelhar_memoria(graph: dict, *, dia: str | None = None) -> list[Path]:
     """Espelha o grafo da aranha em ``Memoria/``: índice + nota do dia.
 
     Chutado por :func:`mirror_index`, que é o que ``core/memory_index.py`` já
     chama a cada evento. São dois arquivos por passada, de propósito: nota por
     tópico se escreve quando o tópico merece página própria
     (:func:`write_memory_note`), e não a cada evento do mundo.
+
+    ``dia`` existe para o teste fixar a data (o "hoje" do relógio de parede
+    não pode decidir o nome do arquivo que um teste compara — o mesmo defeito
+    de estado que deixou F3/F4 vermelhas); em produção o padrão é hoje.
     """
     with _LOCK:
-        hoje = dt.date.today().isoformat()
+        hoje = str(dia or "").strip() or dt.date.today().isoformat()
         indice = indice_da_memoria(graph or {}, dia=hoje)
-        dia = nota_do_dia(graph or {}, dia=hoje)
-        _log_event("vault_memoria_espelhada", indice=indice, dia=dia)
-        return [indice, dia]
+        dia_nota = nota_do_dia(graph or {}, dia=hoje)
+        _log_event("vault_memoria_espelhada", indice=indice, dia=dia_nota)
+        return [indice, dia_nota]
