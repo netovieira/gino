@@ -178,6 +178,34 @@ _PHRASES = {
 
 _RATE_MESSAGE = "one assistant restart per 5 minutes"
 
+# A recusa é FALADA com o motivo (dono, 10/11/2026, áudio): "se eu te pedir e
+# você tiver algum impedimento, você tem que me falar que você não pode
+# reiniciar por conta de tal coisa". Cada frase abaixo nomeia o impedimento
+# concreto em linguagem comum. Ela não afrouxa guarda nenhuma: o que muda é o
+# que quem pediu OUVE, nunca o que é permitido fazer.
+GUARD_JOBS = "tarefa de fundo em execução"
+GUARD_DELIVERING = "resposta ainda em entrega"
+GUARD_DEFERRED_FULL = "adiamento já em espera"
+GUARD_CEILING = "teto de reinício"
+REFUSE_CEILING = (
+    "Não reiniciei agora: o teto de um reinício do meu processo a cada 5 "
+    "minutos já foi gasto nesta janela — faltam {secs} segundos. Nada foi "
+    "reiniciado.")
+REFUSE_SLOT_FULL = (
+    "Não reiniciei agora: {guard}, e já existe um reinício do meu processo "
+    "adiado esperando isso terminar. Um pedido por lote — o seu não entrou na "
+    "fila. Nada foi reiniciado.")
+DEFERRED_TEXT = (
+    "Reinício do processo ADIADO: {guard}. Acontece sozinho quando isso "
+    "terminar — nada foi reiniciado ainda.")
+# Avisos do lado que ninguém pediu: o adiamento que virou efeito e o slot que
+# venceu sem executar. Sem eles, adiamento silencioso deixa o dono achando que
+# aconteceu algo que não aconteceu.
+NOTICE_FIRED = "O reinício do meu processo que estava adiado vai sair agora."
+NOTICE_DISCARD = (
+    "O reinício do meu processo que estava adiado venceu o prazo e foi "
+    "descartado sem executar. Nada foi reiniciado.")
+
 # Origem do reinício: o manager NUNCA inventa que o dono ordenou. Um reason
 # vazio vira "origem não informada"; o rótulo antigo que main.py gravava por
 # detecção automática de intenção não é ordem literal do dono e é registrado
@@ -376,6 +404,9 @@ class RestartManager:
         self._expire_cb: Optional[Callable[[str], None]] = None
         self._pc_restart: Optional[Callable[[], object]] = None
         self._delivering_cb: Optional[Callable[[], bool]] = None
+        # Canal do aviso falado do reinício próprio (o app liga no seu
+        # "aviso"; nunca é uma resposta de turno).
+        self._notice_cb: Optional[Callable[[str], None]] = None
 
     # ── wiring ──────────────────────────────────────────────────────────────
 
@@ -383,7 +414,8 @@ class RestartManager:
              confirm_cb: Optional[Callable[[str], None]] = None,
              pc_restart: Optional[Callable[[], object]] = None,
              expire_cb: Optional[Callable[[str], None]] = None,
-             delivering_cb: Optional[Callable[[], bool]] = None) -> None:
+             delivering_cb: Optional[Callable[[], bool]] = None,
+             notice_cb: Optional[Callable[[str], None]] = None) -> None:
         """Wire the manager to the app.
 
         shutdown_cb: called with no arguments to end the app cleanly.
@@ -399,12 +431,28 @@ class RestartManager:
         delivering_cb: True while the current answer is still leaving (TTS
                      queue or the outgoing chat note). Guarda 2 do reinício do
                      próprio processo: o reinício espera a entrega acabar.
+        notice_cb:   called with the one-line notice of a deferred restart
+                     that left the queue — it fired, or it aged out and was
+                     thrown away. Best-effort: it runs from the task watch,
+                     never inside the manager lock, and must never call back
+                     into the manager. Sem isso o adiamento é silencioso.
         """
         self._shutdown_cb = shutdown_cb if callable(shutdown_cb) else None
         self._confirm_cb = confirm_cb if callable(confirm_cb) else None
         self._expire_cb = expire_cb if callable(expire_cb) else None
         self._pc_restart = pc_restart if callable(pc_restart) else None
         self._delivering_cb = delivering_cb if callable(delivering_cb) else None
+        self._notice_cb = notice_cb if callable(notice_cb) else None
+
+    def _notice(self, line: str) -> None:
+        """Avisa o dono do que aconteceu com o reinício adiado. Nunca sobe."""
+        cb = self._notice_cb
+        if cb is None or not line:
+            return
+        try:
+            cb(line)
+        except Exception as e:
+            self._log(f"aviso de reinício adiado falhou — {e}")
 
     def _log(self, message: str) -> None:
         try:
@@ -789,12 +837,12 @@ class RestartManager:
         por callback, porque só o app sabe se a fala dele terminou de sair.
         """
         if _jobs_busy():
-            return "tarefa de fundo em execução"
+            return GUARD_JOBS
         cb = self._delivering_cb
         if cb is not None:
             try:
                 if cb():
-                    return "resposta ainda em entrega"
+                    return GUARD_DELIVERING
             except Exception as e:
                 self._log(f"guarda de entrega indisponível — {e}")
         return ""
@@ -807,27 +855,35 @@ class RestartManager:
         reiniciar o processo e nunca chama ``_run_pc``. A máquina continua no
         protocol antigo (``request_pc`` + a frase exata do dono).
 
-        Ordem dos chequeiros: teto (recusa), depois guardas (adia), depois
-        executa. Adiar nunca derruba o pedido — ele sai em
-        ``flush_self_restart`` quando a entrega/executor liberar.
+        Ordem dos chequeiros: teto (recusa), depois guardas (adia, ou recusa
+        quando o único slot já está tomado), depois executa. Adiar nunca
+        derruba o pedido — ele sai em ``flush_self_restart`` quando a
+        entrega/executor liberar. Toda recusa sai daqui escrita em linguagem
+        comum e NOMEANDO o impedimento concreto (dono, 10/11/2026): quem
+        pediu ouve por que não foi, em vez de um "não deu".
         """
         who = normalize_requester(requester)
         why = recorded_origin(reason)
-        ceiling = self._rate_limited()
-        if ceiling:
-            self._trail("recusado", who, why, guard="teto de reinício")
-            return ceiling
+        remaining = self._ceiling_remaining()
+        if remaining is not None:
+            self._trail("recusado", who, why, guard=GUARD_CEILING)
+            return self._ceiling_refusal()
         guard = self._self_guard()
         if guard:
             with self._lock:
                 # Um reinício por lote: o slot já cheio não acumula o segundo.
-                if self._self_deferred is None:
+                parked = self._self_deferred is None
+                if parked:
                     self._self_deferred = _PendingRequest(
                         kind="assistant", reason=why, phrase="",
                         at=time.monotonic(), requester=who)
-            self._trail("adiado", who, why, guard=guard)
-            return (f"Reinício do processo ADIADO: {guard}. Acontece sozinho "
-                    f"quando isso terminar — nada foi reiniciado ainda.")
+            if parked:
+                self._trail("adiado", who, why, guard=guard)
+                return DEFERRED_TEXT.format(guard=guard)
+            # O segundo pedido do lote não entrou na fila. Dizer "adiado" aqui
+            # seria prometer um reinício que nunca vai acontecer.
+            self._trail("recusado", who, why, guard=GUARD_DEFERRED_FULL)
+            return REFUSE_SLOT_FULL.format(guard=guard)
         return self._run_self(_PendingRequest(kind="assistant", reason=why,
                                               phrase="", at=time.monotonic(),
                                               requester=who))
@@ -851,6 +907,12 @@ class RestartManager:
         vivo (a fila de saída esvaziou). Ainda assim o método confere as
         guardas de novo — se algo voltou a ocupá-las, o pedido continua
         adiado em vez de cortar o trabalho no meio.
+
+        Todo saída da fila é AVISADA (dono, 10/11/2026): sem aviso, adiamento
+        silencioso é o mesmo defeito de sempre — ele acha que aconteceu algo
+        que não aconteceu. O aviso sai antes do efeito porque o efeito derruba
+        este processo; quando não há como executar (sem gancho de desligada),
+        nada é prometido.
         """
         with self._lock:
             request = self._self_deferred
@@ -863,19 +925,23 @@ class RestartManager:
                     self._self_deferred = None
             self._trail("descartado", request.requester, request.reason,
                         guard="adiamento venceu")
-            return ("The deferred assistant restart aged out. Nothing was "
-                    "restarted.")
-        ceiling = self._rate_limited()
-        if ceiling:
+            self._notice(NOTICE_DISCARD)
+            return NOTICE_DISCARD
+        remaining = self._ceiling_remaining()
+        if remaining is not None:
             with self._lock:
                 if self._self_deferred is request:
                     self._self_deferred = None
             self._trail("recusado", request.requester, request.reason,
-                        guard="teto de reinício")
-            return ceiling
+                        guard=GUARD_CEILING)
+            refusal = self._ceiling_refusal()
+            self._notice(refusal)
+            return refusal
         guard = self._self_guard()
         if guard:
             return ""
+        if self.dry_run or self._shutdown_cb is not None:
+            self._notice(NOTICE_FIRED)
         return self._run_self(request)
 
     def deferred_self_restart(self) -> Optional[dict]:
@@ -962,6 +1028,18 @@ class RestartManager:
         return self._run_pc(p)
 
     def _rate_limited(self) -> Optional[str]:
+        remaining = self._ceiling_remaining()
+        if remaining is None:
+            return None
+        return (f"Assistant restart is rate-limited to {_RATE_MESSAGE}; "
+                f"try again in {remaining} seconds. Nothing was done.")
+
+    def _ceiling_remaining(self) -> Optional[int]:
+        """Segundos até o teto liberar; None quando o teto está livre.
+
+        Única fonte do fato: ``_rate_limited`` veste inglês para o caminho da
+        frase, ``_ceiling_refusal`` veste a recusa falada do poder próprio.
+        """
         with self._lock:
             last = self._last_assistant_at
             now = time.monotonic()
@@ -970,9 +1048,10 @@ class RestartManager:
         elapsed = now - last
         if elapsed >= RATE_LIMIT_SECONDS:
             return None
-        remaining = int(RATE_LIMIT_SECONDS - elapsed) + 1
-        return (f"Assistant restart is rate-limited to {_RATE_MESSAGE}; "
-                f"try again in {remaining} seconds. Nothing was done.")
+        return int(RATE_LIMIT_SECONDS - elapsed) + 1
+
+    def _ceiling_refusal(self) -> str:
+        return REFUSE_CEILING.format(secs=self._ceiling_remaining() or 0)
 
     def _spawn_relaunch_helper(self, script: str) -> Optional[str]:
         """Lança o helper FORA do cgroup deste processo; descreve o mecanismo.

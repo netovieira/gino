@@ -55,8 +55,12 @@ def _unbound_action():
 
 
 def _manager(tmp_path, **kw) -> RestartManager:
+    """Manager com estado isolado. Um subdiretório pedido pelo teste é criado
+    na hora — assim o teto de um manager nunca vaza para o outro."""
+    folder = Path(tmp_path)
+    folder.mkdir(parents=True, exist_ok=True)
     return RestartManager(dry_run=True, logger=mock.Mock(),
-                          state_path=tmp_path / "restart_pending.json", **kw)
+                          state_path=folder / "restart_pending.json", **kw)
 
 
 def _trail(tmp_path) -> list[dict]:
@@ -244,7 +248,9 @@ def test_deferred_slot_coalesces_one_decision_per_batch(tmp_path, monkeypatch):
     first = m.self_restart(reason="primeiro", requester="dono")
     second = m.self_restart(reason="segundo", requester="iniciativa propria")
 
-    assert "ADIADO" in first and "ADIADO" in second
+    # O primeiro foi adiamento; o segundo é RECUSA, porque não entrou na fila.
+    assert "ADIADO" in first
+    assert "não reiniciei" in second.lower(), second
     monkeypatch.setattr(restart, "_jobs_busy", lambda: False)
     fired = m.flush_self_restart()
 
@@ -252,7 +258,7 @@ def test_deferred_slot_coalesces_one_decision_per_batch(tmp_path, monkeypatch):
     assert m.deferred_self_restart() is None
     # O slot tinha a origem do primeiro pedido, não a do segundo.
     assert m._last_reason or True
-    assert [r["decisao"] for r in _trail(tmp_path)] == ["adiado", "adiado",
+    assert [r["decisao"] for r in _trail(tmp_path)] == ["adiado", "recusado",
                                                         "executado"]
     assert _trail(tmp_path)[-1]["motivo"] == "primeiro"
 
@@ -265,7 +271,7 @@ def test_deferral_ages_out_instead_of_firing_days_later(tmp_path, monkeypatch):
     monkeypatch.setattr(restart, "SELF_DEFER_TTL_SECONDS", -1.0)
     out = m.flush_self_restart()
 
-    assert "aged out" in out
+    assert "descartado" in out.lower(), out
     assert m.deferred_self_restart() is None
     assert _trail(tmp_path)[-1]["decisao"] == "descartado"
 
@@ -278,8 +284,8 @@ def test_ceiling_refuses_a_second_restart_in_the_window(tmp_path):
     assert "[DRY RUN]" in m.self_restart(reason="primeiro do lote")
     second = m.self_restart(reason="segundo pedido", requester="outra voz")
 
-    assert "rate-limited" in second, second
-    assert "one assistant restart per 5 minutes" in second
+    assert "não reiniciei" in second.lower(), second
+    assert "teto" in second and "5 minutos" in second
     assert _trail(tmp_path)[-1]["decisao"] == "recusado"
     assert _trail(tmp_path)[-1]["guarda"] == "teto de reinício"
 
@@ -293,8 +299,149 @@ def test_ceiling_survives_the_restart_it_guards(tmp_path):
 
     out = m.self_restart(reason="logo depois do boot")
 
-    assert "rate-limited" in out, out
+    assert "não reiniciei" in out.lower(), out
     assert _trail(tmp_path)[-1]["decisao"] == "recusado"
+
+
+# ── (e2) a recusa é FALADA com o motivo (dono, 10/11/2026, áudio) ───────────
+#
+# "Se eu te pedir e você tiver algum impedimento, você tem que me falar que
+# você não pode reiniciar por conta de tal coisa." Cada um dos quatro
+# impedimentos tem de sair daqui nomeando o fato concreto — nunca silêncio,
+# nunca "não deu". Afrouxar guarda não é opção: o que muda é a frase.
+
+def test_each_impediment_names_itself_in_the_refusal(tmp_path, monkeypatch):
+    monkeypatch.setattr(restart, "_jobs_busy", lambda: True)
+    m = _manager(tmp_path)
+
+    fundo = m.self_restart(reason="pediram na conversa", requester="dono")
+    assert "tarefa de fundo em execução" in fundo, fundo
+
+    def _segundo_pedido(manager):
+        return manager.self_restart(reason="de novo", requester="dono")
+
+    slot_cheio = _segundo_pedido(m)
+    assert "já existe um reinício" in slot_cheio, slot_cheio
+    assert "tarefa de fundo em execução" in slot_cheio
+
+    teto = _manager(tmp_path / "teto")
+    monkeypatch.setattr(restart, "_jobs_busy", lambda: False)
+    assert "[DRY RUN]" in teto.self_restart(reason="primeiro")
+    gasto = _segundo_pedido(teto)
+    assert "teto" in gasto and "5 minutos" in gasto, gasto
+
+    entrega = _manager(tmp_path / "entrega")
+    entrega.bind(delivering_cb=lambda: True)
+    monkeypatch.setattr(restart, "_jobs_busy", lambda: False)
+    no_ar = _segundo_pedido(entrega)
+    assert "resposta ainda em entrega" in no_ar, no_ar
+
+    for phrase in (fundo, slot_cheio, gasto, no_ar):
+        assert "Nada foi reiniciado" in phrase or "nada foi reiniciado" \
+            in phrase, phrase
+
+
+def test_the_slot_full_refusal_does_not_promise_a_restart(tmp_path,
+                                                          monkeypatch):
+    """Caso (d): o segundo pedido do lote NÃO ficou na fila — dizer o contrário
+    seria prometer um reinício que nunca acontece."""
+    monkeypatch.setattr(restart, "_jobs_busy", lambda: True)
+    m = _manager(tmp_path)
+    m.self_restart(reason="primeiro", requester="dono")
+
+    out = m.self_restart(reason="segundo", requester="dono")
+
+    assert "ADIADO" not in out, out
+    assert "o seu não entrou na fila" in out
+    assert _trail(tmp_path)[-1]["decisao"] == "recusado"
+    assert _trail(tmp_path)[-1]["guarda"] == "adiamento já em espera"
+
+
+def test_refusal_carries_no_secret_and_no_contact_number(tmp_path,
+                                                         monkeypatch):
+    """A frase de recusa é receita fixa: nem o reason sujo vaza nela."""
+    monkeypatch.setattr(restart, "_jobs_busy", lambda: True)
+    m = _manager(tmp_path)
+    sujo = ("liga no +55 48 99999-1234 e confere senha=abracadabra123 "
+            "token=DEADBEEF")
+
+    first = m.self_restart(reason=sujo, requester="dono")
+    second = m.self_restart(reason=sujo, requester="dono")
+    m._last_assistant_at = None
+    teto = _manager(tmp_path / "sem-teto")
+    teto.self_restart(reason=sujo)
+    gasto = teto.self_restart(reason=sujo)
+
+    for phrase in (first, second, gasto):
+        assert "abracadabra123" not in phrase, phrase
+        assert "DEADBEEF" not in phrase, phrase
+        assert "99999-1234" not in phrase and "999991234" not in phrase, phrase
+
+
+# ── (e3) adiamento que sai da fila vira AVISO (dono, 10/11/2026) ────────────
+
+def _notice_manager(tmp_path, monkeypatch, busy=True):
+    """Manager com o canal de aviso do app capturado."""
+    monkeypatch.setattr(restart, "_jobs_busy", lambda: busy)
+    m = _manager(tmp_path)
+    saids: list[str] = []
+    m.bind(notice_cb=saids.append)
+    return m, saids
+
+
+def test_when_the_impediment_passes_the_owner_is_warned(tmp_path, monkeypatch):
+    m, saids = _notice_manager(tmp_path, monkeypatch)
+
+    assert "ADIADO" in m.self_restart(reason="correção do portão",
+                                      requester="dono")
+    assert saids == []                    # ainda esperando: nada a dizer
+    monkeypatch.setattr(restart, "_jobs_busy", lambda: False)
+
+    fired = m.flush_self_restart()
+
+    assert fired.startswith("[DRY RUN]"), fired
+    assert any("adiado" in line and "vai sair agora" in line for line in saids
+               ), saids
+
+
+def test_an_expired_deferral_is_announced_as_thrown_away(tmp_path,
+                                                         monkeypatch):
+    m, saids = _notice_manager(tmp_path, monkeypatch)
+    assert "ADIADO" in m.self_restart(reason="adiado para sempre")
+
+    monkeypatch.setattr(restart, "SELF_DEFER_TTL_SECONDS", -1.0)
+    out = m.flush_self_restart()
+
+    assert out in saids, (out, saids)
+    assert "descartado" in saids[-1] and "Nada foi reiniciado" in saids[-1]
+
+
+def test_the_fire_notice_is_not_promised_without_a_shutdown_hook(tmp_path,
+                                                                 monkeypatch):
+    """dry_run=False sem gancho de desligada: não executa, então não promete."""
+    monkeypatch.setattr(restart, "_jobs_busy", lambda: True)
+    m = RestartManager(dry_run=False, logger=mock.Mock(),
+                       state_path=tmp_path / "restart_pending.json")
+    saids: list[str] = []
+    m.bind(notice_cb=saids.append)
+    assert "ADIADO" in m.self_restart(reason="efeito real")
+    monkeypatch.setattr(restart, "_jobs_busy", lambda: False)
+
+    out = m.flush_self_restart()
+
+    assert "shutdown hook" in out, out
+    assert saids == []
+
+
+def test_notice_failure_never_breaks_the_restart(tmp_path, monkeypatch):
+    monkeypatch.setattr(restart, "_jobs_busy", lambda: True)
+    m = _manager(tmp_path)
+    m.bind(notice_cb=mock.Mock(side_effect=RuntimeError("boca ocupada")))
+    assert "ADIADO" in m.self_restart(reason="aviso que quebra")
+    monkeypatch.setattr(restart, "_jobs_busy", lambda: False)
+
+    assert m.flush_self_restart().startswith("[DRY RUN]")
+
 
 
 def os_pid_of_someone_else() -> int:

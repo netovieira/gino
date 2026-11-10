@@ -605,7 +605,8 @@ def test_action_assistant_is_a_power_and_pc_keeps_the_phrase(manager, no_popen):
 
     # O teto de 5 minutos é o que trava o próximo, não uma janela de "sim".
     limited = action.restart_assistant({"action": "assistant"})
-    assert "rate-limited" in limited
+    assert ("não reiniciei" in limited.lower()
+            and "teto" in limited.lower())
     assert manager.pending() is None
 
     # O modelo continua sem poder confirmar nada pelo dono.

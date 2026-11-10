@@ -6033,11 +6033,18 @@ class JarvisLive:
         if self._restart_enabled:
             try:
                 self._restart = _restart.RestartManager(logger=print)
+
+                def _restart_aviso(line: str) -> None:
+                    # Canal dos avisos do reinício: request vencido, adiamento
+                    # que virou efeito, slot descartado. Não é resposta de
+                    # turno — é o "aviso" de segundo plano, boca fechada inclusa.
+                    self._say_now(line, log=True, origin="aviso")
+
                 self._restart.bind(shutdown_cb=self._restart_shutdown,
                                    pc_restart=self._pc_restart_confirmed,
                                    delivering_cb=self._restart_is_delivering,
-                                   expire_cb=lambda line: self._say_now(
-                                       line, log=True, origin="aviso"))
+                                   expire_cb=_restart_aviso,
+                                   notice_cb=_restart_aviso)
                 _restart_action.bind(self._restart)
             except Exception as e:
                 self._restart = None
@@ -14508,6 +14515,12 @@ class JarvisLive:
         low = str(out).lower()
         if "restarting the assistant" in low or "[dry run]" in low:
             self._say_now("Reiniciando o meu processo agora.")
+        elif "não reiniciei" in low or "reinício do processo adiado" in low:
+            # A frase do manager JÁ nomeia o impedimento concreto (trabalho em
+            # segundo plano, resposta no ar, teto gasto, adiamento em espera).
+            # Vai como veio: ordem do dono (10/11/2026) é que a recusa seja
+            # falada com o motivo, e não um "não deu" genérico.
+            self._say_now(_restart._short(out, 200))
         elif "adiado" in low:
             self._say_now("Vou reiniciar o meu processo assim que isso "
                           "terminar; nada foi reiniciado ainda.")

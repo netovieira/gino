@@ -353,8 +353,8 @@ class OwnerDirectRestartTests(unittest.TestCase):
                          [("dono", "ordem falada do dono")])
         self.assertEqual(obj._restart.confirmed_owner, [])
         self.assertEqual(obj._restart.requested, [])
-        self.assertTrue(any("Vou reiniciar o meu processo assim que isso "
-                            "terminar" in said for said in obj.said), obj.said)
+        self.assertTrue(any("tarefa de fundo em execução" in said
+                            for said in obj.said), obj.said)
 
     def test_background_job_still_holds_the_pc_restart(self):
         obj = _obj()
